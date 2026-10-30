@@ -19,6 +19,10 @@ Propose Claude Code hooks that stop wasteful patterns. Check the current Claude 
 documentation for the exact input fields and the deny/allow output format before writing
 any script.
 
+The plugin ships no live loop guard. Use `Stuck turns` as the evidence gate: if they
+are a large share of cost over two audits, first propose fixes for their causes. A
+heuristic hook with no model call is a later option, not a shipped guard.
+
 1. Big-read guard (PreToolUse on Read): deny a Read of a code, data, scene or log file
    over ~400 lines when no line limit is given. The denial message must:
    - name the file and its line count;

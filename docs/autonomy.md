@@ -41,9 +41,14 @@ Reversible and local, with no effect on what agents are allowed to do:
 - Creating `docs/kaizen/` files (ledger, baseline, model roster, reports) and git-ignore rules for audit reports.
 - Shortening or deduplicating instruction files (CLAUDE.md, AGENTS.md, agent and skill descriptions), **as long as no rule is dropped**. Merged rules stay word-for-word in the diff.
 - Adding a tools-before-tokens line, a code-map line or a topic-doc pointer to instructions.
+- Adding one short, confirmed repo-fact line to a project's CLAUDE.md.
 - Setting `disable-model-invocation: true` on your own user-triggered skills.
 - Switching a single routing row to a model already in your roster, as a one-row trial.
 - Writing new scripts under `tools/` or `~/.claude/bin/` (new files only; nothing existing is replaced).
+
+`permissions.deny` rules for unused tools are proposed in `safe` and applied only in
+`auto`. They are reversible and tighten permissions, but can remove a tool needed by a
+rare workflow.
 
 ## Hard stops (always need a human, in every mode)
 

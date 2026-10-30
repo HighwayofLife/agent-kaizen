@@ -9,7 +9,7 @@ argument-hint: "[propose|safe|auto|yolo]"
 
 Every MCP tool schema, connector, enabled plugin, skill description and custom-agent description can add tokens to every turn, even if you never use it. Removing what this project never uses saves tokens on every turn after that.
 
-**Changes:** settings and config, after you approve. Back up `~/.claude/settings.json`, `.claude/settings.json` and `~/.codex/config.toml` first.
+**Changes:** settings and config, after you approve. Back up each file changed, including `.claude/settings.local.json` when used, first.
 
 **Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `~/.claude/agent-kaizen.json`, else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
@@ -28,6 +28,14 @@ Every MCP tool schema, connector, enabled plugin, skill description and custom-a
    - Codex MCP servers in ~/.codex/config.toml, and how often Codex sessions used them.
 2. Propose, each with the token or turn saving where you can estimate it. Check every
    setting name against the current Claude Code settings docs first:
+   - use `Unused tools and MCP servers` in the audit to propose `permissions.deny`
+     entries in `.claude/settings.local.json`. Check the current Claude Code settings
+     docs for exact built-in tool and MCP server/tool deny syntax before writing;
+   - never deny a tool named in the project's CLAUDE.md, agents, skills or hooks. Prefer
+     denying a whole unused MCP server over its tools. Deferred tools cost only their name
+     per turn, so prioritize servers loaded in full or carrying server instructions;
+   - apply each deny between sessions: a changed tool set invalidates a resumed conversation's
+     prompt cache. Each entry gets its own ledger row and `/agent-kaizen:undo` can reverse it;
    - deny servers or connectors this project never uses (settings key deniedMcpServers;
      disableClaudeAiConnectors to turn all claude.ai connectors off; for project .mcp.json
      servers, disabledMcpjsonServers or enabledMcpjsonServers). Prefer project-level

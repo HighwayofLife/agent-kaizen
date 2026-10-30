@@ -43,12 +43,23 @@ Report, for the last 14 days:
    - whole-file reads of big files;
    - planners or reviewers that run far longer than the median;
    - many small agent spawns, each of which wakes the main session.
+5. `Cost (API-equivalent)`: cache-aware cost by agent type and model, using published
+   prices in `scripts/pricing.json`, with shares for cache reads, writes, uncached input
+   and output. This is a comparison weight, not a bill; most users have subscriptions.
+6. `Stuck turns`: repeated failures (same tool, command or file, and first error line)
+   at least 3 times in a turn, with count, share, tool calls, cost and top signatures.
+7. `Repeated failures across sessions`: failures in at least 3 sessions per project,
+   with a "worked instead" hint when a later command variant succeeded; these are
+   repo-fact candidates.
+8. `Unused tools and MCP servers`: per project, unused over at least 10 prompts across
+   2 sessions, or at least 5 sessions; mark deferred or loaded in full when known.
 
 Write docs/kaizen/audit-<yyyy-mm-dd>.md: a headline (3 lines), the tables above,
 and a ranked list of the 10 biggest savings, each with estimated tokens saved per week,
 effort (S/M/L), risk, and which prompt or change addresses it. If
 docs/kaizen/LEDGER.md exists, fill in "measured effect" for earlier rows that this
-audit can now measure.
+audit can now measure. Rank findings from all sections by API-equivalent dollars where
+available, and tokens otherwise.
 Finish by recommending the first 3 changes.
 
 ## Bundled resources

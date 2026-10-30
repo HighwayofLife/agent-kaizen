@@ -22,7 +22,8 @@ Review the newest usage audit (docs/kaizen/ or ~/.claude/audits/) against the on
 before it and docs/kaizen/LEDGER.md.
 
 1. For every ledger row without a measured effect: fill it in from the audits, then say
-   keep, tune or revert. If a change made things worse or nobody is using it (for
+   keep, tune or revert. Record API-equivalent dollars alongside tokens when available.
+   If a change made things worse or nobody is using it (for
    example a tool that agents never call), propose the fix: better wording where agents
    actually read it, a hook, or a revert.
 2. List the 5 largest remaining costs and any new patterns since the last review.
@@ -34,6 +35,12 @@ before it and docs/kaizen/LEDGER.md.
    too weakly.
 4. Propose the next 3 changes, ranked by expected saving per unit of effort, each with
    how we'll measure it. Prefer small, reversible changes.
+   For `Repeated failures across sessions`, propose one short fact line per candidate in
+   the project's CLAUDE.md only when the "worked instead" hint or code confirms the form
+   (for example, "Run tests with `python -m pytest`"). Propose dropping it if later audits
+   show the failure persists or the fact is stale. For `Stuck turns` with a large share of
+   cost, propose fixing the cause: a brief, agent instructions, a missing check script or
+   a guardrail, not a live judge.
 Wait for my OK, implement the approved ones (each with a ledger row), and mark the audit
 reviewed.
 

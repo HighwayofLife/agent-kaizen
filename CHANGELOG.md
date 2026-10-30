@@ -2,6 +2,20 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.3.0 (2026-10-29)
+
+Four new audit measurements, inspired by Microsoft's [TokenEconomizer](https://github.com/microsoft/TokenEconomizer), which acts on the same signals live inside each session. Agent Kaizen measures them offline at zero token cost and turns them into proposals:
+- **API-equivalent cost:** every message priced cache-aware (cache reads, 5-minute and 1-hour cache writes, uncached input, output) from published prices in `scripts/pricing.json`, including Haiku 5.5's higher rate above 100k prompt tokens. It is a weighting for comparing changes, not a bill.
+- **Stuck turns:** the same failure (tool, command or file, and first error line) repeated three or more times in one turn.
+- **Repeated failures across sessions:** candidates for one-line repo facts in CLAUDE.md, with a "worked instead" hint when a different launcher, environment variable or directory fixed it.
+- **Unused tools and MCP servers** per project, one row per server. Deferred tools are summarised, since only their names are sent.
+
+Also:
+- Error lines in the report are normalised and secret-like strings redacted. The scan is faster than 0.2.1, despite the extra measurements.
+- The audit, review, trim-context and guardrails skills and docs/autonomy.md use the new sections: repo facts apply in `safe` mode, deny rules only in `auto`.
+- README: an animated teaser, the loop redrawn as a light/dark SVG, a new banner, tested versions, and a comparison with TokenEconomizer. The graphics are drawn by `assets/src/*.py`.
+- AGENTS.md (also imported by CLAUDE.md and used as the subagent role context): commands and rules for coding agents working on this repo.
+
 ## 0.2.1 (2026-10-29)
 
 Fixes from five end-to-end `yolo` test runs on a real project:

@@ -13,6 +13,20 @@ import sys
 
 TIMESTAMP = re.compile(rb'"timestamp"\s*:\s*"([^"\n]+)"')
 MARKERS = (b'"usage"', b'"tool_result"', b'"timestamp"')
+REQUIRED_TOOLS = frozenset(("Read", "Edit", "Write", "Bash", "Grep", "Glob",
+                            "Agent", "Task", "ToolSearch", "Skill"))
+USER_ROW = re.compile(rb'"type"\s*:\s*"user"')
+MESSAGE_ROW = re.compile(rb'"type"\s*:\s*"(?:user|assistant)"')
+TOOL_METADATA = (b'"api-request-shape"', b'"deferred_tools_delta"', b'"mcp_instructions_delta"')
+EXIT_HEADER = re.compile(r"^Exit code\s*:?\s*(-?\d+)\s*$", re.I)
+BENIGN_EXITS = {"grep": {1}, "rg": {1}, "test": {1}, "[": {1}, "diff": {1}, "cmp": {1},
+                "sed -n": {141, -13}, "wc": {141, -13}, "head": {141, -13}}
+SHELL_NO_HINT = frozenset(("for", "while", "if", "then", "do", "case", "cat", "echo", "cd", "printf"))
+SECRET = re.compile(r"sk-[A-Za-z0-9_-]+|ghp_[A-Za-z0-9_]+|xox[a-z]*-[A-Za-z0-9-]+|AKIA[A-Z0-9]+|"
+                    r"(?<![A-Za-z0-9_])[A-Za-z0-9+/=_-]{32,}(?![A-Za-z0-9_])")
+JSON_DECODER = json.JSONDecoder()
+METADATA_FIELDS = {key: re.compile(('"' + key + r'"\s*:\s*').encode()) for key in (
+    "tools", "addedNames", "readdedNames", "surfacedDefinitions", "removedNames")}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*=")
 
 
@@ -21,12 +35,32 @@ def date_time(value):
     return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
 
 
-def rows(path, since, warnings, keep_model=False):
-    """Timestamp gate runs on bytes, before decoding/JSON parsing large content."""
+def metadata_row(line, timestamp):
+    shape = b'"api-request-shape"' in line[:256]
+    kind = "api-request-shape" if shape else "attachment"
+    attachment = "deferred_tools_delta" if b'"deferred_tools_delta"' in line[:1024] else "mcp_instructions_delta"
+    value = {}
+    for key in (("tools",) if shape else ("addedNames", "readdedNames", "surfacedDefinitions", "removedNames")):
+        match = METADATA_FIELDS[key].search(line)
+        if match:
+            value[key] = JSON_DECODER.raw_decode(line[match.end():].decode("utf-8"))[0]
+    return dict(type=kind, timestamp=timestamp, **({"shape": value} if shape else {
+        "attachment": dict(type=attachment, **value)}))
+
+
+def rows(path, since, warnings, keep_model=False, keep_tools=False):
+    """Timestamp and record-type gates run before decoding large content."""
     cutoff = since.strftime("%Y-%m-%dT%H:%M:%S")
+    saved_shape, saved_deltas, before_user = None, [], False
     try:
         with path.open("rb") as stream:
             for line in stream:
+                prefix = line[:1024]
+                metadata = keep_tools and any(marker in prefix for marker in TOOL_METADATA)
+                if keep_tools and not (metadata or b'"message"' in prefix or MESSAGE_ROW.search(prefix) or b'"usage"' in prefix):
+                    continue
+                if keep_model and not (b'"token_count"' in prefix or b'"model"' in line):
+                    continue
                 if not any(marker in line for marker in MARKERS):
                     continue
                 match = TIMESTAMP.search(line)
@@ -34,13 +68,31 @@ def rows(path, since, warnings, keep_model=False):
                     continue
                 timestamp = match[1].decode("ascii", "replace")
                 try:
-                    # Nearly all transcripts are UTC. Avoid datetime parsing on
-                    # every line, while correctly handling explicit offsets too.
                     old = (timestamp[:19] < cutoff if timestamp.endswith(("Z", "+00:00"))
                            else date_time(timestamp) < since)
+                    if old and keep_tools:
+                        if metadata:
+                            if b'"api-request-shape"' in prefix:
+                                saved_shape = (line, timestamp)
+                            else:
+                                saved_deltas.append((line, timestamp))
+                        elif (USER_ROW.search(line) and b'"tool_result"' not in line
+                              and b'"isMeta":true' not in prefix and b'"isMeta": true' not in prefix
+                              and b'<task-notification>' not in line):
+                            before_user = True
+                        continue
                     if old and not (keep_model and b'"model"' in line):
                         continue
-                    row = json.loads(line)
+                    if keep_tools and (saved_shape or saved_deltas or before_user):
+                        for saved, ts in ([saved_shape] if saved_shape else []) + saved_deltas:
+                            try:
+                                yield dict(metadata_row(saved, ts), _before_window=True)
+                            except (ValueError, UnicodeError):
+                                warnings["malformed rows"] += 1
+                        if before_user:
+                            yield dict(type="user", message={}, _before_window=True)
+                        saved_shape, saved_deltas, before_user = None, [], False
+                    row = metadata_row(line, timestamp) if metadata else json.loads(line)
                     if isinstance(row, dict):
                         if old:
                             row["_before_window"] = True
@@ -72,7 +124,7 @@ def image_count(content):
     return 0
 
 
-def bash_head(command):
+def bash_head(command, words_limit=2):
     segments = [part.strip() for part in re.split(r"&&|;|\n|\|", command) if part.strip()]
     for segment in segments:
         try:
@@ -86,7 +138,7 @@ def bash_head(command):
         if words and words[0] in ("cd", "export", "set"):
             continue
         if words:
-            return " ".join(words[:2])[:40]
+            return redact(" ".join(words[:words_limit]))[:40]
     return "(cd/vars only)"
 
 
@@ -95,13 +147,223 @@ def blocks(message):
     return [item for item in content if isinstance(item, dict)] if isinstance(content, list) else []
 
 
-def scan_claude(path, agent, since, data, seen_messages):
+def load_pricing(path):
+    try:
+        value = json.loads(path.read_text())
+        if not isinstance(value.get("models"), dict) or not isinstance(value.get("aliases", {}), dict):
+            raise ValueError("expected models and aliases objects")
+        return value, None
+    except (OSError, ValueError, AttributeError) as exc:
+        return {}, f"Pricing file unavailable: {path} ({exc})"
+
+
+def price(data, model, agent, usage, codex=False):
+    pricing = data["_pricing"]
+    key = model if model in pricing.get("models", {}) else next((
+        pricing["aliases"][prefix] for prefix in sorted(pricing.get("aliases", {}), key=len, reverse=True)
+        if model.startswith(prefix)), None)
+    rates = pricing.get("models", {}).get(key)
+    if codex:
+        cached = usage.get("cached_input_tokens", 0) or 0
+        output = usage.get("output_tokens", 0) or 0
+        # Codex normally reports reasoning as a subset of output. Only add it
+        # when the billed total explicitly places it outside output_tokens.
+        extra = max(0, (usage.get("total_tokens", 0) or 0) - (usage.get("input_tokens", 0) or 0) - output)
+        output += min(extra, usage.get("reasoning_output_tokens", 0) or 0)
+        tokens = dict(uncached_input=max(0, (usage.get("input_tokens", 0) or 0) - cached),
+                      cache_read=cached, cache_write_5m=0, cache_write_1h=0, output=output)
+    else:
+        breakdown = usage.get("cache_creation") or {}
+        write = usage.get("cache_creation_input_tokens", 0) or 0
+        hour = min(write, breakdown.get("ephemeral_1h_input_tokens", 0) or 0)
+        tokens = dict(uncached_input=usage.get("input_tokens", 0) or 0,
+                      cache_read=usage.get("cache_read_input_tokens", 0) or 0,
+                      cache_write_5m=write - hour, cache_write_1h=hour,
+                      output=usage.get("output_tokens", 0) or 0)
+    if not any(tokens.values()):
+        return 0
+    if rates is None:
+        data["cost"]["unpriced"].setdefault(model, Counter()).update(tokens)
+        return 0
+    threshold = rates.get("over_threshold")
+    if not codex and threshold and context(usage) >= threshold["prompt_tokens"]:
+        rates = dict(rates, **threshold)
+    components = Counter()
+    for component, count in tokens.items():
+        rate = "input" if component == "uncached_input" else component
+        if codex and component == "cache_read":
+            rate = "cached_input"
+        group = "cache_write" if component.startswith("cache_write") else component
+        components[group] += count * rates.get(rate, 0) / 1000000
+    cost = sum(components.values())
+    data["cost"]["components"].update(components)
+    data["cost"]["by_model"][model] += cost
+    data["cost"]["by_agent"][agent] += cost
+    data["cost"]["total"] += cost
+    return cost
+
+
+def redact(text):
+    return SECRET.sub("[redacted]", str(text))
+
+
+def result_text(content):
+    if isinstance(content, list):
+        return "\n".join(str(b.get("text", "")) for b in content if isinstance(b, dict))
+    return str(content or "")
+
+
+def error_line(content):
+    text = next((line.strip() for line in result_text(content).splitlines()
+                 if line.strip() and not EXIT_HEADER.match(line.strip())), "(empty error)")
+    text = redact(text)
+    text = re.sub(r"/(?:private/)?(?:tmp|var/folders)/[^\s:]+", "<tmp>", text)
+    text = re.sub(r"\b(?:0x[0-9a-f]+|[0-9a-f]{8,}(?:-[0-9a-f]+)*)\b", "<id>", text, flags=re.I)
+    return re.sub(r"\d+", "#", text)
+
+
+def signature_text(signature):
+    tool, target, code, error = signature
+    return f"{tool} {redact(target)}" + (f" [exit {code}]" if code is not None else "") + f": {redact(error)[:120]}"
+
+
+def command_info(command):
+    env, cwd, words = [], "", []
+    for segment in re.split(r"&&|;|\n|\|", command):
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            return None
+        if not words:
+            continue
+        if words[0] == "cd":
+            cwd = words[1] if len(words) == 2 else cwd
+            continue
+        if words[0] == "export":
+            env.extend(w for w in words[1:] if ASSIGNMENT.match(w))
+            continue
+        while words and ASSIGNMENT.match(words[0]):
+            env.append(words.pop(0))
+        if words and words[0] == "env":
+            words.pop(0)
+            while words and ASSIGNMENT.match(words[0]):
+                env.append(words.pop(0))
+        if words:
+            break
+    if not words or Path(words[0]).name in SHELL_NO_HINT:
+        return None
+    launcher, offset = "direct", 0
+    first = Path(words[0]).name
+    if first.startswith("python") and len(words) > 2 and words[1] == "-m":
+        launcher, offset = " ".join(words[:2]), 2
+    elif first in ("uv", "poetry") and len(words) > 2 and words[1] == "run":
+        launcher, offset = first + " run", 2
+    elif first in ("npx", "uvx") and len(words) > 1 and not words[1].startswith("-"):
+        launcher, offset = first, 1
+    elif "/node_modules/.bin/" in words[0]:
+        launcher = "node_modules/.bin"
+    elif first.startswith("python") and len(words) > 1 and not words[1].startswith("-"):
+        launcher, offset = first, 1
+    target = Path(words[offset]).name
+    subcommand = words[offset + 1] if target == "git" and len(words) > offset + 1 else ""
+    head = " ".join(words[:offset + 1] if offset else words[:2])
+    if env:
+        head = " ".join(env) + " " + head
+    if cwd:
+        head = "cd " + cwd + " && " + head
+    return dict(program=target, launcher=launcher, env=tuple(sorted(env)), cwd=cwd,
+                subcommand=subcommand, head=redact(head)[:120])
+
+
+def plausible_fix(failure, success):
+    return (failure and success and failure["program"] == success["program"]
+            and failure["subcommand"] == success["subcommand"]
+            and any(failure[k] != success[k] for k in ("launcher", "env", "cwd")))
+
+
+def benign_exit(head, code):
+    words = head.split()
+    if not words:
+        return False
+    name = Path(words[0]).name
+    key = "sed -n" if name == "sed" and len(words) > 1 and words[1] == "-n" else name
+    return code in BENIGN_EXITS.get(key, ())
+
+
+def tool_metadata(row, session):
+    definitions = (row.get("shape") or {}).get("tools") if row.get("type") == "api-request-shape" else None
+    if isinstance(definitions, list):
+        session["known"] = True
+        for tool in definitions:
+            if isinstance(tool, dict) and tool.get("name"):
+                session["available"].add(tool["name"])
+                session["loading"][tool["name"]].add("deferred" if tool.get("defer_loading") else "loaded in full")
+    attachment = row.get("attachment") or {}
+    if attachment.get("type") == "deferred_tools_delta":
+        session["known"] = True
+        for name in attachment.get("addedNames", []) + attachment.get("readdedNames", []):
+            session["available"].add(name)
+            session["loading"][name].add("deferred")
+        for tool in attachment.get("surfacedDefinitions", []):
+            if isinstance(tool, dict) and tool.get("name"):
+                session["available"].add(tool["name"])
+                session["loading"][tool["name"]].add("loaded in full")
+    if attachment.get("type") == "mcp_instructions_delta":
+        session["servers"].update(attachment.get("addedNames", []))
+
+
+def finish_turn(turn, project, session_id, agent, data):
+    if turn is None or not turn["active"]:
+        return
+    stuck = data["stuck_turns"]
+    stuck["turns"] += 1
+    failures = Counter(event[0] for event in turn["failures"])
+    flagged = [(signature, count) for signature, count in failures.items() if count >= data["_options"]["stuck_repeats"]]
+    if flagged:
+        stuck["flagged_turns"] += 1
+        stuck["tool_calls"] += turn["calls"]
+        stuck["cost"] += turn["cost"]
+        for signature, count in flagged:
+            stuck["signatures"].append(dict(project=project, agent=agent, repeats=count,
+                                             session=session_id, signature=signature_text(signature), _turn=stuck["turns"]))
+    for signature, head, order in turn["failures"]:
+        fact = data["_failures"][(project, signature)]
+        fact["sessions"].add(session_id)
+        fact["occurrences"] += 1
+        if fact["worked_instead"]:
+            continue
+        # The next call on this program must succeed nearby; unrelated later
+        # commands and changes of flags/subcommands do not establish a fix.
+        for later, (candidate, outcome) in sorted(turn["bash_calls"].items()):
+            if later <= order or later > order + 3 or not candidate or not head:
+                continue
+            if candidate["program"] == head["program"]:
+                if outcome is True and plausible_fix(head, candidate):
+                    fact["worked_instead"].add(candidate["head"])
+                break
+
+
+def scan_claude(path, agent, since, data, seen_messages, project):
     main = agent is None
     counter = Counter()
     tools = {}
     pending = None
     first, last, session_id = None, None, path.stem
-    for row in rows(path, since, data["warnings"]):
+    observed = dict(main=main, known=False, available=set(), loading=defaultdict(set), servers=set(),
+                    used=set(), prompts=0, cwd=None, active=False)
+    turn = None
+    for row in rows(path, since, data["warnings"], keep_tools=True):
+        if row.get("type") in ("api-request-shape", "attachment"):
+            tool_metadata(row, observed)
+            continue
+        observed["cwd"] = row.get("cwd") or observed["cwd"]
+        if row.get("_before_window"):
+            raw = (row.get("message") or {}).get("content", "")
+            if (row.get("type") == "user" and not row.get("isMeta")
+                    and "<task-notification>" not in str(raw)):
+                turn = dict(calls=0, cost=0, failures=[], bash_calls={}, active=False)
+            continue
+        observed["active"] = True
         ts = row.get("timestamp", "")
         first = min(first, ts) if first else ts
         last = max(last, ts) if last else ts
@@ -126,33 +388,76 @@ def scan_claude(path, agent, since, data, seen_messages):
                 pending = "task notification"
             else:
                 pending = "human"
+        raw = message.get("content", "")
+        if (row.get("type") == "user" and not row.get("isMeta")
+                and not any(item.get("type") == "tool_result" for item in content)
+                and "<task-notification>" not in (raw if isinstance(raw, str) else str(raw))):
+            prompt_id = row.get("uuid")
+            if not prompt_id or ("prompt", prompt_id) not in seen_messages:
+                if prompt_id:
+                    seen_messages.add(("prompt", prompt_id))
+                finish_turn(turn, project, session_id, agent or "main", data)
+                turn = dict(calls=0, cost=0, failures=[], bash_calls={}, active=True)
+                observed["prompts"] += int(main)
         usage = message.get("usage")
         if row.get("type") == "assistant" and isinstance(usage, dict) and usage and not usage_seen:
             model = message.get("model", "unknown")
             add(data["models"][model], usage)
             add(counter, usage)
+            cost = price(data, model, agent or "main", usage)
+            if turn is not None:
+                turn["active"] = True
+                turn["cost"] += cost
             if main and pending:
                 add(data["triggers"][pending], usage)
                 pending = None
         for block in content:
             if block.get("type") == "tool_use":
+                name, head = block.get("name", "unknown"), None
+                observed["used"].add(name)
+                data["_tool_universe"].add(name)
                 if ("use", block.get("id")) in seen_messages:
                     continue
                 seen_messages.add(("use", block.get("id")))
-                name, head = block.get("name", "unknown"), None
                 tool_input = block.get("input") or {}
+                if turn is not None:
+                    turn["active"] = True
+                    turn["calls"] += 1
+                original_name = name
+                target = str(tool_input.get("file_path") or tool_input.get("path") or tool_input.get("filePath") or "")
+                failure_head = bash_head(tool_input.get("command", "")) if name == "Bash" else redact(target)
+                order = turn["calls"] if turn is not None else 0
+                match_head = None
+                if name == "Bash" and turn is not None:
+                    match_head = command_info(tool_input.get("command", ""))
+                    turn["bash_calls"][order] = (match_head, None)
                 if name == "Agent":
                     name += ":" + str(tool_input.get("subagent_type", "unknown"))
                 if name == "Bash" and not main:
                     head = bash_head(tool_input.get("command", ""))
                     data["bash"][agent][head] += 1
-                tools[block.get("id")] = (name, head)
+                tools[block.get("id")] = (name, head, original_name, failure_head, match_head, order)
             elif block.get("type") == "tool_result":
                 if ("result", block.get("tool_use_id")) in seen_messages:
                     continue
                 seen_messages.add(("result", block.get("tool_use_id")))
-                name, head = tools.get(block.get("tool_use_id"), ("unknown", None))
+                name, head, original_name, failure_head, match_head, order = tools.get(
+                    block.get("tool_use_id"), ("unknown", None, "unknown", "", None, 0))
                 result = block.get("content")
+                failed = block.get("is_error") is True
+                exit_code = None
+                if original_name == "Bash":
+                    if failed:
+                        first_line = result_text(result).partition("\n")[0].strip()
+                        exit_match = EXIT_HEADER.match(first_line)
+                        if exit_match:
+                            exit_code = int(exit_match[1])
+                        failed = not benign_exit(failure_head, exit_code)
+                    if turn is not None:
+                        turn["bash_calls"][order] = (match_head, not failed)
+                if turn is not None and failed:
+                    signature = (original_name, failure_head, exit_code, error_line(result))
+                    turn["failures"].append((signature, match_head, order))
                 chars = len(json.dumps(result))
                 if main:
                     data["tool_chars"][name] += chars
@@ -160,6 +465,9 @@ def scan_claude(path, agent, since, data, seen_messages):
                     data["images"] += image_count(result)
                 elif head:
                     data["bash_chars"][agent][head] += chars
+    finish_turn(turn, project, session_id, agent or "main", data)
+    if observed["active"]:
+        data["_observed"][project].append((session_id, observed))
     if not counter["calls"]:
         return
     minutes = 0
@@ -179,6 +487,7 @@ def scan_codex(root, since, data):
     for path in root.glob("*/*/*/*.jsonl"):
         data["codex_files_scanned"] += 1
         model, final = "unknown", None
+        prior_usage = Counter()
         # Older session files can contain recent resumes. Keep earlier model
         # metadata, but count only sessions with a token_count in the window.
         for row in rows(path, since, data["warnings"], keep_model=True):
@@ -194,6 +503,10 @@ def scan_codex(root, since, data):
                 usage = info.get("total_token_usage")
                 if isinstance(usage, dict):
                     final = dict(usage)
+                    delta = {key: max(0, value - prior_usage[key]) for key, value in usage.items()
+                             if isinstance(value, (int, float))}
+                    price(data, model, "codex", delta, codex=True)
+                    prior_usage = Counter(usage)
         if final is not None:
             total = data["codex"][model]
             total.update(sessions=1, input=final.get("input_tokens", 0),
@@ -202,11 +515,17 @@ def scan_codex(root, since, data):
                          tokens=final.get("total_tokens", final.get("input_tokens", 0) + final.get("output_tokens", 0)))
 
 
-def collect(projects, codex_root, since):
+def collect(projects, codex_root, since, pricing, pricing_error, options):
     data = dict(models=defaultdict(Counter), sessions=[], agents=defaultdict(list),
                 triggers=defaultdict(Counter), tool_chars=Counter(), tool_counts=Counter(),
                 images=0, bash=defaultdict(Counter), bash_chars=defaultdict(Counter),
                 codex=defaultdict(Counter), warnings=Counter(), codex_files_scanned=0)
+    data.update(cost=dict(total=0, by_agent=Counter(), by_model=Counter(), components=Counter(),
+                          unpriced={}, pricing_error=pricing_error),
+                deferred_tools_unused=0, stuck_turns=dict(turns=0, flagged_turns=0, tool_calls=0, cost=0, signatures=[]),
+                repeat_failures=[], unused_tools=[])
+    data.update(_pricing=pricing, _options=options, _observed=defaultdict(list), _tool_universe=set(),
+                _failures=defaultdict(lambda: dict(sessions=set(), occurrences=0, worked_instead=set())))
     seen = set()
     seen_messages = set()
     for project in projects:
@@ -214,7 +533,7 @@ def collect(projects, codex_root, since):
             real = path.resolve()
             if real not in seen:
                 seen.add(real)
-                scan_claude(path, None, since, data, seen_messages)
+                scan_claude(path, None, since, data, seen_messages, project.name)
         for path in project.glob("*/subagents/*.jsonl"):
             real = path.resolve()
             if real in seen:
@@ -227,7 +546,7 @@ def collect(projects, codex_root, since):
                     agent = str(json.loads(meta.read_text()).get("agentType") or "unknown")
                 except (OSError, ValueError, AttributeError):
                     data["warnings"]["malformed metadata"] += 1
-            scan_claude(path, agent, since, data, seen_messages)
+            scan_claude(path, agent, since, data, seen_messages, project.name)
     scan_codex(codex_root, since, data)
     data["files_scanned"] = len(seen)
     data["headline"] = {
@@ -248,8 +567,230 @@ def collect(projects, codex_root, since):
             "WARNING: Codex transcript format may have changed; token-audit's parser needs updating "
             f"({data['codex_files_scanned']} files scanned, 0 token_count rows)")
     data["parser_warning"] = bool(data["parser_warnings"])
+    finalize_measurements(data, projects, since)
     data["since"] = since.isoformat()
     return data
+
+
+def configured_servers(project, observed, config):
+    servers = set(config.get("mcpServers", {}))
+    paths = {entry["cwd"] for _, entry in observed if entry["cwd"]}
+    for cwd, settings in config.get("projects", {}).items():
+        if re.sub(r"[^a-zA-Z0-9]", "-", cwd) == project or cwd in paths:
+            paths.add(cwd)
+            servers.update(settings.get("mcpServers", {}))
+    for cwd in paths:
+        try:
+            value = json.loads((Path(cwd) / ".mcp.json").read_text())
+            servers.update(value.get("mcpServers", {}))
+        except (OSError, ValueError, AttributeError):
+            pass
+    return servers
+
+
+def finalize_measurements(data, projects, since):
+    cost, stuck = data["cost"], data["stuck_turns"]
+    cost["shares"] = {key: value / cost["total"] if cost["total"] else 0
+                      for key, value in cost["components"].items()}
+    stuck["share"] = stuck["flagged_turns"] / max(1, stuck["turns"])
+    stuck["cost_share"] = stuck["cost"] / cost["total"] if cost["total"] else 0
+    grouped = {}
+    for row in stuck["signatures"]:
+        key = tuple(row[k] for k in ("project", "agent", "session", "signature"))
+        if key not in grouped:
+            grouped[key] = dict(row, repeats=0, turns=set())
+            del grouped[key]["_turn"]
+        grouped[key]["repeats"] += row["repeats"]
+        grouped[key]["turns"].add(row["_turn"])
+    for row in grouped.values():
+        row["turns"] = len(row["turns"])
+    stuck["signatures"] = sorted(grouped.values(), key=lambda v: (
+        -v["repeats"], -v["turns"], v["project"], v["agent"], v["session"], v["signature"]))[:10]
+    for row in stuck["signatures"]:
+        row["session"] = row["session"][:12]
+    for (project, signature), fact in sorted(data["_failures"].items(), key=lambda item: (
+            -len(item[1]["sessions"]), -item[1]["occurrences"], str(item[0]))):
+        if len(fact["sessions"]) >= data["_options"]["fact_sessions"]:
+            data["repeat_failures"].append(dict(project=project, signature=signature_text(signature),
+                sessions=len(fact["sessions"]), occurrences=fact["occurrences"],
+                worked_instead=next(iter(fact["worked_instead"]), "")))
+    # Filters should not shrink the fallback universe to tools used in that project.
+    root = Path.home() / ".claude/projects"
+    selected = {p.resolve() for p in projects}
+    for directory in root.iterdir() if root.is_dir() else []:
+        if not directory.is_dir() or directory.resolve() in selected:
+            continue
+        paths = list(directory.glob("*.jsonl")) + list(directory.glob("*/subagents/*.jsonl"))
+        for path in paths:
+            # Only parse potential tool-use records from other projects.
+            try:
+                with path.open("rb") as stream:
+                    for line in stream:
+                        if b'"tool_use"' not in line:
+                            continue
+                        match = TIMESTAMP.search(line)
+                        if not match or date_time(match[1].decode()) < since:
+                            continue
+                        try:
+                            row = json.loads(line)
+                            data["_tool_universe"].update(b["name"] for b in blocks(row.get("message") or {})
+                                if b.get("type") == "tool_use" and b.get("name"))
+                        except (ValueError, TypeError):
+                            pass
+            except (OSError, ValueError):
+                pass
+    try:
+        config = json.loads((Path.home() / ".claude.json").read_text())
+    except (OSError, ValueError):
+        config = {}
+    prune_tools(data, config)
+    for key in list(data):
+        if key.startswith("_"):
+            del data[key]
+
+
+def server_name(name):
+    return re.sub(r"[^a-z0-9]", "_", name.lower())
+
+
+def tool_server(name):
+    return server_name(name.split("__", 2)[1]) if name.startswith("mcp__") and name.count("__") >= 2 else None
+
+
+def prune_tools(data, config):
+    for project, observed in sorted(data["_observed"].items()):
+        configured = {server_name(name) for name in configured_servers(project, observed, config)}
+        sessions = {}
+        used = set().union(*(entry["used"] for _, entry in observed))
+        used_servers = {tool_server(name) for name in used if tool_server(name)}
+        for session_id, entry in observed:
+            if not entry["main"]:
+                continue
+            if session_id not in sessions:
+                sessions[session_id] = dict(known=False, available=set(), servers=set(), prompts=0,
+                                            loading=defaultdict(set))
+            session = sessions[session_id]
+            session["known"] |= entry["known"]
+            session["available"].update(entry["available"] | entry["used"])
+            session["servers"].update(server_name(name) for name in entry["servers"])
+            session["prompts"] += entry["prompts"]
+            for name, states in entry["loading"].items():
+                session["loading"][name].update(states)
+        candidates = defaultdict(lambda: dict(sessions=set(), prompts=0, loading=set(), tools=set(), instructions=False))
+        deferred = defaultdict(lambda: dict(sessions=set(), prompts=0))
+        all_loading = defaultdict(set)
+        for session in sessions.values():
+            for name, states in session["loading"].items():
+                all_loading[name].update(states)
+        for session_id, session in sessions.items():
+            universe = session["available"] if session["known"] else data["_tool_universe"]
+            grouped = defaultdict(set)
+            names = {(name, "built-in tool") for name in universe
+                     if name not in REQUIRED_TOOLS and not tool_server(name)}
+            for name in universe:
+                server = tool_server(name)
+                if server:
+                    grouped[server].add(name)
+                if name not in used and "deferred" in all_loading[name] and "loaded in full" not in all_loading[name]:
+                    deferred[name]["sessions"].add(session_id)
+                    deferred[name]["prompts"] += session["prompts"]
+            names.update((name, "MCP server") for name in configured | session["servers"] | set(grouped))
+            for name, kind in names:
+                if name in (used_servers if kind == "MCP server" else used):
+                    continue
+                candidate = candidates[(name, kind)]
+                candidate["sessions"].add(session_id)
+                candidate["prompts"] += session["prompts"]
+                if kind == "MCP server":
+                    candidate["tools"].update(grouped[name])
+                    candidate["instructions"] |= name in session["servers"]
+                    for tool in grouped[name]:
+                        candidate["loading"].update(session["loading"].get(tool, {"unknown"}))
+                else:
+                    candidate["loading"].update(session["loading"].get(name, {"unknown"}))
+        options = data["_options"]
+        def eligible(candidate):
+            count = len(candidate["sessions"])
+            return ((candidate["prompts"] >= options["prune_prompts"] and count >= options["prune_min_sessions"])
+                    or count >= options["prune_sessions"])
+        data["deferred_tools_unused"] += sum(eligible(candidate) for candidate in deferred.values())
+        for (name, kind), candidate in candidates.items():
+            states = candidate["loading"]
+            if not eligible(candidate):
+                continue
+            if not candidate["instructions"] and "deferred" in states and "loaded in full" not in states:
+                continue
+            if candidate["instructions"]:
+                states.add("loaded in full (instructions)")
+            data["unused_tools"].append(dict(project=project, candidate=name, kind=kind,
+                sessions=len(candidate["sessions"]), prompts=candidate["prompts"], tools=len(candidate["tools"]),
+                loading=", ".join(sorted(states or {"unknown"}))))
+    def saving(row):
+        loaded = "loaded in full" in row["loading"]
+        priority = 3 if loaded and row["kind"] == "MCP server" else 2 if loaded else 1 if row["kind"] == "MCP server" else 0
+        return (-priority, -row["sessions"], -row["prompts"], row["project"], row["candidate"])
+    data["unused_tools"].sort(key=saving)
+
+
+def money(value):
+    return f"${value:,.2f}"
+
+
+def loading_state(value):
+    if "instructions" in value:
+        return "full + instructions"
+    if "loaded in full" in value:
+        return "full"
+    return "deferred" if "deferred" in value else "unknown"
+
+
+def measurement_sections(data):
+    cost, stuck = data["cost"], data["stuck_turns"]
+    lines = ["", "## Cost (API-equivalent)",
+             "API-equivalent $ is a comparison weighting, not a subscription bill."]
+    lines.append("Codex resumed sessions may be over-counted: pre-window cumulative usage is not seeded.")
+    if cost["pricing_error"]:
+        lines.append(cost["pricing_error"])
+    lines.append(f"Total API-equivalent cost: {money(cost['total'])}")
+    for label, mapping in (("Agent", cost["by_agent"]), ("Model", cost["by_model"])):
+        lines += [f"{label} | API-equivalent $ | Share", "--- | --- | ---"]
+        lines += [f"{cell(name)} | {money(value)} | {value / cost['total'] if cost['total'] else 0:.1%}"
+                  for name, value in sorted(mapping.items(), key=lambda pair: (-pair[1], pair[0]))]
+    lines += ["Component | API-equivalent $ | Share", "--- | --- | ---"]
+    lines += [f"{name} | {money(cost['components'].get(name, 0))} | {cost['shares'].get(name, 0):.1%}"
+              for name in ("cache_read", "cache_write", "uncached_input", "output")]
+    if cost["unpriced"]:
+        lines += ["Unpriced model | Token totals", "--- | ---"]
+        lines += [f"{cell(model)} | " + ", ".join(f"{k}={v}" for k, v in tokens.items())
+                  for model, tokens in sorted(cost["unpriced"].items())]
+    lines += ["", "## Stuck turns",
+              f"{stuck['flagged_turns']} of {stuck['turns']} turns ({stuck['share']:.1%}); "
+              f"{stuck['tool_calls']} tool calls; API-equivalent cost {money(stuck['cost'])} ({stuck['cost_share']:.1%} of cost).",
+              "Project | Agent | Repeats | Turns | Session | Signature", "--- | --- | --- | --- | --- | ---"]
+    lines += [" | ".join(cell(row[k]) for k in ("project", "agent", "repeats", "turns", "session", "signature"))
+              for row in stuck["signatures"]] or ["None."]
+    lines += ["", "## Repeated failures across sessions", "Project | Signature | Sessions | Occurrences | Worked instead",
+              "--- | --- | --- | --- | ---"]
+    lines += [" | ".join(cell(row[k]) for k in ("project", "signature", "sessions", "occurrences", "worked_instead"))
+              for row in data["repeat_failures"]] or ["None."]
+    lines += ["", "## Unused tools and MCP servers",
+              "A deny rule takes effect for new sessions. Changing the tool set invalidates the prompt cache of a resumed conversation.",
+              "Universe: recorded tool definitions/deferred names and MCP instructions when available; otherwise tools used across all projects in the window plus user/project MCP configuration. Loading state is unknown without evidence.",
+              f"{data['deferred_tools_unused']} deferred tools unused (names only, ~negligible per turn)",
+              "Project | Candidate | Kind | Sessions without use | Prompts without use | Tools | Loading",
+              "--- | --- | --- | --- | --- | --- | ---"]
+    lines += [" | ".join(cell(row[k]) for k in ("project", "candidate", "kind", "sessions", "prompts")) +
+              " | " + (f"{row['tools']} tools" if row["kind"] == "MCP server" else "—") +
+              " | " + loading_state(row["loading"])
+              for row in data["unused_tools"][:25]] or ["None."]
+    if len(data["unused_tools"]) > 25:
+        lines.append(f"+{len(data['unused_tools']) - 25} more; use --json for all details.")
+    projects = len({r["project"] for r in data["unused_tools"]})
+    headline = [f"API-equivalent cost {money(cost['total'])} (cache reads {cost['shares'].get('cache_read', 0):.1%})",
+                f"Stuck turns: {stuck['flagged_turns']} of {stuck['turns']} ({stuck['cost_share']:.1%} of cost)",
+                f"Repo-fact candidates: {len(data['repeat_failures'])}",
+                f"Pruning candidates: {len(data['unused_tools'])} across {projects} project{'s' if projects != 1 else ''}"]
+    return lines, headline
 
 
 def cell(value):
@@ -367,7 +908,8 @@ def report(data, out):
             lines += body[:max(0, budget - 1)] + [f"… {len(body) - max(0, budget - 1)} more rows; use --json for all details."]
         else:
             lines += body
-    return "\n".join(lines) + "\n", headline
+    extra, headlines = measurement_sections(data)
+    return "\n".join(lines + extra) + "\n", headline + headlines
 
 
 def main():
@@ -380,7 +922,15 @@ def main():
     parser.add_argument("--codex", action="store_true", help="include Codex sessions (also included by default)")
     parser.add_argument("--out", type=Path)
     parser.add_argument("--json", action="store_true", help="print full structured data instead of headline stdout")
+    parser.add_argument("--pricing", type=Path, default=Path(__file__).resolve().with_name("pricing.json"))
+    for flag, default in (("stuck-repeats", 3), ("fact-sessions", 3), ("prune-prompts", 10),
+                          ("prune-min-sessions", 2), ("prune-sessions", 5)):
+        parser.add_argument("--" + flag, type=int, default=default)
     args = parser.parse_args()
+    options = {key: getattr(args, key) for key in ("stuck_repeats", "fact_sessions", "prune_prompts",
+                                                  "prune_min_sessions", "prune_sessions")}
+    if any(value < 1 for value in options.values()):
+        parser.error("measurement thresholds must be positive")
     if args.days < 0:
         parser.error("--days must be nonnegative")
     now = datetime.now(timezone.utc)
@@ -396,7 +946,8 @@ def main():
         for path in projects:
             if not path.is_dir():
                 raise ValueError(f"project directory missing: {path}")
-        data = collect(projects, Path.home() / ".codex/sessions", since)
+        pricing, pricing_error = load_pricing(args.pricing.expanduser())
+        data = collect(projects, Path.home() / ".codex/sessions", since, pricing, pricing_error, options)
         for warning in data["parser_warnings"]:
             print(warning, file=sys.stderr)
         text, headline = report(data, out)
