@@ -34,6 +34,7 @@ Rules:
 Report, for the last 14 days:
 1. Main sessions: turns, peak and median context, total tokens by kind.
 2. Per subagent type: spawns, median and p90 tool calls, median context, total tokens.
+   Report Claude and Codex brief sizes; flag median growth between audits.
 3. Per tool: call counts; top 20 Bash commands by first word; the largest files read
    whole; images read (count and who read them); URLs fetched more than once.
 4. Patterns that waste tokens, each with numbers:

@@ -18,7 +18,8 @@ record = pathlib.Path(os.environ['RECORD'])
 calls = record.read_text().splitlines() if record.exists() else []
 number = len(calls)
 with record.open('a') as stream:
-    stream.write(json.dumps(dict(args=args, prompt=sys.stdin.read(), cwd=os.getcwd())) + '\\n')
+    stream.write(json.dumps(dict(args=args, prompt=sys.stdin.read(), cwd=os.getcwd(),
+                                 dispatch_env={k: os.environ.get(k) for k in ('DISPATCH_ROUND', 'DISPATCH_PASS')})) + '\\n')
 print(json.dumps({'type':'thread.started', 'thread_id':'test-thread'}))
 scenario = os.environ.get('SCENARIO', '')
 if scenario == 'empty' or (scenario == 'retry-empty' and number == 0):
@@ -29,7 +30,7 @@ if scenario == 'overloaded' or (scenario == 'retry-overloaded' and number == 0):
 text = os.environ.get('FINAL', 'Completed task')
 pathlib.Path(args[args.index('-o')+1]).write_text(text)
 print(json.dumps({'type':'turn.completed', 'usage':{'input_tokens':10, 'output_tokens':2}}))
-if scenario == 'nonzero':
+if scenario == 'nonzero' or (scenario == 'resume-nonzero' and number > 0):
     sys.exit(1)
 '''
 
@@ -62,7 +63,7 @@ class StubCase(unittest.TestCase):
         executable(self.bin / 'codex', FAKE_CODEX)
         self.record = self.root / 'calls.jsonl'
         self.env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin) + os.pathsep + os.environ['PATH'], RECORD=str(self.record), PYTHONDONTWRITEBYTECODE='1')
-        for name in ('CODEX_DISPATCH_MODEL', 'CODEX_REVIEW_MODEL', 'CODEX_LOOK_MODEL', 'FINAL', 'SCENARIO', 'CODEMAP_TIMEOUT'):
+        for name in ('CODEX_DISPATCH_MODEL', 'CODEX_REVIEW_MODEL', 'CODEX_LOOK_MODEL', 'FINAL', 'SCENARIO', 'CODEMAP_TIMEOUT', 'DISPATCH_ROUND', 'DISPATCH_PASS'):
             self.env.pop(name, None)
         self.brief = write(self.work / 'task.md', 'Fix the example.\n')
 
@@ -140,6 +141,7 @@ raise SystemExit(1 if n == 0 else 0)
         self.assertTrue(list((self.work / 'out/dispatch').glob('*/check-1-round-0.log')))
 
     def test_confirmation_failure_becomes_next_retry(self):
+        self.env['DISPATCH_ROUND'] = 'caller'
         a = "echo $DISPATCH_ROUND/$DISPATCH_PASS >> a; [ $DISPATCH_ROUND != 0 ]"
         b = "echo $DISPATCH_ROUND/$DISPATCH_PASS >> b; [ $DISPATCH_PASS != final ] || { echo ERROR: B-failed; exit 1; }"
         result = self.dispatch('-k', a, '-k', b, '-r', '2')
@@ -148,6 +150,8 @@ raise SystemExit(1 if n == 0 else 0)
         self.assertEqual((self.work / 'b').read_text().splitlines(), ['0/initial', '1/final', '2/retry'])
         self.assertIn('ERROR: B-failed', self.calls()[2]['prompt'])
         self.assertNotIn('Check 1:', self.calls()[2]['prompt'])
+        self.assertEqual([call['dispatch_env'] for call in self.calls()],
+                         [dict(DISPATCH_ROUND='caller', DISPATCH_PASS=None)] * 3)
 
     def test_confirmation_failure_at_limit_reports_latest_results(self):
         a = "[ $DISPATCH_ROUND != 0 ] || { echo ERROR: A-failed; exit 1; }"
@@ -167,7 +171,13 @@ raise SystemExit(1 if n == 0 else 0)
         out = next((self.work / 'out/dispatch').iterdir())
         self.assertTrue((out / 'check-2-round-0.log').exists())
         self.assertFalse((out / 'check-2-round-1.log').exists())
-        self.assertTrue(any('Check 2 PASS:' in line for line in lines))
+        self.assertTrue(any('Check 2 PASS (round 0, not re-run):' in line for line in lines))
+
+    def test_codex_failure_on_resume_marks_stale_checks(self):
+        self.env['SCENARIO'] = 'resume-nonzero'
+        lines = self.report(self.dispatch('-k', 'exit 1', '-k', 'true', code=2))
+        self.assertEqual(lines[-1], 'STATUS: CODEX FAILED')
+        self.assertTrue(any('Check 2 PASS (round 0, not re-run):' in line for line in lines))
 
     def test_initial_success_runs_checks_once(self):
         check = 'echo $DISPATCH_ROUND/$DISPATCH_PASS >> initial'
@@ -395,6 +405,101 @@ class AuditTests(StubCase):
         later = json.loads(self.run_script('token-audit', '--since', '2026-01-03', '--json').stdout)
         self.assertEqual(later['headline']['claude_calls'], 0)
 
+
+    def test_codex_prompt_texts_and_precedence(self):
+        now = datetime.now(timezone.utc).isoformat()
+        root = self.home / '.codex/sessions/2026/01/01'
+        def response(*texts):
+            return dict(type='response_item', timestamp=now, payload=dict(
+                role='user', content=[dict(type='input_text', text=text) for text in texts]))
+        def event(text):
+            return dict(type='event_msg', timestamp=now, payload=dict(type='user_message', message=text))
+        cases = {
+            'sum': ([response('first', 'second')], 11),
+            'image': ([response('<image name=x>', 'prompt', '</image>')], 6),
+            'tag': ([response('<task>hello</task>')], 18),
+            'injected': ([response('# AGENTS.md instructions', '<environment_context>',
+                                   '<user_instructions>', '<user_action>', '<turn_aborted>', '')], None),
+            'event-first': ([event('old'), response('newer')], 3),
+            'response-first': ([response('first'), event('later')], 5),
+            'many-injected': ([response('# AGENTS.md instructions')] * 4 + [response('real')], 4),
+        }
+        cases['image'][0][0]['payload']['content'].insert(1, dict(type='input_image', image_url='fixture'))
+        for model, (messages, _) in cases.items():
+            jsonl(root / (model + '.jsonl'), messages + [dict(timestamp=now, payload=dict(
+                model=model, type='token_count', info=dict(total_token_usage=dict(input_tokens=1))))])
+        data = json.loads(self.run_script('token-audit', '--json').stdout)
+        for model, (_, expected) in cases.items():
+            self.assertEqual(data['codex'][model]['sessions'], 1)
+            if expected is None:
+                self.assertNotIn(model, data['codex_briefs'])
+            else:
+                self.assertEqual(data['codex_briefs'][model]['median'], expected)
+
+    def test_brief_sizes_and_prior_audits(self):
+        now = datetime.now(timezone.utc).isoformat()
+        project = self.home / '.claude/projects/example'
+        def spawn(ident, agent, prompt):
+            return dict(type='tool_use', id=ident, name='Agent',
+                        input=dict(subagent_type=agent, prompt=prompt))
+        calls = [spawn('one', 'worker', 'a' * 100), spawn('two', 'worker', 'b' * 142),
+                 spawn('one', 'worker', 'a' * 100), spawn('three', 'missing', 'x')]
+        jsonl(project / 'session.jsonl', [dict(type='assistant', timestamp=now,
+              message=dict(id='main', usage=dict(input_tokens=1), content=calls))])
+        for agent in ('worker', 'other'):
+            path = project / f'session/subagents/{agent}.jsonl'
+            write(path.with_suffix('.meta.json'), json.dumps(dict(agentType=agent)))
+            jsonl(path, [dict(type='assistant', timestamp=now,
+                  message=dict(id=agent, usage=dict(input_tokens=1), content=[]))])
+        codex = self.home / '.codex/sessions/2026/01/01'
+        jsonl(codex / 'rollout.jsonl', [
+            dict(type='event_msg', timestamp='2000-01-01T00:00:00Z', payload=dict(type='user_message', message='hello')),
+            dict(type='event_msg', timestamp=now, payload=dict(type='user_message', message='later')),
+            dict(timestamp=now, payload=dict(model='code-model', type='token_count',
+                 info=dict(total_token_usage=dict(input_tokens=1))))])
+        context = [dict(type='input_text', text='# AGENTS.md instructions for repo'),
+                   dict(type='input_text', text='<environment_context></environment_context>')]
+        jsonl(codex / 'current.jsonl', [
+            dict(type='response_item', timestamp=now, payload=dict(type='message', role='user', content=context)),
+            dict(type='response_item', timestamp=now, payload=dict(
+                type='message', role='user', content=[dict(type='input_text', text='b' * 9)])),
+            dict(timestamp=now, payload=dict(model='current-model', type='token_count',
+                 info=dict(total_token_usage=dict(input_tokens=1))))])
+        jsonl(codex / 'no-usage.jsonl', [dict(type='event_msg', timestamp=now,
+              payload=dict(type='user_message', message='ignored'))])
+        for has_key in (True, False):
+            directory = self.root / f'brief-report-{has_key}'
+            old = dict(claude_calls=3, claude_context=3, claude_output=0,
+                       codex_sessions=1, codex_tokens=1, image_reads=0)
+            if has_key:
+                old['brief_chars_median'] = 100
+            write(directory / 'token-audit-previous.md',
+                  '<!-- token-audit-headline ' + json.dumps(old) + ' -->\n')
+            data = json.loads(self.run_script('token-audit', '--out', directory, '--json').stdout)
+            report = Path(data['report_path']).read_text()
+            self.assertEqual(data['briefs']['worker'], dict(median=121, max=142, count=2))
+            self.assertEqual(data['codex_briefs']['code-model'], dict(median=5, max=5, count=1))
+            self.assertEqual(data['headline']['brief_chars_median'], 100)
+            self.assertEqual(data['codex_briefs']['current-model'], dict(median=9, max=9, count=1))
+            self.assertEqual(data['headline']['codex_brief_chars_median'], 7)
+            self.assertRegex(report, r'worker \| 1 \| 1/1 \| 1 \| 1 \| [0-9.]+ \| 121/142')
+            self.assertRegex(report, r'other \| 1 \| 1/1 \| 1 \| 1 \| [0-9.]+ \| -')
+            self.assertIn('code-model | 1 | 1 (0) | 0 | 1 | 5', report)
+            self.assertNotIn('missing |', report)
+            self.assertNotIn('brief_chars_median', [f['metric'] for f in data['flagged']])
+            if not has_key:
+                section = report.split('## 8. Changes since last audit')[1].split('## 9.')[0]
+                self.assertIn('brief_chars_median new', section)
+                self.assertIn('codex_brief_chars_median new', section)
+        # Remove the brief-only spawn so the median grows from 100 to 121.
+        calls.pop()
+        jsonl(project / 'session.jsonl', [dict(type='assistant', timestamp=now,
+              message=dict(id='main', usage=dict(input_tokens=1), content=calls))])
+        directory = self.root / 'brief-growth'
+        write(directory / 'token-audit-previous.md', '<!-- token-audit-headline ' +
+              json.dumps(dict(brief_chars_median=100)) + ' -->\n')
+        data = json.loads(self.run_script('token-audit', '--out', directory, '--json').stdout)
+        self.assertIn(dict(metric='brief_chars_median', old=100, new=121, percent_change=21.0), data['flagged'])
 
     def audit_rows(self, session, commands, prompts=1, metadata=None, project='example'):
         now = datetime.now(timezone.utc).isoformat()

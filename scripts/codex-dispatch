@@ -72,9 +72,12 @@ def main():
         if reason:
             fixed.append(f"Reason: {one_line(reason)}")
         check_lines = []
-        for number, command, rc, log in checks:
+        for number, command, rc, log, check_round in checks:
             errors = "; ".join(key_errors(log)) if rc else ""
-            check_lines.append(f"Check {number} {'FAIL' if rc else 'PASS'}: {one_line(command)}" +
+            status_text = "FAIL" if rc else "PASS"
+            if not rc and check_round < rounds:
+                status_text += f" (round {check_round}, not re-run)"
+            check_lines.append(f"Check {number} {status_text}: {one_line(command)}" +
                                (f" — {one_line(errors)}" if errors else ""))
         # Every check gets a result, even when the caller supplied many checks.
         # Pack overflow onto one line so the hard report limit always holds.
@@ -128,7 +131,7 @@ def main():
                 reason = "; ".join(key_errors(log)) or "Codex returned no final message"
                 return report("CODEX FAILED", 2)
             selected = list(enumerate(args.k, 1)) if attempt == 0 else [
-                (number, command) for number, command, _, _ in failures]
+                (number, command) for number, command, _, _, _ in failures]
             results = {check[0]: check for check in checks}
 
             def run_checks(selected, pass_name):
@@ -139,7 +142,7 @@ def main():
                         log = out / f"check-{number}.log"
                         rc = run_logged(command, cwd, log, shell=True)
                         shutil.copyfile(log, out / f"check-{number}-round-{attempt}.log")
-                        results[number] = (number, command, rc, log)
+                        results[number] = (number, command, rc, log, attempt)
                 finally:
                     for name, value in previous.items():
                         if value is None:
@@ -164,7 +167,7 @@ def main():
             brief = out / f"resume-{attempt + 1}.md"
             brief.write_text("Fix the failing checks below. Do not commit or push.\n\n" + "\n\n".join(
                 f"Check {number}: {command}\n" + "\n".join(relevant(log))
-                for number, command, _, log in failures))
+                for number, command, _, log, _ in failures))
             rounds += 1
     except (OSError, ValueError) as exc:
         reason = str(exc)

@@ -13,6 +13,8 @@ import sys
 
 TIMESTAMP = re.compile(rb'"timestamp"\s*:\s*"([^"\n]+)"')
 MARKERS = (b'"usage"', b'"tool_result"', b'"timestamp"')
+INJECTED_PREFIXES = ("# AGENTS.md instructions", "<environment_context>", "<user_instructions>",
+                     "<user_action>", "<turn_aborted>", "<image", "</image>")
 REQUIRED_TOOLS = frozenset(("Read", "Edit", "Write", "Bash", "Grep", "Glob",
                             "Agent", "Task", "ToolSearch", "Skill"))
 USER_ROW = re.compile(rb'"type"\s*:\s*"user"')
@@ -59,7 +61,7 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False):
                 metadata = keep_tools and any(marker in prefix for marker in TOOL_METADATA)
                 if keep_tools and not (metadata or b'"message"' in prefix or MESSAGE_ROW.search(prefix) or b'"usage"' in prefix):
                     continue
-                if keep_model and not (b'"token_count"' in prefix or b'"model"' in line):
+                if keep_model and not (b'"token_count"' in prefix or b'"user_message"' in prefix or b'"role":"user"' in prefix or b'"role": "user"' in prefix or b'"model"' in line):
                     continue
                 if not any(marker in line for marker in MARKERS):
                     continue
@@ -81,7 +83,7 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False):
                               and b'<task-notification>' not in line):
                             before_user = True
                         continue
-                    if old and not (keep_model and b'"model"' in line):
+                    if old and not (keep_model and (b'"model"' in line or b'"user_message"' in prefix or b'"role":"user"' in prefix or b'"role": "user"' in prefix)):
                         continue
                     if keep_tools and (saved_shape or saved_deltas or before_user):
                         for saved, ts in ([saved_shape] if saved_shape else []) + saved_deltas:
@@ -432,7 +434,9 @@ def scan_claude(path, agent, since, data, seen_messages, project):
                     match_head = command_info(tool_input.get("command", ""))
                     turn["bash_calls"][order] = (match_head, None)
                 if name == "Agent":
-                    name += ":" + str(tool_input.get("subagent_type", "unknown"))
+                    agent_type = str(tool_input.get("subagent_type", "unknown"))
+                    data["briefs"][agent_type].append(len(tool_input.get("prompt") or ""))
+                    name += ":" + agent_type
                 if name == "Bash" and not main:
                     head = bash_head(tool_input.get("command", ""))
                     data["bash"][agent][head] += 1
@@ -486,7 +490,7 @@ def scan_codex(root, since, data):
     # Session filenames are usually rollout-*.jsonl; scan the standard date tree.
     for path in root.glob("*/*/*/*.jsonl"):
         data["codex_files_scanned"] += 1
-        model, final = "unknown", None
+        model, final, brief = "unknown", None, None
         prior_usage = Counter()
         # Older session files can contain recent resumes. Keep earlier model
         # metadata, but count only sessions with a token_count in the window.
@@ -498,6 +502,13 @@ def scan_codex(root, since, data):
                 model = row["model"]
             if payload.get("model"):
                 model = payload["model"]
+            if row.get("type") == "event_msg" and payload.get("type") == "user_message" and brief is None:
+                brief = len(payload.get("message") or "")
+            if row.get("type") == "response_item" and payload.get("role") == "user" and brief is None:
+                texts = [item.get("text") or "" for item in payload.get("content") or [] if isinstance(item, dict)]
+                length = sum(len(text) for text in texts if text and not text.startswith(INJECTED_PREFIXES))
+                if length:
+                    brief = length
             if payload.get("type") == "token_count" and not row.get("_before_window"):
                 info = payload.get("info") or {}
                 usage = info.get("total_token_usage")
@@ -508,6 +519,8 @@ def scan_codex(root, since, data):
                     price(data, model, "codex", delta, codex=True)
                     prior_usage = Counter(usage)
         if final is not None:
+            if brief is not None:
+                data["codex_briefs"][model].append(brief)
             total = data["codex"][model]
             total.update(sessions=1, input=final.get("input_tokens", 0),
                          cached_input=final.get("cached_input_tokens", 0),
@@ -519,7 +532,7 @@ def collect(projects, codex_root, since, pricing, pricing_error, options):
     data = dict(models=defaultdict(Counter), sessions=[], agents=defaultdict(list),
                 triggers=defaultdict(Counter), tool_chars=Counter(), tool_counts=Counter(),
                 images=0, bash=defaultdict(Counter), bash_chars=defaultdict(Counter),
-                codex=defaultdict(Counter), warnings=Counter(), codex_files_scanned=0)
+                codex=defaultdict(Counter), briefs=defaultdict(list), codex_briefs=defaultdict(list), warnings=Counter(), codex_files_scanned=0)
     data.update(cost=dict(total=0, by_agent=Counter(), by_model=Counter(), components=Counter(),
                           unpriced={}, pricing_error=pricing_error),
                 deferred_tools_unused=0, stuck_turns=dict(turns=0, flagged_turns=0, tool_calls=0, cost=0, signatures=[]),
@@ -556,6 +569,8 @@ def collect(projects, codex_root, since, pricing, pricing_error, options):
         "codex_sessions": sum(c["sessions"] for c in data["codex"].values()),
         "codex_tokens": sum(c["tokens"] for c in data["codex"].values()),
         "image_reads": data["images"],
+        "brief_chars_median": int(statistics.median([n for values in data["briefs"].values() for n in values])) if data["briefs"] else 0,
+        "codex_brief_chars_median": int(statistics.median([n for values in data["codex_briefs"].values() for n in values])) if data["codex_briefs"] else 0,
     }
     data["parser_warnings"] = []
     if data["files_scanned"] and not data["headline"]["claude_calls"]:
@@ -567,6 +582,9 @@ def collect(projects, codex_root, since, pricing, pricing_error, options):
             "WARNING: Codex transcript format may have changed; token-audit's parser needs updating "
             f"({data['codex_files_scanned']} files scanned, 0 token_count rows)")
     data["parser_warning"] = bool(data["parser_warnings"])
+    for key in ("briefs", "codex_briefs"):
+        data[key] = {name: dict(median=statistics.median(values), max=max(values), count=len(values))
+                     for name, values in data[key].items()}
     finalize_measurements(data, projects, since)
     data["since"] = since.isoformat()
     return data
@@ -808,8 +826,10 @@ def agent_stats(data):
         median = statistics.median(calls)
         ctx = sum(spawn["context"] for spawn in spawns)
         flag = " ⚠" if median > 120 else ""
+        brief = data["briefs"].get(name)
+        brief_text = f"{brief['median']:g}/{brief['max']}" if brief else "-"
         result.append((ctx, name, f"{cell(name)}{flag} | {len(spawns)} | {median:g}/{max(calls)} | "
-                       f"{ctx} | {round(ctx / sum(calls))} | {statistics.median(s['minutes'] for s in spawns):.1f}"))
+                       f"{ctx} | {round(ctx / sum(calls))} | {statistics.median(s['minutes'] for s in spawns):.1f} | {brief_text}"))
     return sorted(result, reverse=True)
 
 
@@ -842,7 +862,7 @@ def report(data, out):
                      [f"{cell(s['id'])}{' ⚠' if s['context'] > s['calls'] * 150000 or s['peak'] > 250000 else ''} | "
                       f"{s['date']} | {s['calls']} | {avg(s)} | {s['peak']}" for s in sessions]))
     agents = agent_stats(data)
-    sections.append(("3. By agent type", ["Agent | Spawns | Median/max calls | Context | Avg context | Median minutes"],
+    sections.append(("3. By agent type", ["Agent | Spawns | Median/max calls | Context | Avg context | Median minutes | Median/max brief chars"],
                      [row for _, _, row in agents]))
     sections.append(("4. Orchestrator turns by trigger", ["Trigger | Turns | Avg context"],
                      [f"{trigger} | {data['triggers'][trigger]['calls']} | {avg(data['triggers'][trigger])}"
@@ -857,14 +877,16 @@ def report(data, out):
                      [f"{cell(name)}: " + "; ".join(
                          f"{cell(head)} ({count} calls, {data['bash_chars'][name][head]} chars)"
                          for head, count in data["bash"][name].most_common(6)) for name in heavy]))
-    sections.append(("7. Codex by model", ["Model | Sessions | Input (cached subset) | Output | Tokens"],
-                     [f"{cell(name)} | {c['sessions']} | {c['input']} ({c['cached_input']}) | {c['output']} | {c['tokens']}"
+    sections.append(("7. Codex by model", ["Model | Sessions | Input (cached subset) | Output | Tokens | Median brief chars"],
+                     [f"{cell(name)} | {c['sessions']} | {c['input']} ({c['cached_input']}) | {c['output']} | {c['tokens']} | "
+                      f"{data['codex_briefs'][name]['median']:g}" if name in data["codex_briefs"] else
+                      f"{cell(name)} | {c['sessions']} | {c['input']} ({c['cached_input']}) | {c['output']} | {c['tokens']} | -"
                       for name, c in sorted(data["codex"].items(), key=lambda pair: -pair[1]["tokens"])]))
     prior, old = previous_audit(out)
     changes = ["No earlier token-audit report with comparable headline metadata."]
     if old:
         changes = ["Compared with " + prior.name + ": " + "; ".join(
-            f"{key} {value - old.get(key, 0):+,}" for key, value in h.items()) + "."]
+            (f"{key} {value - old[key]:+,}" if key in old else f"{key} new") for key, value in h.items()) + "."]
     sections.append(("8. Changes since last audit", [], changes))
     data["flagged"] = []
     for key, value in h.items():

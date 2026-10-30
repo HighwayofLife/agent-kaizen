@@ -50,8 +50,10 @@ thread's model. Repeat `--disable-mcp NAME` to pass
 Names containing punctuation are quoted as TOML keys.
 
 `-r 0|1|2` caps check-failure resumes (default 2). Each resume receives up to
-60 error/tail lines per failing check, each trimmed to 2,000 characters. All
-checks rerun, and both latest and per-round logs are retained. Infrastructure
+60 error/tail lines per failing check, each trimmed to 2,000 characters. Resume
+rounds re-run failing checks, then confirm skipped checks once. Checks see
+`DISPATCH_ROUND` and `DISPATCH_PASS` (`initial`, `retry`, `final`); latest and
+per-round logs are retained. Infrastructure
 failures caused by overload or an empty final message get one additional
 attempt per Codex invocation; this is separate from check resumes.
 If executable `tools/codemap` exists in the target, the dispatcher runs
@@ -141,7 +143,9 @@ the window, including resumes of older files, attributed to the latest model.
 Cached input is a subset of Codex input and is never added twice. Claude context
 includes input, cache reads and cache creation. These are usage counts, not
 currency estimates. Reports cap at 80 lines; JSON retains all rows. Malformed
-rows are skipped and reported. Generic high median agent-call counts are flagged.
+rows are skipped and reported. Generic high median agent-call counts are
+flagged. Claude and Codex brief sizes are reported, and median growth between
+audits is flagged.
 Exit 0 means the report was written; errors use nonzero exit codes.
 
 ## dispatch-status

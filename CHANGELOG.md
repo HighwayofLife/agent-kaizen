@@ -2,6 +2,11 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.3.2 (2026-10-29)
+
+- token-audit: report Claude and Codex brief sizes and flag median growth between audits.
+- codex-dispatch: checks that were not re-run in the final round are marked as such in the report.
+
 ## 0.3.1 (2026-10-29)
 
 - codex-dispatch: resume rounds re-run only the failing checks, then confirm the checks that were skipped, once. Checks see `DISPATCH_ROUND` and `DISPATCH_PASS` (`initial`, `retry`, `final`) so project tooling can run cheaper checks while iterating.
