@@ -1,0 +1,21 @@
+# Starting point for ~/.codex/config.toml. Check key names against the current Codex docs
+# for your version; merge into your existing file rather than replacing it.
+
+# Default model and effort for interactive use. The dispatch scripts pass -m / -c per run,
+# so a cheaper default here is fine.
+model = "<your default Codex model>"
+model_reasoning_effort = "medium"
+
+# MCP servers: every enabled server adds tool definitions to every Codex run. Disable the
+# ones you rarely need and enable them per run (codex exec -c mcp_servers.NAME.enabled=true),
+# or keep them enabled and turn them off for runs that do not need them
+# (codex exec -c mcp_servers.NAME.enabled=false, or codex-dispatch --disable-mcp NAME).
+# [mcp_servers.example]
+# command = "example-mcp"
+# args = []
+# enabled = false
+
+# Trusted projects: list only the repos you work in. Codex adds an entry whenever you
+# trust a folder, so prune stale ones now and then.
+# [projects."/path/to/your/repo"]
+# trust_level = "trusted"

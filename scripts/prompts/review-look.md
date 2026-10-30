@@ -1,0 +1,1 @@
+Answer the question only from what is visible in the attached images. Cite which image by name for each observation. Say CANNOT TELL when unsure; do not infer hidden details. Stay under 15 lines. End with ANSWER: followed by a one-line summary.

@@ -1,0 +1,416 @@
+#!/usr/bin/env python3
+"""Stream Claude project transcripts and Codex sessions into a compact audit."""
+import argparse
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
+import re
+import shlex
+import statistics
+import sys
+
+
+TIMESTAMP = re.compile(rb'"timestamp"\s*:\s*"([^"\n]+)"')
+MARKERS = (b'"usage"', b'"tool_result"', b'"timestamp"')
+ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*=")
+
+
+def date_time(value):
+    dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    return dt.replace(tzinfo=timezone.utc) if dt.tzinfo is None else dt.astimezone(timezone.utc)
+
+
+def rows(path, since, warnings, keep_model=False):
+    """Timestamp gate runs on bytes, before decoding/JSON parsing large content."""
+    cutoff = since.strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        with path.open("rb") as stream:
+            for line in stream:
+                if not any(marker in line for marker in MARKERS):
+                    continue
+                match = TIMESTAMP.search(line)
+                if not match:
+                    continue
+                timestamp = match[1].decode("ascii", "replace")
+                try:
+                    # Nearly all transcripts are UTC. Avoid datetime parsing on
+                    # every line, while correctly handling explicit offsets too.
+                    old = (timestamp[:19] < cutoff if timestamp.endswith(("Z", "+00:00"))
+                           else date_time(timestamp) < since)
+                    if old and not (keep_model and b'"model"' in line):
+                        continue
+                    row = json.loads(line)
+                    if isinstance(row, dict):
+                        if old:
+                            row["_before_window"] = True
+                        yield row
+                except (ValueError, TypeError, UnicodeError):
+                    warnings["malformed rows"] += 1
+    except OSError:
+        warnings["unreadable files"] += 1
+
+
+def context(usage):
+    return sum(usage.get(key, 0) or 0 for key in (
+        "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
+
+
+def add(counter, usage):
+    ctx = context(usage)
+    counter.update(calls=1, context=ctx, cache_read=usage.get("cache_read_input_tokens", 0) or 0,
+                   cache_write=usage.get("cache_creation_input_tokens", 0) or 0,
+                   output=usage.get("output_tokens", 0) or 0)
+    counter["peak"] = max(counter["peak"], ctx)
+
+
+def image_count(content):
+    if isinstance(content, dict):
+        return int(content.get("type") == "image") + sum(image_count(v) for v in content.values())
+    if isinstance(content, list):
+        return sum(map(image_count, content))
+    return 0
+
+
+def bash_head(command):
+    segments = [part.strip() for part in re.split(r"&&|;|\n|\|", command) if part.strip()]
+    for segment in segments:
+        try:
+            words = shlex.split(segment)
+        except ValueError:
+            words = segment.split()
+        if not words or words[0] in ("cd", "export", "set"):
+            continue
+        while words and ASSIGNMENT.match(words[0]):
+            words.pop(0)
+        if words and words[0] in ("cd", "export", "set"):
+            continue
+        if words:
+            return " ".join(words[:2])[:40]
+    return "(cd/vars only)"
+
+
+def blocks(message):
+    content = message.get("content")
+    return [item for item in content if isinstance(item, dict)] if isinstance(content, list) else []
+
+
+def scan_claude(path, agent, since, data, seen_messages):
+    main = agent is None
+    counter = Counter()
+    tools = {}
+    pending = None
+    first, last, session_id = None, None, path.stem
+    for row in rows(path, since, data["warnings"]):
+        ts = row.get("timestamp", "")
+        first = min(first, ts) if first else ts
+        last = max(last, ts) if last else ts
+        session_id = row.get("sessionId") or session_id
+        message = row.get("message") or {}
+        if not isinstance(message, dict):
+            continue
+        # One assistant message can span several rows (one per content block), and resumed
+        # sessions can repeat rows from another file: count usage once per message id and
+        # each tool call or result once per tool-use id, but keep every row's blocks.
+        message_id = message.get("id")
+        usage_seen = False
+        if row.get("type") == "assistant" and message_id:
+            usage_seen = message_id in seen_messages
+            seen_messages.add(message_id)
+        content = blocks(message)
+        if row.get("type") == "user" and main:
+            raw = message.get("content", "")
+            if any(item.get("type") == "tool_result" for item in content):
+                pending = "tool result"
+            elif "<task-notification>" in (raw if isinstance(raw, str) else str(raw)):
+                pending = "task notification"
+            else:
+                pending = "human"
+        usage = message.get("usage")
+        if row.get("type") == "assistant" and isinstance(usage, dict) and usage and not usage_seen:
+            model = message.get("model", "unknown")
+            add(data["models"][model], usage)
+            add(counter, usage)
+            if main and pending:
+                add(data["triggers"][pending], usage)
+                pending = None
+        for block in content:
+            if block.get("type") == "tool_use":
+                if ("use", block.get("id")) in seen_messages:
+                    continue
+                seen_messages.add(("use", block.get("id")))
+                name, head = block.get("name", "unknown"), None
+                tool_input = block.get("input") or {}
+                if name == "Agent":
+                    name += ":" + str(tool_input.get("subagent_type", "unknown"))
+                if name == "Bash" and not main:
+                    head = bash_head(tool_input.get("command", ""))
+                    data["bash"][agent][head] += 1
+                tools[block.get("id")] = (name, head)
+            elif block.get("type") == "tool_result":
+                if ("result", block.get("tool_use_id")) in seen_messages:
+                    continue
+                seen_messages.add(("result", block.get("tool_use_id")))
+                name, head = tools.get(block.get("tool_use_id"), ("unknown", None))
+                result = block.get("content")
+                chars = len(json.dumps(result))
+                if main:
+                    data["tool_chars"][name] += chars
+                    data["tool_counts"][name] += 1
+                    data["images"] += image_count(result)
+                elif head:
+                    data["bash_chars"][agent][head] += chars
+    if not counter["calls"]:
+        return
+    minutes = 0
+    if first and last:
+        try:
+            minutes = max(0, (date_time(last) - date_time(first)).total_seconds() / 60)
+        except ValueError:
+            pass
+    if main:
+        data["sessions"].append(dict(id=session_id, date=first[:10], **counter))
+    else:
+        data["agents"][agent].append(dict(minutes=minutes, **counter))
+
+
+def scan_codex(root, since, data):
+    # Session filenames are usually rollout-*.jsonl; scan the standard date tree.
+    for path in root.glob("*/*/*/*.jsonl"):
+        data["codex_files_scanned"] += 1
+        model, final = "unknown", None
+        # Older session files can contain recent resumes. Keep earlier model
+        # metadata, but count only sessions with a token_count in the window.
+        for row in rows(path, since, data["warnings"], keep_model=True):
+            payload = row.get("payload") or {}
+            if not isinstance(payload, dict):
+                continue
+            if row.get("model"):
+                model = row["model"]
+            if payload.get("model"):
+                model = payload["model"]
+            if payload.get("type") == "token_count" and not row.get("_before_window"):
+                info = payload.get("info") or {}
+                usage = info.get("total_token_usage")
+                if isinstance(usage, dict):
+                    final = dict(usage)
+        if final is not None:
+            total = data["codex"][model]
+            total.update(sessions=1, input=final.get("input_tokens", 0),
+                         cached_input=final.get("cached_input_tokens", 0),
+                         output=final.get("output_tokens", 0),
+                         tokens=final.get("total_tokens", final.get("input_tokens", 0) + final.get("output_tokens", 0)))
+
+
+def collect(projects, codex_root, since):
+    data = dict(models=defaultdict(Counter), sessions=[], agents=defaultdict(list),
+                triggers=defaultdict(Counter), tool_chars=Counter(), tool_counts=Counter(),
+                images=0, bash=defaultdict(Counter), bash_chars=defaultdict(Counter),
+                codex=defaultdict(Counter), warnings=Counter(), codex_files_scanned=0)
+    seen = set()
+    seen_messages = set()
+    for project in projects:
+        for path in project.glob("*.jsonl"):
+            real = path.resolve()
+            if real not in seen:
+                seen.add(real)
+                scan_claude(path, None, since, data, seen_messages)
+        for path in project.glob("*/subagents/*.jsonl"):
+            real = path.resolve()
+            if real in seen:
+                continue
+            seen.add(real)
+            meta = path.with_name(path.stem + ".meta.json")
+            agent = "unknown"
+            if meta.is_file():
+                try:
+                    agent = str(json.loads(meta.read_text()).get("agentType") or "unknown")
+                except (OSError, ValueError, AttributeError):
+                    data["warnings"]["malformed metadata"] += 1
+            scan_claude(path, agent, since, data, seen_messages)
+    scan_codex(codex_root, since, data)
+    data["files_scanned"] = len(seen)
+    data["headline"] = {
+        "claude_calls": sum(c["calls"] for c in data["models"].values()),
+        "claude_context": sum(c["context"] for c in data["models"].values()),
+        "claude_output": sum(c["output"] for c in data["models"].values()),
+        "codex_sessions": sum(c["sessions"] for c in data["codex"].values()),
+        "codex_tokens": sum(c["tokens"] for c in data["codex"].values()),
+        "image_reads": data["images"],
+    }
+    data["parser_warnings"] = []
+    if data["files_scanned"] and not data["headline"]["claude_calls"]:
+        data["parser_warnings"].append(
+            "WARNING: transcript format may have changed; token-audit's parser needs updating "
+            f"({data['files_scanned']} files scanned, 0 usage rows)")
+    if data["codex_files_scanned"] and not data["headline"]["codex_sessions"]:
+        data["parser_warnings"].append(
+            "WARNING: Codex transcript format may have changed; token-audit's parser needs updating "
+            f"({data['codex_files_scanned']} files scanned, 0 token_count rows)")
+    data["parser_warning"] = bool(data["parser_warnings"])
+    data["since"] = since.isoformat()
+    return data
+
+
+def cell(value):
+    return str(value).replace("|", "\\|").replace("\n", " ").replace("\r", " ")
+
+
+def avg(counter):
+    return round(counter["context"] / max(1, counter["calls"]))
+
+
+def agent_stats(data):
+    result = []
+    for name, spawns in data["agents"].items():
+        calls = [spawn["calls"] for spawn in spawns]
+        median = statistics.median(calls)
+        ctx = sum(spawn["context"] for spawn in spawns)
+        flag = " ⚠" if median > 120 else ""
+        result.append((ctx, name, f"{cell(name)}{flag} | {len(spawns)} | {median:g}/{max(calls)} | "
+                       f"{ctx} | {round(ctx / sum(calls))} | {statistics.median(s['minutes'] for s in spawns):.1f}"))
+    return sorted(result, reverse=True)
+
+
+def previous_audit(out):
+    candidates = sorted((p for p in out.parent.glob("token-audit-*.md") if p != out),
+                        key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True)
+    for path in candidates:
+        try:
+            with path.open() as stream:
+                for line in stream:
+                    if line.startswith("<!-- token-audit-headline "):
+                        value = json.loads(line.removeprefix("<!-- token-audit-headline ").removesuffix(" -->\n"))
+                        return path, value
+        except (OSError, ValueError):
+            continue
+    return None, None
+
+
+def report(data, out):
+    h = data["headline"]
+    headline = [f"Claude: {h['claude_calls']:,} calls; {h['claude_context']:,} context tokens; {h['claude_output']:,} output tokens.",
+                f"Codex: {h['codex_sessions']:,} sessions; {h['codex_tokens']:,} tokens."]
+    sections = []
+    sections.append(("1. Totals by model (Claude)",
+                     ["Model | Calls | Context | Cache-read share | Output"],
+                     [f"{cell(name)} | {c['calls']} | {c['context']} | {c['cache_read'] / max(1, c['context']):.1%} | {c['output']}"
+                      for name, c in sorted(data["models"].items(), key=lambda pair: -pair[1]["context"])]))
+    sessions = sorted(data["sessions"], key=lambda s: -s["context"])
+    sections.append(("2. Main sessions", ["ID | Date | Calls | Avg context | Peak context"],
+                     [f"{cell(s['id'])}{' ⚠' if s['context'] > s['calls'] * 150000 or s['peak'] > 250000 else ''} | "
+                      f"{s['date']} | {s['calls']} | {avg(s)} | {s['peak']}" for s in sessions]))
+    agents = agent_stats(data)
+    sections.append(("3. By agent type", ["Agent | Spawns | Median/max calls | Context | Avg context | Median minutes"],
+                     [row for _, _, row in agents]))
+    sections.append(("4. Orchestrator turns by trigger", ["Trigger | Turns | Avg context"],
+                     [f"{trigger} | {data['triggers'][trigger]['calls']} | {avg(data['triggers'][trigger])}"
+                      for trigger in ("human", "tool result", "task notification")]))
+    sections.append(("5. Main-session tool results",
+                     [f"Image blocks read: {data['images']}{' ⚠ images in main session' if data['images'] else ''}",
+                      "Tool | Results | Chars"],
+                     [f"{cell(tool)} | {data['tool_counts'][tool]} | {chars}"
+                      for tool, chars in data["tool_chars"].most_common()]))
+    heavy = [name for _, name, _ in agents if any(s["calls"] > 8 for s in data["agents"][name])]
+    sections.append(("6. Top Bash command heads per heavy agent", [],
+                     [f"{cell(name)}: " + "; ".join(
+                         f"{cell(head)} ({count} calls, {data['bash_chars'][name][head]} chars)"
+                         for head, count in data["bash"][name].most_common(6)) for name in heavy]))
+    sections.append(("7. Codex by model", ["Model | Sessions | Input (cached subset) | Output | Tokens"],
+                     [f"{cell(name)} | {c['sessions']} | {c['input']} ({c['cached_input']}) | {c['output']} | {c['tokens']}"
+                      for name, c in sorted(data["codex"].items(), key=lambda pair: -pair[1]["tokens"])]))
+    prior, old = previous_audit(out)
+    changes = ["No earlier token-audit report with comparable headline metadata."]
+    if old:
+        changes = ["Compared with " + prior.name + ": " + "; ".join(
+            f"{key} {value - old.get(key, 0):+,}" for key, value in h.items()) + "."]
+    sections.append(("8. Changes since last audit", [], changes))
+    data["flagged"] = []
+    for key, value in h.items():
+        if old is None or key not in old:
+            continue
+        before = old[key]
+        if value > before and (value - before) * 100 > before * 20:
+            data["flagged"].append(dict(metric=key, old=before, new=value,
+                                        percent_change=(value - before) / before * 100 if before else None))
+    flags = []
+    for flag in data["flagged"]:
+        percent = f"{flag['percent_change']:.1f}" if flag['percent_change'] is not None else "∞"
+        flags.append(f"{flag['metric']}: {flag['old']:,} → {flag['new']:,} (+{percent}%).")
+    sections.append(("9. Flagged", [], flags or [
+        "no previous audit to compare" if old is None else "None."]))
+    # A pipe header needs a separator row to render as a Markdown table.
+    for _, headers, _ in sections:
+        if headers and " | " in headers[-1]:
+            headers.append(" | ".join("---" for _ in headers[-1].split(" | ")))
+    lines = [*data["parser_warnings"], "# Token audit", f"Since: {data['since']} (UTC; Claude calls in window, Codex final session totals).",
+             *headline, "<!-- token-audit-headline " + json.dumps(h) + " -->"]
+    if data["warnings"]:
+        lines.append("Skipped: " + "; ".join(f"{n} {key}" for key, n in data["warnings"].items()))
+    # Fairly share the remaining 80-line budget; JSON retains every row.
+    budgets = [0] * len(sections)
+    remaining = 80 - len(lines) - sum(2 + len(headers) for _, headers, _ in sections)
+    # Always show every regression, even when other sections need truncation.
+    budgets[-1] = len(sections[-1][2])
+    remaining -= budgets[-1]
+    needs = [max(1, len(rows)) for _, _, rows in sections]
+    while remaining > 0 and any(b < n for b, n in zip(budgets, needs)):
+        for i, need in enumerate(needs):
+            if remaining and budgets[i] < need:
+                budgets[i] += 1
+                remaining -= 1
+    for (title, headers, body), budget in zip(sections, budgets):
+        lines += ["", "## " + title] + headers
+        if not body:
+            lines.append("None.")
+        elif len(body) > budget:
+            lines += body[:max(0, budget - 1)] + [f"… {len(body) - max(0, budget - 1)} more rows; use --json for all details."]
+        else:
+            lines += body
+    return "\n".join(lines) + "\n", headline
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    period = parser.add_mutually_exclusive_group()
+    period.add_argument("--days", type=int, default=3)
+    period.add_argument("--since", type=lambda s: datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc))
+    parser.add_argument("--project", help="filter project folder names by substring")
+    parser.add_argument("--project-dir", action="append", default=[], type=Path)
+    parser.add_argument("--codex", action="store_true", help="include Codex sessions (also included by default)")
+    parser.add_argument("--out", type=Path)
+    parser.add_argument("--json", action="store_true", help="print full structured data instead of headline stdout")
+    args = parser.parse_args()
+    if args.days < 0:
+        parser.error("--days must be nonnegative")
+    now = datetime.now(timezone.utc)
+    since = args.since or (now - timedelta(days=args.days)).replace(microsecond=0)
+    root = Path.home() / ".claude/projects"
+    projects = [p.expanduser().resolve() for p in args.project_dir] if args.project_dir else (
+        sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else [])
+    if args.project:
+        projects = [p for p in projects if args.project.casefold() in p.name.casefold()]
+    directory = (args.out or Path.home() / ".claude/audits").expanduser().resolve()
+    out = directory / f"token-audit-{now:%Y%m%dT%H%M%S.%fZ}.md"
+    try:
+        for path in projects:
+            if not path.is_dir():
+                raise ValueError(f"project directory missing: {path}")
+        data = collect(projects, Path.home() / ".codex/sessions", since)
+        for warning in data["parser_warnings"]:
+            print(warning, file=sys.stderr)
+        text, headline = report(data, out)
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(text)
+        if args.json:
+            print(json.dumps(dict(report_path=str(out), **data), indent=2))
+        else:
+            print(str(out) + "\n" + "\n".join(headline))
+        return 0
+    except (OSError, ValueError) as exc:
+        print(f"token-audit: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

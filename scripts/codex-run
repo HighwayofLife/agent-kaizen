@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+"""Internal runner: codex-run [--resume THREAD] MODEL_OR_EFFORT [EFFORT] BRIEF [ARGSFILE]."""
+import argparse
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--resume', metavar='THREAD')
+    parser.add_argument('values', nargs='+', help='new: MODEL EFFORT BRIEF [ARGSFILE]; resume: EFFORT BRIEF [ARGSFILE]')
+    args = parser.parse_args()
+    values = args.values
+    model = None
+    if not args.resume:
+        if len(values) not in (3, 4):
+            parser.error('new runs need MODEL EFFORT BRIEF [ARGSFILE]; empty MODEL uses the configured default')
+        model, *values = values
+    elif len(values) not in (2, 3):
+        parser.error('resumes need EFFORT BRIEF [ARGSFILE]')
+    effort, brief, *argfile = values
+    brief = Path(brief)
+    out = brief.parent
+    extra = Path(argfile[0]).read_text().splitlines() if argfile else []
+    thread = args.resume
+    summary, usage, rc = '', None, 2
+    # One infrastructure retry is separate from the dispatcher's two check resumes.
+    for attempt in range(2):
+        last = out / (brief.stem + f'-attempt-{attempt}-last.md')
+        events = out / (brief.stem + f'-attempt-{attempt}-events.jsonl')
+        errors = out / (brief.stem + f'-attempt-{attempt}-stderr.log')
+        last.unlink(missing_ok=True)
+        command = ['codex', 'exec']
+        if thread:
+            command += ['resume', thread, '-c', 'sandbox_mode=workspace-write']
+        else:
+            command += ['-s', 'workspace-write', '-C', str(Path.cwd())]
+            if model:
+                command += ['-m', model]
+        command += ['--json', '-c', f'model_reasoning_effort={effort}'] + extra + ['-o', str(last), '-']
+        try:
+            with brief.open() as source, events.open('w') as log, errors.open('w') as err:
+                rc = subprocess.run(command, stdin=source, stdout=log, stderr=err, check=False).returncode
+        except OSError as exc:
+            errors.write_text(str(exc))
+            rc = 127
+        overloaded = False
+        with events.open(errors='replace') as log:
+            for line in log:
+                overloaded |= 'server_overloaded' in line or 'model is at capacity' in line
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                thread = event.get('thread_id') or thread
+                usage = event.get('usage') or usage
+        overloaded |= any(word in errors.read_text(errors='replace') for word in ('server_overloaded', 'model is at capacity'))
+        summary = last.read_text() if last.is_file() else ''
+        if summary.strip() and not overloaded:
+            break
+    print('THREAD_ID:', thread or 'unknown')
+    if usage:
+        print(json.dumps({'usage': usage}))
+    print('---- CODEX FINAL MESSAGE ----')
+    print(summary.strip() or '(no final message)')
+    print('---- GIT DIFF STAT ----')
+    return rc if rc else (0 if summary.strip() and not overloaded else 2)
+
+
+if __name__ == '__main__':
+    sys.exit(main())

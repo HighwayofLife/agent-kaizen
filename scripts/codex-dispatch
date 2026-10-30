@@ -1,0 +1,154 @@
+#!/usr/bin/env python3
+"""Run codex-run and checks synchronously; callers may background this process."""
+import argparse
+import os
+from pathlib import Path
+import re
+import shutil
+import sys
+
+from codex_common import code_locations, emit, key_errors, one_line, relevant, run_logged, stamp, mcp_overrides
+
+
+def arguments():
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument("-m", default=os.environ.get("CODEX_DISPATCH_MODEL"))
+    p.add_argument("-e", default="medium")
+    p.add_argument("-C", default=os.getcwd())
+    p.add_argument("-k", action="append", default=[])
+    p.add_argument("-r", type=int, default=2, help="maximum resume rounds after the initial run")
+    p.add_argument("-p", choices=["engineer", "planner", "none"], default="engineer")
+    p.add_argument("--disable-mcp", action="append", default=[], metavar="NAME")
+    p.add_argument("-i", action="append", default=[])
+    p.add_argument("--resume")
+    p.add_argument("-o")
+    p.add_argument("brief", type=Path)
+    args = p.parse_args()
+    if not 0 <= args.r <= 2:
+        p.error("-r must be between 0 and 2")
+    return args
+
+
+def parse_run(path):
+    thread, usage, summary = None, None, []
+    final = False
+    with path.open(errors="replace") as stream:
+        for line in stream:
+            line = line.rstrip()
+            if line.startswith("THREAD_ID:"):
+                thread = line.partition(":")[2].strip()
+            elif line == "---- CODEX FINAL MESSAGE ----":
+                final = True
+            elif line == "---- GIT DIFF STAT ----":
+                final = False
+            elif final:
+                summary.append(line)
+            elif '"usage"' in line:
+                usage = line
+    return thread, usage, [line for line in summary if line.strip()]
+
+
+def main():
+    args = arguments()
+    cwd = Path(args.C).expanduser().resolve()
+    if not cwd.is_dir():
+        print(f"Reason: working directory missing: {cwd}\nSTATUS: CODEX FAILED")
+        return 2
+    base = cwd / "out/dispatch"
+    slug = re.sub(r"[^\w.-]", "-", args.brief.stem)
+    out = Path(args.o).expanduser().resolve() if args.o else base / f"{stamp()}-{slug}"
+    out.mkdir(parents=True, exist_ok=True)
+    thread, usage, summary, checks, rounds = args.resume, None, [], [], 0
+    reason = None
+    locations = ""
+
+    def report(status, code):
+        fixed = [f"Model/effort: {one_line(args.m or 'configured default')} / {one_line(args.e)}",
+                 f"THREAD_ID: {one_line(thread or 'unknown')}", f"Token usage: {one_line(usage or 'unavailable')}"]
+        count = sum(bool(line.strip()) and not line.startswith("#") for line in locations.splitlines())
+        fixed.append(f"Code map: {count} location lines" if locations else "Code map: none")
+        if args.resume:
+            fixed[0] += " (resume inherits thread model)"
+        if reason:
+            fixed.append(f"Reason: {one_line(reason)}")
+        check_lines = []
+        for number, command, rc, log in checks:
+            errors = "; ".join(key_errors(log)) if rc else ""
+            check_lines.append(f"Check {number} {'FAIL' if rc else 'PASS'}: {one_line(command)}" +
+                               (f" — {one_line(errors)}" if errors else ""))
+        # Every check gets a result, even when the caller supplied many checks.
+        # Pack overflow onto one line so the hard report limit always holds.
+        if len(check_lines) > 8:
+            check_lines = check_lines[:7] + [" | ".join(check_lines[7:])]
+        end = [f"Rounds used: {rounds}/{args.r} resumes", f"OUTDIR: {out}", f"STATUS: {status}"]
+        statlog = out / "git-diff-stat.log"
+        run_logged(["git", "diff", "--stat"], cwd, statlog)
+        stat = statlog.read_text(errors="replace").splitlines()
+        if stat and stat[0].startswith(("warning:", "fatal:", "error:")):
+            stat = ["not a git repository"]
+        budget = 25 - len(fixed) - len(check_lines) - len(end)
+        stat_budget = min(11, max(1, budget // 2))
+        if len(stat) > stat_budget:
+            stat = stat[:max(0, stat_budget - 1)] + [stat[-1]]
+        stat = stat or ["(no tracked diff)"]
+        final = ["Codex: " + one_line(line) for line in summary[:min(10, max(0, budget - len(stat)))]]
+        emit(out / "report.md", fixed + final + ["Diff: " + line for line in stat] + check_lines + end)
+        return code
+
+    try:
+        if not cwd.is_dir():
+            raise OSError(f"working directory missing: {cwd}")
+        task = args.brief.expanduser().read_text()
+        locations = code_locations(cwd, args.brief.expanduser().resolve(), out / "codemap.log")
+        here = Path(__file__).resolve().parent
+        preamble = "" if args.p == "none" else (here / f"preambles/{args.p}.md").read_text()
+        extra = mcp_overrides(args.disable_mcp)
+        for image in args.i:
+            path = Path(image).expanduser().resolve()
+            if not path.is_file():
+                raise OSError(f"image missing: {path}")
+            extra += ["-i", str(path)]
+        if any("\n" in value or "\r" in value for value in extra):
+            raise ValueError("extra arguments cannot contain newlines")
+        argfile = out / "extra-args.txt"
+        argfile.write_text("\n".join(extra) + ("\n" if extra else ""))
+        brief = out / "brief.md"
+        brief.write_text(preamble + "\n" + (locations.rstrip() + "\n\n" if locations else "") + task)
+        runner = str(here / "codex-run")
+        for attempt in range(args.r + 1):
+            log = out / f"codex-{attempt}.log"
+            command = ([runner, "--resume", thread, args.e, str(brief)] if thread else
+                       [runner, args.m or "", args.e, str(brief)]) + [str(argfile)]
+            rc = run_logged(command, cwd, log)
+            next_thread, next_usage, summary = parse_run(log)
+            thread = next_thread if next_thread and next_thread != "unknown" else thread
+            usage = next_usage or usage
+            if rc or not summary or any(line == "(no final message)" for line in summary):
+                reason = "; ".join(key_errors(log)) or "Codex returned no final message"
+                return report("CODEX FAILED", 2)
+            checks = []
+            for number, command in enumerate(args.k, 1):
+                log = out / f"check-{number}.log"
+                rc = run_logged(command, cwd, log, shell=True)
+                shutil.copyfile(log, out / f"check-{number}-round-{attempt}.log")
+                checks.append((number, command, rc, log))
+            failures = [check for check in checks if check[2]]
+            if not failures:
+                return report("DONE", 0)
+            if attempt == args.r:
+                return report("CHECKS FAILING", 1)
+            if not thread:
+                reason = "Cannot resume failing checks without a thread id"
+                return report("CODEX FAILED", 2)
+            brief = out / f"resume-{attempt + 1}.md"
+            brief.write_text("Fix the failing checks below. Do not commit or push.\n\n" + "\n\n".join(
+                f"Check {number}: {command}\n" + "\n".join(relevant(log))
+                for number, command, _, log in failures))
+            rounds += 1
+    except (OSError, ValueError) as exc:
+        reason = str(exc)
+        return report("CODEX FAILED", 2)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

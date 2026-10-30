@@ -1,0 +1,3 @@
+   - Model/effort/target.
+   - Findings, most severe first: `file:line — one-line defect — why it matters`. Drop pure style nitpicks.
+   - `VERDICT: NO ISSUES` | `VERDICT: ISSUES FOUND (n)` | `VERDICT: REVIEW FAILED` (with the error).

@@ -1,0 +1,159 @@
+#!/usr/bin/env python3
+"""Read-only diff, plan, visual, and free-form image reviews."""
+import argparse
+import os
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+from codex_common import code_locations, emit, key_errors, mcp_overrides, one_line, run_logged, stamp
+
+
+def arguments():
+    parser = argparse.ArgumentParser(description=__doc__)
+    modes = parser.add_subparsers(dest="mode", required=True)
+    for mode in ("diff", "plan", "visual", "look"):
+        p = modes.add_parser(mode)
+        p.add_argument("-m", default=os.environ.get("CODEX_LOOK_MODEL" if mode in ("visual", "look") else "CODEX_REVIEW_MODEL"))
+        p.add_argument("-e", default="medium")
+        p.add_argument("-C", default=os.getcwd())
+        p.add_argument("--disable-mcp", action="append", default=[], metavar="NAME")
+        if mode == "diff":
+            target = p.add_mutually_exclusive_group()
+            target.add_argument("--uncommitted", action="store_true")
+            target.add_argument("--base")
+            target.add_argument("--commit")
+        if mode in ("diff", "plan"):
+            p.add_argument("--focus", default="")
+        if mode == "plan":
+            p.add_argument("plan", type=Path)
+        if mode in ("visual", "look"):
+            p.add_argument("images", nargs="+", type=Path)
+        if mode == "visual":
+            p.add_argument("--criteria", required=True)
+            p.add_argument("--ref", action="append", default=[], type=Path)
+        if mode == "look":
+            p.add_argument("--question", required=True)
+    return parser.parse_args()
+
+
+def git(cwd, *args):
+    return subprocess.run(["git", *args], cwd=cwd, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL, text=True, check=False)
+
+
+def main():
+    args = arguments()
+    cwd = Path(args.C).expanduser().resolve()
+    if not cwd.is_dir():
+        print(f"Error: working directory missing: {cwd}\nSTATUS: REVIEW FAILED")
+        return 2
+    out = cwd / "out/dispatch" / (stamp() + "-review")
+    out.mkdir(parents=True)
+    limit = 15 if args.mode == "look" else 25
+    header = [f"Model/effort: {one_line(args.m or 'configured default')} / {one_line(args.e)}; mode: {args.mode}", f"Raw output: {out}"]
+
+    def failed(reason):
+        emit(out / "report.md", header[:limit - 2] +
+             ["Error: " + one_line(reason), "STATUS: REVIEW FAILED"])
+        return 2
+
+    try:
+        if not cwd.is_dir():
+            raise ValueError(f"working directory missing: {cwd}")
+        here = Path(__file__).resolve().parent
+        prompt = (here / f"prompts/review-{args.mode}.md").read_text()
+        command = ["codex", "exec", "-s", "read-only", "-c",
+                   f"model_reasoning_effort={args.e}", "-C", str(cwd)]
+        if args.m:
+            command += ["-m", args.m]
+        if args.mode == "diff":
+            if not (args.uncommitted or args.base or args.commit):
+                # Match the reference default only if there really are branch commits.
+                base = git(cwd, "rev-parse", "--verify", "origin/master")
+                ahead = git(cwd, "rev-list", "--count", "origin/master..HEAD") if base.returncode == 0 else None
+                args.base = "origin/master" if ahead and ahead.returncode == 0 and int(ahead.stdout.strip()) else None
+            if args.base:
+                if git(cwd, "rev-parse", "--verify", args.base + "^{commit}").returncode:
+                    raise ValueError(f"base branch does not exist: {args.base}")
+                target = f"--base {args.base} (review the merge-base-to-HEAD diff)"
+            elif args.commit:
+                if git(cwd, "rev-parse", "--verify", args.commit + "^{commit}").returncode:
+                    raise ValueError(f"commit does not exist: {args.commit}")
+                target = f"--commit {args.commit} (review this commit's changes)"
+            else:
+                target = "--uncommitted (review staged, unstaged, and untracked changes)"
+            header.append("Target: " + one_line(target))
+            prompt = ("Review this repository's diff read-only. Do not edit files. "
+                      "Read AGENTS.md/CLAUDE.md. Hunt for actionable bugs.\n" + prompt +
+                      f"\nTarget: {target}\nFocus: {args.focus}\n")
+        elif args.mode == "plan":
+            plan = args.plan.expanduser().resolve()
+            if not plan.exists():
+                raise ValueError(f"plan missing: {plan}")
+            header.append("Plan: " + str(plan))
+            prompt += f"\nPlan path: {plan}\nFocus: {args.focus}\n"
+            prompt += code_locations(cwd, plan, out / "codemap.log")
+        else:
+            refs = [p.expanduser().resolve() for p in getattr(args, "ref", [])]
+            images = [p.expanduser().resolve() for p in args.images]
+            all_images = list(dict.fromkeys(images + refs))
+            for path in all_images:
+                if not path.is_file():
+                    raise ValueError(f"image missing: {path}")
+            prompt += "\nImages (in attachment order):\n" + "\n".join(
+                f"{index}. {'REFERENCE' if path in refs else 'RESULT'}: {path}"
+                for index, path in enumerate(all_images, 1)) + "\n"
+            if args.mode == "visual":
+                criteria_file = Path(args.criteria).expanduser()
+                try:
+                    is_file = criteria_file.is_file()
+                except OSError:
+                    is_file = False
+                criteria = criteria_file.read_text() if is_file else args.criteria
+                prompt += f"\nAcceptance criteria / task: {criteria}\n"
+            else:
+                prompt += f"\nQuestion: {args.question}\n"
+            attached = all_images
+            header.append("Images: " + ", ".join(one_line(path.name) for path in all_images))
+            command += ["--skip-git-repo-check"]
+            for path in attached:
+                command += ["-i", str(path)]
+        prompt += f"\nKeep the complete response under {limit - len(header)} lines, with the verdict/answer last.\n"
+        brief = out / "prompt.md"
+        brief.write_text(prompt)
+        last = out / "last.md"
+        command += mcp_overrides(args.disable_mcp) + ["-o", str(last), "-"]
+        for attempt in range(2):
+            last.unlink(missing_ok=True)
+            rc = run_logged(command, cwd, out / f"raw-{attempt}.log", stdin=brief)
+            has_final = last.is_file() and bool(last.read_text().strip())
+            overloaded = "server_overloaded" in (out / f"raw-{attempt}.log").read_text() or "model is at capacity" in (out / f"raw-{attempt}.log").read_text()
+            if has_final and not overloaded:
+                break
+        if rc or overloaded or not last.is_file() or not last.read_text().strip():
+            return failed("; ".join(key_errors(out / f"raw-{attempt}.log")) or "no final message")
+        # Models sometimes bold the verdict line ("**VERDICT: REVISE** — ..."); strip markdown emphasis first.
+        lines = [re.sub(r"^[*_\s]+|\*\*|__", "", line) if re.match(r"^[*_\s]*(VERDICT|ANSWER):", line) else line
+                 for line in last.read_text().splitlines() if line.strip()]
+        prefix = "ANSWER:" if args.mode == "look" else "VERDICT:"
+        endings = [line for line in lines if line.startswith(prefix)]
+        if not endings:
+            return failed(f"missing {prefix} in final message")
+        verdict = endings[-1]
+        if args.mode != "look":
+            patterns = {"diff": r"VERDICT: (NO ISSUES|ISSUES FOUND \(\d+\)|REVIEW FAILED)",
+                        "plan": r"VERDICT: (APPROVE|REVISE|REJECT|REVIEW FAILED)",
+                        "visual": r"VERDICT: (ACCEPT|REVISE|REJECT|REVIEW FAILED)"}
+            if not re.match(patterns[args.mode] + r"(?=\s|$)", verdict):
+                return failed("invalid verdict: " + verdict)
+        body = [line for line in lines if not line.startswith(prefix)]
+        emit(out / "report.md", header + body[:limit - len(header) - 2] + [verdict, "STATUS: " + ("REVIEW FAILED" if verdict.startswith("VERDICT: REVIEW FAILED") else "DONE")])
+        return 2 if verdict.startswith("VERDICT: REVIEW FAILED") else 0
+    except (OSError, ValueError) as exc:
+        return failed(str(exc))
+
+
+if __name__ == "__main__":
+    sys.exit(main())

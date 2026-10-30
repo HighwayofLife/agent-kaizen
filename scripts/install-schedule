@@ -1,0 +1,125 @@
+#!/usr/bin/env python3
+"""Install, show or remove the agent-kaizen schedule.
+
+Jobs:
+  audit   every 3 days: scripts/token-audit -> ~/.claude/audits/ (a plain script, no tokens)
+  review  weekly, optional (--review): runs the audit, then
+          claude -p "/agent-kaizen:cycle propose-only" in --project-dir with no shell, edit or
+          write tools (Read, Grep, Glob, WebFetch, WebSearch); stdout is saved by the shell
+          as ~/.claude/audits/cycle-<date>.md
+
+macOS uses launchd (~/Library/LaunchAgents); other systems use the user crontab.
+--apply copies token-audit to ~/.claude/bin/ and schedules that copy, so the jobs keep
+working when the plugin cache or your clone moves; re-run --apply after updating to refresh it.
+Without --apply or --remove, prints what it would install.
+"""
+import argparse
+import os
+import platform
+import plistlib
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+AUDITS = Path.home() / ".claude" / "audits"
+BIN = Path.home() / ".claude" / "bin"
+LABEL = "com.agent-kaizen"
+MARK = "# agent-kaizen"
+REVIEW_TOOLS = "Read,Grep,Glob,WebFetch,WebSearch"  # no Bash/Edit/Write: propose-only
+REVIEW_MODEL = os.environ.get("KAIZEN_REVIEW_MODEL", "sonnet")  # keep the weekly run cheap
+REVIEW_MAX_TURNS = os.environ.get("KAIZEN_REVIEW_MAX_TURNS", "40")
+
+
+def commands(project_dir):
+    audit = f"python3 {shlex.quote(str(BIN / 'token-audit'))} --out {shlex.quote(str(AUDITS))}"
+    log = shlex.quote(str(AUDITS / "run.log"))
+    review = (f"{audit} >> {log} 2>&1; cd {shlex.quote(str(project_dir))} && "
+              f"claude -p '/agent-kaizen:cycle propose-only' "
+              f"--model {shlex.quote(REVIEW_MODEL)} --max-turns {shlex.quote(REVIEW_MAX_TURNS)} "
+              f"--allowedTools {shlex.quote(REVIEW_TOOLS)} --permission-mode dontAsk "
+              f"> {shlex.quote(str(AUDITS))}/cycle-$(date +%F).md 2>> {log}")
+    return {"audit": f"{audit} >> {log} 2>&1", "review": review}
+
+
+def plist(name, command, interval=None, weekday=None):
+    job = {
+        "Label": f"{LABEL}.{name}",
+        "ProgramArguments": ["/bin/sh", "-c", command],
+        "EnvironmentVariables": {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")},
+        "RunAtLoad": False,
+    }
+    if interval:
+        job["StartInterval"] = interval
+    else:
+        job["StartCalendarInterval"] = {"Weekday": weekday, "Hour": 9, "Minute": 0}
+    return plistlib.dumps(job).decode()
+
+
+def jobs(args):
+    cmd = commands(args.project_dir)
+    out = {"audit": dict(command=cmd["audit"], interval=3 * 86400, cron="0 9 */3 * *")}
+    if args.review:
+        out["review"] = dict(command=cmd["review"], weekday=1, cron="0 9 * * 1")
+    return out
+
+
+def mac(args, selected):
+    agents = Path.home() / "Library" / "LaunchAgents"
+    domain = f"gui/{os.getuid()}"
+    for name, job in selected.items():
+        path = agents / f"{LABEL}.{name}.plist"
+        if args.remove:
+            subprocess.run(["launchctl", "bootout", domain, str(path)], stderr=subprocess.DEVNULL)
+            path.unlink(missing_ok=True)
+            print(f"removed {path}")
+            continue
+        body = plist(name, job["command"], job.get("interval"), job.get("weekday"))
+        if not args.apply:
+            print(f"--- {path}\n{body}")
+            continue
+        agents.mkdir(parents=True, exist_ok=True)
+        subprocess.run(["launchctl", "bootout", domain, str(path)], stderr=subprocess.DEVNULL)
+        path.write_text(body)
+        subprocess.run(["launchctl", "bootstrap", domain, str(path)], check=True)
+        print(f"installed {path}")
+
+
+def cron(args, selected):
+    current = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
+    kept = [line for line in current.splitlines() if not any(line.endswith(f"{MARK}-{n}") for n in selected)]
+    # cron treats an unescaped % as a newline
+    added = [] if args.remove else [f"{job['cron']} {job['command'].replace('%', chr(92) + '%')} {MARK}-{name}"
+                                    for name, job in selected.items()]
+    if not args.apply and not args.remove:
+        print("\n".join(added))
+        return
+    text = "\n".join(kept + added) + "\n"
+    subprocess.run(["crontab", "-"], input=text, text=True, check=True)
+    print(("removed" if args.remove else "installed") + ": " + ", ".join(selected))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--apply", action="store_true", help="install the jobs")
+    parser.add_argument("--remove", action="store_true", help="remove the jobs (audit and review)")
+    parser.add_argument("--review", action="store_true", help="also the weekly propose-only review (uses tokens)")
+    parser.add_argument("--project-dir", type=Path, default=Path.cwd(), help="project the review runs in (default: cwd)")
+    args = parser.parse_args(argv)
+    args.project_dir = args.project_dir.resolve()
+    if args.remove:
+        args.review = True
+    AUDITS.mkdir(parents=True, exist_ok=True)
+    if args.apply:
+        BIN.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(HERE / "token-audit", BIN / "token-audit")
+        print(f"copied token-audit to {BIN / 'token-audit'}")
+    selected = jobs(args)
+    (mac if platform.system() == "Darwin" else cron)(args, selected)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

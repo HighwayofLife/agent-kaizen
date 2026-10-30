@@ -1,0 +1,64 @@
+{
+  "model": "<your main model alias>",
+  "effortLevel": "<low|medium|high>",
+  "env": {
+    "CLAUDE_CODE_SUBAGENT_MODEL": "sonnet"
+  },
+  "modelSettings": {
+    "<your main model id, e.g. claude-opus-...>": {
+      "autoCompactWindow": 250000
+    }
+  },
+  "deniedMcpServers": [
+    {
+      "serverName": "<a connector or MCP server you never use in Claude Code>"
+    }
+  ],
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/after-compact.sh"
+          }
+        ]
+      },
+      {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/audit-notice.sh"
+          }
+        ]
+      }
+    ],
+    "SubagentStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/subagent-context.sh"
+          }
+        ]
+      }
+    ],
+    "PreToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/block-image-read.sh"
+          },
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/limit-big-read.sh"
+          }
+        ]
+      }
+    ]
+  }
+}
