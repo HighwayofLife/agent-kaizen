@@ -11,6 +11,33 @@ import subprocess
 ERROR = re.compile(r"error|fail|exception|assert", re.I)
 
 
+def ensure_ignored(repo, pattern="out/"):
+    """Keep generated output out of Git without changing tracked files."""
+    try:
+        command = ["git", "-C", str(repo)]
+        ignored = subprocess.run(command + ["check-ignore", "-q", pattern + "x"],
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+        if ignored.returncode != 1:
+            return
+        result = subprocess.run(command + ["rev-parse", "--git-path", "info/exclude"],
+                                stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, check=False)
+        if result.returncode:
+            return
+        exclude = Path(result.stdout.strip())
+        if not exclude.is_absolute():
+            exclude = Path(repo) / exclude
+        exclude.parent.mkdir(parents=True, exist_ok=True)
+        with exclude.open("a+b") as stream:
+            stream.seek(0, os.SEEK_END)
+            if stream.tell():
+                stream.seek(-1, os.SEEK_END)
+                if stream.read(1) != b"\n":
+                    stream.write(b"\n")
+            stream.write((pattern + "\n").encode())
+    except OSError:
+        pass
+
+
 def stamp():
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S.%fZ")
 

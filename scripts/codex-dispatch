@@ -5,9 +5,10 @@ import os
 from pathlib import Path
 import re
 import shutil
+import subprocess
 import sys
 
-from codex_common import code_locations, emit, key_errors, one_line, relevant, run_logged, stamp, mcp_overrides
+from codex_common import code_locations, emit, ensure_ignored, key_errors, one_line, relevant, run_logged, stamp, mcp_overrides
 
 
 def arguments():
@@ -48,6 +49,27 @@ def parse_run(path):
     return thread, usage, [line for line in summary if line.strip()]
 
 
+def rewrite_check(command, cwd):
+    """A repo may route check commands through its own runner via an executable tools/rewrite_check."""
+    hook = cwd / "tools" / "rewrite_check"
+    if not os.access(hook, os.X_OK):
+        # Worktrees branched before the hook existed use the main checkout's copy.
+        try:
+            common = subprocess.run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                                    cwd=cwd, capture_output=True, text=True, timeout=15).stdout.strip()
+        except (OSError, subprocess.SubprocessError):
+            return command
+        hook = Path(common).parent / "tools" / "rewrite_check" if common else hook
+        if not os.access(hook, os.X_OK):
+            return command
+    try:
+        result = subprocess.run([str(hook), command], cwd=cwd, capture_output=True, text=True, timeout=15)
+    except (OSError, subprocess.SubprocessError):
+        return command
+    rewritten = result.stdout.strip()
+    return rewritten if result.returncode == 0 and rewritten else command
+
+
 def main():
     args = arguments()
     cwd = Path(args.C).expanduser().resolve()
@@ -57,6 +79,8 @@ def main():
     base = cwd / "out/dispatch"
     slug = re.sub(r"[^\w.-]", "-", args.brief.stem)
     out = Path(args.o).expanduser().resolve() if args.o else base / f"{stamp()}-{slug}"
+    if out == cwd or cwd in out.parents:
+        ensure_ignored(cwd)
     out.mkdir(parents=True, exist_ok=True)
     thread, usage, summary, checks, rounds = args.resume, None, [], [], 0
     reason = None
@@ -131,7 +155,7 @@ def main():
                 reason = "; ".join(key_errors(log)) or "Codex returned no final message"
                 return report("CODEX FAILED", 2)
             selected = list(enumerate(args.k, 1)) if attempt == 0 else [
-                (number, command) for number, command, _, _, _ in failures]
+                (number, args.k[number - 1]) for number, _, _, _, _ in failures]
             results = {check[0]: check for check in checks}
 
             def run_checks(selected, pass_name):
@@ -139,6 +163,7 @@ def main():
                 os.environ.update(DISPATCH_ROUND=str(attempt), DISPATCH_PASS=pass_name)
                 try:
                     for number, command in selected:
+                        command = rewrite_check(command, cwd)
                         log = out / f"check-{number}.log"
                         rc = run_logged(command, cwd, log, shell=True)
                         shutil.copyfile(log, out / f"check-{number}-round-{attempt}.log")

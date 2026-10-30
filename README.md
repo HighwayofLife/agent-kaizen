@@ -47,9 +47,9 @@ The full list of findings and fixes is in [docs/what-we-learned.md](docs/what-we
 
 So this plugin is built as a **loop**:
 
-<p align="center"><img src="assets/loop.svg" alt="The loop, clockwise around a ledger: 1 Measure: token-audit reads your session logs every 3 days, a script that costs no tokens. 2 Review: Claude compares the audit with the ledger and proposes the next changes. 3 Change one thing: backed up, verified, and rolled back if it fails. 4 Re-measure: the next audit fills in the measured effect, and the change is kept, tuned or reverted. The ledger in the middle lists changes with their verdicts, including one that was reverted and retried." width="100%"></p>
+<p align="center"><img src="assets/loop.svg" alt="The loop, clockwise around a ledger: 1 Measure: token-audit reads your session logs about every 3 days, a script that costs no tokens. 2 Review: Claude compares the audit with the ledger and proposes the next changes. 3 Change one thing: backed up, verified, and rolled back if it fails. 4 Re-measure: the next audit fills in the measured effect, and the change is kept, tuned or reverted. The ledger in the middle lists changes with their verdicts, including one that was reverted and retried." width="100%"></p>
 
-1. **Measure:** `scripts/token-audit` runs every 3 days. It's a plain script, so it costs no tokens.
+1. **Measure:** `scripts/token-audit` runs about every 3 days. It's a plain script, so it costs no tokens.
 2. **Review:** `/agent-kaizen:review` or `/agent-kaizen:cycle` compares the audit with the ledger.
 3. **Change one thing** at a time, and log it in `LEDGER.md`.
 4. **Re-measure:** the next audit shows whether the change paid off, so you keep, tune or revert it.
@@ -90,7 +90,7 @@ Or install it straight from GitHub, without a clone:
 /plugin install agent-kaizen@agent-kaizen-tools
 ```
 
-To update: `git pull` in the clone (or `/plugin marketplace update` for a GitHub install), then `/reload-plugins` or start a new session. Releases bump `version` in `plugin.json` (see [CHANGELOG.md](CHANGELOG.md)); a GitHub install only picks up a new version. Re-run `install-schedule --apply` after updating to refresh the scheduled copy of `token-audit`.
+To update: `git pull` in the clone (or `/plugin marketplace update` for a GitHub install), then `/reload-plugins` or start a new session. Releases bump `version` in `plugin.json` (see [CHANGELOG.md](CHANGELOG.md)); a GitHub install only picks up a new version. Re-run `install-schedule --apply` after updating to refresh the scheduled scripts. See the [0.4.0 migration note](docs/scheduling.md#03x-migration).
 
 ### 2. Start the loop in a project
 
@@ -109,7 +109,7 @@ Then run the skills the audit points at. By default each skill **proposes first 
 If you'd rather not approve every change:
 
 ```
-/agent-kaizen:autonomy auto       # or: yolo, safe, propose. Saved to ~/.claude/agent-kaizen.json
+/agent-kaizen:autonomy auto       # or: yolo, safe, propose. Saved to agent-kaizen.json in your Claude config dir
 /agent-kaizen:cycle yolo          # or for a single run only
 ```
 
@@ -123,15 +123,40 @@ In every mode, each applied change is backed up to `~/.claude/kaizen-backups/`, 
 
 ### 3. Make it periodic
 
+Run `scripts/install-schedule` from the plugin or your clone; the plugin path varies by install.
+
 ```bash
-~/.claude/agent-kaizen/scripts/install-schedule --apply            # usage audit every 3 days (no tokens)
-~/.claude/agent-kaizen/scripts/install-schedule --apply --review --project-dir ~/code/my-project
-#   + weekly propose-only review in that project (Sonnet, max 40 turns, read-only tools)
-~/.claude/agent-kaizen/scripts/install-schedule --apply --auto --project-dir ~/code/my-project
-#   or: the weekly cycle applies changes in auto mode (acceptEdits, narrow tool list, never bypassPermissions)
+scripts/install-schedule --apply                  # audit about every 3 days, no tokens
+scripts/install-schedule --apply --review         # weekly review of enrolled projects with activity
+scripts/install-schedule --apply --review --auto all  # allow changes in all projects
+scripts/install-schedule --apply --review --auto none # propose globally
+scripts/install-schedule --apply --review --auto ~/code/my-project # allow changes in this project
 ```
 
 The plugin's session-start hook tells Claude when a new audit hasn't been reviewed. Then run `/agent-kaizen:cycle`, or ask Claude to use the `kaizen-auditor` agent. See [docs/scheduling.md](docs/scheduling.md).
+
+## Support and environment
+
+| Platform | Scheduler |
+|---|---|
+| macOS | launchd |
+| Linux | cron or systemd user timers |
+| Windows | Run the scripts by hand |
+
+| Variable | Used by | Effect |
+|---|---|---|
+| `CLAUDE_CONFIG_DIR` | Scheduler, audit, hooks | Claude config directory; default `~/.claude` |
+| `CODEX_HOME` | Scheduler, audit | Codex data directory; default `~/.codex` |
+| `AUDIT_DIR` | Audit notice hook | Overrides notice audit directory; default `<Claude config dir>/audits` |
+| `KAIZEN_NOTICE_ALL` | Audit notice hook | `1` enables notices outside enrolled projects; default off |
+| `IMAGE_AGENTS` | Image guard | Space-separated agent names; default `image-reader` |
+| `ALLOW_IMAGE_READS` | Image guard | `1` disables the guard; default off |
+| `READ_GUARD_MAX_LINES` | Read guard | Line limit; default 400 |
+| `READ_GUARD_EXTENSIONS` | Read guard | Overrides the exempt extension regex; default is listed in the hook |
+| `PLANS_GLOB` | After-compact hook | Plan search glob; default `docs/plans/*/plan.md` |
+| `KAIZEN_BACKUP_DIR` | Backup script | Backup directory; default `~/.claude/kaizen-backups` |
+| `KAIZEN_REVIEW_MODEL` | Scheduler | Review model; default `sonnet`. Read when you run `install-schedule` (or `kaizen-scheduled` by hand), not by installed jobs |
+| `KAIZEN_REVIEW_MAX_TURNS` | Scheduler | Review turn limit; default 40. Read like `KAIZEN_REVIEW_MODEL` |
 
 ## Skills
 
@@ -160,6 +185,8 @@ All skills are user-triggered (`disable-model-invocation: true`), so their descr
 | `/agent-kaizen:undo` | Reverse the last applied change, a specific one, or a whole run | Any time |
 | `/agent-kaizen:schedule` | Install the periodic audit and the optional weekly review | Once the audit works |
 
+Resume rounds re-run only the checks that failed, then all checks once; check commands see `DISPATCH_ROUND` and `DISPATCH_PASS`. Give `-k` the narrowest check (affected/filtered tests); full suites run at the project's batch cadence. A repo may route check commands through an executable `tools/rewrite_check` (argv[1] = the command, stdout = its replacement, empty = unchanged; worktrees fall back to the main checkout's copy).
+
 The plugin also ships an **`kaizen-auditor` agent**, which runs one propose-only cycle and returns a 20-line summary, and a **SessionStart hook** for the unreviewed-audit notice.
 
 ## What's in the repo
@@ -171,7 +198,7 @@ agents/             kaizen-auditor (propose-only)
 hooks/              audit-notice (enabled by the plugin), plus opt-in guardrails:
                     limit-big-read, block-image-read, subagent-context, after-compact
 scripts/            token-audit (+ pricing.json), kaizen-backup (backups + undo), codex-dispatch, codex-review,
-                    dispatch-status, install-schedule
+                    dispatch-status, install-schedule, kaizen-scheduled
 templates/          starting points: global and project CLAUDE.md, orchestrator.md,
                     Codex AGENTS.md and config.toml, settings.example.json,
                     agent templates (scout, judge, swarm-lead, verifier, planner,
@@ -195,7 +222,7 @@ Or paste the `## Task` section of any skill into a session.
 ## Safety
 
 - By default skills propose before they change anything. In `safe`/`auto` mode they apply changes themselves, but always back up first, verify, roll back on failure, log to the ledger, and stop at the hard stops. `/agent-kaizen:undo` reverses any change.
-- Scheduled runs are propose-only unless you install them with `--auto`: the audit is a plain script, and the weekly review runs with read-only tools and prints its proposal.
+- Scheduled runs default to propose mode: the audit is a plain script, and the weekly review runs with read-only tools and prints its proposal.
 - Audits read your local transcripts (`~/.claude/projects`, `~/.codex/sessions`). Reports stay on your machine under `docs/kaizen/` or `~/.claude/audits/`. Don't commit audit reports to a public repo; they can contain file paths and prompt fragments.
 - Setting names and CLI flags change between versions. The skills tell Claude to check the current docs before writing config.
 

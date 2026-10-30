@@ -4,10 +4,13 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import re
+import runpy
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'scripts'
@@ -63,7 +66,7 @@ class StubCase(unittest.TestCase):
         executable(self.bin / 'codex', FAKE_CODEX)
         self.record = self.root / 'calls.jsonl'
         self.env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin) + os.pathsep + os.environ['PATH'], RECORD=str(self.record), PYTHONDONTWRITEBYTECODE='1')
-        for name in ('CODEX_DISPATCH_MODEL', 'CODEX_REVIEW_MODEL', 'CODEX_LOOK_MODEL', 'FINAL', 'SCENARIO', 'CODEMAP_TIMEOUT', 'DISPATCH_ROUND', 'DISPATCH_PASS'):
+        for name in ('CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'CODEX_DISPATCH_MODEL', 'CODEX_REVIEW_MODEL', 'CODEX_LOOK_MODEL', 'FINAL', 'SCENARIO', 'CODEMAP_TIMEOUT', 'DISPATCH_ROUND', 'DISPATCH_PASS'):
             self.env.pop(name, None)
         self.brief = write(self.work / 'task.md', 'Fix the example.\n')
 
@@ -118,6 +121,15 @@ class ScriptTests(StubCase):
             self.assertIn('mcp_servers.' + name + '.enabled=false', args)
         self.dispatch()
         self.assertIn('preferred-model', self.calls()[1]['args'])
+
+    def test_check_rewrite_hook_and_missing_hook(self):
+        subprocess.run(['git', 'init', '-q', str(self.work)], check=True, env=self.env)
+        command = 'echo original >> check-result'
+        self.dispatch('-k', command)
+        self.assertEqual((self.work / 'check-result').read_text().splitlines(), ['original'])
+        executable(self.work / 'tools/rewrite_check', "#!/usr/bin/env python3\nimport sys\nassert sys.argv[1] == 'echo original >> check-result'\nprint('echo rewritten >> check-result')\n")
+        self.dispatch('-k', command)
+        self.assertEqual((self.work / 'check-result').read_text().splitlines(), ['original', 'rewritten'])
 
     def test_checks_resume_and_confirm_skipped(self):
         check = executable(self.work / 'check', '''#!/usr/bin/env python3
@@ -272,6 +284,95 @@ raise SystemExit(1 if n == 0 else 0)
 
 class AuditTests(StubCase):
     # Keep fixtures small and deterministic; no real transcript data is read.
+    def old_report(self, directory, headline, scope=None, name='token-audit-previous.md'):
+        if scope is None:
+            scope = dict(codex='none', cwd=None, project=None, project_dirs=[], v=1, window='3d')
+        return write(directory / name,
+                     '<!-- token-audit-headline ' + json.dumps(headline) + ' -->\n' +
+                     '<!-- token-audit-scope ' + json.dumps(scope, sort_keys=True) + ' -->\n')
+
+    def test_config_roots_override_home_and_default_audits(self):
+        cfg, cx = self.root / 'cfg', self.root / 'cx'
+        self.env.update(CLAUDE_CONFIG_DIR=str(cfg), CODEX_HOME=str(cx))
+        write(self.home / '.claude.json', json.dumps(dict(mcpServers={'decoy': {}})))
+        write(cfg / '.claude.json', json.dumps(dict(mcpServers={'idle': {}, 'busy': {}})))
+        for session in ('one', 'two'):
+            path = self.audit_rows(session, [('mcp__busy__query', '', False)], prompts=5)
+            jsonl(cfg / f'projects/example/{session}.jsonl',
+                  [json.loads(line) for line in path.read_text().splitlines()])
+        self.audit_rows('decoy', [('DecoyTool', '', False)])
+        path = self.audit_rows('elsewhere', [('mcp__elsewhere__query', '', False)], project='other')
+        jsonl(cfg / 'projects/other/elsewhere.jsonl',
+              [json.loads(line) for line in path.read_text().splitlines()])
+        now = datetime.now(timezone.utc).isoformat()
+        row = dict(timestamp=now, payload=dict(type='token_count', info=dict(
+            total_token_usage=dict(input_tokens=10, output_tokens=2, total_tokens=12))))
+        jsonl(self.home / '.codex/sessions/2026/01/01/decoy.jsonl', [row])
+        jsonl(cx / 'sessions/2026/01/01/session.jsonl', [row])
+        data = json.loads(self.run_script('token-audit', '--project', 'example', '--json').stdout)
+        self.assertEqual(data['files_scanned'], 2)
+        self.assertEqual(data['headline']['claude_calls'], 2)
+        self.assertEqual(data['codex_files_scanned'], 1)
+        self.assertEqual(data['headline']['codex_sessions'], 1)
+        self.assertEqual({r['candidate'] for r in data['unused_tools']}, {'idle', 'elsewhere'})
+        self.assertEqual(Path(data['report_path']).parent, cfg / 'audits')
+
+    def test_old_mtime_claude_files_are_not_parsed_or_counted(self):
+        path = self.audit_rows('old', [('Bash', 'true', False)])
+        subagent = path.parent / 'old/subagents/agent.jsonl'
+        write(subagent, path.read_text())
+        for transcript in (path, subagent):
+            os.utime(transcript, (1, 1))
+        result = self.run_script('token-audit', '--json')
+        data = json.loads(result.stdout)
+        self.assertEqual(data['headline']['claude_calls'], 0)
+        self.assertEqual(data['files_scanned'], 0)
+        self.assertFalse(data['parser_warning'])
+        self.assertEqual(result.stderr, '')
+
+    def test_old_mtime_codex_files_do_not_trigger_parser_warning(self):
+        (self.home / '.claude/projects/example').mkdir(parents=True)
+        path = jsonl(self.home / '.codex/sessions/2026/01/01/session.jsonl', [
+            dict(timestamp=datetime.now(timezone.utc).isoformat(), payload=dict(model='code-model'))])
+        os.utime(path, (1, 1))
+        result = self.run_script('token-audit', '--json')
+        data = json.loads(result.stdout)
+        self.assertEqual(data['codex_files_scanned'], 0)
+        self.assertFalse(data['parser_warning'])
+        self.assertEqual(result.stderr, '')
+
+    def test_codex_old_date_folder_with_recent_mtime_is_scanned(self):
+        jsonl(self.home / '.codex/sessions/2000/01/01/session.jsonl', [
+            dict(timestamp=datetime.now(timezone.utc).isoformat(), payload=dict(
+                type='token_count', info=dict(total_token_usage=dict(total_tokens=12))))])
+        result = self.run_script('token-audit', '--json')
+        data = json.loads(result.stdout)
+        self.assertEqual(data['codex_files_scanned'], 1)
+        self.assertEqual(data['headline']['codex_sessions'], 1)
+        self.assertEqual(result.stderr, '')
+
+    def test_old_mtime_other_project_tools_are_skipped(self):
+        for session in ('one', 'two'):
+            self.audit_rows(session, [('Bash', 'true', False)], prompts=5)
+        path = self.audit_rows('other', [('mcp__old__query', '', False)], project='other')
+        subagent = path.parent / 'other/subagents/agent.jsonl'
+        write(subagent, path.read_text())
+        for transcript in (path, subagent):
+            os.utime(transcript, (1, 1))
+        data = json.loads(self.run_script('token-audit', '--project', 'example', '--json').stdout)
+        self.assertEqual(data['unused_tools'], [])
+
+    def test_missing_project_and_session_roots_warn_and_write_report(self):
+        result = self.run_script('token-audit', '--json')
+        data = json.loads(result.stdout)
+        root = self.home / '.claude/projects'
+        self.assertEqual(result.stderr, f'token-audit: no Claude Code projects under {root} '
+                         '(set CLAUDE_CONFIG_DIR if they live elsewhere)\n')
+        self.assertEqual(data['files_scanned'], 0)
+        self.assertEqual(data['codex_files_scanned'], 0)
+        self.assertFalse(data['parser_warning'])
+        self.assertTrue(Path(data['report_path']).is_file())
+
     def test_parser_warning_without_usage(self):
         now = datetime.now(timezone.utc).isoformat()
         jsonl(self.home / '.claude/projects/example/session.jsonl', [
@@ -300,10 +401,10 @@ class AuditTests(StubCase):
         for context in (121, 119, 120):
             with self.subTest(context=context):
                 directory = self.root / f'reports-{context}'
-                old = dict(claude_calls=1, claude_context=100, claude_output=0,
+                old = dict(claude_calls=20, claude_context=2000, claude_output=0,
+                           claude_context_per_call=100,
                            codex_sessions=0, codex_tokens=0, image_reads=0)
-                write(directory / 'token-audit-previous.md',
-                      '<!-- token-audit-headline ' + json.dumps(old) + ' -->\n')
+                self.old_report(directory, old)
                 jsonl(self.home / '.claude/projects/example/session.jsonl', [
                     dict(type='assistant', timestamp=now, message=dict(
                         id='message', usage=dict(input_tokens=context)))])
@@ -313,8 +414,8 @@ class AuditTests(StubCase):
                 self.assertIn('## 9. Flagged', report)
                 if context > 120:
                     self.assertEqual(data['flagged'], [dict(
-                        metric='claude_context', old=100, new=121, percent_change=21.0)])
-                    self.assertIn('claude_context: 100 → 121 (+21.0%).', report)
+                        metric='claude_context_per_call', old=100, new=121, percent_change=21.0)])
+                    self.assertIn('claude_context_per_call: 100 → 121 (+21.0%).', report)
                 else:
                     self.assertEqual(data['flagged'], [])
 
@@ -323,6 +424,129 @@ class AuditTests(StubCase):
         self.assertFalse(data['parser_warning'])
         self.assertEqual(data['flagged'], [])
         self.assertIn('no previous audit to compare', Path(data['report_path']).read_text())
+        for key in ('claude_context_per_call', 'claude_output_per_call',
+                    'image_reads_per_100_calls', 'codex_tokens_per_session'):
+            self.assertEqual(data['headline'][key], 0)
+
+    def test_volume_growth_is_activity_only(self):
+        now = datetime.now(timezone.utc).isoformat()
+        jsonl(self.home / '.claude/projects/example/session.jsonl', [
+            dict(type='assistant', timestamp=now, message=dict(
+                id=str(i), usage=dict(input_tokens=100))) for i in range(121)])
+        directory = self.root / 'reports'
+        self.old_report(directory, dict(claude_calls=100, claude_context=10000,
+                                       claude_context_per_call=100))
+        data = json.loads(self.run_script('token-audit', '--out', directory, '--json').stdout)
+        report = Path(data['report_path']).read_text()
+        self.assertEqual(data['flagged'], [])
+        self.assertIn('Activity (never flagged): claude_calls +21', report)
+        self.assertIn('Intensity: claude_context_per_call 100 → 100 (+0.0%)', report)
+        self.assertIn('Compared with token-audit-previous.md (same scope: window 3d, all projects).', report)
+
+    def test_reports_without_matching_scope_are_not_comparable(self):
+        for kind in ('window', 'legacy', 'malformed'):
+            with self.subTest(kind=kind):
+                directory = self.root / kind
+                old = dict(claude_calls=20, claude_context_per_call=1)
+                if kind == 'window':
+                    self.old_report(directory, old, dict(
+                        codex='none', cwd=None, project=None, project_dirs=[], v=1, window='7d'))
+                else:
+                    write(directory / 'token-audit-previous.md',
+                          '<!-- token-audit-headline ' + json.dumps(old) + ' -->\n' +
+                          ('<!-- token-audit-scope broken -->\n' if kind == 'malformed' else ''))
+                data = json.loads(self.run_script('token-audit', '--out', directory, '--json').stdout)
+                report = Path(data['report_path']).read_text()
+                self.assertIn('## 8. Changes since last audit\nNot comparable:', report)
+                self.assertIn('Newest other report: token-audit-previous.md', report)
+                self.assertIn('window 7d' if kind == 'window' else
+                              'no scope metadata, before 0.4.0', report)
+                self.assertIn('Nothing flagged: no comparable report.', report)
+                self.assertEqual(data['flagged'], [])
+
+    def test_previous_audit_selects_newest_match_and_other(self):
+        previous_audit = runpy.run_path(str(SCRIPTS / 'token-audit'))['previous_audit']
+        directory = self.root / 'reports'
+        scope = dict(codex='none', cwd=None, project=None, project_dirs=[], v=1, window='3d')
+        old = dict(claude_calls=20)
+        first = self.old_report(directory, old, name='token-audit-a.md')
+        newest = self.old_report(directory, old, name='token-audit-b.md')
+        newest.write_text(newest.read_text().rstrip('\n'))
+        other_scope = dict(scope, window='7d')
+        other = self.old_report(directory, old, other_scope, name='token-audit-other.md')
+        out = self.old_report(directory, old, name='token-audit-current.md')
+        malformed = write(directory / 'token-audit-malformed.md', '<!-- token-audit-headline broken -->\n')
+        non_dict = self.old_report(directory, [], name='token-audit-list.md')
+        for path, mtime in ((first, 1), (newest, 1), (other, 2), (out, 3),
+                            (malformed, 4), (non_dict, 5)):
+            os.utime(path, (mtime, mtime))
+        self.assertEqual(previous_audit(out, scope), ((newest, old, scope), (other, old, other_scope)))
+        self.assertEqual(previous_audit(other, scope), ((out, old, scope), (newest, old, scope)))
+
+    def test_intensity_baseline_sample_thresholds(self):
+        claude = ('claude_context_per_call', 'claude_output_per_call',
+                  'image_reads_per_100_calls', 'brief_chars_median')
+        codex = ('codex_tokens_per_session', 'codex_brief_chars_median')
+        now = datetime.now(timezone.utc).isoformat()
+        jsonl(self.home / '.claude/projects/example/session.jsonl', [
+            dict(type='assistant', timestamp=now, message=dict(id='main',
+                 usage=dict(input_tokens=100, output_tokens=100), content=[dict(
+                     type='tool_use', id='spawn', name='Agent', input=dict(prompt='a' * 100))])),
+            dict(type='user', timestamp=now, message=dict(content=[dict(
+                type='tool_result', content=[dict(type='image')])]))])
+        jsonl(self.home / '.codex/sessions/2026/01/01/session.jsonl', [
+            dict(type='event_msg', timestamp=now, payload=dict(type='user_message', message='a' * 100)),
+            dict(timestamp=now, payload=dict(type='token_count', info=dict(
+                total_token_usage=dict(total_tokens=100))))])
+        scope = dict(codex='all', cwd=None, project=None, project_dirs=[], v=1, window='3d')
+        for key in claude + codex:
+            sample, minimum = ('claude_calls', 20) if key in claude else ('codex_sessions', 3)
+            for before, count in ((0, minimum), (1, minimum - 1), (1, minimum)):
+                with self.subTest(key=key, before=before, count=count):
+                    directory = self.root / f'{key}-{before}-{count}'
+                    self.old_report(directory, {sample: count, key: before}, scope)
+                    data = json.loads(self.run_script('token-audit', '--out', directory, '--json').stdout)
+                    report = Path(data['report_path']).read_text()
+                    self.assertEqual(data['headline'][key], 100)
+                    if before and count >= minimum:
+                        self.assertEqual([f['metric'] for f in data['flagged']], [key])
+                    else:
+                        self.assertEqual(data['flagged'], [])
+                        self.assertIn(key + ': baseline too small to compare', report)
+
+    def test_partial_scope_line_is_treated_as_no_scope(self):
+        out = self.root / 'partial'
+        out.mkdir()
+        write(out / 'token-audit-20260101T000000.000000Z.md',
+              '<!-- token-audit-headline {"claude_calls": 50} -->\n<!-- token-audit-scope {"window": "7d"} -->\n')
+        result = self.run_script('token-audit', '--out', out)
+        self.assertNotIn('Traceback', result.stderr)
+        report = sorted(out.glob('token-audit-*.md'))[-1].read_text()
+        self.assertIn('no scope metadata', report)
+
+    def test_scope_metadata_normalizes_inputs(self):
+        a, b = self.root / 'a', self.root / 'b'
+        a.mkdir()
+        b.mkdir()
+        cases = [([], dict(window='3d', project=None, project_dirs=[])),
+                 (['--since', '2026-10-01'], dict(window='since:2026-10-01', project=None, project_dirs=[])),
+                 (['--days', '7', '--project', 'Example'], dict(window='7d', project='example', project_dirs=[])),
+                 (['--project-dir', b, '--project-dir', a, '--project-dir', b],
+                  dict(window='3d', project=None, project_dirs=[str(a.resolve()), str(b.resolve())]))]
+        for index, (args, expected) in enumerate(cases):
+            with self.subTest(args=args):
+                data = json.loads(self.run_script('token-audit', *args, '--out',
+                                                 self.root / f'scope-{index}', '--json').stdout)
+                lines = Path(data['report_path']).read_text().splitlines()
+                headline_index = next(i for i, line in enumerate(lines) if line.startswith('<!-- token-audit-headline '))
+                scope_line = lines[headline_index + 1]
+                expected.update(codex='none', cwd=None, v=1)
+                self.assertEqual(scope_line, '<!-- token-audit-scope ' + json.dumps(expected, sort_keys=True) + ' -->')
+                self.assertEqual(json.loads(scope_line[len('<!-- token-audit-scope '):-len(' -->')]), data['scope'])
+                self.assertEqual(data['scope'], expected)
+        (self.home / '.codex/sessions').mkdir(parents=True)
+        data = json.loads(self.run_script('token-audit', '--json').stdout)
+        self.assertEqual(data['scope']['codex'], 'all')
 
     def test_synthetic_projects_duplicates_and_codex(self):
         now = datetime.now(timezone.utc).isoformat()
@@ -339,6 +563,9 @@ class AuditTests(StubCase):
         data = json.loads(self.run_script('token-audit', '--days', '1', '--json').stdout)
         self.assertEqual(data['headline']['claude_calls'], 2)
         self.assertEqual(data['headline']['claude_context'], 250)
+        self.assertEqual(data['headline']['claude_context_per_call'], 125)
+        self.assertEqual(data['headline']['claude_output_per_call'], 10)
+        self.assertEqual(data['headline']['codex_tokens_per_session'], 120)
         self.assertFalse(data['parser_warning'])
         self.assertEqual(data['codex']['code-model']['tokens'], 120)
         self.assertEqual(data['codex']['code-model']['sessions'], 1)
@@ -397,6 +624,7 @@ class AuditTests(StubCase):
         data = json.loads(self.run_script('token-audit', *args).stdout)
         self.assertEqual(data['headline']['claude_calls'], 3)
         self.assertEqual(data['images'], 1)
+        self.assertEqual(data['headline']['image_reads_per_100_calls'], 33.3)
         self.assertEqual(data['triggers']['human']['calls'], 1)
         self.assertEqual(data['triggers']['tool result']['calls'], 1)
         self.assertEqual(data['bash']['worker'], {'python3 check.py': 1})
@@ -469,12 +697,12 @@ class AuditTests(StubCase):
               payload=dict(type='user_message', message='ignored'))])
         for has_key in (True, False):
             directory = self.root / f'brief-report-{has_key}'
-            old = dict(claude_calls=3, claude_context=3, claude_output=0,
+            old = dict(claude_calls=20, claude_context=3, claude_output=0,
                        codex_sessions=1, codex_tokens=1, image_reads=0)
             if has_key:
                 old['brief_chars_median'] = 100
-            write(directory / 'token-audit-previous.md',
-                  '<!-- token-audit-headline ' + json.dumps(old) + ' -->\n')
+            scope = dict(codex='all', cwd=None, project=None, project_dirs=[], v=1, window='3d')
+            self.old_report(directory, old, scope)
             data = json.loads(self.run_script('token-audit', '--out', directory, '--json').stdout)
             report = Path(data['report_path']).read_text()
             self.assertEqual(data['briefs']['worker'], dict(median=121, max=142, count=2))
@@ -496,12 +724,11 @@ class AuditTests(StubCase):
         jsonl(project / 'session.jsonl', [dict(type='assistant', timestamp=now,
               message=dict(id='main', usage=dict(input_tokens=1), content=calls))])
         directory = self.root / 'brief-growth'
-        write(directory / 'token-audit-previous.md', '<!-- token-audit-headline ' +
-              json.dumps(dict(brief_chars_median=100)) + ' -->\n')
+        self.old_report(directory, dict(claude_calls=20, brief_chars_median=100), scope)
         data = json.loads(self.run_script('token-audit', '--out', directory, '--json').stdout)
         self.assertIn(dict(metric='brief_chars_median', old=100, new=121, percent_change=21.0), data['flagged'])
 
-    def audit_rows(self, session, commands, prompts=1, metadata=None, project='example'):
+    def audit_rows(self, session, commands, prompts=1, metadata=None, project='example', cwd=None):
         now = datetime.now(timezone.utc).isoformat()
         rows = []
         if metadata:
@@ -519,7 +746,194 @@ class AuditTests(StubCase):
                     content='missing executable 123 /tmp/private-45/file' if error else 'ok')])))
         for row in rows:
             row['sessionId'] = session
+            if cwd is not None:
+                row['cwd'] = str(cwd)
         return jsonl(self.home / f'.claude/projects/{project}/{session}.jsonl', rows)
+
+    def codex_rows(self, session, cwd=None):
+        now = datetime.now(timezone.utc).isoformat()
+        return jsonl(self.home / f'.codex/sessions/2026/01/01/{session}.jsonl', [
+            dict(type='session_meta', payload={} if cwd is None else dict(cwd=str(cwd))),
+            dict(timestamp=now, payload=dict(type='token_count', info=dict(
+                total_token_usage=dict(input_tokens=10, output_tokens=2, total_tokens=12))))])
+
+    def test_cwd_selects_exact_project_and_descendants(self):
+        target = self.root / 'a/api'
+        for session, cwd in (('api', target), ('sub', target / 'sub'), ('gateway', self.root / 'a/api-gateway')):
+            self.audit_rows(session, [('Read', '', False)],
+                            project=re.sub(r'[^a-zA-Z0-9]', '-', str(cwd)), cwd=cwd)
+        data = json.loads(self.run_script('token-audit', '--cwd', target, '--json').stdout)
+        self.assertEqual((data['files_scanned'], data['headline']['claude_calls']), (2, 2))
+        self.assertEqual(data['scope']['cwd'], [str(target)])
+        self.assertIsNone(data['scope']['project'])
+        self.assertEqual(data['scope']['codex'], 'none')
+
+    def test_cwd_collision_uses_first_cwd(self):
+        target, other = self.root / 'w/a-b', self.root / 'w/a/b'
+        folder = re.sub(r'[^a-zA-Z0-9]', '-', str(target))
+        self.assertEqual(folder, re.sub(r'[^a-zA-Z0-9]', '-', str(other)))
+        for session, first, later in (('included', target, other), ('excluded', other, target)):
+            path = self.audit_rows(session, [('Read', '', False)], project=folder, cwd=later)
+            write(path, json.dumps(dict(cwd=str(first))) + '\n' + path.read_text())
+        data = json.loads(self.run_script('token-audit', '--cwd', target, '--json').stdout)
+        self.assertEqual((data['files_scanned'], data['headline']['claude_calls']), (1, 1))
+
+    def test_cwd_missing_row_falls_back_to_exact_folder(self):
+        target = self.root / 'deleted'
+        folder = re.sub(r'[^a-zA-Z0-9]', '-', str(target))
+        self.audit_rows('included', [('Read', '', False)], project=folder)
+        self.audit_rows('excluded', [('Read', '', False)], project=folder + '-other')
+        data = json.loads(self.run_script('token-audit', '--cwd', target, '--json').stdout)
+        self.assertEqual((data['files_scanned'], data['headline']['claude_calls']), (1, 1))
+
+    def test_cwd_subagents_follow_parent_or_fall_back_to_self(self):
+        target, other = self.root / 'project', self.root / 'other'
+        for session, cwd in (('included', target), ('excluded', other)):
+            parent = self.audit_rows(session, [('Read', '', False)], cwd=cwd)
+            child = self.audit_rows(session + '-child', [('Read', '', False)],
+                                    cwd=other if cwd == target else target)
+            child.rename(write(parent.parent / f'{session}/subagents/agent.jsonl', ''))
+        orphan = self.audit_rows('orphan', [('Read', '', False)], cwd=target)
+        orphan.rename(write(orphan.parent / 'missing/subagents/orphan.jsonl', ''))
+        data = json.loads(self.run_script('token-audit', '--cwd', target, '--json').stdout)
+        self.assertEqual((data['files_scanned'], data['headline']['claude_calls']), (3, 3))
+        self.assertEqual(sum(len(rows) for rows in data['agents'].values()), 2)
+
+    def test_cwd_codex_filters_first_line_and_counts_selected_files(self):
+        target = self.root / 'project'
+        self.codex_rows('included', target / 'sub')
+        self.codex_rows('other', self.root / 'other')
+        self.codex_rows('missing')
+        write(self.home / '.codex/sessions/2026/01/01/broken.jsonl', 'broken\n')
+        data = json.loads(self.run_script('token-audit', '--cwd', target, '--json').stdout)
+        self.assertEqual((data['codex_files_scanned'], data['headline']['codex_sessions']), (1, 1))
+        self.assertEqual(data['scope']['codex'], 'cwd')
+        self.assertEqual(data['scope']['cwd'], [str(target)])
+        unfiltered = json.loads(self.run_script('token-audit', '--json').stdout)
+        self.assertEqual((unfiltered['codex_files_scanned'], unfiltered['headline']['codex_sessions']), (4, 3))
+
+    def test_cwd_odd_first_rows_are_skipped_not_fatal(self):
+        target = self.root / 'project'
+        self.audit_rows('selected', [('Read', '', False)], cwd=target)
+        self.audit_rows('nul', [('Read', '', False)], project='nul', cwd=str(target) + '\0x')
+        self.codex_rows('included', target)
+        self.codex_rows('nul', str(target) + '\0x')
+        deep = '{"cwd": "%s", "x": %s}\n' % (target, '[' * 100000 + ']' * 100000)
+        write(self.home / '.claude/projects/deep/deep.jsonl', deep)
+        write(self.home / '.codex/sessions/2026/01/01/deep.jsonl', deep)
+        huge = '{"cwd": "%s", "x": "%s"}\n' % (target, 'a' * (2 << 20))
+        write(self.home / '.claude/projects/huge/huge.jsonl', huge)
+        write(self.home / '.codex/sessions/2026/01/01/huge.jsonl', huge)
+        data = json.loads(self.run_script('token-audit', '--cwd', target, '--json').stdout)
+        self.assertEqual(data['headline']['claude_calls'], 1)
+        self.assertEqual(data['codex_files_scanned'], 1)
+
+    def test_cwd_configured_servers_only_from_observed_paths(self):
+        first, second = self.root / 'first', self.root / 'second'
+        self.audit_rows('first', [('Read', '', False)], project='shared', cwd=first)
+        self.audit_rows('second', [('Read', '', False)], project='other', cwd=second)
+        write(self.home / '.claude.json', json.dumps(dict(projects={
+            str(first): dict(mcpServers={'from_first': {}}),
+            str(second): dict(mcpServers={'from_second': {}})})))
+        data = json.loads(self.run_script('token-audit', '--cwd', first, '--cwd', second,
+                                          '--prune-sessions', '1', '--json').stdout)
+        self.assertEqual({(r['project'], r['candidate']) for r in data['unused_tools']},
+                         {('shared', 'from_first'), ('other', 'from_second')})
+
+    def test_cwd_and_project_are_mutually_exclusive(self):
+        self.run_script('token-audit', '--cwd', self.root, '--project', 'example', code=2)
+
+    def test_cwd_configured_servers_excludes_collision(self):
+        target, other = self.root / 'w/a-b', self.root / 'w/a/b'
+        self.audit_rows('selected', [('Read', '', False)],
+                        project=re.sub(r'[^a-zA-Z0-9]', '-', str(target)), cwd=target)
+        write(self.home / '.claude.json', json.dumps(dict(projects={
+            str(target): dict(mcpServers={'included': {}}),
+            str(other): dict(mcpServers={'excluded': {}})})))
+        data = json.loads(self.run_script('token-audit', '--cwd', target, '--prune-sessions', '1', '--json').stdout)
+        self.assertEqual({r['candidate'] for r in data['unused_tools']}, {'included'})
+
+    def test_cwd_tool_universe_includes_unscanned_files_in_selected_folder(self):
+        target = self.root / 'project'
+        self.audit_rows('selected', [('Read', '', False)], cwd=target)
+        self.audit_rows('excluded', [('mcp__same_folder__query', '', False)], cwd=self.root / 'other')
+        self.audit_rows('elsewhere', [('mcp__other_folder__query', '', False)], project='elsewhere')
+        data = json.loads(self.run_script('token-audit', '--cwd', target, '--prune-sessions', '1', '--json').stdout)
+        self.assertEqual((data['files_scanned'], data['headline']['claude_calls']), (1, 1))
+        self.assertEqual({r['candidate'] for r in data['unused_tools']}, {'same_folder', 'other_folder'})
+
+    def test_cwd_repeatable_sorted_scope_and_codex_union(self):
+        main, worktree = self.root / 'main', self.root / 'wt'
+        for session, cwd in (('main', main), ('wt', worktree), ('other', self.root / 'other')):
+            self.audit_rows(session, [('Read', '', False)], cwd=cwd)
+            self.codex_rows(session, cwd)
+        scopes = []
+        for targets in ((main, worktree), (worktree, main)):
+            args = [arg for target in targets for arg in ('--cwd', target)]
+            data = json.loads(self.run_script('token-audit', *args, '--json').stdout)
+            self.assertEqual((data['files_scanned'], data['headline']['claude_calls']), (2, 2))
+            self.assertEqual((data['codex_files_scanned'], data['headline']['codex_sessions']), (2, 2))
+            self.assertEqual(data['scope']['cwd'], sorted([str(main), str(worktree)]))
+            scopes.append(data['scope'])
+            text = Path(data['report_path']).read_text()
+            line = next(line for line in text.splitlines() if line.startswith('<!-- token-audit-scope '))
+            self.assertEqual(json.loads(line[len('<!-- token-audit-scope '):-len(' -->')]), data['scope'])
+            self.assertEqual(line, '<!-- token-audit-scope ' + json.dumps(data['scope'], sort_keys=True) + ' -->')
+        self.assertEqual(scopes[0], scopes[1])
+        self.assertIn(f'window 3d, cwd {main}, {worktree}', text)
+
+    def test_cwd_overlapping_and_duplicate_paths_count_once_with_project_dir(self):
+        target = self.root / 'main'
+        path = self.audit_rows('nested', [('Read', '', False)], cwd=target / 'sub')
+        data = json.loads(self.run_script('token-audit', '--cwd', target, '--cwd', target / 'sub',
+                         '--cwd', target, '--project-dir', path.parent, '--project-dir', path.parent, '--json').stdout)
+        self.assertEqual((data['files_scanned'], data['headline']['claude_calls']), (1, 1))
+        self.assertEqual(data['scope']['cwd'], [str(target), str(target / 'sub')])
+
+    def test_cwd_symlinks_match_claude_codex_and_observed_config_paths(self):
+        real, link = self.root / 'real', self.root / 'link'
+        real.mkdir()
+        os.symlink(real, link)
+        for session, cwd in (('link', link / 'sub'), ('real', real), ('other', self.root / 'sibling')):
+            self.audit_rows(session, [('Read', '', False)], cwd=cwd)
+        path = self.audit_rows('progress', [('Read', '', False)])
+        write(path, json.dumps(dict(type='progress', cwd=str(link))) + '\n' + path.read_text())
+        write(self.home / '.claude.json', json.dumps(dict(projects={str(link): dict(mcpServers={'alias': {}})})))
+        self.codex_rows('link', link)
+        for target in (real, link):
+            data = json.loads(self.run_script('token-audit', '--cwd', target, '--prune-sessions', '1', '--json').stdout)
+            self.assertEqual((data['files_scanned'], data['headline']['claude_calls']), (3, 3))
+            self.assertEqual((data['codex_files_scanned'], data['headline']['codex_sessions']), (1, 1))
+            self.assertEqual(data['scope']['cwd'], [str(real)])
+            self.assertEqual({r['candidate'] for r in data['unused_tools']}, {'alias'})
+
+    def test_cwd_sniff_limit_malformed_rows_and_realpath_cache(self):
+        namespace = runpy.run_path(str(SCRIPTS / 'token-audit'))
+        sniff = namespace['cwd_of_file']
+        self.assertEqual(namespace['describe'](dict(cwd=['/a'], project_dirs=[], project=None, window='7d')),
+                         'window 7d, cwd /a')
+        path = write(self.root / 'sniff.jsonl', '\n'.join([
+            '{"cwd": broken}', '[]', '{"cwd": null}', '{"cwd": 3}', '{"cwd": "/first"}', '{"cwd": "/second"}']))
+        self.assertEqual(sniff(path), '/first')
+        write(path, '{}\n' * 50 + '{"cwd": "/too-late"}\n')
+        self.assertIsNone(sniff(path))
+        self.assertEqual(sniff(path, limit=51), '/too-late')
+        cache = {}
+        with mock.patch('os.path.realpath', return_value='/resolved/sub') as resolve:
+            for _ in range(2):
+                self.assertTrue(namespace['cwd_matches']('/raw', ['/resolved'], cache))
+            resolve.assert_called_once_with('/raw')
+
+    def test_cwd_old_files_are_skipped_before_sniffing(self):
+        path = self.audit_rows('old', [('Read', '', False)], cwd=self.root)
+        os.utime(path, (1, 1))
+        namespace = runpy.run_path(str(SCRIPTS / 'token-audit'))
+        collect = namespace['collect']
+        with mock.patch.dict(collect.__globals__, cwd_of_file=mock.Mock(side_effect=AssertionError('old file sniffed')),
+                             finalize_measurements=mock.Mock()):
+            data = collect([path.parent], self.root / 'absent', datetime.now(timezone.utc), {}, None, {},
+                           cwd=[str(self.root)])
+        self.assertEqual(data['files_scanned'], 0)
 
     def fixture_pricing(self):
         return write(self.root / 'prices.json', json.dumps(dict(
@@ -588,15 +1002,15 @@ class AuditTests(StubCase):
         data = json.loads(self.run_script('token-audit', '--fact-sessions', '4', '--json').stdout)
         self.assertEqual(data['repeat_failures'], [])
 
-    def test_unused_configured_servers_and_required_tools(self):
+    def test_unused_configured_servers_and_builtins_are_not_candidates(self):
         write(self.home / '.claude.json', json.dumps(dict(mcpServers={'idle': {}, 'busy': {}})))
         for session in ('one', 'two'):
             self.audit_rows(session, [('mcp__busy__query', '', False)], prompts=5)
         self.audit_rows('elsewhere', [('Read', '', False), ('Bash', 'true', False),
-                                    ('OptionalTool', '', False)], project='other')
+                                    ('NotebookEdit', '', False)], project='other')
         data = json.loads(self.run_script('token-audit', '--project', 'example', '--json').stdout)
         candidates = {r['candidate']: r for r in data['unused_tools']}
-        self.assertEqual(set(candidates), {'idle', 'OptionalTool'})
+        self.assertEqual(set(candidates), {'idle'})
         self.assertEqual((candidates['idle']['sessions'], candidates['idle']['prompts']), (2, 10))
         self.assertEqual(candidates['idle']['loading'], 'unknown')
         self.assertIn('invalidates the prompt cache', Path(data['report_path']).read_text())
@@ -605,12 +1019,12 @@ class AuditTests(StubCase):
         required = ['Read', 'Edit', 'Write', 'Bash', 'Grep', 'Glob', 'Agent', 'Task', 'ToolSearch', 'Skill']
         for i in range(5):
             self.audit_rows(str(i), [('mcp__busy__query', '', False)], metadata=[
-                *[dict(name=name) for name in required], dict(name='FullTool'),
+                *[dict(name=name) for name in required], dict(name='FullTool'), dict(name='mcp__full__query'),
                 dict(name='mcp__idle__query', defer_loading=True)])
         data = json.loads(self.run_script('token-audit', '--json').stdout)
         candidates = {r['candidate']: r for r in data['unused_tools']}
-        self.assertEqual(set(candidates), {'FullTool'})
-        self.assertEqual(candidates['FullTool']['loading'], 'loaded in full')
+        self.assertEqual(set(candidates), {'full'})
+        self.assertEqual(candidates['full']['loading'], 'loaded in full')
         self.assertEqual(data['deferred_tools_unused'], 1)
         self.assertIn('1 deferred tools unused (names only, ~negligible per turn)', Path(data['report_path']).read_text())
 
@@ -768,14 +1182,14 @@ class AuditTests(StubCase):
         self.assertEqual(data['unused_tools'], [])
 
     def test_pruning_sort_and_report_cap(self):
-        metadata = [dict(name=f'Optional{index}') for index in range(30)] + [dict(name='mcp__full__query')]
+        metadata = [dict(name=f'mcp__srv{index}__query') for index in range(30)] + [dict(name='mcp__full__query')]
         for session in ('one', 'two'):
             self.audit_rows(session, [], prompts=5, metadata=metadata)
         data = json.loads(self.run_script('token-audit', '--json').stdout)
         self.assertEqual(len(data['unused_tools']), 31)
         self.assertEqual(data['unused_tools'][0]['candidate'], 'full')
         section = Path(data['report_path']).read_text().split('## Unused tools and MCP servers')[1]
-        self.assertEqual(sum(' | built-in tool | ' in line or ' | MCP server | ' in line for line in section.splitlines()), 25)
+        self.assertEqual(sum(' | MCP server | ' in line for line in section.splitlines()), 25)
         self.assertIn('+6 more', section)
 
     def test_threshold_prices_and_zero_token_unpriced(self):
@@ -925,9 +1339,9 @@ class AuditTests(StubCase):
         data = json.loads(self.run_script('token-audit', '--json').stdout)
         text = Path(data['report_path']).read_text().split('## Unused tools and MCP servers')[1]
         self.assertIn('idle | MCP server | 2 | 10 | 1 tools | full + instructions', text)
-        self.assertIn('OptionalTool | built-in tool | 2 | 10 | — | full', text)
+        self.assertNotIn('OptionalTool | built-in tool', text)
         self.assertNotIn('deferred, loaded in full', text)
-        self.assertIn('Pruning candidates: 2 across 1 project\n', self.run_script('token-audit').stdout)
+        self.assertIn('Pruning candidates: 1 across 1 project\n', self.run_script('token-audit').stdout)
         self.assertIn('Pruning candidates: 0 across 0 projects\n', self.run_script('token-audit', '--project', 'absent').stdout)
 
 

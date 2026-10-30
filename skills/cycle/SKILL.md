@@ -7,15 +7,15 @@ argument-hint: "[propose|safe|auto|yolo|propose-only]"
 
 # One self-improvement cycle
 
-This is the entry point when you don't know which skill to run. It runs the loop once. With `propose-only` (used by the scheduled headless run) it changes nothing and prints the proposal as Markdown. The scheduler saves the output to `~/.claude/audits/cycle-<yyyy-mm-dd>.md`; run interactively, write it there yourself.
+This is the entry point when you don't know which skill to run. It runs the loop once. With `propose-only` it changes nothing and prints the proposal as Markdown. The scheduler saves it as `cycle-<yyyy-mm-dd>.md` in this project's report folder, printed as `reports` by `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled config show --for .`. Run interactively, write it to `docs/kaizen/`.
 
 
-**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `~/.claude/agent-kaizen.json`, else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
+**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `agent-kaizen.json` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`), else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
 ## Task
 
-1. **Find the state.** Read `docs/kaizen/LEDGER.md` and the newest audits in `docs/kaizen/` and `~/.claude/audits/`. If there is no ledger, run the steps of `/agent-kaizen:start` first (not in propose-only mode: just say it is missing).
-2. **Measure.** If the newest audit is older than 3 days and you can run commands, run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-audit --project <this project folder> --days 14`. In propose-only runs the scheduler has already run it; use the newest file in `~/.claude/audits/`.
+1. **Find the state.** Read `docs/kaizen/LEDGER.md`. If there is no ledger, run `/agent-kaizen:start` first (in propose-only mode, just say it is missing). In a scheduled `propose-only` or `auto` run, read the report path given after the mode. Otherwise use the newest `token-audit-*.md` in `docs/kaizen/`, then in the folder printed as `reports` by `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled config show --for .`. Never use another project's report folder.
+2. **Measure.** Outside scheduled runs, if the newest report is older than 3 days and you can run commands, run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-audit --cwd . --days 14 --out docs/kaizen/`. Reports with different windows or scopes are not comparable; use the comparison the report itself prints.
 3. **Review.** Follow `${CLAUDE_PLUGIN_ROOT}/skills/review/SKILL.md`: fill in the measured effects, then keep, tune or revert.
 4. **Due checks.** Check the dates of the last runs:
    - models: if the last `models-*.md` audit or ledger entry is more than 30 days old, follow `${CLAUDE_PLUGIN_ROOT}/skills/models/SKILL.md`;

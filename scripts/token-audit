@@ -4,6 +4,7 @@ import argparse
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -11,12 +12,25 @@ import statistics
 import sys
 
 
+# --- paths helper ---
+def claude_home():
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+
+
+def claude_json():
+    root = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(root).expanduser() / ".claude.json" if root else Path.home() / ".claude.json"
+
+
+def codex_home():
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+# --- end paths helper ---
+
+
 TIMESTAMP = re.compile(rb'"timestamp"\s*:\s*"([^"\n]+)"')
 MARKERS = (b'"usage"', b'"tool_result"', b'"timestamp"')
 INJECTED_PREFIXES = ("# AGENTS.md instructions", "<environment_context>", "<user_instructions>",
                      "<user_action>", "<turn_aborted>", "<image", "</image>")
-REQUIRED_TOOLS = frozenset(("Read", "Edit", "Write", "Bash", "Grep", "Glob",
-                            "Agent", "Task", "ToolSearch", "Skill"))
 USER_ROW = re.compile(rb'"type"\s*:\s*"user"')
 MESSAGE_ROW = re.compile(rb'"type"\s*:\s*"(?:user|assistant)"')
 TOOL_METADATA = (b'"api-request-shape"', b'"deferred_tools_delta"', b'"mcp_instructions_delta"')
@@ -486,9 +500,66 @@ def scan_claude(path, agent, since, data, seen_messages, project):
         data["agents"][agent].append(dict(minutes=minutes, **counter))
 
 
-def scan_codex(root, since, data):
+def too_old(path, since):
+    try:
+        return path.stat().st_mtime < since.timestamp()
+    except OSError:
+        return False
+
+
+# Bound each JSONL line read; a huge first line is not a session header.
+LINE_LIMIT = 1 << 20
+
+
+def cwd_of_file(path, limit=50):
+    """Read only the first cwd recorded near the start of a Claude transcript."""
+    try:
+        with path.open("rb") as stream:
+            for _ in range(limit):
+                line = stream.readline(LINE_LIMIT)
+                if not line:
+                    break
+                if b'"cwd"' not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except (ValueError, RecursionError):
+                    continue
+                if isinstance(row, dict) and isinstance(row.get("cwd"), str):
+                    return row["cwd"]
+    except OSError:
+        pass
+    return None
+
+
+def cwd_matches(raw, targets, realpaths):
+    if not isinstance(raw, str):
+        return False
+    if raw not in realpaths:
+        try:
+            realpaths[raw] = os.path.realpath(raw)
+        except (OSError, ValueError):  # e.g. an embedded NUL in a malformed row
+            realpaths[raw] = raw
+    return any(value == target or value.startswith(target.rstrip(os.sep) + os.sep)
+               for target in targets for value in (raw, realpaths[raw]))
+
+
+def scan_codex(root, since, data, cwd=None, realpaths=None):
+    if realpaths is None:
+        realpaths = {}
     # Session filenames are usually rollout-*.jsonl; scan the standard date tree.
     for path in root.glob("*/*/*/*.jsonl"):
+        if too_old(path, since):
+            continue
+        if cwd is not None:
+            try:
+                with path.open("rb") as stream:
+                    row = json.loads(stream.readline(LINE_LIMIT))
+                payload = row.get("payload") if isinstance(row, dict) else None
+                if not isinstance(payload, dict) or not cwd_matches(payload.get("cwd"), cwd, realpaths):
+                    continue
+            except (OSError, ValueError, RecursionError):
+                continue
         data["codex_files_scanned"] += 1
         model, final, brief = "unknown", None, None
         prior_usage = Counter()
@@ -528,7 +599,7 @@ def scan_codex(root, since, data):
                          tokens=final.get("total_tokens", final.get("input_tokens", 0) + final.get("output_tokens", 0)))
 
 
-def collect(projects, codex_root, since, pricing, pricing_error, options):
+def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=None):
     data = dict(models=defaultdict(Counter), sessions=[], agents=defaultdict(list),
                 triggers=defaultdict(Counter), tool_chars=Counter(), tool_counts=Counter(),
                 images=0, bash=defaultdict(Counter), bash_chars=defaultdict(Counter),
@@ -538,18 +609,40 @@ def collect(projects, codex_root, since, pricing, pricing_error, options):
                 deferred_tools_unused=0, stuck_turns=dict(turns=0, flagged_turns=0, tool_calls=0, cost=0, signatures=[]),
                 repeat_failures=[], unused_tools=[])
     data.update(_pricing=pricing, _options=options, _observed=defaultdict(list), _tool_universe=set(),
+                _cwd=cwd, _cwd_observed=defaultdict(set),
                 _failures=defaultdict(lambda: dict(sessions=set(), occurrences=0, worked_instead=set())))
     seen = set()
     seen_messages = set()
+    decisions, realpaths = {}, {}
+    encoded = {re.sub(r"[^a-zA-Z0-9]", "-", target) for target in cwd or []}
+
+    def belongs(path, folder_name):
+        if cwd is None:
+            return True
+        if path.parent.name == "subagents":
+            parent = path.parent.parent.parent / (path.parent.parent.name + ".jsonl")
+            if parent.is_file():
+                path = parent
+        if path not in decisions:
+            raw = cwd_of_file(path)
+            decisions[path] = (folder_name in encoded if raw is None else cwd_matches(raw, cwd, realpaths))
+            if decisions[path] and raw is not None:
+                data["_cwd_observed"][folder_name].add(raw)
+        return decisions[path]
+
     for project in projects:
         for path in project.glob("*.jsonl"):
+            if too_old(path, since):
+                continue
             real = path.resolve()
-            if real not in seen:
+            if real not in seen and belongs(path, project.name):
                 seen.add(real)
                 scan_claude(path, None, since, data, seen_messages, project.name)
         for path in project.glob("*/subagents/*.jsonl"):
+            if too_old(path, since):
+                continue
             real = path.resolve()
-            if real in seen:
+            if real in seen or not belongs(path, project.name):
                 continue
             seen.add(real)
             meta = path.with_name(path.stem + ".meta.json")
@@ -560,7 +653,7 @@ def collect(projects, codex_root, since, pricing, pricing_error, options):
                 except (OSError, ValueError, AttributeError):
                     data["warnings"]["malformed metadata"] += 1
             scan_claude(path, agent, since, data, seen_messages, project.name)
-    scan_codex(codex_root, since, data)
+    scan_codex(codex_root, since, data, cwd, realpaths)
     data["files_scanned"] = len(seen)
     data["headline"] = {
         "claude_calls": sum(c["calls"] for c in data["models"].values()),
@@ -572,6 +665,11 @@ def collect(projects, codex_root, since, pricing, pricing_error, options):
         "brief_chars_median": int(statistics.median([n for values in data["briefs"].values() for n in values])) if data["briefs"] else 0,
         "codex_brief_chars_median": int(statistics.median([n for values in data["codex_briefs"].values() for n in values])) if data["codex_briefs"] else 0,
     }
+    h = data["headline"]
+    h.update(claude_context_per_call=h["claude_context"] // h["claude_calls"] if h["claude_calls"] else 0,
+             claude_output_per_call=h["claude_output"] // h["claude_calls"] if h["claude_calls"] else 0,
+             image_reads_per_100_calls=round(100 * h["image_reads"] / h["claude_calls"], 1) if h["claude_calls"] else 0,
+             codex_tokens_per_session=h["codex_tokens"] // h["codex_sessions"] if h["codex_sessions"] else 0)
     data["parser_warnings"] = []
     if data["files_scanned"] and not data["headline"]["claude_calls"]:
         data["parser_warnings"].append(
@@ -585,17 +683,21 @@ def collect(projects, codex_root, since, pricing, pricing_error, options):
     for key in ("briefs", "codex_briefs"):
         data[key] = {name: dict(median=statistics.median(values), max=max(values), count=len(values))
                      for name, values in data[key].items()}
-    finalize_measurements(data, projects, since)
+    finalize_measurements(data, seen, since)
     data["since"] = since.isoformat()
     return data
 
 
-def configured_servers(project, observed, config):
+def configured_servers(project, observed, config, cwd=None, observed_cwds=()):
     servers = set(config.get("mcpServers", {}))
     paths = {entry["cwd"] for _, entry in observed if entry["cwd"]}
-    for cwd, settings in config.get("projects", {}).items():
-        if re.sub(r"[^a-zA-Z0-9]", "-", cwd) == project or cwd in paths:
-            paths.add(cwd)
+    if cwd is not None:
+        # Only the selected paths this folder's sessions actually ran in, not every --cwd.
+        paths.update(observed_cwds)
+        paths.update(target for target in cwd if any(cwd_matches(seen, [target], {}) for seen in observed_cwds))
+    for config_cwd, settings in config.get("projects", {}).items():
+        if config_cwd in paths or (cwd is None and re.sub(r"[^a-zA-Z0-9]", "-", config_cwd) == project):
+            paths.add(config_cwd)
             servers.update(settings.get("mcpServers", {}))
     for cwd in paths:
         try:
@@ -606,7 +708,7 @@ def configured_servers(project, observed, config):
     return servers
 
 
-def finalize_measurements(data, projects, since):
+def finalize_measurements(data, scanned, since):
     cost, stuck = data["cost"], data["stuck_turns"]
     cost["shares"] = {key: value / cost["total"] if cost["total"] else 0
                       for key, value in cost["components"].items()}
@@ -633,14 +735,15 @@ def finalize_measurements(data, projects, since):
                 sessions=len(fact["sessions"]), occurrences=fact["occurrences"],
                 worked_instead=next(iter(fact["worked_instead"]), "")))
     # Filters should not shrink the fallback universe to tools used in that project.
-    root = Path.home() / ".claude/projects"
-    selected = {p.resolve() for p in projects}
+    root = claude_home() / "projects"
     for directory in root.iterdir() if root.is_dir() else []:
-        if not directory.is_dir() or directory.resolve() in selected:
+        if not directory.is_dir():
             continue
         paths = list(directory.glob("*.jsonl")) + list(directory.glob("*/subagents/*.jsonl"))
         for path in paths:
-            # Only parse potential tool-use records from other projects.
+            if path in scanned or too_old(path, since) or path.resolve() in scanned:
+                continue
+            # Only parse potential tool-use records from unscanned files.
             try:
                 with path.open("rb") as stream:
                     for line in stream:
@@ -658,7 +761,7 @@ def finalize_measurements(data, projects, since):
             except (OSError, ValueError):
                 pass
     try:
-        config = json.loads((Path.home() / ".claude.json").read_text())
+        config = json.loads(claude_json().read_text())
     except (OSError, ValueError):
         config = {}
     prune_tools(data, config)
@@ -677,7 +780,8 @@ def tool_server(name):
 
 def prune_tools(data, config):
     for project, observed in sorted(data["_observed"].items()):
-        configured = {server_name(name) for name in configured_servers(project, observed, config)}
+        configured = {server_name(name) for name in configured_servers(
+            project, observed, config, data["_cwd"], data["_cwd_observed"][project])}
         sessions = {}
         used = set().union(*(entry["used"] for _, entry in observed))
         used_servers = {tool_server(name) for name in used if tool_server(name)}
@@ -703,8 +807,6 @@ def prune_tools(data, config):
         for session_id, session in sessions.items():
             universe = session["available"] if session["known"] else data["_tool_universe"]
             grouped = defaultdict(set)
-            names = {(name, "built-in tool") for name in universe
-                     if name not in REQUIRED_TOOLS and not tool_server(name)}
             for name in universe:
                 server = tool_server(name)
                 if server:
@@ -712,20 +814,17 @@ def prune_tools(data, config):
                 if name not in used and "deferred" in all_loading[name] and "loaded in full" not in all_loading[name]:
                     deferred[name]["sessions"].add(session_id)
                     deferred[name]["prompts"] += session["prompts"]
-            names.update((name, "MCP server") for name in configured | session["servers"] | set(grouped))
+            names = {(name, "MCP server") for name in configured | session["servers"] | set(grouped)}
             for name, kind in names:
-                if name in (used_servers if kind == "MCP server" else used):
+                if name in used_servers:
                     continue
                 candidate = candidates[(name, kind)]
                 candidate["sessions"].add(session_id)
                 candidate["prompts"] += session["prompts"]
-                if kind == "MCP server":
-                    candidate["tools"].update(grouped[name])
-                    candidate["instructions"] |= name in session["servers"]
-                    for tool in grouped[name]:
-                        candidate["loading"].update(session["loading"].get(tool, {"unknown"}))
-                else:
-                    candidate["loading"].update(session["loading"].get(name, {"unknown"}))
+                candidate["tools"].update(grouped[name])
+                candidate["instructions"] |= name in session["servers"]
+                for tool in grouped[name]:
+                    candidate["loading"].update(session["loading"].get(tool, {"unknown"}))
         options = data["_options"]
         def eligible(candidate):
             count = len(candidate["sessions"])
@@ -833,22 +932,55 @@ def agent_stats(data):
     return sorted(result, reverse=True)
 
 
-def previous_audit(out):
+def previous_audit(out, scope):
     candidates = sorted((p for p in out.parent.glob("token-audit-*.md") if p != out),
                         key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True)
+    match, other = None, None
     for path in candidates:
         try:
             with path.open() as stream:
                 for line in stream:
                     if line.startswith("<!-- token-audit-headline "):
-                        value = json.loads(line.removeprefix("<!-- token-audit-headline ").removesuffix(" -->\n"))
-                        return path, value
+                        value = json.loads(line.removeprefix("<!-- token-audit-headline ").rstrip("\r\n").removesuffix(" -->"))
+                        if not isinstance(value, dict):
+                            break
+                        metadata = None
+                        line = next(stream, "")
+                        if line.startswith("<!-- token-audit-scope "):
+                            try:
+                                metadata = json.loads(line.removeprefix("<!-- token-audit-scope ").rstrip("\r\n").removesuffix(" -->"))
+                            except ValueError:
+                                pass
+                        # Partial or other-format scope lines count as no scope, never as a crash.
+                        if not isinstance(metadata, dict) or set(metadata) != set(scope):
+                            metadata = None
+                        entry = (path, value, metadata)
+                        if match is None and metadata == scope:
+                            match = entry
+                        elif other is None:
+                            other = entry
+                        break
         except (OSError, ValueError):
             continue
-    return None, None
+        if match is not None and other is not None:
+            break
+    return match, other
 
 
-def report(data, out):
+def describe(scope):
+    if scope["cwd"] is not None:
+        projects = "cwd " + ", ".join(scope["cwd"])
+    elif scope["project_dirs"]:
+        projects = "project dirs " + ", ".join(scope["project_dirs"])
+    else:
+        projects = "all projects"
+    if scope["project"] is not None:
+        project = "project " + json.dumps(scope["project"])
+        projects = projects + ", " + project if scope["project_dirs"] or scope["cwd"] is not None else project
+    return "window " + scope["window"] + ", " + projects
+
+
+def report(data, out, scope):
     h = data["headline"]
     headline = [f"Claude: {h['claude_calls']:,} calls; {h['claude_context']:,} context tokens; {h['claude_output']:,} output tokens.",
                 f"Codex: {h['codex_sessions']:,} sessions; {h['codex_tokens']:,} tokens."]
@@ -882,40 +1014,65 @@ def report(data, out):
                       f"{data['codex_briefs'][name]['median']:g}" if name in data["codex_briefs"] else
                       f"{cell(name)} | {c['sessions']} | {c['input']} ({c['cached_input']}) | {c['output']} | {c['tokens']} | -"
                       for name, c in sorted(data["codex"].items(), key=lambda pair: -pair[1]["tokens"])]))
-    prior, old = previous_audit(out)
-    changes = ["No earlier token-audit report with comparable headline metadata."]
-    if old:
-        changes = ["Compared with " + prior.name + ": " + "; ".join(
-            (f"{key} {value - old[key]:+,}" if key in old else f"{key} new") for key, value in h.items()) + "."]
+    match, other = previous_audit(out, scope)
+    volume = ("claude_calls", "claude_context", "claude_output", "codex_sessions", "codex_tokens", "image_reads")
+    intensity = ("claude_context_per_call", "claude_output_per_call", "image_reads_per_100_calls",
+                 "brief_chars_median", "codex_tokens_per_session", "codex_brief_chars_median")
+    changes = ["No earlier token-audit report."]
+    old = match[1] if match is not None else None
+    if match is not None:
+        deltas = []
+        for key in intensity:
+            if key not in old:
+                deltas.append(f"{key} new")
+            else:
+                percent = f" ({(h[key] - old[key]) / old[key] * 100:+.1f}%)" if old[key] else ""
+                deltas.append(f"{key} {old[key]:,} → {h[key]:,}{percent}")
+        changes = [f"Compared with {match[0].name} (same scope: {describe(scope)}).",
+                   "Activity (never flagged): " + "; ".join(
+                       f"{key} {h[key] - old[key]:+,}" if key in old else f"{key} new" for key in volume) + ".",
+                   "Intensity: " + "; ".join(deltas) + "."]
+    elif other is not None:
+        prior_scope = describe(other[2]) if other[2] is not None else "no scope metadata, before 0.4.0"
+        changes = [f"Not comparable: no earlier report with the same scope ({describe(scope)}). "
+                   f"Newest other report: {other[0].name} ({prior_scope})."]
     sections.append(("8. Changes since last audit", [], changes))
     data["flagged"] = []
-    for key, value in h.items():
+    flags = []
+    for key in intensity:
         if old is None or key not in old:
             continue
         before = old[key]
-        if value > before and (value - before) * 100 > before * 20:
+        sample, minimum = ("codex_sessions", 3) if key.startswith("codex_") else ("claude_calls", 20)
+        if before <= 0 or old.get(sample, 0) < minimum:
+            flags.append(f"{key}: baseline too small to compare")
+            continue
+        value = h[key]
+        if (value - before) * 100 > before * 20:
             data["flagged"].append(dict(metric=key, old=before, new=value,
-                                        percent_change=(value - before) / before * 100 if before else None))
-    flags = []
+                                        percent_change=(value - before) / before * 100))
     for flag in data["flagged"]:
         percent = f"{flag['percent_change']:.1f}" if flag['percent_change'] is not None else "∞"
         flags.append(f"{flag['metric']}: {flag['old']:,} → {flag['new']:,} (+{percent}%).")
     sections.append(("9. Flagged", [], flags or [
-        "no previous audit to compare" if old is None else "None."]))
+        "Nothing flagged: no comparable report." if match is None and other is not None else
+        "no previous audit to compare" if match is None else "None."]))
     # A pipe header needs a separator row to render as a Markdown table.
     for _, headers, _ in sections:
         if headers and " | " in headers[-1]:
             headers.append(" | ".join("---" for _ in headers[-1].split(" | ")))
     lines = [*data["parser_warnings"], "# Token audit", f"Since: {data['since']} (UTC; Claude calls in window, Codex final session totals).",
-             *headline, "<!-- token-audit-headline " + json.dumps(h) + " -->"]
+             *headline, "<!-- token-audit-headline " + json.dumps(h) + " -->",
+             "<!-- token-audit-scope " + json.dumps(scope, sort_keys=True) + " -->"]
     if data["warnings"]:
         lines.append("Skipped: " + "; ".join(f"{n} {key}" for key, n in data["warnings"].items()))
     # Fairly share the remaining 80-line budget; JSON retains every row.
     budgets = [0] * len(sections)
     remaining = 80 - len(lines) - sum(2 + len(headers) for _, headers, _ in sections)
-    # Always show every regression, even when other sections need truncation.
+    # Always show comparison details and every regression.
+    budgets[-2] = len(changes)
     budgets[-1] = len(sections[-1][2])
-    remaining -= budgets[-1]
+    remaining -= budgets[-2] + budgets[-1]
     needs = [max(1, len(rows)) for _, _, rows in sections]
     while remaining > 0 and any(b < n for b, n in zip(budgets, needs)):
         for i, need in enumerate(needs):
@@ -939,7 +1096,9 @@ def main():
     period = parser.add_mutually_exclusive_group()
     period.add_argument("--days", type=int, default=3)
     period.add_argument("--since", type=lambda s: datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc))
-    parser.add_argument("--project", help="filter project folder names by substring")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--project", help="filter project folder names by substring")
+    selection.add_argument("--cwd", action="append", metavar="PATH", help="select transcripts by working directory (repeatable)")
     parser.add_argument("--project-dir", action="append", default=[], type=Path)
     parser.add_argument("--codex", action="store_true", help="include Codex sessions (also included by default)")
     parser.add_argument("--out", type=Path)
@@ -957,22 +1116,32 @@ def main():
         parser.error("--days must be nonnegative")
     now = datetime.now(timezone.utc)
     since = args.since or (now - timedelta(days=args.days)).replace(microsecond=0)
-    root = Path.home() / ".claude/projects"
+    root = claude_home() / "projects"
     projects = [p.expanduser().resolve() for p in args.project_dir] if args.project_dir else (
         sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else [])
+    codex_root = codex_home() / "sessions"
+    cwd = sorted({str(Path(p).expanduser().resolve()) for p in args.cwd}) if args.cwd else None
+    scope = dict(codex=("cwd" if cwd is not None else "all") if codex_root.exists() else "none", cwd=cwd,
+                 project=args.project.casefold() if args.project else None,
+                 project_dirs=sorted({str(p.expanduser().resolve()) for p in args.project_dir}), v=1,
+                 window="since:" + args.since.strftime("%Y-%m-%d") if args.since else f"{args.days}d")
+    if not args.project_dir and not projects and not next(codex_root.glob("*/*/*/*.jsonl"), None):
+        print(f"token-audit: no Claude Code projects under {root} "
+              "(set CLAUDE_CONFIG_DIR if they live elsewhere)", file=sys.stderr)
     if args.project:
         projects = [p for p in projects if args.project.casefold() in p.name.casefold()]
-    directory = (args.out or Path.home() / ".claude/audits").expanduser().resolve()
+    directory = (args.out or claude_home() / "audits").expanduser().resolve()
     out = directory / f"token-audit-{now:%Y%m%dT%H%M%S.%fZ}.md"
     try:
         for path in projects:
             if not path.is_dir():
                 raise ValueError(f"project directory missing: {path}")
         pricing, pricing_error = load_pricing(args.pricing.expanduser())
-        data = collect(projects, Path.home() / ".codex/sessions", since, pricing, pricing_error, options)
+        data = collect(projects, codex_root, since, pricing, pricing_error, options, cwd)
+        data["scope"] = scope
         for warning in data["parser_warnings"]:
             print(warning, file=sys.stderr)
-        text, headline = report(data, out)
+        text, headline = report(data, out, scope)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(text)
         if args.json:

@@ -11,7 +11,7 @@ If you use OpenAI Codex as well as Claude, send it work through a script that ru
 
 **Changes:** creates scripts, their tests and a CLAUDE.md section, after you approve.
 
-**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `~/.claude/agent-kaizen.json`, else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
+**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `agent-kaizen.json` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`), else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
 ## Task
 
@@ -28,9 +28,8 @@ in the repo):
    - Then runs each -k check command outside the Codex sandbox (the sandbox may have no
      network, and no engine or editor).
    - On a failed check, resumes the same thread (`codex exec resume <id>`) with the
-     failing output trimmed to the relevant lines. At most 2 rounds. Retry only failed
-     checks; once they pass, confirm the skipped checks. Checks receive `DISPATCH_ROUND`
-     and `DISPATCH_PASS` (`initial`, `retry`, or `final`).
+     failing output trimmed to the relevant lines. At most 2 rounds.
+   - Resume rounds re-run only the checks that failed, then all checks once; check commands see `DISPATCH_ROUND` and `DISPATCH_PASS`. Give `-k` the narrowest check (affected/filtered tests); full suites run at the project's batch cadence. A repo may route check commands through an executable `tools/rewrite_check` (argv[1] = the command, stdout = its replacement, empty = unchanged; worktrees fall back to the main checkout's copy). `DISPATCH_PASS` is `initial`, `retry`, or `final`.
    - Writes full logs under out/dispatch/<timestamp>/ and prints at most 25 lines:
      model, thread id, Codex's summary, git diff --stat, each check PASS/FAIL, and
      STATUS: DONE | FAILED | BLOCKED.

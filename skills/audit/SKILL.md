@@ -11,7 +11,7 @@ Measure where tokens, turns and time actually go, so the changes you make target
 
 **Changes:** writes a report and an audit script. Changes no configuration.
 
-**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `~/.claude/agent-kaizen.json`, else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
+**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `agent-kaizen.json` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`), else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
 ## Task
 
@@ -65,7 +65,7 @@ Finish by recommending the first 3 changes.
 
 ## Bundled resources
 
-Start from the bundled audit script instead of writing one: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-audit --project <this project folder name> --days 14 --out docs/kaizen/`. Extend it only if a section below is missing.
+Start from the bundled audit script instead of writing one: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-audit --cwd . --days 14 --out docs/kaizen/`. `--cwd` matches this project's exact path, so it never mixes in similarly named projects; `--project` is a loose substring filter. Extend it only if a section below is missing.
 
 ## Done when
 

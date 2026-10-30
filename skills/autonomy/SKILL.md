@@ -11,8 +11,8 @@ The rules for each mode are in `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. Read it
 
 ## Task
 
-1. **No arguments:** show the effective mode and where it comes from, checking in order the project `docs/kaizen/config.json`, then the global `~/.claude/agent-kaizen.json`, then the default. Then show the three modes in one line each, and stop.
-2. **A mode given** (`yolo` means `auto`): write it to `~/.claude/agent-kaizen.json`, or to `docs/kaizen/config.json` with `--project`. Merge with the keys already there:
+1. **No arguments:** show the effective mode and where it comes from, checking in order the project `docs/kaizen/config.json`, then the global `agent-kaizen.json` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`), then the default. Then show the three modes in one line each, and stop.
+2. **A mode given** (`yolo` means `auto`): write it to `agent-kaizen.json` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`), or to `docs/kaizen/config.json` with `--project`. Merge with the keys already there:
    `{"autonomy": "<mode>", "maxChangesPerRun": <N, default 3>, "allowInstalls": <bool, default false>}`.
    Validate the file with `jq . <file>`.
 3. **When the mode is `safe` or `auto`:** tell me plainly, in at most 6 lines, what that means:
@@ -22,7 +22,7 @@ The rules for each mode are in `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. Read it
    - `/agent-kaizen:undo`.
 4. **Claude Code permissions:** say that tool prompts still apply. Offer, but don't do it without my explicit yes, to help me run with edits auto-accepted:
    - for this session, the acceptEdits permission mode;
-   - for the weekly run, `install-schedule --apply --review --auto`.
+   - for the weekly run, ask me, then run /agent-kaizen:schedule (which uses install-schedule --auto all|none|<dir>).
 
    Never set `bypassPermissions` and never add broad allow rules.
 

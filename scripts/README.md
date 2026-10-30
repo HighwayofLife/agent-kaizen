@@ -110,15 +110,20 @@ variable; when unset, no `-m` is passed. `-e` defaults to `medium`.
 `--disable-mcp NAME` is repeatable in every mode. Plan reviews also use
 `tools/codemap brief PLAN` when available, with `CODEMAP_TIMEOUT` (default 20).
 Diff targets are mutually exclusive: `--uncommitted`, `--base`, `--commit`.
-Without a target, the original branch heuristic uses `origin/master` when HEAD
-is ahead of it, otherwise uncommitted changes; use `--base` for another branch.
+Without a target, the default base is `origin/HEAD`, or the first existing ref
+of `origin/main`, `origin/master`, and `origin/develop`. It is used only when
+HEAD is ahead, and printed as `Base: <ref> (default)`. Otherwise uncommitted changes are
+reviewed. An empty working tree with no ahead base prints `Error: nothing to
+review: ...` and `STATUS: REVIEW FAILED`. When no ignore rule covers `out/`,
+it is added to the repository's `info/exclude` (shared by its worktrees).
 
 ## token-audit
 
 Stream Claude transcript JSONL and Codex session JSONL into a compact Markdown
 audit. Install the executable using the shared copy/symlink instructions; it has
-no helper dependency. Defaults to every folder under `~/.claude/projects/` and
-Codex sessions under `~/.codex/sessions/` in a rolling three-day window.
+no helper dependency. It reads Claude projects from `$CLAUDE_CONFIG_DIR` (default
+`~/.claude`) and Codex sessions from `$CODEX_HOME` (default `~/.codex`) in a
+rolling three-day window.
 
 ```bash
 token-audit --days 7 > audit.log 2>&1 &
@@ -128,12 +133,11 @@ token-audit --since 2026-01-01 --json > audit.json 2> audit-errors.log &
 
 Claude Code should invoke a background Bash command and read the printed report
 path. `--project SUBSTRING` filters folder names case-insensitively;
-`--project-dir DIR` can explicitly select one or more folders. `--out DIR` is a
-directory (default `~/.claude/audits/`), containing timestamped Markdown reports.
+`--project-dir DIR` can explicitly select one or more folders; repeat `--cwd PATH` to select transcripts by working directory. `--out DIR` is a
+directory (default `<Claude config dir>/audits/`), containing timestamped Markdown reports.
 Normal stdout prints that path and totals; `--json` includes `report_path` and
 all structured results. `--days N` and `--since YYYY-MM-DD` are mutually exclusive;
-dates use UTC. There are no model environment variables; `HOME` controls default
-storage locations. `--codex` is accepted for compatibility; sessions are already
+dates use UTC. There are no model environment variables. `--codex` is accepted for compatibility; sessions are already
 included by default.
 
 Duplicate assistant message IDs across selected transcripts count once. Entries
@@ -146,7 +150,16 @@ currency estimates. Reports cap at 80 lines; JSON retains all rows. Malformed
 rows are skipped and reported. Generic high median agent-call counts are
 flagged. Claude and Codex brief sizes are reported, and median growth between
 audits is flagged.
+Reports include scope metadata and compare only with an earlier report of the same scope. Pre-0.4.0 reports have no scope and are not compared. Flags use per-call intensity, not volume.
 Exit 0 means the report was written; errors use nonzero exit codes.
+
+## kaizen-scheduled
+
+`kaizen-scheduled config show [--for DIR]` shows effective settings and the report path; `config set [--for DIR] KEY=VALUE...` merges settings. `audit` writes a global audit; `review` audits and reviews due projects. `review --dry-run` previews without writes or tokens; add `--json` for structured output. Repeat `--project-dir DIR` to replace discovery, or use `--now` to set the review time.
+
+Both audit and review accept `--audits`, `--python`, `--token-audit` and `--pricing` overrides. Review also accepts `--claude`, `--model` and `--max-turns`. Run each subcommand with `--help` for details.
+
+Under `<Claude config dir>/audits`, global reports are `token-audit-*.md`; `projects/index.json` is the registry. Each `projects/<key>/` holds `state.json`, project `token-audit-*.md` and `cycle-<date>.md`. Scheduler output goes to `run.log`.
 
 ## dispatch-status
 

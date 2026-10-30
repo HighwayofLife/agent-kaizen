@@ -40,11 +40,11 @@ jobs:
       - name: Python scripts compile
         run: |
           for f in scripts/token-audit scripts/codex-dispatch scripts/codex-review scripts/codex-run \
-                   scripts/dispatch-status scripts/install-schedule scripts/codex_common.py; do
+                   scripts/dispatch-status scripts/install-schedule scripts/kaizen-scheduled scripts/codex_common.py; do
             python3 -c "import sys; compile(open(sys.argv[1]).read(), sys.argv[1], 'exec')" "$f" || exit 1
           done
       - name: Scripts answer --help
-        run: for s in token-audit codex-dispatch codex-review dispatch-status install-schedule; do scripts/$s --help > /dev/null || exit 1; done
+        run: for s in token-audit codex-dispatch codex-review dispatch-status install-schedule kaizen-scheduled; do scripts/$s --help > /dev/null || exit 1; done
 
   plugin:
     name: claude plugin validate

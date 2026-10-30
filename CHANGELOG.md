@@ -2,6 +2,21 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.4.0 (2026-10-30)
+
+- The optional weekly review runs only for enrolled projects (those with `docs/kaizen/`) that had a session or a commit since their last review. It finds projects from recent Claude Code and Codex sessions, treats a repository's worktrees as one project, and has no project cap. Activity during a successful review does not make the project due again.
+- New settings: global `enabled`, and global or project `schedule` (`active`, `always`, `off`) and `scheduledAutonomy` (`propose`, `auto`). A project value overrides the global one. `scheduledAutonomy` is separate from the interactive `autonomy` setting. `install-schedule --auto all|none|DIR...` sets it, and the `schedule` and `start` skills ask before writing it.
+- New `scripts/kaizen-scheduled` runner: `audit`, `review [--dry-run]` and `config show|set`. `install-schedule --apply` installs it, and the jobs call it. One project's failure no longer stops the others, and a failed retry keeps the day's earlier proposal.
+- token-audit: `--cwd` selects sessions by their recorded project path, including Codex sessions. Reports carry a scope line and are compared only with earlier reports of the same scope. The scan skips files older than the window. Built-in tools are no longer prune candidates.
+- Scripts, hooks and skills honor `CLAUDE_CONFIG_DIR` and `CODEX_HOME`, including in scheduled jobs. Jobs use absolute paths and leave other crontab lines alone. On Linux, systemd user timers are used when cron is not available.
+- `codex-review` defaults to `origin/HEAD`. `codex-review` and `codex-dispatch` keep `out/` out of git. The image and big-read guards degrade when the image agent or `jq` is missing. The audit notice uses the config directory, per-project reports, `enabled` and `schedule`.
+- codex-dispatch: a repo may route check commands through an executable `tools/rewrite_check` (argv[1] is the command, stdout its replacement, empty means unchanged; worktrees fall back to the main checkout's copy). The docs now say to give `-k` the narrowest check.
+- `templates/settings.example.json` no longer registers the audit-notice hook, because the plugin already does. If you copied that entry into your settings, delete it to avoid duplicate notices.
+- Upgrading from 0.3.x: re-run `install-schedule --apply` (add `--review` for the weekly review). Existing launchd and cron jobs are replaced in place. Before moving to systemd, run `install-schedule --remove`. Three behaviour changes:
+  - `--project-dir` no longer defaults to the current directory. Without it, every enrolled project with activity is reviewed, and a `--project-dir` without `docs/kaizen/` is skipped.
+  - Auto mode is now the `scheduledAutonomy` setting. Re-installing without `--auto` makes the review propose-only.
+  - Proposals are written per project in `audits/projects/<key>/`. Old reports are not compared with new ones.
+
 ## 0.3.2 (2026-10-29)
 
 - token-audit: report Claude and Codex brief sizes and flag median growth between audits.

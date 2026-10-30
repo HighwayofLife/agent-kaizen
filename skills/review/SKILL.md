@@ -11,14 +11,14 @@ The part of the loop that repeats. Check whether past changes paid off, keep the
 
 **Changes:** proposes changes, then implements the ones you approve.
 
-**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `~/.claude/agent-kaizen.json`, else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
+**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `agent-kaizen.json` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`), else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
 ## Task
 
-**Propose-only mode:** if the arguments say `propose-only` (the scheduled headless run uses this), do steps 1–4 but change nothing: write the result to `~/.claude/audits/review-<yyyy-mm-dd>.md` (or print it, if writing isn't allowed) and stop.
+**Propose-only mode:** if the arguments say `propose-only` (the scheduled headless run uses this), do steps 1–4 but change nothing: write the result to the project report folder as `review-<yyyy-mm-dd>.md` (or print it, if writing isn't allowed) and stop.
 
 
-Review the newest usage audit (docs/kaizen/ or ~/.claude/audits/) against the one
+Review the newest usage audit (`docs/kaizen/` or this project's report folder, printed as `reports` by `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled config show --for .`) against the one
 before it and docs/kaizen/LEDGER.md.
 
 1. For every ledger row without a measured effect: fill it in from the audits, then say

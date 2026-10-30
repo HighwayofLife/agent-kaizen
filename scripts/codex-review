@@ -7,7 +7,7 @@ import re
 import subprocess
 import sys
 
-from codex_common import code_locations, emit, key_errors, mcp_overrides, one_line, run_logged, stamp
+from codex_common import code_locations, emit, ensure_ignored, key_errors, mcp_overrides, one_line, run_logged, stamp
 
 
 def arguments():
@@ -50,6 +50,7 @@ def main():
         print(f"Error: working directory missing: {cwd}\nSTATUS: REVIEW FAILED")
         return 2
     out = cwd / "out/dispatch" / (stamp() + "-review")
+    ensure_ignored(cwd)
     out.mkdir(parents=True)
     limit = 15 if args.mode == "look" else 25
     header = [f"Model/effort: {one_line(args.m or 'configured default')} / {one_line(args.e)}; mode: {args.mode}", f"Raw output: {out}"]
@@ -70,10 +71,15 @@ def main():
             command += ["-m", args.m]
         if args.mode == "diff":
             if not (args.uncommitted or args.base or args.commit):
-                # Match the reference default only if there really are branch commits.
-                base = git(cwd, "rev-parse", "--verify", "origin/master")
-                ahead = git(cwd, "rev-list", "--count", "origin/master..HEAD") if base.returncode == 0 else None
-                args.base = "origin/master" if ahead and ahead.returncode == 0 and int(ahead.stdout.strip()) else None
+                default = git(cwd, "symbolic-ref", "--short", "refs/remotes/origin/HEAD")
+                candidate = default.stdout.strip() if default.returncode == 0 else None
+                if not candidate:
+                    candidate = next((ref for ref in ("origin/main", "origin/master", "origin/develop")
+                                      if git(cwd, "rev-parse", "--verify", ref + "^{commit}").returncode == 0), None)
+                ahead = git(cwd, "rev-list", "--count", candidate + "..HEAD") if candidate else None
+                if ahead and ahead.returncode == 0 and int(ahead.stdout.strip()) > 0:
+                    args.base = candidate
+                    header.append("Base: " + one_line(candidate) + " (default)")
             if args.base:
                 if git(cwd, "rev-parse", "--verify", args.base + "^{commit}").returncode:
                     raise ValueError(f"base branch does not exist: {args.base}")
@@ -85,6 +91,10 @@ def main():
             else:
                 target = "--uncommitted (review staged, unstaged, and untracked changes)"
             header.append("Target: " + one_line(target))
+            if not (args.base or args.commit):
+                status = git(cwd, "status", "--porcelain")
+                if status.returncode == 0 and not status.stdout.strip():
+                    return failed("nothing to review: working tree is clean and HEAD is not ahead of a base branch")
             prompt = ("Review this repository's diff read-only. Do not edit files. "
                       "Read AGENTS.md/CLAUDE.md. Hunt for actionable bugs.\n" + prompt +
                       f"\nTarget: {target}\nFocus: {args.focus}\n")

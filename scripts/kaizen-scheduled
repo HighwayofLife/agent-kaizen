@@ -1,0 +1,772 @@
+#!/usr/bin/env python3
+"""Configure scheduled agent-kaizen work.
+
+Commands:
+  config show [--for DIR]           show effective scheduled settings and reports path
+  config set [--for DIR] KEY=VALUE  merge global or project scheduled settings
+  audit                            run the global token audit
+  review [--dry-run]                audit and review every due project
+
+Global settings live in <Claude config dir>/agent-kaizen.json; project settings
+live in docs/kaizen/config.json. Interactive autonomy settings are left unchanged.
+"""
+import argparse
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+import time
+import uuid
+
+
+# --- paths helper ---
+def claude_home():
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+
+
+def claude_json():
+    root = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(root).expanduser() / ".claude.json" if root else Path.home() / ".claude.json"
+
+
+def codex_home():
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+# --- end paths helper ---
+
+
+DEFAULTS = {"enabled": True, "schedule": "active", "scheduledAutonomy": "propose"}
+CHOICES = {"schedule": ("active", "always", "off"), "scheduledAutonomy": ("propose", "auto")}
+HERE = Path(__file__).resolve().parent
+READ_ONLY_BASH = ["Bash(ls:*)", "Bash(wc:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(rg:*)",
+                  "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(shasum:*)",
+                  "Bash(sha256sum:*)", "Bash(jq:*)"]
+REVIEW_AVAILABLE = "Read,Grep,Glob,WebFetch,WebSearch,Bash"
+REVIEW_TOOLS = ",".join(["Read", "Grep", "Glob", "WebFetch", "WebSearch", *READ_ONLY_BASH])
+AUTO_AVAILABLE = "Read,Grep,Glob,Edit,Write,WebFetch,WebSearch,Bash"
+HARD_STOP_DENY = ",".join(f"Bash({command}:*)" for command in (
+    "git push", "git commit", "git reset", "git clean", "gh", "rm", "rmdir", "mv", "curl", "wget",
+    "launchctl", "crontab", "brew", "npm", "pip", "pip3", "sudo", "env", "printenv", "chmod"))
+
+
+def audits_dir():
+    return claude_home() / "audits"
+
+
+def global_config_path():
+    return claude_home() / "agent-kaizen.json"
+
+
+def project_config_path(project_dir):
+    return Path(project_dir) / "docs/kaizen/config.json"
+
+
+def load_config(path):
+    """Read a config object, treating missing or malformed files as empty."""
+    path = Path(path)
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (ValueError, UnicodeError):
+        print(f"config: {path}: invalid JSON, using {{}}", file=sys.stderr)
+        return {}
+    except OSError as error:
+        print(f"config: {path}: {error.strerror or error}, using {{}}", file=sys.stderr)
+        return {}
+    if not isinstance(cfg, dict):
+        print(f"config: {path}: expected a JSON object, using {{}}", file=sys.stderr)
+        return {}
+    return cfg
+
+
+def valid_value(name, value):
+    if name == "enabled":
+        return isinstance(value, bool)
+    return value in CHOICES[name]
+
+
+def effective(project_dir=None):
+    """Resolve scheduled settings with their project, global or default source."""
+    global_path = global_config_path()
+    layers = [("global", global_path, load_config(global_path))]
+    if project_dir is not None:
+        path = project_config_path(project_dir)
+        layers.append(("project", path, load_config(path)))
+    result = {name: {"value": value, "source": "default"} for name, value in DEFAULTS.items()}
+    for source, path, cfg in layers:
+        for name in DEFAULTS:
+            if name not in cfg:
+                continue
+            if name == "enabled" and source == "project":
+                print(f"config: {path}: enabled is global-only, ignored", file=sys.stderr)
+                continue
+            value = cfg[name]
+            if not valid_value(name, value):
+                shown = value if isinstance(value, str) else json.dumps(value)
+                shown = shown.replace("\n", "\\n").replace("\r", "\\r")
+                fallback = result[name]["value"]
+                if isinstance(fallback, bool):
+                    fallback = json.dumps(fallback)
+                print(f"config: {path}: {name}={shown} invalid, using {fallback}", file=sys.stderr)
+                continue
+            result[name] = {"value": value, "source": source}
+    if result["enabled"]["value"] is False:
+        result["schedule"] = {"value": "off", "source": "global"}
+    return result
+
+
+def key(path):
+    resolved = Path(path).resolve()
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", resolved.name).strip("-")[:40] or "root"
+    return slug + "-" + hashlib.sha256(str(resolved).encode()).hexdigest()[:12]
+
+
+# --json output must stay parseable, so main() sends log lines to stderr then.
+LOG_TO_STDERR = False
+
+
+def log(message):
+    print(f"{datetime.now(timezone.utc).isoformat()} {message}", file=sys.stderr if LOG_TO_STDERR else sys.stdout)
+
+
+# Bound each JSONL line read; a huge first line is not a session header.
+LINE_LIMIT = 1 << 20
+
+
+def first_cwd(path, max_lines=50):
+    """Read the first top-level cwd from a bounded Claude transcript prefix."""
+    try:
+        with Path(path).open(encoding="utf-8") as stream:
+            for _ in range(max_lines):
+                line = stream.readline(LINE_LIMIT)
+                if not line:
+                    break
+                if '"cwd"' not in line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except (ValueError, RecursionError):
+                    continue
+                if isinstance(row, dict) and isinstance(row.get("cwd"), str) and row["cwd"]:
+                    return row["cwd"]
+    except (OSError, UnicodeError):
+        pass
+    return None
+
+
+class Project:
+    def __init__(self, canonical, paths, folder=None):
+        self.canonical = Path(canonical).resolve()
+        self.paths = sorted({self.canonical, *(Path(path).resolve() for path in paths)})
+        self.key = key(self.canonical)
+        self.folder = Path(folder) if folder is not None else audits_dir() / "projects" / self.key
+
+
+def _git(directory, *arguments):
+    try:
+        result = subprocess.run(["git", "-C", str(directory), *arguments],
+                                capture_output=True, text=True)
+    except (OSError, UnicodeError):
+        return None
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def discover(claude_root, codex_root, index, project_dirs=None):
+    """Find enrolled projects and group paths sharing a git common directory."""
+    candidates = set()
+    if project_dirs is not None:
+        candidates.update(project_dirs)
+    else:
+        candidates.update(index)
+        for folder in Path(claude_root).glob("*"):
+            try:
+                newest = sorted(((path.stat().st_mtime, path) for path in folder.glob("*.jsonl")
+                                 if path.is_file()), reverse=True)[:5]
+            except OSError:
+                continue
+            for _, path in newest:
+                cwd = first_cwd(path)
+                if cwd:
+                    candidates.add(cwd)
+        cutoff = time.time() - 30 * 24 * 60 * 60
+        for path in Path(codex_root).glob("*/*/*/*.jsonl"):
+            try:
+                if path.stat().st_mtime < cutoff:
+                    continue
+                with path.open(encoding="utf-8") as stream:
+                    row = json.loads(stream.readline(LINE_LIMIT))
+                payload = row.get("payload") if isinstance(row, dict) else None
+                cwd = payload.get("cwd") if isinstance(payload, dict) else None
+                if isinstance(cwd, str) and cwd:
+                    candidates.add(cwd)
+            except (OSError, ValueError, UnicodeError, RecursionError):
+                continue
+
+    enrolled, not_enrolled = set(), set()
+    for candidate in candidates:
+        try:
+            directory = Path(candidate).resolve()
+        except (OSError, RuntimeError):
+            continue
+        if not directory.is_dir():
+            continue
+        ancestors = [directory] if project_dirs is not None else [directory, *directory.parents]
+        project = next((path for path in ancestors if (path / "docs/kaizen").is_dir()), None)
+        if project is None:
+            not_enrolled.add(str(directory))
+        else:
+            enrolled.add(project)
+
+    groups = {}
+    for directory in sorted(enrolled):
+        # Relative to `directory`; --path-format=absolute is not in git < 2.31 (it is echoed back).
+        common = _git(directory, "rev-parse", "--git-common-dir")
+        common = (directory / common).resolve() if common else None
+        groups.setdefault(("git", common) if common else ("directory", directory), []).append(directory)
+
+    projects = []
+    for (kind, common), directories in groups.items():
+        canonical = (common.parent if kind == "git" and common.name == ".git"
+                     and common.parent in directories else directories[0])
+        paths = set(directories)
+        worktrees = _git(canonical, "worktree", "list", "--porcelain")
+        for line in (worktrees or "").splitlines():
+            if line.startswith("worktree "):
+                path = Path(line[len("worktree "):]).resolve()
+                if path.is_dir():
+                    paths.add(path)
+        projects.append(Project(canonical, paths))
+    return sorted(projects, key=lambda project: project.canonical), sorted(not_enrolled)
+
+
+def read_index(audits):
+    path = Path(audits) / "projects/index.json"
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+        if (isinstance(document, dict) and type(document.get("v")) is int and document["v"] == 1
+                and isinstance(document.get("projects"), dict)
+                and all(isinstance(path, str) and isinstance(value, str)
+                        for path, value in document["projects"].items())):
+            return document["projects"]
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, UnicodeError):
+        pass
+    log(f"index: {path}: invalid or unreadable, using {{}}")
+    return {}
+
+
+def _index_document(index, projects):
+    merged = dict(index)
+    for project in projects:
+        merged.update((str(path), project.key) for path in project.paths)
+    return {"v": 1, "projects": merged}
+
+
+def write_index(audits, projects):
+    document = _index_document(read_index(audits), projects)
+    path = Path(audits) / "projects/index.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=path.name + ".", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(json.dumps(document, sort_keys=True) + "\n")
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def parse_time(text):
+    """Parse an ISO timestamp with an offset, returning UTC or None."""
+    if not isinstance(text, str):
+        return None
+    try:
+        value = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        return value.astimezone(timezone.utc) if value.tzinfo is not None else None
+    except (ValueError, OverflowError):
+        return None
+
+
+def read_state(project):
+    path = project.folder / "state.json"
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(state, dict):
+            return state
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError, UnicodeError):
+        pass
+    log(f"state: {path}: invalid or unreadable, using {{}}")
+    return {}
+
+
+def write_state(project, state):
+    """Atomically save state, including review ids before starting Claude."""
+    path = project.folder / "state.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=path.name + ".", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(json.dumps(state, indent=2) + "\n")
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _session_cwd(path, cache, codex=False):
+    if not codex and path.parent.name == "subagents":
+        parent = path.parent.parent.parent / (path.parent.parent.name + ".jsonl")
+        if parent.is_file():
+            path = parent
+    key = ("codex" if codex else "claude", path)
+    if key not in cache:
+        cwd = None
+        if codex:
+            try:
+                with path.open(encoding="utf-8") as stream:
+                    row = json.loads(stream.readline(LINE_LIMIT))
+                payload = row.get("payload") if isinstance(row, dict) else None
+                value = payload.get("cwd") if isinstance(payload, dict) else None
+                if isinstance(value, str) and value:
+                    cwd = value
+            except (OSError, ValueError, UnicodeError, RecursionError):
+                pass
+        else:
+            cwd = first_cwd(path)
+        cache[key] = cwd
+    return cache[key]
+
+
+def file_belongs(path, folder_name, target_paths, cache=None, codex=False):
+    """Match a session's cwd (or Claude's no-cwd folder fallback)."""
+    cache = {} if cache is None else cache
+    cwd = _session_cwd(Path(path), cache, codex)
+    if cwd is None:
+        return not codex and any(folder_name == re.sub(r"[^a-zA-Z0-9]", "-", str(target))
+                                 for target in target_paths)
+    key = ("realpath", cwd)
+    if key not in cache:
+        try:
+            cache[key] = os.path.realpath(cwd)
+        except (OSError, ValueError):  # e.g. an embedded NUL in a malformed row
+            cache[key] = cwd
+    return any(candidate == str(target) or candidate.startswith(str(target).rstrip(os.sep) + os.sep)
+               for target in target_paths for candidate in (cwd, cache[key]))
+
+
+def owner_of(path, folder_name, projects, cache=None, codex=False):
+    """Return the project with the longest matching enrolled path."""
+    cache = {} if cache is None else cache
+    owner, longest = None, -1
+    for project in projects:
+        for target in project.paths:
+            if len(str(target)) > longest and file_belongs(path, folder_name, [target], cache, codex):
+                owner, longest = project, len(str(target))
+    return owner
+
+
+def _cutoff(state, now):
+    return parse_time(state.get("reviewed_at")) or now - timedelta(days=7)
+
+
+def gate(project, projects, cfg, state, now, claude_root, codex_root, cache=None):
+    """Decide whether a project is due without writes or review subprocesses."""
+    if cfg["enabled"]["value"] is False:
+        return False, "skipped: disabled"
+    schedule = cfg["schedule"]
+    if schedule["value"] == "off":
+        return False, f"skipped: schedule off ({schedule['source']})"
+    if schedule["value"] == "always":
+        return True, "due: schedule always"
+    cutoff = _cutoff(state, now)
+    cache = {} if cache is None else cache
+    ignored = state.get("ignore_sessions", [])
+    ignored = {value for value in ignored if isinstance(value, str)} if isinstance(ignored, list) else set()
+    for root, patterns, codex in ((Path(claude_root), ("*/*.jsonl", "*/*/subagents/*.jsonl"), False),
+                                  (Path(codex_root), ("*/*/*/*.jsonl",), True)):
+        for pattern in patterns:
+            for path in root.glob(pattern):
+                subagent = not codex and path.parent.name == "subagents"
+                session = path.parent.parent.name if subagent else path.stem
+                if not codex and session in ignored:
+                    continue
+                try:
+                    info = path.stat()
+                    if not stat.S_ISREG(info.st_mode) or info.st_mtime <= cutoff.timestamp():
+                        continue
+                except OSError:
+                    continue
+                folder = path.parent.parent.parent.name if subagent else path.parent.name
+                if owner_of(path, folder, projects, cache, codex) is project:
+                    kind = "codex session" if codex else "claude transcript"
+                    return True, f"due: activity ({kind})"
+    if _git(project.canonical, "log", "-1", "--branches",
+            # --since is inclusive and reviewed_at has whole seconds: skip the review's own second.
+            f"--since=@{int(cutoff.timestamp()) + 1}", "--format=%H"):
+        return True, "due: activity (git commit)"
+    return False, f"skipped: no activity since {cutoff.date().isoformat()}"
+
+
+def review_dry_run(audits, project_dirs=None, now=None, options=None, json_output=False):
+    if not json_output and effective()["enabled"]["value"] is False:
+        log("skipped: disabled")
+        return
+    options = options if options is not None else command_options(argparse.Namespace(dry_run=True))
+    now = now if now is not None else datetime.now(timezone.utc)
+    cache = {}
+    index = read_index(audits)
+    projects, not_enrolled = discover(claude_home() / "projects", codex_home() / "sessions",
+                                    index, project_dirs)
+    if json_output:
+        rows = []
+        for project in projects:
+            setting = effective(project.canonical)["scheduledAutonomy"]
+            rows.append(dict(path=str(project.canonical), scheduledAutonomy=setting["value"],
+                             source=setting["source"]))
+        print(json.dumps(rows))
+        return
+    for project in projects:
+        project.folder = Path(audits) / "projects" / project.key
+        print(f"project: {project.canonical}")
+        print(f"  key: {project.key}")
+        print("  paths: " + ", ".join(map(str, project.paths)))
+        settings = []
+        cfg = effective(project.canonical)
+        for name, setting in cfg.items():
+            value = setting["value"]
+            if isinstance(value, bool):
+                value = json.dumps(value)
+            settings.append(f"{name}={value} ({setting['source']})")
+        print("  config: " + "; ".join(settings))
+        state = read_state(project)
+        due, reason = gate(project, projects, cfg, state, now, claude_home() / "projects",
+                           codex_home() / "sessions", cache)
+        print("  gate: " + (f"due ({reason.removeprefix('due: ')})" if due else reason))
+        print(f"  reviewed_at: {state.get('reviewed_at') or 'never'}")
+        print("  cutoff: " + _cutoff(state, now).strftime("%Y-%m-%dT%H:%M:%SZ"))
+        if due:
+            # The report name is generated by the audit, which dry-run cannot execute.
+            report = "<report path from audit stdout>"
+            mode = "auto" if cfg["scheduledAutonomy"]["value"] == "auto" else "propose-only"
+            print("audit command: " + shlex.join(audit_command(options, project.folder, project)))
+            print("review command: " + shlex.join(review_command(
+                options, mode, report, str(uuid.uuid4()))))
+    for path in not_enrolled:
+        print(f"not enrolled: {path} (no docs/kaizen/ in it or any parent)")
+    if not projects:
+        print("no projects found; enrol a project with /agent-kaizen:start or pass --project-dir")
+    print("index.json (not written, dry run): " + json.dumps(_index_document(index, projects), sort_keys=True))
+
+
+def now(override=None):
+    return override if override is not None else datetime.now(timezone.utc)
+
+
+def timestamp(value):
+    # Keep subsecond exit precision: truncation can make pre-review activity look new.
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def sibling(override, *names):
+    if override is not None:
+        return Path(override).expanduser().resolve()
+    for name in names:
+        path = HERE / name
+        if path.is_file():
+            return path
+    raise FileNotFoundError(f"{names[-1]} not found; pass --{names[-1].removesuffix('.json')}")
+
+
+def command_options(args):
+    """Resolve installed/repository siblings and command defaults without subprocesses."""
+    python = getattr(args, "python", None) or sys.executable
+    python = str(Path(shutil.which(python) or python).expanduser().absolute())
+    claude = getattr(args, "claude", None) or shutil.which("claude")
+    if (claude is None and not getattr(args, "dry_run", False)
+            and getattr(args, "command", "review") == "review"):
+        raise FileNotFoundError("claude not found; pass --claude or put it on PATH")
+    if claude and os.sep in claude:
+        claude = str(Path(claude).expanduser().absolute())
+    token_audit = sibling(getattr(args, "token_audit", None), "kaizen-token-audit", "token-audit")
+    if not token_audit.is_file():
+        raise FileNotFoundError("token-audit not found; pass --token-audit")
+    return argparse.Namespace(
+        python=python, claude=claude or "claude", token_audit=token_audit,
+        pricing=sibling(getattr(args, "pricing", None), "kaizen-pricing.json", "pricing.json"),
+        model=getattr(args, "model", None) or os.environ.get("KAIZEN_REVIEW_MODEL") or "sonnet",
+        max_turns=getattr(args, "max_turns", None) or os.environ.get("KAIZEN_REVIEW_MAX_TURNS") or "40")
+
+
+def audit_command(options, out, project=None):
+    command = [options.python, str(options.token_audit)]
+    if project is not None:
+        for path in sorted(project.paths):
+            command.extend(["--cwd", str(path)])
+        command.extend(["--days", "7"])
+    return command + ["--out", str(out), "--pricing", str(options.pricing)]
+
+
+def review_command(options, mode, report, session_id):
+    auto = mode == "auto"
+    allowed = REVIEW_TOOLS
+    if auto:
+        allowed_tools = ["Read", "Grep", "Glob", "Edit", "Write", "WebFetch", "WebSearch",
+                         *READ_ONLY_BASH, "Bash(cp:*)", "Bash(mkdir:*)", "Bash(diff:*)",
+                         "Bash(touch:*)", "Bash(cd:*)"]
+        for path in (options.token_audit, HERE / "kaizen-backup"):
+            if path == options.token_audit or path.is_file():
+                allowed_tools.extend([f"Bash(python3 {path}:*)", f"Bash({options.python} {path}:*)"])
+                if path.name == "kaizen-backup":
+                    allowed_tools.append(f"Bash({path}:*)")
+        allowed = ",".join(allowed_tools)
+    command = [options.claude, "-p", f"/agent-kaizen:cycle {mode} {report}",
+               "--session-id", session_id, "--model", options.model, "--max-turns", str(options.max_turns),
+               "--tools", AUTO_AVAILABLE if auto else REVIEW_AVAILABLE, "--strict-mcp-config"]
+    for path in (claude_home(), codex_home()):
+        if path.is_dir():
+            command.extend(["--add-dir", str(path.resolve())])
+    command.extend(["--allowedTools", allowed])
+    if auto:
+        command.extend(["--disallowedTools", HARD_STOP_DENY])
+    return command + ["--permission-mode", "acceptEdits" if auto else "dontAsk"]
+
+
+def run_audit(audits, options):
+    audits.mkdir(parents=True, exist_ok=True)
+    try:
+        with (audits / "run.log").open("a", encoding="utf-8") as errors:
+            result = subprocess.run(audit_command(options, audits), stdout=subprocess.PIPE,
+                                    stderr=errors, text=True)
+        if not result.returncode:
+            report = report_path(result.stdout)
+    except (OSError, ValueError) as error:
+        log(f"audit: failed ({error})")
+        return 1
+    if result.returncode:
+        log(f"audit: failed (exit {result.returncode})")
+    else:
+        log(f"audit: ok {report}")
+    return result.returncode
+
+
+def report_path(stdout):
+    lines = stdout.splitlines()
+    if not lines or not lines[0].strip():
+        raise ValueError("token-audit did not print a report path")
+    return Path(lines[0].strip()).expanduser().resolve()
+
+
+def run_review(audits, project_dirs, options, clock):
+    """Review projects serially; failed/killed runs leave reviewed_at unchanged.
+
+    Their Codex sessions and git commits still count as activity at the next gate;
+    the project stays due because its review time did not move.
+    """
+    projects, _ = discover(claude_home() / "projects", codex_home() / "sessions",
+                           read_index(audits), project_dirs)
+    write_index(audits, projects)
+    cache = {}
+    for project in sorted(projects, key=lambda project: project.canonical):
+        project.folder = audits / "projects" / project.key
+        cfg, state = effective(project.canonical), read_state(project)
+        due, reason = gate(project, projects, cfg, state, clock(), claude_home() / "projects",
+                           codex_home() / "sessions", cache)
+        if not due:
+            log(f"{project.canonical}: {reason}")
+            continue
+        audit_error = None
+        try:
+            project.folder.mkdir(parents=True, exist_ok=True)
+            with (audits / "run.log").open("a", encoding="utf-8") as errors:
+                result = subprocess.run(audit_command(options, project.folder, project),
+                                        stdout=subprocess.PIPE, stderr=errors, text=True)
+            if result.returncode:
+                audit_error = f"audit failed (exit {result.returncode})"
+            else:
+                report = report_path(result.stdout)
+        except (OSError, ValueError) as error:
+            audit_error = f"failed ({error})"
+        if audit_error is not None:
+            state.update(status="audit-failed", last_error_at=timestamp(clock()))
+            write_state(project, state)
+            log(f"{project.canonical}: {audit_error}")
+            continue
+        mode = "auto" if cfg["scheduledAutonomy"]["value"] == "auto" else "propose-only"
+        session_id = str(uuid.uuid4())
+        ignored = state.get("ignore_sessions", [])
+        ignored = [value for value in ignored if isinstance(value, str)] if isinstance(ignored, list) else []
+        state["ignore_sessions"] = (ignored + [session_id])[-20:]
+        write_state(project, state)
+        started = clock()
+        proposal = project.folder / ("cycle-" + started.astimezone().strftime("%Y-%m-%d") + ".md")
+        failed = proposal.with_suffix(".failed.md")
+        temporary = None
+        succeeded = False
+        try:
+            env = dict(os.environ, KAIZEN_RUN_ID=started.astimezone().strftime("%Y%m%d-%H%M%S"))
+            with (audits / "run.log").open("a", encoding="utf-8") as errors, tempfile.NamedTemporaryFile(
+                    mode="w", encoding="utf-8", dir=project.folder,
+                    prefix=proposal.name + ".", delete=False) as output:
+                temporary = Path(output.name)
+                result = subprocess.run(review_command(options, mode, report, session_id),
+                                        cwd=project.canonical, env=env, stdout=output, stderr=errors)
+            if result.returncode == 0:
+                os.replace(temporary, proposal)
+                succeeded = True
+                outcome = f"reviewed ({mode})"
+            else:
+                outcome = f"failed (exit {result.returncode})"
+        except (OSError, ValueError) as error:
+            outcome = f"failed ({error})"
+        exited = clock()
+        if succeeded:
+            state.update(reviewed_at=timestamp(exited), status="ok", report=str(report), proposal=str(proposal))
+        else:
+            state.update(status="failed", last_error_at=timestamp(exited))
+            if temporary is not None:
+                try:
+                    os.replace(temporary, failed)
+                    outcome += f"; output: {failed}"
+                except (OSError, ValueError) as error:
+                    outcome += f"; output: {temporary} (could not save as {failed}: {error})"
+        write_state(project, state)
+        log(f"{project.canonical}: {outcome}")
+    return 0
+
+
+def write_config(path, updates):
+    """Merge an object and atomically replace it without discarding other keys."""
+    path = Path(path)
+    try:
+        cfg = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        cfg = {}
+    except (OSError, ValueError, UnicodeError):
+        cfg = None
+    if not isinstance(cfg, dict):
+        print(f"config: {path} is not valid JSON; fix or remove it", file=sys.stderr)
+        raise SystemExit(2)
+    cfg.update(updates)
+    if path.resolve() == global_config_path().resolve():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix=path.name + ".", delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(json.dumps(cfg, indent=2) + "\n")
+        # The temp file is 0600; keep the target's mode (project configs are shared files).
+        if path.exists():
+            mode = stat.S_IMODE(path.stat().st_mode)
+        else:
+            mask = os.umask(0)
+            os.umask(mask)
+            mode = 0o666 & ~mask
+        os.chmod(temporary, mode)
+        os.replace(temporary, path)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def show_config(project_dir=None):
+    result = effective(project_dir)
+    result["reports"] = (str(audits_dir() / "projects" / key(project_dir)) + "/"
+                         if project_dir is not None else None)
+    print(json.dumps(result, indent=2))
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    commands = parser.add_subparsers(dest="command", required=True)
+    config = commands.add_parser("config", help="show or set scheduled settings")
+    actions = config.add_subparsers(dest="action", required=True)
+    for action in ("show", "set"):
+        subparser = actions.add_parser(action, help=action + " scheduled settings")
+        subparser.add_argument("--for", dest="project_dir", type=Path, help="project directory")
+        if action == "set":
+            subparser.add_argument("assignments", metavar="KEY=VALUE", nargs="+")
+    audit = commands.add_parser("audit", help="run the global token audit")
+    review = commands.add_parser("review", help="audit and review due projects")
+    review.add_argument("--json", action="store_true", help="with --dry-run, list project autonomy and sources as JSON")
+    review.add_argument("--dry-run", action="store_true", help="preview without tokens or writes")
+    review.add_argument("--project-dir", type=Path, action="append", help="use only these project directories")
+    review.add_argument("--now", help="review time in ISO format with UTC offset")
+    for scheduled in (audit, review):
+        scheduled.add_argument("--audits", type=Path, help="override the audits folder")
+        scheduled.add_argument("--python", help="Python interpreter (default: current interpreter)")
+        scheduled.add_argument("--token-audit", type=Path, help="override the token-audit script")
+        scheduled.add_argument("--pricing", type=Path, help="override the pricing file")
+    review.add_argument("--claude", help="Claude executable (default: claude on PATH)")
+    review.add_argument("--model", default=os.environ.get("KAIZEN_REVIEW_MODEL") or "sonnet")
+    review.add_argument("--max-turns", type=int, default=os.environ.get("KAIZEN_REVIEW_MAX_TURNS") or "40")
+    args = parser.parse_args(argv)
+    if args.command == "review" and args.json and not args.dry_run:
+        parser.error("--json requires --dry-run")
+    global LOG_TO_STDERR
+    LOG_TO_STDERR = getattr(args, "json", False)
+    if args.command in ("audit", "review"):
+        if not getattr(args, "json", False) and effective()["enabled"]["value"] is False:
+            log("skipped: disabled")
+            return 0
+        fixed = None
+        if args.command == "review":
+            fixed = parse_time(args.now) if args.now is not None else None
+            if args.now is not None and fixed is None:
+                parser.error("--now must be an ISO timestamp with UTC offset")
+            if args.max_turns < 1:
+                parser.error("--max-turns must be positive")
+        try:
+            options = command_options(args)
+            audits = (args.audits if args.audits is not None else audits_dir()).expanduser().resolve()
+            if args.command == "audit":
+                return run_audit(audits, options)
+            if args.dry_run:
+                review_dry_run(audits, args.project_dir, now(fixed), options, args.json)
+                return 0
+            return run_review(audits, args.project_dir, options, lambda: now(fixed))
+        except (OSError, ValueError) as error:
+            print(f"kaizen-scheduled: {error}", file=sys.stderr)
+            return 2
+    if args.action == "set":
+        updates = {}
+        for assignment in args.assignments:
+            name, separator, value = assignment.partition("=")
+            if not separator or name not in DEFAULTS:
+                parser.error(f"unknown setting or invalid assignment: {assignment}")
+            if name == "enabled":
+                if args.project_dir is not None:
+                    parser.error("enabled is global-only")
+                if value not in ("true", "false"):
+                    parser.error(f"invalid value for enabled: {value}; use true or false")
+                value = value == "true"
+            if not valid_value(name, value):
+                parser.error(f"invalid value for {name}: {value}")
+            updates[name] = value
+        path = global_config_path()
+        if args.project_dir is not None:
+            path = project_config_path(args.project_dir)
+            if not path.parent.is_dir():
+                parser.error(f"{args.project_dir} must contain docs/kaizen/")
+        write_config(path, updates)
+    show_config(args.project_dir)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

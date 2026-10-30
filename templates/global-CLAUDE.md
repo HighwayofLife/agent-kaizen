@@ -38,6 +38,7 @@ The main session evaluates, plans, delegates, verifies and integrates. **Delegat
 ## Dispatch and context
 
 - **Scripts over wrapper agents.** <If you use Codex:> run `codex-dispatch BRIEF.md` / `codex-review diff|plan|look` as background Bash commands, not through a relay subagent.
+- **Dispatch checks.** Resume rounds re-run only the checks that failed, then all checks once; check commands see `DISPATCH_ROUND` and `DISPATCH_PASS`. Give `-k` the narrowest check (affected/filtered tests); full suites run at the project's batch cadence. A repo may route check commands through an executable `tools/rewrite_check` (argv[1] = the command, stdout = its replacement, empty = unchanged; worktrees fall back to the main checkout's copy).
 - **Batch wake-ups.** Each agent completion costs a full main-session turn. Per-item swarms go through one swarm-lead agent that returns one merged report.
 - **State lives in files.** Plans and briefs in `docs/plans/<date>-<slug>/`. Agents return short reports and write long output to disk. Don't Read big files or logs here; send a scout or use a script. Wait for notifications, never poll.
 - **Code map.** In repos with `tools/codemap`, briefs tell agents to find code with it before grepping or reading files.

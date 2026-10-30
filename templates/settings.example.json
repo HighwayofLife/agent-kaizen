@@ -24,15 +24,6 @@
             "command": "bash ~/.claude/hooks/after-compact.sh"
           }
         ]
-      },
-      {
-        "matcher": "startup|resume",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "bash ~/.claude/hooks/audit-notice.sh"
-          }
-        ]
       }
     ],
     "SubagentStart": [

@@ -13,8 +13,10 @@ By default every skill proposes changes and waits for your OK. If you trust the 
 Highest precedence first:
 1. **Per run:** pass it as the skill argument: `/agent-kaizen:cycle yolo`, `/agent-kaizen:trim-context safe`, `/agent-kaizen:review propose`.
 2. **Per project:** `docs/kaizen/config.json` → `{"autonomy": "safe"}`.
-3. **Globally:** `~/.claude/agent-kaizen.json` → `{"autonomy": "auto"}`.
+3. **Globally:** `agent-kaizen.json` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`) → `{"autonomy": "auto"}`.
 4. **Default:** `propose`.
+
+Scheduled runs use `scheduledAutonomy`, separate from interactive `autonomy`. Project settings override global settings; the default is `propose`. A tracked `docs/kaizen/config.json` applies to teammates too, so personal choices belong in the global file. `kaizen-scheduled config set` writes settings; `/agent-kaizen:schedule` and `/agent-kaizen:start` write `scheduledAutonomy` only from your answers, as does `install-schedule --auto` from its arguments.
 
 `/agent-kaizen:autonomy [propose|safe|auto]` shows or sets the mode for you. `propose-only` (used by the scheduled review) always wins and never changes anything.
 
@@ -59,7 +61,7 @@ rare workflow.
 - Outward-facing actions: commits, pushes, PRs, publishing, messages.
 - Installing packages, unless `allowInstalls` is true.
 - Installing, changing or removing scheduled jobs (launchd, cron).
-- Changing the autonomy setting itself (only `/agent-kaizen:autonomy`, run by you, does that).
+- Changing the interactive `autonomy` setting itself (only `/agent-kaizen:autonomy`, run by you, does that).
 
 ## What every applied change gets, in every mode
 
@@ -82,13 +84,9 @@ Use the bundled script for the bookkeeping. Call `~/.claude/bin/kaizen-backup` i
 
 The autonomy mode decides what the *skills* will do. Claude Code's own permission prompts still apply. To run without tool prompts:
 - **Interactive:** use a permission mode that auto-accepts edits (`acceptEdits`, or auto mode if your plan has it) for the session. Some files, such as your settings, may still prompt; skills skip what they're not allowed to do and list it.
-- **Scheduled:** `scripts/install-schedule --apply --auto` runs the weekly cycle in `auto` mode with `--permission-mode acceptEdits`. It uses:
-  - `--tools`, which limits the available tools to Read, Grep, Glob, Edit, Write, WebFetch, WebSearch and Bash;
-  - `--allowedTools`, which pre-approves Bash only for `jq`, `cp`, `mkdir`, `diff`, `shasum` and token-audit;
-  - `--disallowedTools`, which denies git commit and push, `rm`, `mv`, curl, package managers, `launchctl`, crontab, `sudo` and `env`, even if your own settings allow them;
-  - `--strict-mcp-config`, so no MCP servers load.
+- **Scheduled:** `install-schedule --auto all|none|DIR...` sets `scheduledAutonomy` globally or for selected projects. The `kaizen-scheduled` runner uses `dontAsk` in propose mode and `acceptEdits` in auto mode. Both restrict available and allowed tools; propose mode includes restricted read-only Bash, and auto mode adds edit tools and selected commands. Auto mode also denies hard-stop commands. Both use `--strict-mcp-config`. See [scheduled permissions](scheduling.md#unattended-permissions) for the exact lists.
 
-  It never uses `bypassPermissions`. Your settings' other allow rules still apply, so keep them narrow. `acceptEdits` covers files in the project. Claude Code treats files under `~/.claude/` (your global CLAUDE.md, agents, settings, even `.reviewed` markers) as sensitive, and refuses to edit them in an unattended run. Those changes are rolled back if they were started, and listed as "do interactively". Run `/agent-kaizen:cycle yolo` in a normal session to apply them, approving the prompts for `~/.claude` files there.
+  It never uses `bypassPermissions`. Apply changes to your Claude or Codex configuration interactively, where you see each edit.
 
 ## Undo
 

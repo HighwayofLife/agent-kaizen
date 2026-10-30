@@ -21,7 +21,7 @@ This is what changed and why.
 | `batch-wakeups` | Was merged with the scheduled audit | Split out: batching turns and scheduling audits are different changes, measured differently |
 | `planning` | Fine, but no exploration limit | Adds the ~60-call budget and "Research needed" instead of open-ended exploring |
 | `test-loop` | Trusted engine "affected tests" features | Requires a spike first (ours never selected a test), and treats missing, empty or timed-out reports as failures |
-| `schedule` | Cloud scheduling was an option | Cloud routines can't read local transcripts. Local launchd/cron only, and the weekly review is propose-only with read-only tools |
+| `schedule` | Cloud scheduling was an option | Cloud routines can't read local transcripts. Local launchd, cron or systemd only. The weekly review proposes by default, with restricted tools |
 | `review` | Didn't exist | New: the recurring step, including a check that rules actually reach agents (by sampling transcripts) |
 | `whats-new` | Didn't exist | New: release notes and new CLI tools vs the current setup, sources required |
 | `models` | Didn't exist | New: available models vs routing rows, using real volumes from the audit, trialled one row at a time |

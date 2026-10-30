@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """Install, show or remove the agent-kaizen schedule.
 
-Jobs:
-  audit   every 3 days: scripts/token-audit -> ~/.claude/audits/ (a plain script, no tokens)
-  review  weekly, optional (--review): runs the audit, then
-          claude -p "/agent-kaizen:cycle propose-only" in --project-dir with no shell, edit or
-          write tools (Read, Grep, Glob, WebFetch, WebSearch); stdout is saved by the shell
-          as ~/.claude/audits/cycle-<date>.md
+Jobs call kaizen-scheduled: audit every 3 days (no tokens), and optional weekly
+review (--review). Reports live in <audits>/projects/<key>/.
+--auto all sets global scheduled auto mode; --auto none sets global propose mode;
+--auto DIR ... opts in projects. Bare --auto opts in one project for compatibility.
+--project-dir DIR may repeat; without it, the runner discovers enrolled projects.
 
-macOS uses launchd (~/Library/LaunchAgents); other systems use the user crontab.
---apply copies token-audit to ~/.claude/bin/kaizen-token-audit and schedules that copy, so the jobs keep
-working when the plugin cache or your clone moves; re-run --apply after updating to refresh it.
-Without --apply or --remove, prints what it would install.
+--scheduler auto uses launchd on macOS, otherwise cron when available, then
+systemd user timers when the user manager is running. Windows is unsupported.
+--apply copies the runner, token-audit, kaizen-backup and pricing.json into
+<claude home>/bin so jobs survive plugin moves; re-run --apply to refresh.
+Claude home is CLAUDE_CONFIG_DIR or ~/.claude; Codex home is CODEX_HOME or ~/.codex.
+Jobs record PATH and those config variables when set, and use absolute Python.
+Without --apply or --remove, prints jobs and config commands without writing config.
 """
 import argparse
+import getpass
+import json
 import os
 import platform
 import plistlib
@@ -23,63 +27,106 @@ import subprocess
 import sys
 from pathlib import Path
 
+# --- paths helper ---
+def claude_home():
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+
+
+def claude_json():
+    root = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(root).expanduser() / ".claude.json" if root else Path.home() / ".claude.json"
+
+
+def codex_home():
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+# --- end paths helper ---
+
 HERE = Path(__file__).resolve().parent
-AUDITS = Path.home() / ".claude" / "audits"
-BIN = Path.home() / ".claude" / "bin"
+AUDITS = claude_home().resolve() / "audits"
+BIN = claude_home().resolve() / "bin"
 AUDIT_NAME = "kaizen-token-audit"  # own name, so it never replaces another token-audit in ~/.claude/bin
 LABEL = "com.agent-kaizen"
 MARK = "# agent-kaizen"
-# Read-only commands both scheduled modes may run; config lives outside the project, so the
-# runs also get --add-dir for ~/.claude and ~/.codex.
-READ_ONLY_BASH = ["Bash(ls:*)", "Bash(wc:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(rg:*)",
-                  "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(shasum:*)",
-                  "Bash(sha256sum:*)", "Bash(jq:*)"]
-REVIEW_AVAILABLE = "Read,Grep,Glob,WebFetch,WebSearch,Bash"  # no Edit/Write: propose-only
-REVIEW_TOOLS = ",".join(["Read", "Grep", "Glob", "WebFetch", "WebSearch", *READ_ONLY_BASH])
-CONFIG_DIRS = [Path.home() / ".claude", Path.home() / ".codex"]
-REVIEW_MODEL = os.environ.get("KAIZEN_REVIEW_MODEL", "sonnet")  # keep the weekly run cheap
-REVIEW_MAX_TURNS = os.environ.get("KAIZEN_REVIEW_MAX_TURNS", "40")
+SCHEDULERS = ("auto", "launchd", "cron", "systemd")
 
 
-# --tools limits which built-in tools exist at all; --allowedTools only pre-approves some of
-# them, and --disallowedTools wins over any allow rule inherited from the user's settings.
-AUTO_AVAILABLE = "Read,Grep,Glob,Edit,Write,WebFetch,WebSearch,Bash"
-HARD_STOP_DENY = ",".join(f"Bash({c}:*)" for c in (
-    "git push", "git commit", "git reset", "git clean", "gh", "rm", "rmdir", "mv", "curl", "wget",
-    "launchctl", "crontab", "brew", "npm", "pip", "pip3", "sudo", "env", "printenv", "chmod"))
-
-
-def auto_tools():
-    """--auto: edits pre-approved, Bash only for backup/verify helpers and the audit. Never bypassPermissions."""
-    audit = BIN / AUDIT_NAME
-    return ",".join(["Read", "Grep", "Glob", "Edit", "Write", "WebFetch", "WebSearch", *READ_ONLY_BASH,
-                     "Bash(cp:*)", "Bash(mkdir:*)", "Bash(diff:*)", "Bash(touch:*)", "Bash(cd:*)",
-                     f"Bash(python3 {audit}:*)", f"Bash(python3 {HERE / 'token-audit'}:*)",
-                     f"Bash({BIN / 'kaizen-backup'}:*)",
-                     f"Bash(python3 {BIN / 'kaizen-backup'}:*)", f"Bash(python3 {HERE / 'kaizen-backup'}:*)",
-                     f"Bash({HERE / 'kaizen-backup'}:*)"])
-
-
-def commands(project_dir, auto=False):
-    audit = f"python3 {shlex.quote(str(BIN / AUDIT_NAME))} --out {shlex.quote(str(AUDITS))}"
+def commands(args):
+    python = str(Path(sys.executable).absolute())
+    runner = [python, str(BIN / "kaizen-scheduled")]
+    audit = shlex.join([*runner, "audit"])
+    review = [*runner, "review", "--python", python]
+    if args.claude:
+        review.extend(["--claude", args.claude])
+    for flag, value in (("--model", args.model), ("--max-turns", args.max_turns)):
+        if value is not None:
+            review.extend([flag, str(value)])
+    for directory in args.project_dir:
+        review.extend(["--project-dir", str(directory)])
     log = shlex.quote(str(AUDITS / "run.log"))
-    review = (f"{audit} >> {log} 2>&1; cd {shlex.quote(str(project_dir))} && "
-              f"KAIZEN_RUN_ID=$(date +%Y%m%d-%H%M%S) claude -p '/agent-kaizen:cycle {'auto' if auto else 'propose-only'}' "
-              f"--model {shlex.quote(REVIEW_MODEL)} --max-turns {shlex.quote(REVIEW_MAX_TURNS)} "
-              f"--tools {shlex.quote(AUTO_AVAILABLE if auto else REVIEW_AVAILABLE)} --strict-mcp-config "
-              + "".join(f"--add-dir {shlex.quote(str(d))} " for d in CONFIG_DIRS) +
-              f"--allowedTools {shlex.quote(auto_tools() if auto else REVIEW_TOOLS)} "
-              + (f"--disallowedTools {shlex.quote(HARD_STOP_DENY)} " if auto else "") +
-              f"--permission-mode {'acceptEdits' if auto else 'dontAsk'} "
-              f"> {shlex.quote(str(AUDITS))}/cycle-$(date +%F).md 2>> {log}")
-    return {"audit": f"{audit} >> {log} 2>&1", "review": review}
+    return {"audit": f"{audit} >> {log} 2>&1",
+            "review": f"{shlex.join(review)} >> {log} 2>&1"}
+
+
+def configure_auto(args):
+    """Delegate all config writes and project discovery to the runner."""
+    runner = [str(Path(sys.executable).absolute()), str(HERE / "kaizen-scheduled")]
+    targets = args.auto
+    if not targets:
+        directory = args.project_dir[0] if args.project_dir else Path.cwd()
+        targets = [str(directory)]
+        print(f"--auto without a value now means: auto mode for {directory} only (see --auto all|none|DIR)")
+    global_mode = targets[0] if targets[0] in ("all", "none") else None
+    updates = ([runner + ["config", "set", "scheduledAutonomy=" +
+                          ("auto" if global_mode == "all" else "propose")]] if global_mode else
+               [runner + ["config", "set", "--for", str(Path(target).expanduser().resolve()),
+                          "scheduledAutonomy=auto"] for target in targets])
+    for command in updates:
+        if not args.apply:
+            print(shlex.join(command))
+        else:
+            result = subprocess.run(command)
+            if result.returncode:
+                return result.returncode
+    return 0
+
+
+def remaining_opt_ins(args):
+    runner = [str(Path(sys.executable).absolute()), str(HERE / "kaizen-scheduled")]
+    command = runner + ["review", "--dry-run", "--json"]
+    for directory in args.project_dir:
+        command.extend(["--project-dir", str(directory)])
+    result = subprocess.run(command, capture_output=True, text=True)
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr)
+    if result.returncode:
+        return result.returncode
+    try:
+        rows = [row for row in json.loads(result.stdout)
+                if row["scheduledAutonomy"] == "auto" and row["source"] == "project"]
+    except (ValueError, KeyError, TypeError) as error:
+        print(f"could not list project opt-ins ({error}); run: {shlex.join(command)}", file=sys.stderr)
+        return 1
+    print("Remaining project-level auto opt-ins:")
+    for row in rows:
+        clear = runner + ["config", "set", "--for", row["path"], "scheduledAutonomy=propose"]
+        print(f"  {row['path']}: {shlex.join(clear)}")
+    return 0
+
+
+def job_env():
+    env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")}
+    # Jobs run with another cwd and no shell expansion, so record absolute paths.
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+        if os.environ.get(name):
+            env[name] = str(Path(os.environ[name]).expanduser().resolve())
+    return env
 
 
 def plist(name, command, interval=None, weekday=None):
     job = {
         "Label": f"{LABEL}.{name}",
         "ProgramArguments": ["/bin/sh", "-c", command],
-        "EnvironmentVariables": {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")},
+        "EnvironmentVariables": job_env(),
         "RunAtLoad": False,
     }
     if interval:
@@ -90,7 +137,7 @@ def plist(name, command, interval=None, weekday=None):
 
 
 def jobs(args):
-    cmd = commands(args.project_dir, args.auto)
+    cmd = commands(args)
     out = {"audit": dict(command=cmd["audit"], interval=3 * 86400, cron="0 9 */3 * *")}
     if args.review:
         out["review"] = dict(command=cmd["review"], weekday=1, cron="0 9 * * 1")
@@ -119,40 +166,209 @@ def mac(args, selected):
 
 
 def cron(args, selected):
-    current = subprocess.run(["crontab", "-l"], capture_output=True, text=True).stdout
-    kept = [line for line in current.splitlines() if not any(line.endswith(f"{MARK}-{n}") for n in selected)]
-    # cron treats an unescaped % as a newline
-    added = [] if args.remove else [f"{job['cron']} {job['command'].replace('%', chr(92) + '%')} {MARK}-{name}"
-                                    for name, job in selected.items()]
+    env = " ".join(f"{key}={shlex.quote(value)}" for key, value in job_env().items())
+    lines = []
+    for name, job in selected.items():
+        text = f"{job['cron']} env {env} /bin/sh -c {shlex.quote(job['command'])}"
+        lines.append(text.replace('%', chr(92) + '%') + f" {MARK}-{name}")
+
+    def missing():
+        print("crontab not found; schedule these jobs by hand:\n" + "\n".join(lines), file=sys.stderr)
+        return 2
+
+    if not shutil.which("crontab"):
+        return missing()
+    try:
+        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+    except FileNotFoundError:
+        return missing()
+    current = result.stdout if result.returncode == 0 else ""
+    kept = [line for line in current.splitlines(keepends=True)
+            if not any(line.rstrip('\r\n').endswith(f"{MARK}-{n}") for n in selected)]
+    added = [] if args.remove else lines
     if not args.apply and not args.remove:
         print("\n".join(added))
-        return
-    text = "\n".join(kept + added) + "\n"
-    subprocess.run(["crontab", "-"], input=text, text=True, check=True)
+        return 0
+    text = "".join(kept)
+    if added:
+        text += ("\n" if text and not text.endswith('\n') else "") + "\n".join(added) + "\n"
+    try:
+        subprocess.run(["crontab", "-"], input=text, text=True, check=True)
+    except FileNotFoundError:
+        return missing()
     print(("removed" if args.remove else "installed") + ": " + ", ".join(selected))
+    return 0
+
+
+def unit_escape(text, exec=False):
+    """Escape systemd quoted strings, with variable escaping only for ExecStart."""
+    text = text.replace('\\', '\\\\').replace('"', '\\"').replace('%', '%%')
+    text = text.replace('\n', r'\n').replace('\r', r'\r').replace('\t', r'\t')
+    return text.replace('$', '$$').replace("'", r"\'") if exec else text
+
+
+def unit_dir():
+    return Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config").expanduser().resolve() / "systemd/user"
+
+
+def systemd_state():
+    if not shutil.which("systemctl"):
+        return "systemctl not found"
+    try:
+        result = subprocess.run(["systemctl", "--user", "is-system-running"], capture_output=True, text=True)
+    except FileNotFoundError:
+        return "systemctl not found"
+    return result.stdout.strip() or "unknown"
+
+
+def select_scheduler(requested, system, mutate=False):
+    if requested == "auto":
+        if system == "Darwin":
+            return "launchd"
+        if shutil.which("crontab"):
+            return "cron"
+        return "systemd" if systemd_state() in ("running", "degraded") else None
+    if requested == "systemd" and mutate:
+        state = systemd_state()
+        if state not in ("running", "degraded"):
+            print(f"systemd user timers unavailable: {state}", file=sys.stderr)
+            return None
+    return requested
+
+
+def systemctl(*arguments):
+    """Run `systemctl --user ...`; report a failure instead of raising."""
+    try:
+        subprocess.run(["systemctl", "--user", *arguments], check=True)
+        return True
+    except (OSError, subprocess.CalledProcessError) as error:
+        print(f"systemctl --user {' '.join(arguments)} failed: {error}", file=sys.stderr)
+        return False
+
+
+def systemd(args, selected):
+    directory = unit_dir()
+    for name, job in selected.items():
+        service = directory / f"agent-kaizen-{name}.service"
+        timer = directory / f"agent-kaizen-{name}.timer"
+        if args.remove:
+            try:  # fails when the timer was never enabled; the unit files go either way
+                subprocess.run(["systemctl", "--user", "disable", "--now", timer.name],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
+            for path in (service, timer):
+                path.unlink(missing_ok=True)
+                print(f"removed {path}")
+            continue
+        environment = "".join(f'Environment="{unit_escape(key + "=" + value)}"\n'
+                              for key, value in job_env().items())
+        command = unit_escape(job["command"], exec=True)
+        body = (f"[Unit]\nDescription=agent-kaizen {name}\n[Service]\nType=oneshot\n"
+                f"{environment}ExecStart=/bin/sh -c '{command}'\n")
+        calendar = "*-*-01/3 09:00:00" if name == "audit" else "Mon *-*-* 09:00:00"
+        timing = f"[Timer]\nOnCalendar={calendar}\nPersistent=true\n[Install]\nWantedBy=timers.target\n"
+        for path, text in ((service, body), (timer, timing)):
+            if args.apply:
+                directory.mkdir(parents=True, exist_ok=True)
+                path.write_text(text)
+                print(f"installed {path}")
+            else:
+                print(f"--- {path}\n{text}")
+    if (args.apply or args.remove) and not systemctl("daemon-reload"):
+        return 2
+    if args.apply and not args.remove:
+        for name in selected:
+            if not systemctl("enable", "--now", f"agent-kaizen-{name}.timer"):
+                return 2
+        if shutil.which("loginctl"):
+            user = getpass.getuser()
+            result = subprocess.run(["loginctl", "show-user", user, "-p", "Linger"], capture_output=True, text=True)
+            if result.stdout.strip() == "Linger=no":
+                print("Timers run only while you are logged in. To run them when logged out: "
+                      f"loginctl enable-linger {user}")
+    return 0
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--scheduler", choices=SCHEDULERS, default="auto",
+                        help="scheduler (default: launchd on macOS, otherwise cron then systemd)")
     parser.add_argument("--apply", action="store_true", help="install the jobs")
     parser.add_argument("--remove", action="store_true", help="remove the jobs (audit and review)")
-    parser.add_argument("--review", action="store_true", help="also the weekly propose-only review (uses tokens)")
-    parser.add_argument("--auto", action="store_true",
-                        help="weekly review applies changes in auto mode (backed up, verified, logged; see docs/autonomy.md)")
-    parser.add_argument("--project-dir", type=Path, default=Path.cwd(), help="project the review runs in (default: cwd)")
+    parser.add_argument("--review", action="store_true", help="also install weekly review (uses tokens)")
+    parser.add_argument("--auto", nargs="*", default=None, metavar="all|none|DIR",
+                        help="set scheduled autonomy globally or for projects; implies --review")
+    parser.add_argument("--project-dir", type=Path, action="append", help="limit review to these projects")
+    parser.add_argument("--model", default=os.environ.get("KAIZEN_REVIEW_MODEL"))
+    parser.add_argument("--max-turns", type=int, default=os.environ.get("KAIZEN_REVIEW_MAX_TURNS"))
     args = parser.parse_args(argv)
-    args.project_dir = args.project_dir.resolve()
-    if args.remove or args.auto:
+    args.project_dir = [directory.expanduser().resolve() for directory in (args.project_dir or [])]
+    if args.auto is not None and any(value in ("all", "none") for value in args.auto) and len(args.auto) != 1:
+        parser.error("--auto all or none cannot be combined with other values")
+    if args.auto == [] and len(args.project_dir) > 1:
+        parser.error("--auto without a value takes at most one --project-dir; name the projects: --auto DIR...")
+    if args.max_turns is not None and args.max_turns < 1:
+        parser.error("--max-turns must be positive")
+    args.claude = shutil.which("claude")
+    if args.claude:
+        args.claude = str(Path(args.claude).absolute())
+    system = platform.system()
+    if system == "Windows":
+        print("not supported on Windows; run token-audit by hand or use Task Scheduler", file=sys.stderr)
+        return 2
+    # Removal must also find units left behind by an earlier scheduler choice.
+    cleanup = args.remove and system != "Darwin" and args.scheduler != "launchd"
+    has_units = any(unit_dir().glob("agent-kaizen-*.*")) if cleanup else False
+    scheduler = ("cron" if cleanup and args.scheduler == "auto" else
+                 select_scheduler(args.scheduler, system, args.apply or args.remove))
+    if scheduler is None:
+        print("No scheduler available; schedule these jobs by hand:", file=sys.stderr)
+        args.review = args.review or args.remove or args.auto is not None
+        environment = " ".join(f"{key}={shlex.quote(value)}" for key, value in job_env().items())
+        for name, job in jobs(args).items():
+            command = f"{job['cron']} env {environment} /bin/sh -c {shlex.quote(job['command'])}"
+            print(command.replace('%', chr(92) + '%') + f" {MARK}-{name}", file=sys.stderr)
+        return 2
+    if scheduler == "launchd" and system != "Darwin" and (args.apply or args.remove):
+        parser.error("launchd --apply and --remove require macOS")
+    if not args.remove and (args.review or args.auto is not None) and not args.claude:
+        parser.error("claude not found on PATH; install Claude Code or put it on PATH, then re-run")
+    if args.remove or args.auto is not None:
         args.review = True
-    AUDITS.mkdir(parents=True, exist_ok=True)
     if args.apply:
+        AUDITS.mkdir(parents=True, exist_ok=True)
         BIN.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(HERE / "kaizen-scheduled", BIN / "kaizen-scheduled")
         shutil.copy2(HERE / "token-audit", BIN / AUDIT_NAME)
         shutil.copy2(HERE / "kaizen-backup", BIN / "kaizen-backup")
-        print(f"copied token-audit to {BIN / AUDIT_NAME} and kaizen-backup to {BIN / 'kaizen-backup'}")
+        shutil.copy2(HERE / "pricing.json", BIN / "kaizen-pricing.json")
+        print(f"copied kaizen-scheduled to {BIN / 'kaizen-scheduled'} and token-audit to {BIN / AUDIT_NAME} and kaizen-backup to {BIN / 'kaizen-backup'} "
+              f"and pricing.json to {BIN / 'kaizen-pricing.json'}")
     selected = jobs(args)
-    (mac if platform.system() == "Darwin" else cron)(args, selected)
-    return 0
+    if cleanup:
+        status = cron(args, selected) if shutil.which("crontab") else 0
+        if has_units or scheduler == "systemd":
+            status = systemd(args, selected) or status
+    else:
+        status = {"launchd": mac, "cron": cron, "systemd": systemd}[scheduler](args, selected) or 0
+        if args.apply and scheduler == "cron" and any(unit_dir().glob("agent-kaizen-*.timer")):
+            print(f"note: agent-kaizen systemd timers are also installed in {unit_dir()}; "
+                  "remove them with --scheduler systemd --remove", file=sys.stderr)
+    # Change the config only once the jobs are in place, so a failed install changes nothing.
+    if status == 0 and args.auto is not None and not args.remove:
+        status = configure_auto(args)
+    if status == 0 and args.apply and args.review and not args.remove:
+        preview = shlex.join([str(Path(sys.executable).absolute()), str(BIN / "kaizen-scheduled"),
+                              "review", "--dry-run"])
+        print(f"Preview what the weekly run would do (no tokens): {preview}")
+        print("The session notice only shows in projects with docs/kaizen/. To see it everywhere: set KAIZEN_NOTICE_ALL=1")
+        print("Changed since 0.3.x: --project-dir no longer defaults to the current directory. Without it, every enrolled project with activity is reviewed.")
+    if status == 0 and args.auto == ["none"] and not args.remove:
+        status = remaining_opt_ins(args)
+    if status == 0 and args.apply and not args.remove and scheduler == "systemd":
+        print("Check the timers: systemctl --user list-timers 'agent-kaizen-*'")
+    return status
 
 
 if __name__ == "__main__":
