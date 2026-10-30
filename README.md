@@ -8,6 +8,13 @@
 
 It was built while developing a game with Claude Code coordinating Claude subagents and the OpenAI Codex CLI. It works for any project, with or without Codex.
 
+<p align="center">
+  <picture>
+    <source media="(prefers-reduced-motion: reduce)" srcset="assets/teaser.png">
+    <img src="assets/teaser.gif" width="100%" alt="An animation of the Agent Kaizen loop: Measure, Review, Change one thing, Re-measure. A zero-token script audits the agents' session logs, and a ledger records one fix at a time: a dispatch script instead of a Codex wrapper agent spawned about 150 times, auto-compact for main sessions that reached 450k to 560k tokens of context, a code-map rule that agents barely used (5 code-map calls against about 137 greps) and was retried in the agents' own context, and a hook for 67 images left in the main context. Schematic usage bars shrink as each change earns a KEEP stamp. It ends on: keep what pays, revert what doesn't, and the install command.">
+  </picture>
+</p>
+
 ## Why I built this
 
 I've been building a Colonization-inspired colonial-era game with Claude Code doing the coordinating and handing work off to Codex and other Claude agents. It worked. It also got expensive. And I ran out of usage within an hour of each 5h reset.
@@ -40,7 +47,7 @@ The full list of findings and fixes is in [docs/what-we-learned.md](docs/what-we
 
 So this plugin is built as a **loop**:
 
-<p align="center"><img src="assets/loop.png" alt="The loop: 1 Measure, 2 Review, 3 Change one thing, 4 Re-measure, around a ledger" width="720"></p>
+<p align="center"><img src="assets/loop.svg" alt="The loop, clockwise around a ledger: 1 Measure: token-audit reads your session logs every 3 days, a script that costs no tokens. 2 Review: Claude compares the audit with the ledger and proposes the next changes. 3 Change one thing: backed up, verified, and rolled back if it fails. 4 Re-measure: the next audit fills in the measured effect, and the change is kept, tuned or reverted. The ledger in the middle lists changes with their verdicts, including one that was reverted and retried." width="100%"></p>
 
 1. **Measure:** `scripts/token-audit` runs every 3 days. It's a plain script, so it costs no tokens.
 2. **Review:** `/agent-kaizen:review` or `/agent-kaizen:cycle` compares the audit with the ledger.
@@ -51,7 +58,15 @@ Every change gets a row in `docs/kaizen/LEDGER.md` (date, change, why, expected 
 
 ## Quick start
 
-Requires Claude Code 2.1.271 or newer (for `omitClaudeMd` subagents), `jq`, and Python 3.9+.
+Requires `jq` and Python 3.9+.
+
+| Tool | Minimum | Tested on |
+|---|---|---|
+| Claude Code | 2.1.271 (for `omitClaudeMd` subagents) | 2.1.314 |
+| Codex CLI (optional) | — | 0.163.0 |
+| Python | 3.9 | 3.9 and 3.13 (CI, Linux and macOS) |
+
+Newer versions haven't been tested yet. Setting names and transcript formats change between releases, so if the audit reports zero sessions or a skill's config step fails, check `/agent-kaizen:whats-new` first.
 
 ### 1. Install (clone it, then add it as a local plugin)
 
@@ -155,13 +170,14 @@ skills/             the loop, one SKILL.md per step (plain Markdown; readable wi
 agents/             kaizen-auditor (propose-only)
 hooks/              audit-notice (enabled by the plugin), plus opt-in guardrails:
                     limit-big-read, block-image-read, subagent-context, after-compact
-scripts/            token-audit, kaizen-backup (backups + undo), codex-dispatch, codex-review,
+scripts/            token-audit (+ pricing.json), kaizen-backup (backups + undo), codex-dispatch, codex-review,
                     dispatch-status, install-schedule
 templates/          starting points: global and project CLAUDE.md, orchestrator.md,
                     Codex AGENTS.md and config.toml, settings.example.json,
                     agent templates (scout, judge, swarm-lead, verifier, planner,
                     debugger, image-reader), agent-context role files, plan + brief
 docs/               what-we-learned.md, scheduling.md, prompt-evaluation.md
+assets/             banner, teaser animation and loop diagram; assets/src/ has the scripts that draw them
 ```
 
 The guardrail hooks and templates are **opt-in**: `/agent-kaizen:guardrails` and `/agent-kaizen:lean-agents` install and adapt them with your approval. Installing the plugin enables only the audit notice.
@@ -183,10 +199,23 @@ Or paste the `## Task` section of any skill into a session.
 - Audits read your local transcripts (`~/.claude/projects`, `~/.codex/sessions`). Reports stay on your machine under `docs/kaizen/` or `~/.claude/audits/`. Don't commit audit reports to a public repo; they can contain file paths and prompt fragments.
 - Setting names and CLI flags change between versions. The skills tell Claude to check the current docs before writing config.
 
+## Compared with TokenEconomizer
+
+[TokenEconomizer](https://github.com/microsoft/TokenEconomizer) (Microsoft Research and UC Berkeley, [paper](https://arxiv.org/abs/2610.22732)) has the same goal: make coding agents cheaper by learning from your own sessions. It works inside each session. Its hooks state repository facts learned from earlier sessions, deny tools that keep going unused, and have a Haiku judge redirect turns that are stuck in failure loops. It supports Claude Code, Codex, the Copilot CLI, Pi and opencode, and its paper measures 18–31% lower cost on SWE-Bench tasks.
+
+Agent Kaizen works one level up, on the whole workflow. It covers how the main session routes work across models and vendors, how subagents are spawned and briefed, how much instruction and fixed context loads every turn, and which tools and models you use at all. It changes configuration between sessions, one measured change at a time, and keeps a ledger of what paid off. Its audit also measures TokenEconomizer's three targets, at zero token cost:
+- failures that repeat across sessions, which become one-line repo facts;
+- unused tools and MCP servers, which become deny rules;
+- stuck turns, which lead to fixing the cause.
+
+It turns these into proposals rather than acting live inside a session.
+
+**Don't run both in the same project.** Both add deny rules to `.claude/settings.local.json` and add context at session start. Each one's changes would show up in the other's measurements as unexplained, and the ledger could no longer tell which change did what. To trial TokenEconomizer's loop guard alongside Kaizen, set its `toolprune=propose` and leave `microskills` off, and log the trial as one ledger row.
+
 ## Contributing
 
 See [CONTRIBUTING.md](CONTRIBUTING.md). Issues and PRs are welcome, especially ledger results ("this change saved X% in a setup like Y"), new skills, and ports of the scripts to other agent CLIs.
 
 ## License
 
-MIT. See [LICENSE](LICENSE). The images in `assets/` and the plugin icon were generated with OpenAI gpt-image-2 for this project and are released under the same MIT license.
+MIT. See [LICENSE](LICENSE). The banner artwork and the plugin icon were generated with OpenAI's image model (gpt-image-2) for this project. The banner title, the teaser animation and the loop diagram are drawn by the scripts in `assets/src/`. All of them are released under the same MIT license.

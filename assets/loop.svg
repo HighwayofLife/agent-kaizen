@@ -1,0 +1,47 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="760" viewBox="0 0 1200 760" role="img" aria-labelledby="title desc">
+<title id="title">Agent Kaizen: measure, review, change, repeat</title>
+<desc id="desc">Four steps run clockwise around a ledger. A zero-token script audits session logs every three days. Claude reviews the audit against the ledger, proposes a single change or applies it within safe or auto mode, then verifies it with rollback on failure. The next audit records the effect so you can keep, tune or revert. The ledger shows source examples: replacing wrapper agents with a dispatch script, and retrying a rarely used code-map rule. Unreported effects and verdicts are marked with a dash.</desc>
+<style>
+/* Palette shared with assets/src/teaser.py: navy #0b1c2e, panel #122a3e,
+   edge #29465b, white #f7f3e8, muted #aec4d4, gold #ffbc38, teal #27daca. */
+:root {color-scheme:light dark;--bg:#f7f3e8;--card:#ffffff;--text:#0b1c2e;--muted:#486174;--line:#bccbd0;--edge:#d8e1e3;--teal:#08786f;--tint:#e9f7f3;--gold:#ffbc38;--shadow:#0b1c2e;}
+@media(prefers-color-scheme:dark){:root{--bg:#0b1c2e;--card:#122a3e;--text:#f7f3e8;--muted:#aec4d4;--line:#617e91;--edge:#29465b;--teal:#27daca;--tint:#173c48;--shadow:#000000;}}
+text{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Helvetica,Arial,sans-serif;fill:var(--text)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace}.muted{fill:var(--muted)}.accent{fill:var(--teal)}
+.card{fill:var(--card);stroke:var(--edge);stroke-width:1.5}.icon{fill:none;stroke:var(--teal);stroke-width:2;stroke-linecap:round;stroke-linejoin:round}
+.route{fill:none;stroke:var(--line);stroke-width:2}.rule{stroke:var(--edge)}.halo{fill:none;stroke:var(--teal);stroke-width:2;opacity:0}.pulse{fill:var(--teal);opacity:0}
+@media(prefers-reduced-motion:no-preference){
+.pulse{opacity:1;offset-path:path("M 300 308 H 1108 Q 1156 308 1156 356 V 472 Q 1156 520 1108 520 H 92 Q 44 520 44 472 V 356 Q 44 308 92 308 Z");animation:orbit 6s linear infinite;filter:url(#glow)}
+/* Orbit length 2575.659246px; card projections: (300,308), (900,308), (900,520), (300,520).
+   Arrival = 6 * distance / length: 0.000000s, 1.397700s, 3.000000s, 4.397700s.
+   Negative delay = arrival - 6, modulo the shared 6s period. */
+.halo{animation:highlight-odd 6s linear infinite}.h2,.h4{animation-name:highlight-even}.h1{animation-delay:0.000000s}.h2{animation-delay:-4.602300s}.h3{animation-delay:-3.000000s}.h4{animation-delay:-1.602300s}
+@keyframes orbit{to{offset-distance:100%}}/* Switch cards at the midpoint between adjacent arrival distances. */
+@keyframes highlight-odd{0%,11.3%,87%,100%{opacity:.65}11.647503%,86.647503%{opacity:0}}
+@keyframes highlight-even{0%,13%,88.7%,100%{opacity:.65}13.352497%,88.352497%{opacity:0}}
+}
+</style>
+<defs>
+<linearGradient id="accent" x2="1" y2="0"><stop stop-color="#27daca"/><stop offset="1" stop-color="#ffbc38"/></linearGradient>
+<filter id="shadow" x="-15%" y="-20%" width="130%" height="150%"><feDropShadow dx="0" dy="6" stdDeviation="9" flood-color="#0b1c2e" flood-opacity=".07"/></filter>
+<filter id="glow" x="-200%" y="-200%" width="500%" height="500%"><feGaussianBlur stdDeviation="4"/><feMerge><feMergeNode/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+<marker id="arrow" viewBox="0 0 10 10" refX="7" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="m2 2 3 3-3 3" fill="none" stroke="var(--line)" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></marker>
+</defs>
+<rect width="1200" height="760" rx="28" fill="var(--bg)"/>
+<rect x="64" y="42" width="42" height="5" rx="2.5" fill="url(#accent)"/>
+<text x="64" y="86" font-size="32" font-weight="700" letter-spacing="-.8">Small changes. Measured progress.</text>
+<text x="1136" y="82" text-anchor="end" class="mono muted" font-size="20">AGENT KAIZEN / THE LOOP</text>
+<path class="route" d="M 300 308 H 1108 Q 1156 308 1156 356 V 472 Q 1156 520 1108 520 H 92 Q 44 520 44 472 V 356 Q 44 308 92 308 Z"/>
+<path class="route" d="M570 308h60" marker-end="url(#arrow)"/><path class="route" d="M1156 400v28" marker-end="url(#arrow)"/><path class="route" d="M630 520h-60" marker-end="url(#arrow)"/><path class="route" d="M44 428v-28" marker-end="url(#arrow)"/>
+<circle class="pulse" r="5"/>
+<g transform="translate(64 132)"><rect class="card" width="472" height="164" rx="18" filter="url(#shadow)"/><rect class="halo h1" width="472" height="164" rx="18"/><rect x="22" y="20" width="42" height="42" rx="12" fill="var(--tint)"/><g class="icon" transform="translate(33 28)"><path d="M0 21V13m8 8V7m8 14V1M-3 25h24"/></g><text x="80" y="47" font-size="28" font-weight="650" letter-spacing="-.5">Measure</text><text x="446" y="45" text-anchor="end" font-size="22" font-weight="600" class="mono muted">01</text><text x="24" y="88" font-size="21">token-audit reads your session logs.</text><text x="24" y="119" font-size="21" class="muted">Every 3 days · a script, 0 tokens.</text></g><g transform="translate(664 132)"><rect class="card" width="472" height="164" rx="18" filter="url(#shadow)"/><rect class="halo h2" width="472" height="164" rx="18"/><rect x="22" y="20" width="42" height="42" rx="12" fill="var(--tint)"/><g class="icon" transform="translate(33 28)"><rect x="0" y="0" width="18" height="24" rx="3"/><path d="M5 6h8M5 11h8m-8 5h4m7 3 6 6"/></g><text x="80" y="47" font-size="28" font-weight="650" letter-spacing="-.5">Review</text><text x="446" y="45" text-anchor="end" font-size="22" font-weight="600" class="mono muted">02</text><text x="24" y="88" font-size="21">Claude compares audit + ledger.</text><text x="24" y="119" font-size="21" class="muted">Propose the next change.</text></g><g transform="translate(664 536)"><rect class="card" width="472" height="164" rx="18" filter="url(#shadow)"/><rect class="halo h3" width="472" height="164" rx="18"/><rect x="22" y="20" width="42" height="42" rx="12" fill="var(--tint)"/><g class="icon" transform="translate(33 28)"><path d="m3 4 5-3 5 3 5-3 3 5-3 5 3 5-3 5-5-3-5 3-5-3 3-5-3-5Z"/><path d="m7 11 3 3 6-6"/></g><text x="80" y="47" font-size="28" font-weight="650" letter-spacing="-.5">Change one thing</text><text x="446" y="45" text-anchor="end" font-size="22" font-weight="600" class="mono muted">03</text><text x="24" y="88" font-size="21">Back up → verify; roll back on failure.</text><text x="24" y="119" font-size="21" class="muted">Propose first; safe / auto applies</text><text x="24" y="143" font-size="21" class="muted">within the mode’s limits.</text></g><g transform="translate(64 536)"><rect class="card" width="472" height="164" rx="18" filter="url(#shadow)"/><rect class="halo h4" width="472" height="164" rx="18"/><rect x="22" y="20" width="42" height="42" rx="12" fill="var(--tint)"/><g class="icon" transform="translate(33 28)"><path d="M20 8a10 10 0 1 0 0 9M20 1v7h-7"/></g><text x="80" y="47" font-size="28" font-weight="650" letter-spacing="-.5">Re-measure</text><text x="446" y="45" text-anchor="end" font-size="22" font-weight="600" class="mono muted">04</text><text x="24" y="88" font-size="21">Next audit records the measured effect.</text><text x="24" y="119" font-size="21" class="muted">Keep, tune or revert.</text></g><g transform="translate(120 326)">
+<rect class="card" width="960" height="180" rx="16" filter="url(#shadow)"/>
+<rect x="0" y="17" width="3" height="30" rx="1.5" fill="url(#accent)"/>
+<text x="24" y="35" font-size="24" font-weight="650">The ledger</text><text x="936" y="34" text-anchor="end" font-size="20" class="mono muted">docs/kaizen/LEDGER.md</text>
+<path class="rule" d="M24 50H936M24 80H936M24 116H936"/>
+<g font-size="20" font-weight="700" letter-spacing=".8" class="muted"><text x="24" y="72" class="muted">CHANGE</text><text x="460" y="72" class="muted">MEASURED EFFECT</text><text x="800" y="72" class="muted">VERDICT</text></g>
+<g font-size="20"><text x="24" y="105">Dispatch script replaces wrapper</text><text x="460" y="105" class="muted">—</text><text x="800" y="105" class="muted">—</text>
+<text x="24" y="140">Code-map rule in CLAUDE.md</text><text x="460" y="140">5 calls / ~137 grep calls</text><text x="800" y="140" class="accent" font-weight="600">Retry ↗</text></g>
+<text x="24" y="168" font-size="20" class="muted">From “What we learned” · — = not reported</text></g>
+<text x="600" y="735" text-anchor="middle" font-size="20" class="muted">Keep what works. Repeat.</text>
+</svg>
