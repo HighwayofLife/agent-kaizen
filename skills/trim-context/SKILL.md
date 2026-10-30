@@ -2,6 +2,7 @@
 name: trim-context
 description: "Measure and trim what loads into every turn: MCP servers and tools, claude.ai connectors, plugins, skill and agent descriptions, and Codex MCP servers."
 disable-model-invocation: true
+argument-hint: "[propose|safe|auto|yolo]"
 ---
 
 # Trim the always-loaded tool and context surface
@@ -9,6 +10,8 @@ disable-model-invocation: true
 Every MCP tool schema, connector, enabled plugin, skill description and custom-agent description can add tokens to every turn, even if you never use it. Removing what this project never uses saves tokens on every turn after that.
 
 **Changes:** settings and config, after you approve. Back up `~/.claude/settings.json`, `.claude/settings.json` and `~/.codex/config.toml` first.
+
+**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `~/.claude/agent-kaizen.json`, else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
 ## Task
 

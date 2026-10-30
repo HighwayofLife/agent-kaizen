@@ -2,6 +2,7 @@
 name: slim-instructions
 description: "Shrink CLAUDE.md, AGENTS.md and their imports, which are re-sent every turn, without losing a rule."
 disable-model-invocation: true
+argument-hint: "[propose|safe|auto|yolo]"
 ---
 
 # Slim the always-loaded instructions
@@ -9,6 +10,8 @@ disable-model-invocation: true
 `CLAUDE.md`, `AGENTS.md` and everything they import are sent with every turn of every session. Shrinking them saves tokens on every turn, so even a small cut adds up across a whole session.
 
 **Changes:** edits instruction files, after you approve.
+
+**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `~/.claude/agent-kaizen.json`, else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
 ## Task
 

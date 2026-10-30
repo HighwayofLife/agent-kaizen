@@ -2,6 +2,7 @@
 name: schedule
 description: "Schedule the usage audit (and optionally a propose-only review) to run locally every few days, with a session-start notice."
 disable-model-invocation: true
+argument-hint: "[propose|safe|auto|yolo]"
 ---
 
 # Schedule the audit
@@ -9,6 +10,8 @@ disable-model-invocation: true
 The audit from `/agent-kaizen:audit` runs by itself every few days, and Claude Code tells you when there's a new one to review. This keeps the loop going without you having to remember it.
 
 **Changes:** a scheduled job and a SessionStart hook, after you approve.
+
+**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `~/.claude/agent-kaizen.json`, else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
 ## Task
 

@@ -2,7 +2,7 @@
 name: roster
 description: "Find out which AI models and subscriptions you actually have, research what each is best at, and set up agents, routing, fallbacks and escalation ladders that use their strengths."
 disable-model-invocation: true
-argument-hint: "[re-evaluate]"
+argument-hint: "[propose|safe|auto|yolo|re-evaluate]"
 ---
 
 # Build your agent roster: who does what, with fallbacks and escalation
@@ -14,6 +14,8 @@ The best routing depends on what *you* have. One example: if you have a Grok sub
 - builds agents, dispatch scripts, a routing table with fallbacks and escalation, and per-vendor instructions.
 
 **Changes:** creates agents, scripts and instruction sections, after you approve each part. With `re-evaluate`, it re-checks an existing roster and proposes changes only.
+
+**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `~/.claude/agent-kaizen.json`, else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
 ## Task
 

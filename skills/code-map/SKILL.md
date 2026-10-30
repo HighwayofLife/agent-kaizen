@@ -2,6 +2,7 @@
 name: code-map
 description: "Build a local SQLite code map (symbols, settings keys, ids, scenes) so agents find code in one query instead of grep-and-read loops."
 disable-model-invocation: true
+argument-hint: "[propose|safe|auto|yolo]"
 ---
 
 # Code map: a symbol index for agents
@@ -9,6 +10,8 @@ disable-model-invocation: true
 Agents find code with one indexed query that gives exact line ranges, instead of grep → read → grep loops. This is usually the single biggest saving for planners and engineers in a large codebase.
 
 **Changes:** adds a tool under `tools/` with tests, plus an instruction rule, after you approve.
+
+**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `~/.claude/agent-kaizen.json`, else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
 ## Task
 

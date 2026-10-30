@@ -2,6 +2,7 @@
 name: codex-dispatch
 description: "Hand coding work to the Codex CLI through a dispatch script (checks, resume rounds, short report) instead of a relay subagent."
 disable-model-invocation: true
+argument-hint: "[propose|safe|auto|yolo]"
 ---
 
 # Hand coding to Codex by script, not by a wrapper agent
@@ -9,6 +10,8 @@ disable-model-invocation: true
 If you use OpenAI Codex as well as Claude, send it work through a script that runs it, runs the checks, loops failures back and prints a short report. A Claude subagent that only relays Codex output costs a full agent context for nothing.
 
 **Changes:** creates scripts, their tests and a CLAUDE.md section, after you approve.
+
+**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `~/.claude/agent-kaizen.json`, else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
 ## Task
 

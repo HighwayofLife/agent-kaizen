@@ -2,7 +2,7 @@
 name: review
 description: "The recurring step: compare the newest audit with the ledger, keep or revert past changes, and propose the next improvements."
 disable-model-invocation: true
-argument-hint: "[propose-only]"
+argument-hint: "[propose|safe|auto|yolo|propose-only]"
 ---
 
 # Review the latest audit and improve (the recurring step)
@@ -10,6 +10,8 @@ argument-hint: "[propose-only]"
 The part of the loop that repeats. Check whether past changes paid off, keep the ones that did, revert the ones that didn't, and pick the next improvements.
 
 **Changes:** proposes changes, then implements the ones you approve.
+
+**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `~/.claude/agent-kaizen.json`, else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
 ## Task
 

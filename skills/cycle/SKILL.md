@@ -2,12 +2,15 @@
 name: cycle
 description: "Run one full self-improvement cycle: audit, review the ledger, check new models and releases when due, and propose the next changes."
 disable-model-invocation: true
-argument-hint: "[propose-only]"
+argument-hint: "[propose|safe|auto|yolo|propose-only]"
 ---
 
 # One self-improvement cycle
 
 This is the entry point when you don't know which skill to run. It runs the loop once. With `propose-only` (used by the scheduled headless run) it changes nothing and prints the proposal as Markdown. The scheduler saves the output to `~/.claude/audits/cycle-<yyyy-mm-dd>.md`; run interactively, write it there yourself.
+
+
+**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `~/.claude/agent-kaizen.json`, else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
 ## Task
 

@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests (Python ${{ matrix.python }}, ${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install jq (macOS)
+        if: runner.os == 'macOS'
+        run: command -v jq || brew install jq
+      - name: Unit, hook and repo-consistency tests
+        run: python -m unittest discover -s tests -v
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: shellcheck hooks
+        run: shellcheck -S warning hooks/*.sh
+      - name: JSON parses
+        run: for f in .claude-plugin/*.json hooks/hooks.json templates/*.json; do jq empty "$f" || exit 1; done
+      - name: Python scripts compile
+        run: |
+          for f in scripts/token-audit scripts/codex-dispatch scripts/codex-review scripts/codex-run \
+                   scripts/dispatch-status scripts/install-schedule scripts/codex_common.py; do
+            python3 -c "import sys; compile(open(sys.argv[1]).read(), sys.argv[1], 'exec')" "$f" || exit 1
+          done
+      - name: Scripts answer --help
+        run: for s in token-audit codex-dispatch codex-review dispatch-status install-schedule; do scripts/$s --help > /dev/null || exit 1; done
+
+  plugin:
+    name: claude plugin validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Install Claude Code
+        run: npm install -g @anthropic-ai/claude-code
+      - name: Validate plugin and marketplace
+        run: claude plugin validate .
+
+  version:
+    name: Version bump and changelog
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Plugin changes bump the version and add a CHANGELOG entry
+        run: |
+          base=origin/${{ github.base_ref }}
+          changed=$(git diff --name-only "$base"...HEAD -- skills agents hooks scripts templates .claude-plugin)
+          [ -z "$changed" ] && { echo "No plugin files changed."; exit 0; }
+          old=$(git show "$base":.claude-plugin/plugin.json | jq -r .version)
+          new=$(jq -r .version .claude-plugin/plugin.json)
+          [ "$old" != "$new" ] || { echo "::error::Plugin files changed but version is still $new. Bump .claude-plugin/plugin.json (users on a GitHub install only get new versions)."; exit 1; }
+          grep -q "^## $new" CHANGELOG.md || { echo "::error::CHANGELOG.md has no '## $new' entry."; exit 1; }

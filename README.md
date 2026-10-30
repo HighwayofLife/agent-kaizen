@@ -65,7 +65,24 @@ Open Claude Code in your project and run:
 /agent-kaizen:roster     # which AI tools you have, what each is best at, who does what
 ```
 
-Then run the skills the audit points at. Each skill **proposes first and waits for your OK** before changing any configuration, and backs up the files it touches.
+Then run the skills the audit points at. By default each skill **proposes first and waits for your OK** before changing any configuration, and backs up the files it touches.
+
+### Autonomous mode (`yolo`)
+
+If you'd rather not approve every change:
+
+```
+/agent-kaizen:autonomy auto       # or: yolo, safe, propose. Saved to ~/.claude/agent-kaizen.json
+/agent-kaizen:cycle yolo          # or for a single run only
+```
+
+| Mode | Behaviour |
+|---|---|
+| `propose` | Default: every change is shown and waits for your OK |
+| `safe` | Applies low-risk, reversible changes (docs, instruction cleanups that drop no rule, new scripts, one-row model trials) and proposes the rest |
+| `auto` / `yolo` | Applies everything except the hard stops: secrets, spending money or new vendors, loosening permissions, deleting things, commits and pushes, package installs (unless `allowInstalls`) |
+
+In every mode, each applied change is backed up to `~/.claude/kaizen-backups/`, verified (`jq`, hook tests, `claude plugin validate`), rolled back automatically if verification fails, and logged in the ledger. At most 3 changes are made per run (`maxChangesPerRun`), so the next audit can tell which change did what. `/agent-kaizen:undo last` (or `run`) reverses changes. Claude Code's own permission prompts still apply: run the session with edits auto-accepted to avoid them. Details: [docs/autonomy.md](docs/autonomy.md).
 
 ### 3. Make it periodic
 
@@ -73,6 +90,8 @@ Then run the skills the audit points at. Each skill **proposes first and waits f
 ~/.claude/agent-kaizen/scripts/install-schedule --apply            # usage audit every 3 days (no tokens)
 ~/.claude/agent-kaizen/scripts/install-schedule --apply --review --project-dir ~/code/my-project
 #   + weekly propose-only review in that project (Sonnet, max 40 turns, read-only tools)
+~/.claude/agent-kaizen/scripts/install-schedule --apply --auto --project-dir ~/code/my-project
+#   or: the weekly cycle applies changes in auto mode (acceptEdits, narrow tool list, never bypassPermissions)
 ```
 
 The plugin's session-start hook tells Claude when a new audit hasn't been reviewed. Then run `/agent-kaizen:cycle`, or ask Claude to use the `kaizen-auditor` agent. See [docs/scheduling.md](docs/scheduling.md).
@@ -100,6 +119,8 @@ All skills are user-triggered (`disable-model-invocation: true`), so their descr
 | `/agent-kaizen:test-loop` | Tiered tests for game/engine projects, engine slots, fast worktrees | Slow test feedback |
 | `/agent-kaizen:models` | New Claude and Codex models vs your routing rows, with sources | Monthly |
 | `/agent-kaizen:whats-new` | Claude Code and Codex release notes and new CLI tools vs your setup | Monthly |
+| `/agent-kaizen:autonomy` | Show or set the mode: `propose` (default), `safe` or `auto` (alias `yolo`) | When you trust the loop |
+| `/agent-kaizen:undo` | Reverse the last applied change, a specific one, or a whole run | Any time |
 | `/agent-kaizen:schedule` | Install the periodic audit and the optional weekly review | Once the audit works |
 
 The plugin also ships an **`kaizen-auditor` agent**, which runs one propose-only cycle and returns a 20-line summary, and a **SessionStart hook** for the unreviewed-audit notice.
@@ -134,8 +155,8 @@ Or paste the `## Task` section of any skill into a session.
 
 ## Safety
 
-- Skills propose before they change anything, back up config first, and log every change in the ledger.
-- Scheduled runs are propose-only: the audit is a plain script, and the weekly review runs with read-only tools and prints its proposal.
+- By default skills propose before they change anything. In `safe`/`auto` mode they apply changes themselves, but always back up first, verify, roll back on failure, log to the ledger, and stop at the hard stops. `/agent-kaizen:undo` reverses any change.
+- Scheduled runs are propose-only unless you install them with `--auto`: the audit is a plain script, and the weekly review runs with read-only tools and prints its proposal.
 - Audits read your local transcripts (`~/.claude/projects`, `~/.codex/sessions`). Reports stay on your machine under `docs/kaizen/` or `~/.claude/audits/`. Don't commit audit reports to a public repo; they can contain file paths and prompt fragments.
 - Setting names and CLI flags change between versions. The skills tell Claude to check the current docs before writing config.
 

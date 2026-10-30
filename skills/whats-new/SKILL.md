@@ -2,6 +2,7 @@
 name: whats-new
 description: "Check recent Claude Code and Codex releases and new CLI tools for features that replace workarounds or cut cost."
 disable-model-invocation: true
+argument-hint: "[propose|safe|auto|yolo]"
 ---
 
 # What's new: tools and features worth adopting
@@ -9,6 +10,8 @@ disable-model-invocation: true
 Claude Code, Codex and the CLI ecosystem change quickly. Check what's new now and then, and adopt what cuts cost or time, instead of carrying old workarounds forever.
 
 **Changes:** none until you approve a proposal.
+
+**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `~/.claude/agent-kaizen.json`, else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
 ## Task
 

@@ -2,6 +2,7 @@
 name: lean-agents
 description: "Make subagents load only the context they need and run on the cheapest model that fits, with a routing table for the main session."
 disable-model-invocation: true
+argument-hint: "[propose|safe|auto|yolo]"
 ---
 
 # Lean subagents and model routing
@@ -9,6 +10,8 @@ disable-model-invocation: true
 Each subagent loads only the context its job needs and runs on the cheapest model that does that job well. The main session routes work to it on purpose, not by habit.
 
 **Changes:** edits agent definitions, settings and hooks, after you approve. Back up `~/.claude/agents/` and `~/.claude/settings.json` first.
+
+**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `~/.claude/agent-kaizen.json`, else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
 ## Task
 

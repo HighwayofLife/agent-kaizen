@@ -2,6 +2,7 @@
 name: batch-wakeups
 description: "Cut main-session turns by batching agent completions through a swarm lead and merged reviews."
 disable-model-invocation: true
+argument-hint: "[propose|safe|auto|yolo]"
 ---
 
 # Batch the wake-ups
@@ -9,6 +10,8 @@ disable-model-invocation: true
 Each time a subagent finishes, the main session takes a full turn with its whole context. Ten small agents mean ten expensive turns. A lead agent can gather the results first and wake the main session once.
 
 **Changes:** agent definitions and routing rows, after you approve.
+
+**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `~/.claude/agent-kaizen.json`, else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
 ## Task
 

@@ -2,6 +2,7 @@
 name: guardrails
 description: "Install hooks that block whole-file reads of big files, images in the wrong context, and runaway sessions, each with an override."
 disable-model-invocation: true
+argument-hint: "[propose|safe|auto|yolo]"
 ---
 
 # Guardrail hooks, each with an escape hatch
@@ -9,6 +10,8 @@ disable-model-invocation: true
 Stop the most expensive habits automatically: whole-file reads of big files, images landing in the wrong context, and sessions that grow without limit. Each guardrail has a documented override, so an agent with a real need is never blocked.
 
 **Changes:** adds hook scripts and `settings.json` entries, after you approve. Back up `settings.json` first.
+
+**Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `~/.claude/agent-kaizen.json`, else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
 ## Task
 
