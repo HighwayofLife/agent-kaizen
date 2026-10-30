@@ -140,6 +140,34 @@ all structured results. `--days N` and `--since YYYY-MM-DD` are mutually exclusi
 dates use UTC. There are no model environment variables. `--codex` is accepted for compatibility; sessions are already
 included by default.
 
+`--extract-out DIR` selects the machine-readable extract folder. Its default is
+`<Claude config dir>/audits/extracts/`, independent of `--out`. Each report has a
+matching `<report stem>.extract.json` file, where the stem is the report file name
+without `.md`. The report records only this file name in
+`<!-- token-audit-extract {"v": 1, "file": "<report stem>.extract.json"} -->`,
+directly after its scope comment. The scope comment still follows the headline
+comment. Extracts are written atomically. An extract write error goes to stderr;
+the audit still exits 0 if the report was written. `--json` also includes the
+absolute `extract_path`, or null if the extract could not be written.
+
+Extract v1 has exactly `v` (1), `scope` (the report's scope dict), `since` (the
+audit cutoff), `report` (the report file name only), and `usage`. `usage.agents`
+holds the same rows as `agent_usage` in `--json`; `usage.sessions`,
+`usage.task_switches`, and `usage.instructions` are empty lists for now.
+Agent rows contain `agent`, `spawns`, `calls_median`, `calls_p90` (nearest rank),
+`cost`, `cost_share`, `models` (calls by model), `effort` (counts by label),
+`result_chars_median`, `stuck_share`, `failure_rate`, and
+`cheaper_model_candidate`. Missing effort is `unknown`; missing result sizes
+are null. Costs and shares are rounded to six decimal places. Result sizes count
+serialized main-session Agent results; background launches can return short text.
+
+The cheaper-model hint requires a cost share of at least 5%, median calls of at
+most 15, a known median result size of at most 4000 characters, and at least one
+priced model with an output rate above the cheapest `claude-` pricing entry.
+Unpriced models are ignored. Without pricing the hint is false. Section 3 also
+shows each agent type's cost share, up to three models by call count, and effort
+counts. These are hints for review, not automatic model changes.
+
 Duplicate assistant message IDs across selected transcripts count once. Entries
 without message IDs count individually. Duplicate file paths are scanned once.
 Codex counts final cumulative session totals for sessions with usage events in
@@ -155,11 +183,13 @@ Exit 0 means the report was written; errors use nonzero exit codes.
 
 ## kaizen-scheduled
 
-`kaizen-scheduled config show [--for DIR]` shows effective settings and the report path; `config set [--for DIR] KEY=VALUE...` merges settings. `audit` writes a global audit; `review` audits and reviews due projects. `review --dry-run` previews without writes or tokens; add `--json` for structured output. Repeat `--project-dir DIR` to replace discovery, or use `--now` to set the review time.
+`kaizen-scheduled config show [--for DIR]` shows effective settings and the report path; `config set [--for DIR] KEY=VALUE...` merges settings, including global `retention` and `retentionOverrides`. `audit` writes a global audit; `review` audits and reviews due projects. `review --dry-run` previews without writes or tokens; add `--json` for structured output. Repeat `--project-dir DIR` to replace discovery, or use `--now` to set the review time.
+
+`housekeep [--dry-run] [--audits DIR]` removes old generated audit files under the retention settings. Use `--dry-run` to preview deletions.
 
 Both audit and review accept `--audits`, `--python`, `--token-audit` and `--pricing` overrides. Review also accepts `--claude`, `--model` and `--max-turns`. Run each subcommand with `--help` for details.
 
-Under `<Claude config dir>/audits`, global reports are `token-audit-*.md`; `projects/index.json` is the registry. Each `projects/<key>/` holds `state.json`, project `token-audit-*.md` and `cycle-<date>.md`. Scheduler output goes to `run.log`.
+Under `<Claude config dir>/audits`, global reports are `token-audit-*.md`, extracts live in `extracts/`, and `projects/index.json` is the registry. Each `projects/<key>/` holds `state.json`, project `token-audit-*.md` and `cycle-<date>.md`. Scheduler output goes to `run.log`.
 
 ## dispatch-status
 

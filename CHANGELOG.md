@@ -2,6 +2,16 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.5.0 (2026-10-30)
+
+- token-audit: the by-agent table shows each subagent type's cost share, models and effort mix. A new extract file per report holds the same numbers per agent type, plus a hint for types that might run on a cheaper model. New `--extract-out` defaults to the audits folder's `extracts/`, never `--out`.
+- New `kaizen-scheduled housekeep` runs after every scheduled audit and review and at the end of an interactive cycle. It deletes the plugin's own old generated files: extracts and probe output after 30 days (200 MB cap), failed proposals and notice markers after 30 days, and reports and proposals after 365 days (newest 5 per folder and family kept). Settings `retention` (`auto`/`off`) and `retentionOverrides` are global only.
+- Scheduled auto runs can edit Markdown instruction files under the Claude and Codex config homes. Deny rules block settings, hooks, plugins, skills, commands, bin, credentials and every `.json`, `.toml`, `.sh`, `.py` and `.js` file under both homes, the Claude user config file, and the project's `.claude/settings*.json`. The rules cover Edit, Write and recognised file commands, not `cp` or scripts.
+- `docs/autonomy.md` adds exceptions to "Deleting things" for own generated data and files kaizen created earlier through `kaizen-backup undo`, and adds Markdown instruction files to the safe list.
+- Scheduled auto runs no longer allow `cp` or `touch`, which the deny rules don't cover. Deny rules are not built for paths that contain `,`, `(`, `)`, `*`, `?`, `[`, `]` or `\`; the review fails closed instead.
+- Config values are validated by type (integers, enums, objects, relative-path lists); invalid values fall back to the default with a warning.
+- Upgrade notes: re-run `install-schedule --apply` to refresh the installed runner. Housekeeping starts on the next scheduled run after that. Set `retention=off` to keep every file. Scheduled auto runs that previously could not touch the config homes can now edit the Markdown files listed above.
+
 ## 0.4.0 (2026-10-30)
 
 - The optional weekly review runs only for enrolled projects (those with `docs/kaizen/`) that had a session or a commit since their last review. It finds projects from recent Claude Code and Codex sessions, treats a repository's worktrees as one project, and has no project cap. Activity during a successful review does not make the project due again.

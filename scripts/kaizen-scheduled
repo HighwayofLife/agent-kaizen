@@ -6,11 +6,13 @@ Commands:
   config set [--for DIR] KEY=VALUE  merge global or project scheduled settings
   audit                            run the global token audit
   review [--dry-run]                audit and review every due project
+  housekeep [--dry-run]             delete expired generated audit files
 
 Global settings live in <Claude config dir>/agent-kaizen.json; project settings
 live in docs/kaizen/config.json. Interactive autonomy settings are left unchanged.
 """
 import argparse
+import fnmatch
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
@@ -42,8 +44,33 @@ def codex_home():
 # --- end paths helper ---
 
 
-DEFAULTS = {"enabled": True, "schedule": "active", "scheduledAutonomy": "propose"}
-CHOICES = {"schedule": ("active", "always", "off"), "scheduledAutonomy": ("propose", "auto")}
+def valid_retention_overrides(value):
+    return isinstance(value, dict) and all(
+        isinstance(name, str) and isinstance(limits, dict) and all(
+            key in ("days", "hours", "maxMB") and type(limit) is int and limit >= 1
+            for key, limit in limits.items())
+        for name, limits in value.items())
+
+
+def valid_relative_paths(value):
+    """Check relative path syntax only; do not resolve filesystem paths."""
+    return isinstance(value, list) and all(
+        isinstance(path, str) and bool(path) and not path.startswith("/")
+        and not re.match(r"^[A-Za-z]:", path) and "\\" not in path and "\0" not in path
+        and all(part not in ("", ".", "..") for part in path.split("/"))
+        for path in value)
+
+
+SCHEMA = {
+    "enabled": {"kind": "bool", "default": True, "global_only": True},
+    "schedule": {"kind": "enum", "default": "active", "choices": ("active", "always", "off")},
+    "scheduledAutonomy": {"kind": "enum", "default": "propose", "choices": ("propose", "auto")},
+    "retention": {"kind": "enum", "default": "auto", "choices": ("auto", "off"), "global_only": True},
+    "retentionOverrides": {"kind": "object", "default": {}, "global_only": True,
+                           "check": valid_retention_overrides},
+}
+DEFAULTS = {name: spec["default"] for name, spec in SCHEMA.items()}
+CHOICES = {name: spec["choices"] for name, spec in SCHEMA.items() if spec["kind"] == "enum"}
 HERE = Path(__file__).resolve().parent
 READ_ONLY_BASH = ["Bash(ls:*)", "Bash(wc:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(rg:*)",
                   "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(shasum:*)",
@@ -88,9 +115,19 @@ def load_config(path):
 
 
 def valid_value(name, value):
-    if name == "enabled":
+    spec = SCHEMA[name]
+    kind = spec["kind"]
+    if kind == "bool":
         return isinstance(value, bool)
-    return value in CHOICES[name]
+    if kind == "enum":
+        return isinstance(value, str) and value in spec["choices"]
+    if kind == "int":
+        return type(value) is int and value >= spec["minimum"]
+    if kind == "object":
+        return isinstance(value, dict) and spec["check"](value)
+    if kind == "paths":
+        return valid_relative_paths(value)
+    return False
 
 
 def effective(project_dir=None):
@@ -105,15 +142,15 @@ def effective(project_dir=None):
         for name in DEFAULTS:
             if name not in cfg:
                 continue
-            if name == "enabled" and source == "project":
-                print(f"config: {path}: enabled is global-only, ignored", file=sys.stderr)
+            if SCHEMA[name].get("global_only", False) and source == "project":
+                print(f"config: {path}: {name} is global-only, ignored", file=sys.stderr)
                 continue
             value = cfg[name]
             if not valid_value(name, value):
                 shown = value if isinstance(value, str) else json.dumps(value)
                 shown = shown.replace("\n", "\\n").replace("\r", "\\r")
                 fallback = result[name]["value"]
-                if isinstance(fallback, bool):
+                if not isinstance(fallback, str):
                     fallback = json.dumps(fallback)
                 print(f"config: {path}: {name}={shown} invalid, using {fallback}", file=sys.stderr)
                 continue
@@ -464,8 +501,11 @@ def review_dry_run(audits, project_dirs=None, now=None, options=None, json_outpu
             report = "<report path from audit stdout>"
             mode = "auto" if cfg["scheduledAutonomy"]["value"] == "auto" else "propose-only"
             print("audit command: " + shlex.join(audit_command(options, project.folder, project)))
-            print("review command: " + shlex.join(review_command(
-                options, mode, report, str(uuid.uuid4()))))
+            try:
+                print("review command: " + shlex.join(review_command(
+                    options, mode, report, str(uuid.uuid4()), project.canonical)))
+            except ValueError as error:
+                print(f"review command: not built ({error})")
     for path in not_enrolled:
         print(f"not enrolled: {path} (no docs/kaizen/ in it or any parent)")
     if not projects:
@@ -518,16 +558,41 @@ def audit_command(options, out, project=None):
         for path in sorted(project.paths):
             command.extend(["--cwd", str(path)])
         command.extend(["--days", "7"])
-    return command + ["--out", str(out), "--pricing", str(options.pricing)]
+    extracts = out.parent.parent / "extracts" if project is not None else out / "extracts"
+    return command + ["--out", str(out), "--pricing", str(options.pricing),
+                      "--extract-out", str(extracts)]
 
 
-def review_command(options, mode, report, session_id):
+def config_home_deny(project_dir=None):
+    """Protect config state while leaving Markdown instructions editable."""
+    def absolute(path):
+        path = path.resolve().as_posix()
+        # Rule syntax gives these characters meaning; fail closed rather than build a wrong rule.
+        bad = sorted(set(path) & set(",()*?[]\\"))
+        if bad:
+            raise ValueError(f"cannot build deny rules: path contains {''.join(bad)!r}: {path}")
+        return "//" + path.lstrip("/")
+
+    rules = []
+    for home in (claude_home(), codex_home()):
+        root = absolute(home)
+        for pattern in ("settings*.json", "hooks/**", "plugins/**", "skills/**", "commands/**",
+                        "bin/**", "**/*.json", "**/*.toml", "**/*.sh", "**/*.py", "**/*.js",
+                        ".credentials*", "auth.json"):
+            rules.append(f"Edit({root}/{pattern})")
+    rules.append(f"Edit({absolute(claude_json())})")
+    if project_dir is not None:
+        rules.append(f"Edit({absolute(Path(project_dir))}/.claude/settings*.json)")
+    return rules
+
+
+def review_command(options, mode, report, session_id, project_dir=None):
     auto = mode == "auto"
     allowed = REVIEW_TOOLS
     if auto:
         allowed_tools = ["Read", "Grep", "Glob", "Edit", "Write", "WebFetch", "WebSearch",
-                         *READ_ONLY_BASH, "Bash(cp:*)", "Bash(mkdir:*)", "Bash(diff:*)",
-                         "Bash(touch:*)", "Bash(cd:*)"]
+                         *READ_ONLY_BASH, "Bash(mkdir:*)", "Bash(diff:*)", "Bash(cd:*)"]
+        # No cp or touch: deny rules don't cover them, so they could write protected config.
         for path in (options.token_audit, HERE / "kaizen-backup"):
             if path == options.token_audit or path.is_file():
                 allowed_tools.extend([f"Bash(python3 {path}:*)", f"Bash({options.python} {path}:*)"])
@@ -542,11 +607,197 @@ def review_command(options, mode, report, session_id):
             command.extend(["--add-dir", str(path.resolve())])
     command.extend(["--allowedTools", allowed])
     if auto:
-        command.extend(["--disallowedTools", HARD_STOP_DENY])
+        command.extend(["--disallowedTools", ",".join([HARD_STOP_DENY, *config_home_deny(project_dir)])])
     return command + ["--permission-mode", "acceptEdits" if auto else "dontAsk"]
 
 
+# Patterns are relative to audits; each wildcard matches one path component.
+RETENTION_KINDS = {
+    "extracts": {"patterns": ("extracts/*.extract.json", "projects/*/*.extract.json",
+                              "projects/*/host-probe-*.json", "projects/*/friction-inputs-*.json"),
+                 "days": 30, "maxMB": 200},
+    "markers": {"patterns": ("projects/*/cycle-*.failed.md", "*.noticed-*",
+                             "projects/*/*.noticed-*"), "days": 30},
+    "reports": {"families": {
+        "token-audit": ("token-audit-*.md", "projects/*/token-audit-*.md"),
+        "cycle": ("projects/*/cycle-*.md",)}, "days": 365},
+}
+
+
+def retention_matches(root, pattern):
+    """Expand a pattern without traversing symlink directories."""
+    folders = [root]
+    parts = pattern.split("/")
+    for index, part in enumerate(parts):
+        matches = []
+        for folder in folders:
+            try:
+                if not stat.S_ISDIR(os.lstat(folder).st_mode):
+                    continue
+                with os.scandir(folder) as entries:
+                    matches.extend(Path(entry.path) for entry in entries
+                                   if fnmatch.fnmatchcase(entry.name, part)
+                                   and (index == len(parts) - 1
+                                        or entry.is_dir(follow_symlinks=False)))
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                log(f"housekeep: cannot scan {folder}: {error}")
+                continue
+        folders = matches
+    return folders
+
+
+def retention_stat(root, path):
+    """Only regular files inside the real audits root are eligible."""
+    try:
+        info = os.lstat(path)
+        if not stat.S_ISREG(info.st_mode):
+            return None
+        if not os.path.realpath(path).startswith(os.path.realpath(root).rstrip(os.sep) + os.sep):
+            return None
+        parent = path.parent
+        while parent != root:
+            if not stat.S_ISDIR(os.lstat(parent).st_mode):
+                return None
+            parent = parent.parent
+        return info
+    except OSError:
+        return None
+
+
+def housekeep(audits, cfg, dry_run=False, now=None):
+    """Plan retention in kind order, then apply the same plan used by dry-run."""
+    if cfg.get("retention", {}).get("value", "auto") == "off":
+        return []
+    audits = Path(audits).absolute()
+    current = datetime.now(timezone.utc) if now is None else now
+    current = current.timestamp() if isinstance(current, datetime) else current
+    overrides = cfg.get("retentionOverrides", {}).get("value", {})
+
+    def warn(reason):
+        print(f"housekeep: retentionOverrides: {reason}, ignored", file=sys.stderr)
+
+    valid = {}
+    if not isinstance(overrides, dict):
+        warn("expected an object")
+        overrides = {}
+    for kind, limits in overrides.items():
+        if kind not in RETENTION_KINDS:
+            warn(f"unknown kind {kind}")
+            continue
+        if not isinstance(limits, dict):
+            warn(f"{kind}: expected an object")
+            continue
+        valid[kind] = {}
+        for field, value in limits.items():
+            if field not in ("days", "hours", "maxMB"):
+                warn(f"{kind}: unknown field {field}")
+            elif type(value) is not int or value < 1:
+                warn(f"{kind}.{field}: expected an integer >= 1")
+            else:
+                valid[kind][field] = value
+    plan = []
+    planned = set()
+    identities = {}
+
+    def add(path, info, kind, reason):
+        if path not in planned:
+            planned.add(path)
+            identities[path] = (info.st_ino, info.st_dev, info.st_mtime_ns)
+            plan.append({"path": path.relative_to(audits).as_posix(), "kind": kind,
+                         "size": info.st_size, "reason": reason})
+
+    for kind, spec in RETENTION_KINDS.items():
+        limits = valid.get(kind, {})
+        window = (limits["hours"] * 3600 if "hours" in limits
+                  else limits.get("days", spec["days"]) * 86400)
+        cap = limits.get("maxMB", spec.get("maxMB"))
+        files, protected = {}, set()
+        families = spec.get("families", {"": spec.get("patterns", ())})
+        for family, patterns in families.items():
+            groups = {}
+            for pattern in patterns:
+                for path in retention_matches(audits, pattern):
+                    if family == "cycle" and path.name.endswith(".failed.md"):
+                        continue
+                    info = retention_stat(audits, path)
+                    if info is not None:
+                        files[path] = info
+                        groups.setdefault(path.parent, {})[path] = info
+            if kind == "reports":
+                for group in groups.values():
+                    protected.update(sorted(group, key=lambda p: (group[p].st_mtime, p.name),
+                                            reverse=True)[:5])
+        for path in sorted(files, key=lambda p: (files[p].st_mtime, p.as_posix())):
+            info = files[path]
+            if path not in protected and current - info.st_mtime > window:
+                add(path, info, kind, "age")
+                if kind == "reports":
+                    marker = path.with_suffix(".reviewed")
+                    marker_info = retention_stat(audits, marker)
+                    if marker_info is not None:
+                        add(marker, marker_info, kind, "report")
+        remaining = [p for p in files if p not in planned]
+        total = sum(files[p].st_size for p in remaining)
+        if cap is not None:
+            for path in sorted(remaining, key=lambda p: (files[p].st_mtime, p.as_posix())):
+                if total <= cap * 1024 * 1024:
+                    break
+                if path not in protected:
+                    add(path, files[path], kind, "cap")
+                    total -= files[path].st_size
+    touched = set()
+    completed = []
+    for entry in plan:
+        path = audits / entry["path"]
+        if not dry_run:
+            try:
+                info = retention_stat(audits, path)
+                if info is None or (info.st_ino, info.st_dev, info.st_mtime_ns) != identities[path]:
+                    log(f"housekeep: skipped {entry['path']}: file changed or missing")
+                    continue
+                path.unlink()
+            except OSError as error:
+                log(f"housekeep: skipped {entry['path']}: {error}")
+                continue
+            touched.add(path.parent)
+        completed.append(entry)
+        action = "would delete" if dry_run else "deleted"
+        log(f"housekeep: {action} {entry['path']} kind={entry['kind']} "
+            f"size={entry['size']} reason={entry['reason']}")
+    for folder in sorted(touched):
+        if folder == audits / "extracts" or folder.parent == audits / "projects":
+            try:
+                if stat.S_ISDIR(os.lstat(folder).st_mode):
+                    os.rmdir(folder)
+            except OSError:
+                pass
+    return completed
+
+
+def scheduled_housekeep(audits):
+    try:
+        housekeep(audits, effective())
+    except Exception as error:
+        log(f"housekeep: failed ({error})")
+
+
 def run_audit(audits, options):
+    try:
+        return _run_audit(audits, options)
+    finally:
+        scheduled_housekeep(audits)
+
+
+def run_review(audits, project_dirs, options, clock):
+    try:
+        return _run_review(audits, project_dirs, options, clock)
+    finally:
+        scheduled_housekeep(audits)
+
+
+def _run_audit(audits, options):
     audits.mkdir(parents=True, exist_ok=True)
     try:
         with (audits / "run.log").open("a", encoding="utf-8") as errors:
@@ -571,7 +822,7 @@ def report_path(stdout):
     return Path(lines[0].strip()).expanduser().resolve()
 
 
-def run_review(audits, project_dirs, options, clock):
+def _run_review(audits, project_dirs, options, clock):
     """Review projects serially; failed/killed runs leave reviewed_at unchanged.
 
     Their Codex sessions and git commits still count as activity at the next gate;
@@ -623,7 +874,7 @@ def run_review(audits, project_dirs, options, clock):
                     mode="w", encoding="utf-8", dir=project.folder,
                     prefix=proposal.name + ".", delete=False) as output:
                 temporary = Path(output.name)
-                result = subprocess.run(review_command(options, mode, report, session_id),
+                result = subprocess.run(review_command(options, mode, report, session_id, project.canonical),
                                         cwd=project.canonical, env=env, stdout=output, stderr=errors)
             if result.returncode == 0:
                 os.replace(temporary, proposal)
@@ -701,6 +952,9 @@ def main(argv=None):
         subparser.add_argument("--for", dest="project_dir", type=Path, help="project directory")
         if action == "set":
             subparser.add_argument("assignments", metavar="KEY=VALUE", nargs="+")
+    cleanup = commands.add_parser("housekeep", help="delete expired generated audit files")
+    cleanup.add_argument("--dry-run", action="store_true", help="preview deletions")
+    cleanup.add_argument("--audits", type=Path, help="override the audits folder")
     audit = commands.add_parser("audit", help="run the global token audit")
     review = commands.add_parser("review", help="audit and review due projects")
     review.add_argument("--json", action="store_true", help="with --dry-run, list project autonomy and sources as JSON")
@@ -720,6 +974,10 @@ def main(argv=None):
         parser.error("--json requires --dry-run")
     global LOG_TO_STDERR
     LOG_TO_STDERR = getattr(args, "json", False)
+    if args.command == "housekeep":
+        audits = (args.audits if args.audits is not None else audits_dir()).expanduser().resolve()
+        housekeep(audits, effective(), args.dry_run)
+        return 0
     if args.command in ("audit", "review"):
         if not getattr(args, "json", False) and effective()["enabled"]["value"] is False:
             log("skipped: disabled")
@@ -749,12 +1007,19 @@ def main(argv=None):
             name, separator, value = assignment.partition("=")
             if not separator or name not in DEFAULTS:
                 parser.error(f"unknown setting or invalid assignment: {assignment}")
-            if name == "enabled":
-                if args.project_dir is not None:
-                    parser.error("enabled is global-only")
+            spec = SCHEMA[name]
+            if spec.get("global_only", False) and args.project_dir is not None:
+                parser.error(f"{name} is global-only")
+            kind = spec["kind"]
+            if kind == "bool":
                 if value not in ("true", "false"):
-                    parser.error(f"invalid value for enabled: {value}; use true or false")
+                    parser.error(f"invalid value for {name}: {value}; use true or false")
                 value = value == "true"
+            elif kind in ("int", "object", "paths"):
+                try:
+                    value = int(value) if kind == "int" else json.loads(value)
+                except ValueError:
+                    parser.error(f"invalid value for {name}: {value}")
             if not valid_value(name, value):
                 parser.error(f"invalid value for {name}: {value}")
             updates[name] = value

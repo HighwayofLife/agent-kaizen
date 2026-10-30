@@ -29,6 +29,8 @@ This is the entry point when you don't know which skill to run. It runs the loop
    - Read "In `auto`, these are NOT reasons to skip a change" in `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md` before deciding to skip anything.
    - **`propose-only`:** print the proposal and stop.
 
+7. **Tidy.** Outside scheduled runs, run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled housekeep` once. Mention in the summary how many of the plugin's own old files it removed. In a scheduled run the runner does this; skip it. Use `--dry-run` first if the user asked to see what would go.
+
 ## Done when
 
 The ledger is up to date and a short, ranked proposal exists, either applied with your OK or written to the proposal file.

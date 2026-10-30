@@ -31,7 +31,7 @@ Optional settings in the same file:
 
 The person chose `auto` so they wouldn't be asked. Don't invent extra conditions:
 - **"No measured saving yet."** Measuring comes after the change; that's what the ledger and the next audit are for. A reasoned expected effect is enough.
-- **"The user hasn't confirmed I may edit this file."** In `auto`, every file under the project and `~/.claude/` (CLAUDE.md, imported docs, agents, skills, the `~/.claude/orchestrator/` docs) and `~/.codex/AGENTS.md` is in scope, apart from the hard stops (permissions, hooks being removed, secrets).
+- **"The user hasn't confirmed I may edit this file."** In `auto`, every file under the project and `~/.claude/` (CLAUDE.md, imported docs, agents, skills, the `~/.claude/orchestrator/` docs) and `~/.codex/AGENTS.md` is in scope, apart from the hard stops (permissions, hooks being removed, secrets). In scheduled runs only Markdown instruction files under the config homes are writable (see Permissions).
 - **"It needs web access."** Web research (models, whats-new, roster research) is free and allowed. "Spending money" means buying a plan or paying for API calls, not reading docs.
 - **"It's a big change."** Make a smaller version that you can verify, for example trimming one section of one file.
 
@@ -44,6 +44,7 @@ Reversible and local, with no effect on what agents are allowed to do:
 - Shortening or deduplicating instruction files (CLAUDE.md, AGENTS.md, agent and skill descriptions), **as long as no rule is dropped**. Merged rules stay word-for-word in the diff.
 - Adding a tools-before-tokens line, a code-map line or a topic-doc pointer to instructions.
 - Adding one short, confirmed repo-fact line to a project's CLAUDE.md.
+- Editing Markdown instruction files under the Claude and Codex homes (CLAUDE.md, agents/*.md, rules/**/*.md, memory MEMORY.md files, Codex AGENTS.md), in scheduled auto runs too; settings, hooks, plugins, skills, commands, bin, credentials and every .json, .toml, .sh, .py and .js file under the homes stay denied in scheduled runs.
 - Setting `disable-model-invocation: true` on your own user-triggered skills.
 - Switching a single routing row to a model already in your roster, as a one-row trial.
 - Writing new scripts under `tools/` or `~/.claude/bin/` (new files only; nothing existing is replaced).
@@ -57,7 +58,7 @@ rare workflow.
 - Anything involving secrets: reading, printing, moving or storing keys and tokens, or `.env` files.
 - Spending money or using a new vendor: new subscriptions or API plans, or sending repo code to a vendor that hasn't seen it (for example the roster bake-off).
 - Loosening permissions: `bypassPermissions`, broad allow rules, or removing deny rules or safety hooks.
-- Deleting things: transcripts, audits, backups, branches, or files Claude did not create in this run.
+- Deleting things: transcripts, backups, branches, build caches in active worktrees, or files kaizen did not create. Exceptions: the plugin's own generated data under <audits> (deleted on the retention schedule in every mode; see the retention and retentionOverrides settings in scheduling.md); files kaizen created in an earlier run, through `kaizen-backup undo`.
 - Outward-facing actions: commits, pushes, PRs, publishing, messages.
 - Installing packages, unless `allowInstalls` is true.
 - Installing, changing or removing scheduled jobs (launchd, cron).
@@ -84,9 +85,9 @@ Use the bundled script for the bookkeeping. Call `~/.claude/bin/kaizen-backup` i
 
 The autonomy mode decides what the *skills* will do. Claude Code's own permission prompts still apply. To run without tool prompts:
 - **Interactive:** use a permission mode that auto-accepts edits (`acceptEdits`, or auto mode if your plan has it) for the session. Some files, such as your settings, may still prompt; skills skip what they're not allowed to do and list it.
-- **Scheduled:** `install-schedule --auto all|none|DIR...` sets `scheduledAutonomy` globally or for selected projects. The `kaizen-scheduled` runner uses `dontAsk` in propose mode and `acceptEdits` in auto mode. Both restrict available and allowed tools; propose mode includes restricted read-only Bash, and auto mode adds edit tools and selected commands. Auto mode also denies hard-stop commands. Both use `--strict-mcp-config`. See [scheduled permissions](scheduling.md#unattended-permissions) for the exact lists.
+- **Scheduled:** `install-schedule --auto all|none|DIR...` sets `scheduledAutonomy` globally or for selected projects. The `kaizen-scheduled` runner uses `dontAsk` in propose mode and `acceptEdits` in auto mode. Both restrict available and allowed tools; propose mode includes restricted read-only Bash, and auto mode adds edit tools and selected commands. Auto mode also denies hard-stop commands. It passes `--disallowedTools` deny rules using `Edit(//<abs>/...)` for both config homes: settings*.json, hooks, plugins, skills, commands, bin, `.credentials*`, `auth.json`, and every `.json`, `.toml`, `.sh`, `.py` and `.js` under them. It also denies edits to the Claude user config file and the project's `.claude/settings*.json`. Markdown instruction files stay editable. Both modes use `--strict-mcp-config`. See [scheduled permissions](scheduling.md#unattended-permissions) for the exact lists.
 
-  It never uses `bypassPermissions`. Apply changes to your Claude or Codex configuration interactively, where you see each edit.
+  Deny rules cover Edit/Write and the file commands Claude Code recognises (cat, sed, tee, redirects). They do not cover `cp` or scripts, so every script the runner allows re-checks its own paths. It never uses `bypassPermissions`. Changes to settings, hooks and permissions are still made interactively, where you see each edit.
 
 ## Undo
 

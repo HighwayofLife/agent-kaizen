@@ -49,6 +49,8 @@ class RunnerTests(StubCase):
             "enabled": {"value": True, "source": "default"},
             "schedule": {"value": "active", "source": "default"},
             "scheduledAutonomy": {"value": "propose", "source": "default"},
+            "retention": {"value": "auto", "source": "default"},
+            "retentionOverrides": {"value": {}, "source": "default"},
             "reports": None,
         })
         self.assertEqual(result.stderr, "")
@@ -71,6 +73,107 @@ class RunnerTests(StubCase):
                 self.assertEqual(data[name], {"value": value, "source": source})
                 if global_cfg.get("enabled") is False:
                     self.assertEqual(data["enabled"], {"value": False, "source": "global"})
+
+    def test_config_typed_validators(self):
+        valid = self.runner["valid_value"]
+        with patch.dict(self.runner["SCHEMA"], {"count": {"kind": "int", "minimum": 5}}):
+            self.assertTrue(valid("count", 5))
+            for value in (True, "5", 4.0, 4, None):
+                with self.subTest(value=value):
+                    self.assertFalse(valid("count", value))
+        self.assertTrue(valid("retention", "off"))
+        for value in ("never", True, [], {}):
+            self.assertFalse(valid("retention", value))
+        for value in ({}, {"samples": {}}, {"samples": {"days": 30, "hours": 1, "maxMB": 2}}):
+            self.assertTrue(valid("retentionOverrides", value))
+        for value in ({"samples": {"days": 0}}, {"samples": {"weeks": 1}}, {"samples": 5},
+                      {"samples": {"days": True}}, {"samples": {"hours": 1.0}},
+                      {"samples": {"maxMB": "5"}}, {1: {"days": 30}}, [], None):
+            with self.subTest(value=value):
+                self.assertFalse(valid("retentionOverrides", value))
+
+    def test_config_relative_paths_are_syntax_only(self):
+        valid = self.runner["valid_relative_paths"]
+        self.assertTrue(valid(["out", "build/cache"]))
+        self.assertTrue(valid([]))
+        for value in (["/abs"], [".."], ["a/../b"], ["."], [""], ["a//b"], ["C:x"],
+                      ["a\\b"], ["a\0b"], ["a/./b"], ["a/"], "out", ("out",), [5]):
+            with self.subTest(value=value):
+                self.assertFalse(valid(value))
+        with patch.dict(self.runner["SCHEMA"], {"folders": {"kind": "paths"}}):
+            self.assertTrue(self.runner["valid_value"]("folders", ["out"]))
+            self.assertFalse(self.runner["valid_value"]("folders", ["../out"]))
+
+    def test_config_set_typed_values(self):
+        schema = {"count": {"kind": "int", "minimum": 5, "default": 5},
+                  "folders": {"kind": "paths", "default": []}}
+        with patch.dict(self.runner["SCHEMA"], schema), \
+                patch.dict(self.runner["DEFAULTS"], {name: spec["default"] for name, spec in schema.items()}):
+            for assignment in ("count=no", "count=4", "count=4.0", "folders=notjson", 'folders=[".."]'):
+                with self.subTest(assignment=assignment), redirect_stderr(io.StringIO()):
+                    with self.assertRaises(SystemExit) as error:
+                        self.runner["main"](["config", "set", "retention=off", assignment])
+                    self.assertEqual(error.exception.code, 2)
+                    self.assertFalse(self.global_path.exists())
+            with redirect_stdout(io.StringIO()) as output:
+                self.runner["main"](["config", "set", "count=6", 'folders=["build/cache"]'])
+            self.assertEqual(json.loads(self.global_path.read_text()), {"count": 6, "folders": ["build/cache"]})
+            shown = json.loads(output.getvalue())
+            self.assertEqual(shown["count"], {"value": 6, "source": "global"})
+            self.assertEqual(shown["folders"], {"value": ["build/cache"], "source": "global"})
+
+    def test_config_retention_set_and_invalid_assignments(self):
+        invalid = ("retention=never", "retentionOverrides=notjson", 'retentionOverrides={"samples":{"days":0}}')
+        for existing in (False, True):
+            for assignment in invalid:
+                with self.subTest(existing=existing, assignment=assignment):
+                    original = '{"schedule":"active"}\n'
+                    if existing:
+                        write(self.global_path, original)
+                    self.config("set", "schedule=off", assignment, code=2)
+                    self.assertEqual(self.global_path.exists(), existing)
+                    if existing:
+                        self.assertEqual(self.global_path.read_text(), original)
+        self.config("set", "retention=off", 'retentionOverrides={"samples":{"days":30}}')
+        stored = json.loads(self.global_path.read_text())
+        self.assertEqual(stored["retention"], "off")
+        self.assertEqual(stored["retentionOverrides"], {"samples": {"days": 30}})
+
+    def test_config_retention_global_only(self):
+        for name, value in (("retention", "off"), ("retentionOverrides", "{}")):
+            for existing in (False, True):
+                with self.subTest(name=name, existing=existing):
+                    original = '{"schedule":"active"}\n'
+                    if existing:
+                        write(self.project_path, original)
+                    else:
+                        self.project_path.unlink(missing_ok=True)
+                    result = self.config("set", "schedule=off", f"{name}={value}", "--for", self.project, code=2)
+                    self.assertIn(f"{name} is global-only", result.stderr)
+                    self.assertEqual(self.project_path.exists(), existing)
+                    if existing:
+                        self.assertEqual(self.project_path.read_text(), original)
+                    self.assertFalse(self.global_path.exists())
+        write(self.global_path, '{"retention":"off","retentionOverrides":{"samples":{"days":30}}}')
+        write(self.project_path, '{"retention":"auto","retentionOverrides":{}}')
+        result = self.config("show", "--for", self.project)
+        self.assertEqual(result.stderr.splitlines(), [
+            f"config: {self.project_path}: {name} is global-only, ignored"
+            for name in ("retention", "retentionOverrides")])
+        shown = json.loads(result.stdout)
+        self.assertEqual(shown["retention"], {"value": "off", "source": "global"})
+        self.assertEqual(shown["retentionOverrides"], {"value": {"samples": {"days": 30}}, "source": "global"})
+
+    def test_config_retention_invalid_values_warn_and_use_defaults(self):
+        for name, value, fallback in (("retention", "never", "auto"),
+                                      ("retentionOverrides", {"samples": {"days": 0}}, {}),
+                                      ("retentionOverrides", [], {})):
+            with self.subTest(name=name, value=value):
+                write(self.global_path, json.dumps({name: value}))
+                result = self.config("show")
+                shown = value if isinstance(value, str) else json.dumps(value)
+                self.assertEqual(result.stderr, f"config: {self.global_path}: {name}={shown} invalid, using {fallback}\n")
+                self.assertEqual(json.loads(result.stdout)[name], {"value": fallback, "source": "default"})
 
     def test_interactive_autonomy_is_ignored(self):
         write(self.global_path, '{"autonomy": "auto"}')
@@ -863,6 +966,25 @@ class ExecutionTests(DiscoveryCase):
     def values(argv, flag):
         return [argv[index + 1] for index, value in enumerate(argv) if value == flag]
 
+    def expected_config_deny(self, project=None):
+        rules = []
+        for home in (self.cfg.resolve(), self.cx.resolve()):
+            root = '//' + home.as_posix().lstrip('/')
+            rules.extend([
+                f'Edit({root}/settings*.json)', f'Edit({root}/hooks/**)',
+                f'Edit({root}/plugins/**)', f'Edit({root}/skills/**)',
+                f'Edit({root}/commands/**)', f'Edit({root}/bin/**)',
+                f'Edit({root}/**/*.json)', f'Edit({root}/**/*.toml)',
+                f'Edit({root}/**/*.sh)', f'Edit({root}/**/*.py)', f'Edit({root}/**/*.js)',
+                f'Edit({root}/.credentials*)', f'Edit({root}/auth.json)',
+            ])
+        config = (self.cfg / '.claude.json').resolve().as_posix().lstrip('/')
+        rules.append(f'Edit(//{config})')
+        if project is not None:
+            root = project.resolve().as_posix().lstrip('/')
+            rules.append(f'Edit(//{root}/.claude/settings*.json)')
+        return rules
+
     def test_two_due_projects_have_independent_commands_outputs_and_state(self):
         b, a = self.due('b project'), self.due('a project')
         before = self.runner.now()
@@ -974,7 +1096,17 @@ class ExecutionTests(DiscoveryCase):
                 for tool in self.runner.READ_ONLY_BASH:
                     self.assertIn(tool, allowed)
                 if auto:
-                    self.assertEqual(self.values(argv, '--disallowedTools'), [self.runner.HARD_STOP_DENY])
+                    rules = self.expected_config_deny(path)
+                    self.assertEqual(len(rules), 28)
+                    self.assertEqual(self.values(argv, '--disallowedTools'),
+                                     [','.join([self.runner.HARD_STOP_DENY, *rules])])
+                    for rule in rules:
+                        self.assertFalse(rule.startswith('Write('))
+                        for text in ('.md', 'CLAUDE', 'agents', 'rules'):
+                            self.assertNotIn(text, rule)
+                    root = '//' + self.cfg.as_posix().lstrip('/')
+                    for pattern in ('settings*.json', 'hooks/**', '**/*.json'):
+                        self.assertIn(f'Edit({root}/{pattern})', rules)
                     for helper in (self.audit, SCRIPTS / 'kaizen-backup'):
                         self.assertIn(f'Bash(python3 {helper}:*)', allowed)
                         self.assertIn(f'Bash({sys.executable} {helper}:*)', allowed)
@@ -982,6 +1114,80 @@ class ExecutionTests(DiscoveryCase):
                 else:
                     self.assertEqual(allowed, self.runner.REVIEW_TOOLS)
                 self.assertNotIn('bypassPermissions', argv)
+
+    def test_permission_config_rules_resolve_missing_homes_and_default_user_config(self):
+        self.assertFalse(self.cfg.exists())
+        self.assertFalse(self.cx.exists())
+        self.assertEqual(self.runner.config_home_deny(), self.expected_config_deny())
+        self.env.pop('CLAUDE_CONFIG_DIR')
+        self.env.pop('CODEX_HOME')
+        with patch.dict(os.environ, self.env, clear=True):
+            rules = self.runner.config_home_deny()
+        root = '//' + self.home.resolve().as_posix().lstrip('/')
+        self.assertEqual(rules[0], f'Edit({root}/.claude/settings*.json)')
+        self.assertEqual(rules[13], f'Edit({root}/.codex/settings*.json)')
+        self.assertEqual(rules[-1], f'Edit({root}/.claude.json)')
+        target = self.root / 'actual config'
+        target.mkdir()
+        self.cfg.symlink_to(target, target_is_directory=True)
+        with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(self.cfg)}):
+            rules = self.runner.config_home_deny()
+        root = '//' + target.as_posix().lstrip('/')
+        self.assertEqual(rules[0], f'Edit({root}/settings*.json)')
+        self.assertEqual(rules[-1], f'Edit({root}/.claude.json)')
+
+    def test_permission_comma_paths_fail_closed_before_claude(self):
+        path = self.due('comma home')
+        write(path / 'docs/kaizen/config.json', '{"scheduledAutonomy":"auto"}')
+        options = self.runner.command_options(type('Args', (), {'dry_run': True})())
+        for name in ('CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'project', 'claude_json'):
+            comma = self.root / ('bad,' + name)
+            environment = {name: str(comma)} if name in ('CLAUDE_CONFIG_DIR', 'CODEX_HOME') else {}
+            project = comma if name == 'project' else path
+            user_config = comma if name == 'claude_json' else self.cfg / '.claude.json'
+            with self.subTest(name=name), patch.dict(os.environ, environment), \
+                    patch.object(self.runner, 'claude_json', return_value=user_config):
+                with self.assertRaisesRegex(ValueError, "cannot build deny rules: path contains ',':"):
+                    self.runner.review_command(options, 'auto', 'report', 'session', project)
+                self.assertNotIn('--disallowedTools', self.runner.review_command(
+                    options, 'propose-only', 'report', 'session', project))
+        self.env['CODEX_HOME'] = str(self.root / 'bad,codex')
+        result = self.review('--project-dir', path)
+        self.assertIn(f"{path}: failed (cannot build deny rules: path contains ',':", result.stdout)
+        self.assertEqual(self.state(path)['status'], 'failed')
+        self.assertFalse(self.record.exists())
+
+    def test_permission_rule_metacharacters_fail_closed(self):
+        path = self.due('glob home')
+        write(path / 'docs/kaizen/config.json', '{"scheduledAutonomy":"auto"}')
+        options = self.runner.command_options(type('Args', (), {'dry_run': True})())
+        for char in '()*?[]':
+            with self.subTest(char=char), patch.dict(os.environ, {'CODEX_HOME': str(self.root / f'bad{char}codex')}):
+                with self.assertRaisesRegex(ValueError, 'cannot build deny rules: path contains'):
+                    self.runner.review_command(options, 'auto', 'report', 'session', path)
+        self.env['CODEX_HOME'] = str(self.root / 'bad*codex')
+        result = self.run_script('kaizen-scheduled', 'review', '--dry-run', '--audits', self.audits,
+                                 '--project-dir', path)
+        self.assertIn("review command: not built (cannot build deny rules: path contains '*':", result.stdout)
+        self.assertNotIn('Traceback', result.stderr)
+
+    def test_permission_auto_allows_no_cp_or_touch(self):
+        options = self.runner.command_options(type('Args', (), {'dry_run': True})())
+        command = self.runner.review_command(options, 'auto', 'report', 'session')
+        allowed = command[command.index('--allowedTools') + 1].split(',')
+        self.assertNotIn('Bash(cp:*)', allowed)
+        self.assertNotIn('Bash(touch:*)', allowed)
+
+    def test_permission_auto_dry_run_has_same_deny_rules(self):
+        path = self.due('auto dry project')
+        write(path / 'docs/kaizen/config.json', '{"scheduledAutonomy":"auto"}')
+        before = {p: p.read_bytes() if p.is_file() else None for p in self.root.rglob('*')}
+        output = self.review('--dry-run').stdout
+        command = shlex.split(next(line.split('review command: ', 1)[1]
+                                   for line in output.splitlines() if 'review command: ' in line))
+        expected = ','.join([self.runner.HARD_STOP_DENY, *self.expected_config_deny(path)])
+        self.assertEqual(self.values(command, '--disallowedTools'), [expected])
+        self.assertEqual(before, {p: p.read_bytes() if p.is_file() else None for p in self.root.rglob('*')})
 
     def test_disabled_runs_nothing_and_writes_nothing(self):
         self.due('disabled')
@@ -1107,7 +1313,8 @@ class ExecutionTests(DiscoveryCase):
             with self.subTest(exit_code=exit_code):
                 self.env['STUB_AUDIT_EXIT'] = str(exit_code)
                 result = self.audit_run(code=exit_code)
-                self.assertEqual(self.audit_calls()[-1], ['--out', str(self.audits), '--pricing', str(self.pricing)])
+                self.assertEqual(self.audit_calls()[-1], ['--out', str(self.audits), '--pricing', str(self.pricing),
+                                                        '--extract-out', str(self.audits / 'extracts')])
                 message = f'audit: failed (exit {exit_code})' if exit_code else f'audit: ok {self.audits / "token-audit-stub.md"}'
                 self.assertIn(message, result.stdout)
                 self.assertEqual(len(result.stdout.splitlines()), 1)
@@ -1126,7 +1333,8 @@ class ExecutionTests(DiscoveryCase):
         project = self.runner.Project(path, [path], self.folder(path))
         argv = self.runner.audit_command(options, project.folder, project)
         self.assertEqual(argv[2:], ['--cwd', str(path), '--days', '7', '--out', str(project.folder),
-                                   '--pricing', str(SCRIPTS / 'pricing.json')])
+                                   '--pricing', str(SCRIPTS / 'pricing.json'),
+                                   '--extract-out', str(self.audits / 'extracts')])
 
     def test_dry_run_commands_are_quoted_and_do_not_write_or_run(self):
         path = self.due('dry project')
@@ -1135,7 +1343,8 @@ class ExecutionTests(DiscoveryCase):
         audit = shlex.split(next(line.split('audit command: ', 1)[1] for line in output.splitlines() if 'audit command: ' in line))
         review = shlex.split(next(line.split('review command: ', 1)[1] for line in output.splitlines() if 'review command: ' in line))
         self.assertEqual(audit, [sys.executable, str(self.audit), '--cwd', str(path),
-                                 '--days', '7', '--out', str(self.folder(path)), '--pricing', str(self.pricing)])
+                                 '--days', '7', '--out', str(self.folder(path)), '--pricing', str(self.pricing),
+                                 '--extract-out', str(self.audits / 'extracts')])
         self.assertEqual(review[0], str(self.claude))
         self.assertEqual(self.values(review, '-p'), ['/agent-kaizen:cycle propose-only <report path from audit stdout>'])
         uuid.UUID(self.values(review, '--session-id')[0])

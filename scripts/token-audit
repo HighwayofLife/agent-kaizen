@@ -4,12 +4,14 @@ import argparse
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 import json
+import math
 import os
 from pathlib import Path
 import re
 import shlex
 import statistics
 import sys
+import tempfile
 
 
 # --- paths helper ---
@@ -44,6 +46,7 @@ JSON_DECODER = json.JSONDecoder()
 METADATA_FIELDS = {key: re.compile(('"' + key + r'"\s*:\s*').encode()) for key in (
     "tools", "addedNames", "readdedNames", "surfacedDefinitions", "removedNames")}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*=")
+CHEAPER_MODEL_THRESHOLDS = dict(cost_share=0.05, calls_median=15, result_chars_median=4000)
 
 
 def date_time(value):
@@ -173,11 +176,16 @@ def load_pricing(path):
         return {}, f"Pricing file unavailable: {path} ({exc})"
 
 
-def price(data, model, agent, usage, codex=False):
-    pricing = data["_pricing"]
+def pricing_key(pricing, model):
     key = model if model in pricing.get("models", {}) else next((
         pricing["aliases"][prefix] for prefix in sorted(pricing.get("aliases", {}), key=len, reverse=True)
         if model.startswith(prefix)), None)
+    return key if key in pricing.get("models", {}) else None
+
+
+def price(data, model, agent, usage, codex=False):
+    pricing = data["_pricing"]
+    key = pricing_key(pricing, model)
     rates = pricing.get("models", {}).get(key)
     if codex:
         cached = usage.get("cached_input_tokens", 0) or 0
@@ -333,10 +341,12 @@ def finish_turn(turn, project, session_id, agent, data):
         return
     stuck = data["stuck_turns"]
     stuck["turns"] += 1
+    data["_agent_turns"][agent] += 1
     failures = Counter(event[0] for event in turn["failures"])
     flagged = [(signature, count) for signature, count in failures.items() if count >= data["_options"]["stuck_repeats"]]
     if flagged:
         stuck["flagged_turns"] += 1
+        data["_agent_flagged"][agent] += 1
         stuck["tool_calls"] += turn["calls"]
         stuck["cost"] += turn["cost"]
         for signature, count in flagged:
@@ -418,6 +428,12 @@ def scan_claude(path, agent, since, data, seen_messages, project):
         usage = message.get("usage")
         if row.get("type") == "assistant" and isinstance(usage, dict) and usage and not usage_seen:
             model = message.get("model", "unknown")
+            if not isinstance(model, str):
+                model = "unknown"
+            if not main:
+                label = row.get("perTurnEffort") or row.get("effort") or "unknown"
+                data["_agent_models"][agent][model] += 1
+                data["_agent_effort"][agent][label if isinstance(label, str) else "unknown"] += 1
             add(data["models"][model], usage)
             add(counter, usage)
             cost = price(data, model, agent or "main", usage)
@@ -481,8 +497,13 @@ def scan_claude(path, agent, since, data, seen_messages, project):
                     data["tool_chars"][name] += chars
                     data["tool_counts"][name] += 1
                     data["images"] += image_count(result)
-                elif head:
-                    data["bash_chars"][agent][head] += chars
+                    if original_name == "Agent" and name.startswith("Agent:"):
+                        data["_agent_result_chars"][name[len("Agent:"):]].append(chars)
+                else:
+                    data["_agent_results"][agent] += 1
+                    data["_agent_failed"][agent] += int(failed)
+                    if head:
+                        data["bash_chars"][agent][head] += chars
     finish_turn(turn, project, session_id, agent or "main", data)
     if observed["active"]:
         data["_observed"][project].append((session_id, observed))
@@ -609,6 +630,9 @@ def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=No
                 deferred_tools_unused=0, stuck_turns=dict(turns=0, flagged_turns=0, tool_calls=0, cost=0, signatures=[]),
                 repeat_failures=[], unused_tools=[])
     data.update(_pricing=pricing, _options=options, _observed=defaultdict(list), _tool_universe=set(),
+                _agent_models=defaultdict(Counter), _agent_effort=defaultdict(Counter),
+                _agent_turns=Counter(), _agent_flagged=Counter(), _agent_results=Counter(),
+                _agent_failed=Counter(), _agent_result_chars=defaultdict(list),
                 _cwd=cwd, _cwd_observed=defaultdict(set),
                 _failures=defaultdict(lambda: dict(sessions=set(), occurrences=0, worked_instead=set())))
     seen = set()
@@ -708,10 +732,40 @@ def configured_servers(project, observed, config, cwd=None, observed_cwds=()):
     return servers
 
 
+def agent_usage(data):
+    pricing = data["_pricing"]
+    rates = pricing.get("models", {})
+    cheapest = min((rate.get("output", 0) for key, rate in rates.items()
+                    if key.startswith("claude-")), default=None)
+    result = []
+    for agent, spawns in data["agents"].items():
+        calls = sorted(spawn["calls"] for spawn in spawns)
+        cost = data["cost"]["by_agent"].get(agent, 0)
+        share = cost / data["cost"]["total"] if data["cost"]["total"] else 0
+        models = dict(data["_agent_models"][agent])
+        chars = data["_agent_result_chars"][agent]
+        median_chars = round(statistics.median(chars)) if chars else None
+        median_calls = statistics.median(calls)
+        thresholds = CHEAPER_MODEL_THRESHOLDS
+        candidate = (share >= thresholds["cost_share"] and median_calls <= thresholds["calls_median"]
+                     and median_chars is not None and median_chars <= thresholds["result_chars_median"]
+                     and cheapest is not None and any(
+                         rates[key].get("output", 0) > cheapest for model in models
+                         for key in [pricing_key(pricing, model)] if key is not None))
+        result.append(dict(agent=agent, spawns=len(spawns), calls_median=median_calls,
+            calls_p90=calls[math.ceil(0.9 * len(calls)) - 1], cost=round(cost, 6), cost_share=round(share, 6),
+            models=models, effort=dict(data["_agent_effort"][agent]), result_chars_median=median_chars,
+            stuck_share=round(data["_agent_flagged"][agent] / max(1, data["_agent_turns"][agent]), 6),
+            failure_rate=round(data["_agent_failed"][agent] / max(1, data["_agent_results"][agent]), 6),
+            cheaper_model_candidate=candidate))
+    return sorted(result, key=lambda row: (-row["cost"], row["agent"]))
+
+
 def finalize_measurements(data, scanned, since):
     cost, stuck = data["cost"], data["stuck_turns"]
     cost["shares"] = {key: value / cost["total"] if cost["total"] else 0
                       for key, value in cost["components"].items()}
+    data["agent_usage"] = agent_usage(data)
     stuck["share"] = stuck["flagged_turns"] / max(1, stuck["turns"])
     stuck["cost_share"] = stuck["cost"] / cost["total"] if cost["total"] else 0
     grouped = {}
@@ -920,6 +974,7 @@ def avg(counter):
 
 def agent_stats(data):
     result = []
+    usage = {row["agent"]: row for row in data["agent_usage"]}
     for name, spawns in data["agents"].items():
         calls = [spawn["calls"] for spawn in spawns]
         median = statistics.median(calls)
@@ -927,8 +982,14 @@ def agent_stats(data):
         flag = " ⚠" if median > 120 else ""
         brief = data["briefs"].get(name)
         brief_text = f"{brief['median']:g}/{brief['max']}" if brief else "-"
-        result.append((ctx, name, f"{cell(name)}{flag} | {len(spawns)} | {median:g}/{max(calls)} | "
-                       f"{ctx} | {round(ctx / sum(calls))} | {statistics.median(s['minutes'] for s in spawns):.1f} | {brief_text}"))
+        row = usage[name]
+        models = ", ".join(sorted(row["models"], key=lambda model: (-row["models"][model], model))[:3]) or "-"
+        effort = ", ".join(f"{label} {count}" for label, count in sorted(
+            row["effort"].items(), key=lambda pair: (-pair[1], pair[0]))) or "-"
+        values = (name + flag, len(spawns), f"{median:g}/{max(calls)}", ctx, round(ctx / sum(calls)),
+                  f"{statistics.median(s['minutes'] for s in spawns):.1f}", brief_text,
+                  f"{row['cost_share']:.1%}", models, effort)
+        result.append((ctx, name, " | ".join(cell(value) for value in values)))
     return sorted(result, reverse=True)
 
 
@@ -994,7 +1055,7 @@ def report(data, out, scope):
                      [f"{cell(s['id'])}{' ⚠' if s['context'] > s['calls'] * 150000 or s['peak'] > 250000 else ''} | "
                       f"{s['date']} | {s['calls']} | {avg(s)} | {s['peak']}" for s in sessions]))
     agents = agent_stats(data)
-    sections.append(("3. By agent type", ["Agent | Spawns | Median/max calls | Context | Avg context | Median minutes | Median/max brief chars"],
+    sections.append(("3. By agent type", ["Agent | Spawns | Median/max calls | Context | Avg context | Median minutes | Median/max brief chars | Cost share | Models | Effort"],
                      [row for _, _, row in agents]))
     sections.append(("4. Orchestrator turns by trigger", ["Trigger | Turns | Avg context"],
                      [f"{trigger} | {data['triggers'][trigger]['calls']} | {avg(data['triggers'][trigger])}"
@@ -1063,7 +1124,8 @@ def report(data, out, scope):
             headers.append(" | ".join("---" for _ in headers[-1].split(" | ")))
     lines = [*data["parser_warnings"], "# Token audit", f"Since: {data['since']} (UTC; Claude calls in window, Codex final session totals).",
              *headline, "<!-- token-audit-headline " + json.dumps(h) + " -->",
-             "<!-- token-audit-scope " + json.dumps(scope, sort_keys=True) + " -->"]
+             "<!-- token-audit-scope " + json.dumps(scope, sort_keys=True) + " -->",
+             "<!-- token-audit-extract " + json.dumps(dict(v=1, file=out.stem + ".extract.json")) + " -->"]
     if data["warnings"]:
         lines.append("Skipped: " + "; ".join(f"{n} {key}" for key, n in data["warnings"].items()))
     # Fairly share the remaining 80-line budget; JSON retains every row.
@@ -1091,6 +1153,31 @@ def report(data, out, scope):
     return "\n".join(lines + extra) + "\n", headline + headlines
 
 
+def write_extract(data, out, directory, scope):
+    temporary = None
+    try:
+        directory = directory.expanduser().resolve()
+        directory.mkdir(parents=True, exist_ok=True)
+        path = directory / (out.stem + ".extract.json")
+        value = dict(v=1, scope=scope, since=data["since"], report=out.name,
+                     usage=dict(agents=data["agent_usage"], sessions=[], task_switches=[], instructions=[]))
+        with tempfile.NamedTemporaryFile(mode="w", dir=directory, delete=False) as stream:
+            temporary = stream.name
+            json.dump(value, stream)
+            stream.write("\n")
+        os.replace(temporary, path)
+        return str(path)
+    except OSError as exc:
+        print(f"token-audit: extract not written ({exc})", file=sys.stderr)
+        return None
+    finally:
+        if temporary is not None:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     period = parser.add_mutually_exclusive_group()
@@ -1102,6 +1189,8 @@ def main():
     parser.add_argument("--project-dir", action="append", default=[], type=Path)
     parser.add_argument("--codex", action="store_true", help="include Codex sessions (also included by default)")
     parser.add_argument("--out", type=Path)
+    parser.add_argument("--extract-out", type=Path, default=claude_home() / "audits" / "extracts",
+                        help="extract directory (default: Claude config dir/audits/extracts)")
     parser.add_argument("--json", action="store_true", help="print full structured data instead of headline stdout")
     parser.add_argument("--pricing", type=Path, default=Path(__file__).resolve().with_name("pricing.json"))
     for flag, default in (("stuck-repeats", 3), ("fact-sessions", 3), ("prune-prompts", 10),
@@ -1144,8 +1233,9 @@ def main():
         text, headline = report(data, out, scope)
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(text)
+        extract_path = write_extract(data, out, args.extract_out, scope)
         if args.json:
-            print(json.dumps(dict(report_path=str(out), **data), indent=2))
+            print(json.dumps(dict(report_path=str(out), extract_path=extract_path, **data), indent=2))
         else:
             print(str(out) + "\n" + "\n".join(headline))
         return 0

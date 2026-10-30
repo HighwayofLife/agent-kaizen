@@ -62,9 +62,11 @@ Settings live in `agent-kaizen.json` in the Claude config directory and in each 
 | `enabled` | Global | `true` (default), `false` disables all scheduled work |
 | `schedule` | Global or project | `active` (default), `always`, `off` |
 | `scheduledAutonomy` | Global or project | `propose` (default), `auto` |
+| `retention` | Global only | `auto` (default), `off` keeps everything |
+| `retentionOverrides` | Global only | Object, default `{}`; for example `{"extracts":{"days":14}}` |
 | `autonomy` | Global or project | Interactive mode; scheduled runs do not read it |
 
-Global `enabled=false` takes precedence over everything. Otherwise, project settings override global settings, which override defaults. A tracked project config applies to teammates too; put personal choices in the global file.
+Global `enabled=false` takes precedence over everything. Otherwise, project settings override global settings, which override defaults. Project values for `retention` and `retentionOverrides` are ignored with a warning. A tracked project config applies to teammates too; put personal choices in the global file.
 
 Use `kaizen-scheduled config set [--for DIR] KEY=VALUE...` to merge settings. `/agent-kaizen:schedule` and `/agent-kaizen:start` ask for your choices and run the relevant commands.
 
@@ -76,14 +78,33 @@ The audits directory is `<Claude config dir>/audits`:
 
 ```text
 <audits>/token-audit-*.md
+<audits>/token-audit-*.reviewed
+<audits>/extracts/*.extract.json
 <audits>/projects/index.json
 <audits>/projects/<key>/state.json
 <audits>/projects/<key>/token-audit-*.md
+<audits>/projects/<key>/*.extract.json
 <audits>/projects/<key>/cycle-<date>.md
 <audits>/run.log
 ```
 
 Reports carry a scope line and compare only with an earlier report of the same scope. Flags use per-call intensity, not volume. Reports from before 0.4.0 lack scope metadata and are never compared.
+
+Each report has a machine-local JSON extract with per-agent usage and a cheaper-model hint. Extracts go in `<audits>/extracts/`, for scheduled and interactive runs alike. They never go into `docs/kaizen/`.
+
+### Retention
+
+The runner tidies after each scheduled audit and review; interactive cycles run it at the end. `kaizen-scheduled housekeep --dry-run` previews deletions. Use `--audits DIR` to select an audits folder.
+
+| Kind | Files | Default |
+|---|---|---|
+| `extracts` | `extracts/*.extract.json`, `projects/*/*.extract.json`, `projects/*/host-probe-*.json`, `projects/*/friction-inputs-*.json` | 30 days; 200 MB cap |
+| `markers` | `projects/*/cycle-*.failed.md`, `*.noticed-*`, `projects/*/*.noticed-*` | 30 days |
+| `reports` | `token-audit-*.md`, `projects/*/token-audit-*.md`, `projects/*/cycle-*.md` | 365 days; newest 5 per folder and family kept |
+
+A report's `.reviewed` marker is removed with it. Only regular files inside the audits folder are deleted; symlinks are skipped. Each deletion is logged: in `run.log` for scheduled runs, on screen for manual ones. Housekeeping does not touch `host-actions.json`, `host-fixes/`, `projects/index.json`, project `state.json` files, `run.log`, `kaizen-backups/`, transcripts, Codex sessions or project files.
+
+Set `retention=off` to keep everything. Override a kind with `kaizen-scheduled config set retentionOverrides='{"extracts":{"days":14}}'`. Each kind accepts positive integer `days`, `hours` and `maxMB`; `hours` takes precedence over `days`.
 
 ## Schedulers and environment
 
@@ -95,7 +116,7 @@ The installer captures `PATH` and, when set, `CLAUDE_CONFIG_DIR` and `CODEX_HOME
 
 The runner uses `--strict-mcp-config` and limits `--tools` to Read, Grep, Glob, WebFetch, WebSearch and Bash in propose mode. `--allowedTools` permits restricted read-only Bash: ls, wc, head, tail, rg, git status, git diff, git log, shasum, sha256sum and jq. It uses `--permission-mode dontAsk`.
 
-Auto mode adds Edit and Write, and permits cp, mkdir, diff, touch, cd, token-audit and kaizen-backup in addition to those read-only commands. It uses `--permission-mode acceptEdits` and `--disallowedTools` denies git push, git commit, git reset, git clean, gh, rm, rmdir, mv, curl, wget, launchctl, crontab, brew, npm, pip, pip3, sudo, env, printenv and chmod. It never uses bypassPermissions. Changes to your Claude or Codex configuration are best applied interactively, where you see each edit. See [autonomy.md](autonomy.md#permissions).
+Auto mode adds Edit and Write, and permits mkdir, diff, cd, token-audit and kaizen-backup in addition to those read-only commands. It uses `--permission-mode acceptEdits` and `--disallowedTools` denies git push, git commit, git reset, git clean, gh, rm, rmdir, mv, curl, wget, launchctl, crontab, brew, npm, pip, pip3, sudo, env, printenv and chmod. It never uses bypassPermissions. Deny rules protect settings, hooks, plugins, skills, commands, bin, credentials and all `.json`, `.toml`, `.sh`, `.py` and `.js` files under both config homes, the Claude user config file, and the project’s `.claude/settings*.json`. Markdown instruction files, including `CLAUDE.md`, `agents/*.md`, rules, memory `MEMORY.md` and Codex `AGENTS.md`, remain editable. These rules cover Edit, Write and recognised file commands such as cat, sed, tee and redirects; they do not cover `cp` or scripts. See [autonomy.md](autonomy.md#permissions).
 
 ## 0.3.x migration
 
