@@ -16,8 +16,9 @@ Every MCP tool schema, connector, enabled plugin, skill description and custom-a
 ## Task
 
 ```text
-1. Measure first. Ask me to run /context and paste the result (or read it if you can),
-   and list:
+1. Measure first. Ask me to run /context and paste the result. In a headless or autonomous
+   run, estimate instead: file sizes / 4 for instruction files, plus counts of servers, tools,
+   skills and agents. Then list:
    - MCP servers (`claude mcp list`), and which of their tools any transcript in the last
      30 days actually called (count tool names starting with mcp__ in ~/.claude/projects);
    - claude.ai connectors that show up in this project;

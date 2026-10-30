@@ -19,7 +19,9 @@ I want to set up a self-improving workflow for this project: we regularly measur
 Claude Code (and Codex, if I use it) spends time, tokens and money here, make targeted
 changes, and check whether each change paid off.
 
-Set up the scaffolding only, don't change any configuration yet:
+Set up the scaffolding only, don't change any configuration yet. In safe or auto mode,
+back up every existing file you touch (for example .gitignore) and write a manifest that
+lists the files you create, as docs/autonomy.md requires, so /agent-kaizen:undo works:
 1. Create docs/kaizen/LEDGER.md with a table:
    date | change | why (which audit finding) | expected effect | measured effect | keep/revert.
    Add a short header explaining that every efficiency change gets a row, and that the

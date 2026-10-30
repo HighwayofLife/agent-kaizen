@@ -9,7 +9,7 @@ Jobs:
           as ~/.claude/audits/cycle-<date>.md
 
 macOS uses launchd (~/Library/LaunchAgents); other systems use the user crontab.
---apply copies token-audit to ~/.claude/bin/ and schedules that copy, so the jobs keep
+--apply copies token-audit to ~/.claude/bin/kaizen-token-audit and schedules that copy, so the jobs keep
 working when the plugin cache or your clone moves; re-run --apply after updating to refresh it.
 Without --apply or --remove, prints what it would install.
 """
@@ -26,9 +26,17 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 AUDITS = Path.home() / ".claude" / "audits"
 BIN = Path.home() / ".claude" / "bin"
+AUDIT_NAME = "kaizen-token-audit"  # own name, so it never replaces another token-audit in ~/.claude/bin
 LABEL = "com.agent-kaizen"
 MARK = "# agent-kaizen"
-REVIEW_TOOLS = "Read,Grep,Glob,WebFetch,WebSearch"  # no Bash/Edit/Write: propose-only
+# Read-only commands both scheduled modes may run; config lives outside the project, so the
+# runs also get --add-dir for ~/.claude and ~/.codex.
+READ_ONLY_BASH = ["Bash(ls:*)", "Bash(wc:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(rg:*)",
+                  "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(shasum:*)",
+                  "Bash(sha256sum:*)", "Bash(jq:*)"]
+REVIEW_AVAILABLE = "Read,Grep,Glob,WebFetch,WebSearch,Bash"  # no Edit/Write: propose-only
+REVIEW_TOOLS = ",".join(["Read", "Grep", "Glob", "WebFetch", "WebSearch", *READ_ONLY_BASH])
+CONFIG_DIRS = [Path.home() / ".claude", Path.home() / ".codex"]
 REVIEW_MODEL = os.environ.get("KAIZEN_REVIEW_MODEL", "sonnet")  # keep the weekly run cheap
 REVIEW_MAX_TURNS = os.environ.get("KAIZEN_REVIEW_MAX_TURNS", "40")
 
@@ -43,19 +51,23 @@ HARD_STOP_DENY = ",".join(f"Bash({c}:*)" for c in (
 
 def auto_tools():
     """--auto: edits pre-approved, Bash only for backup/verify helpers and the audit. Never bypassPermissions."""
-    audit = BIN / "token-audit"
-    return ",".join(["Read", "Grep", "Glob", "Edit", "Write", "WebFetch", "WebSearch",
-                     "Bash(jq:*)", "Bash(cp:*)", "Bash(mkdir:*)", "Bash(diff:*)", "Bash(shasum:*)",
-                     "Bash(sha256sum:*)", f"Bash(python3 {audit}:*)"])
+    audit = BIN / AUDIT_NAME
+    return ",".join(["Read", "Grep", "Glob", "Edit", "Write", "WebFetch", "WebSearch", *READ_ONLY_BASH,
+                     "Bash(cp:*)", "Bash(mkdir:*)", "Bash(diff:*)", "Bash(touch:*)", "Bash(cd:*)",
+                     f"Bash(python3 {audit}:*)", f"Bash(python3 {HERE / 'token-audit'}:*)",
+                     f"Bash({BIN / 'kaizen-backup'}:*)",
+                     f"Bash(python3 {BIN / 'kaizen-backup'}:*)", f"Bash(python3 {HERE / 'kaizen-backup'}:*)",
+                     f"Bash({HERE / 'kaizen-backup'}:*)"])
 
 
 def commands(project_dir, auto=False):
-    audit = f"python3 {shlex.quote(str(BIN / 'token-audit'))} --out {shlex.quote(str(AUDITS))}"
+    audit = f"python3 {shlex.quote(str(BIN / AUDIT_NAME))} --out {shlex.quote(str(AUDITS))}"
     log = shlex.quote(str(AUDITS / "run.log"))
     review = (f"{audit} >> {log} 2>&1; cd {shlex.quote(str(project_dir))} && "
-              f"claude -p '/agent-kaizen:cycle {'auto' if auto else 'propose-only'}' "
+              f"KAIZEN_RUN_ID=$(date +%Y%m%d-%H%M%S) claude -p '/agent-kaizen:cycle {'auto' if auto else 'propose-only'}' "
               f"--model {shlex.quote(REVIEW_MODEL)} --max-turns {shlex.quote(REVIEW_MAX_TURNS)} "
-              f"--tools {shlex.quote(AUTO_AVAILABLE if auto else REVIEW_TOOLS)} --strict-mcp-config "
+              f"--tools {shlex.quote(AUTO_AVAILABLE if auto else REVIEW_AVAILABLE)} --strict-mcp-config "
+              + "".join(f"--add-dir {shlex.quote(str(d))} " for d in CONFIG_DIRS) +
               f"--allowedTools {shlex.quote(auto_tools() if auto else REVIEW_TOOLS)} "
               + (f"--disallowedTools {shlex.quote(HARD_STOP_DENY)} " if auto else "") +
               f"--permission-mode {'acceptEdits' if auto else 'dontAsk'} "
@@ -135,8 +147,9 @@ def main(argv=None):
     AUDITS.mkdir(parents=True, exist_ok=True)
     if args.apply:
         BIN.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(HERE / "token-audit", BIN / "token-audit")
-        print(f"copied token-audit to {BIN / 'token-audit'}")
+        shutil.copy2(HERE / "token-audit", BIN / AUDIT_NAME)
+        shutil.copy2(HERE / "kaizen-backup", BIN / "kaizen-backup")
+        print(f"copied token-audit to {BIN / AUDIT_NAME} and kaizen-backup to {BIN / 'kaizen-backup'}")
     selected = jobs(args)
     (mac if platform.system() == "Darwin" else cron)(args, selected)
     return 0

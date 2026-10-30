@@ -27,7 +27,7 @@ scripts/install-schedule --remove       # uninstalls both
 The review job runs, from your main project directory:
 
 ```bash
-python3 ~/.claude/bin/token-audit --out ~/.claude/audits >> ~/.claude/audits/run.log 2>&1
+python3 ~/.claude/bin/kaizen-token-audit --out ~/.claude/audits >> ~/.claude/audits/run.log 2>&1
 claude -p "/agent-kaizen:cycle propose-only" --model sonnet --max-turns 40 \
   --allowedTools "Read,Grep,Glob,WebFetch,WebSearch" \
   --permission-mode dontAsk > ~/.claude/audits/cycle-$(date +%F).md 2>> ~/.claude/audits/run.log
@@ -37,4 +37,6 @@ It runs the audit script first, then Claude with no shell, edit or write tools: 
 
 `--auto` (implies `--review`) runs `/agent-kaizen:cycle auto` instead, with `--permission-mode acceptEdits`, `--tools` limited to Read, Grep, Glob, Edit, Write, WebFetch, WebSearch and Bash, Bash pre-approved only for `jq`, `cp`, `mkdir`, `diff`, `shasum` and token-audit, and `--disallowedTools` denying git commit and push, `rm`, `mv`, curl, package managers, `launchctl`, crontab and `sudo` (see [autonomy.md](autonomy.md#permissions)). Changes follow [autonomy.md](autonomy.md): backed up, verified, at most 3 per run, logged, and reversible with `/agent-kaizen:undo`. `bypassPermissions` is never used.
 
-`--apply` copies `token-audit` to `~/.claude/bin/` and schedules that copy, so the job survives plugin updates and a moved clone; re-run `--apply` after updating. The weekly run uses `--model sonnet --max-turns 40` (override with `KAIZEN_REVIEW_MODEL` / `KAIZEN_REVIEW_MAX_TURNS`); API-key users can also add `--max-budget-usd`. Check the flags against `claude --help` for your version. The review run uses your normal login. Don't add `--bare`: it skips plugins and needs an API key.
+Unattended runs can change project files, but not files under `~/.claude/`, which Claude Code protects. Those come back as "do interactively" items (see [autonomy.md](autonomy.md#permissions)).
+
+`--apply` copies `token-audit` to `~/.claude/bin/kaizen-token-audit` and schedules that copy, so the job survives plugin updates and a moved clone; re-run `--apply` after updating. The weekly run uses `--model sonnet --max-turns 40` (override with `KAIZEN_REVIEW_MODEL` / `KAIZEN_REVIEW_MAX_TURNS`); API-key users can also add `--max-budget-usd`. Check the flags against `claude --help` for your version. The review run uses your normal login. Don't add `--bare`: it skips plugins and needs an API key.

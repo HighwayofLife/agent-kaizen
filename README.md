@@ -8,17 +8,37 @@
 
 It was built while developing a game with Claude Code coordinating Claude subagents and the OpenAI Codex CLI. It works for any project, with or without Codex.
 
-## Why
+## Why I built this
 
-Agentic coding gets expensive in ways that are hard to see from inside a session:
-- A main session re-sends its whole context every turn, so 500k context × 100 turns adds up quickly.
-- Subagents that load the entire `CLAUDE.md` to run a single grep.
-- Wrapper agents that spend a full context just relaying another tool's output.
-- Planners that explore with hundreds of grep-and-read calls.
-- Images and whole files that sit in context for the rest of a session.
-- MCP tools and connectors that load on every turn and are never used.
+I've been building a Colonization-inspired colonial-era game with Claude Code doing the coordinating and handing work off to Codex and other Claude agents. It worked. It also got expensive. And I ran out of usage within an hour of each 5h reset.
 
-One-off tune-ups decay: new habits creep in, new features ship, new models appear. So this plugin is built as a **loop**:
+So I wrote a script to go through my own session logs and found some very disturbing results.
+
+My main sessions were regularly sitting at 450-560k tokens of context, and every single turn re-sends all of that. I had a little "wrapper" agent whose whole job was to run Codex and pass the answer back, and I'd spawned it about 150 times at roughly 80k tokens a pop. My planning agents were averaging around 190 tool calls each, just grepping and reading their way around the codebase. Screenshots I'd passed in once for analysis were stuck in context for the rest of the session. One set of research agents had re-downloaded the same handful of web pages almost 400 times.
+
+None of the fixes were clever:
+- compact the session earlier;
+- swap the wrapper agent for a plain script;
+- build a small symbol index so agents find code in one query instead of fifty;
+- a hook that stops agents from reading entire 600-line files unless they really mean it;
+- give each subagent a ten-line brief instead of my whole CLAUDE.md;
+- turn off MCP connectors I never use in that project.
+
+The problem is that this stuff drifts. New habits creep back in, Claude Code ships a feature that makes one of my workarounds pointless, a cheaper model comes out. A one-time cleanup doesn't stick.
+
+So I turned it into a loop and packaged it as a Claude Code plugin. I called it Agent Kaizen, after the idea of continuous improvement through small changes.
+
+The audit runs every few days on its own (it's just a script, so it costs nothing). When there's a new one, Claude reviews it against a ledger of what I've already changed, proposes the next couple of fixes, and after the next audit we check whether they actually helped. If a change didn't move the numbers, it gets reverted. That ledger has been the most useful part. A few things I was sure would help barely did anything.
+
+There's also a roster step. It figures out which AI tools you pay for, looks up what each one is good at right now, and sets up agents and fallbacks around that. For me, Grok is great for research, Codex for most of the coding, Claude for most of the planning, Codex's Terra model for image analysis, and Gemini gets the giant-document jobs. Yours will be different, so the plugin tailors the agents to what suits your project, and it only sets up what you have.
+
+If you're ready for it, there's a yolo (auto) mode where it applies the changes itself instead of asking you every time. I run it this way. Everything gets backed up and checked first; it rolls back anything that fails, and there's an undo. It still stops and asks before it touches keys, spends money, loosens permissions, deletes anything, or pushes code.
+
+The full list of findings and fixes is in [docs/what-we-learned.md](docs/what-we-learned.md).
+
+## How it works
+
+So this plugin is built as a **loop**:
 
 <p align="center"><img src="assets/loop.png" alt="The loop: 1 Measure, 2 Review, 3 Change one thing, 4 Re-measure, around a ledger" width="720"></p>
 
@@ -135,7 +155,8 @@ skills/             the loop, one SKILL.md per step (plain Markdown; readable wi
 agents/             kaizen-auditor (propose-only)
 hooks/              audit-notice (enabled by the plugin), plus opt-in guardrails:
                     limit-big-read, block-image-read, subagent-context, after-compact
-scripts/            token-audit, codex-dispatch, codex-review, dispatch-status, install-schedule
+scripts/            token-audit, kaizen-backup (backups + undo), codex-dispatch, codex-review,
+                    dispatch-status, install-schedule
 templates/          starting points: global and project CLAUDE.md, orchestrator.md,
                     Codex AGENTS.md and config.toml, settings.example.json,
                     agent templates (scout, judge, swarm-lead, verifier, planner,

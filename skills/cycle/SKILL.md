@@ -23,7 +23,11 @@ This is the entry point when you don't know which skill to run. It runs the loop
    - roster: if `docs/kaizen/model-roster.md` is missing or more than 60 days old, or the audit shows a pool hitting its limits, suggest `/agent-kaizen:roster re-evaluate`;
    - context surface: if the last trim is more than 60 days old, or the audit shows a jump in fixed context, suggest `/agent-kaizen:trim-context`.
 5. **Propose.** At most 5 next changes across everything above, ranked by expected saving per unit of effort. For each: the skill that implements it, the risk, and how the next audit will measure it.
-6. **Act.** In normal mode, wait for my OK and then run the approved changes one at a time, each with a ledger row. In propose-only mode, print the proposal and stop.
+6. **Act.**
+   - **`propose` mode:** wait for my OK, then run the approved changes one at a time, each with a ledger row.
+   - **`safe` and `auto` modes:** don't stop at a proposal list. Take the top proposals the mode allows, up to `maxChangesPerRun`, and carry each one out now. Follow the implementing skill's `SKILL.md` in `${CLAUDE_PLUGIN_ROOT}/skills/<skill>/` in the same mode, with backup, verify, roll back on failure, and a ledger row. "Needs the user's decision" is a reason to skip only for a hard stop, or for a change you can't verify in this run. Pick a smaller, verifiable version of the change when one exists. For example, trim one instruction file rather than all of them.
+   - Read "In `auto`, these are NOT reasons to skip a change" in `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md` before deciding to skip anything.
+   - **`propose-only`:** print the proposal and stop.
 
 ## Done when
 

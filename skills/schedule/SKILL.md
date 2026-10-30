@@ -17,7 +17,7 @@ The audit from `/agent-kaizen:audit` runs by itself every few days, and Claude C
 
 Turn the usage audit into a scheduled, self-reporting job.
 
-1. Install the bundled token-audit script as ~/.claude/bin/token-audit (copy it, so plugin
+1. Install the bundled token-audit script as ~/.claude/bin/kaizen-token-audit (copy it, so plugin
    updates don't move it) and confirm that it:
    - it covers all my projects, with a --project filter;
    - it compares against the previous report and prints the change in each headline

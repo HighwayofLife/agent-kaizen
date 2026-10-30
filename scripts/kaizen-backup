@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+"""Backups, manifests and undo for Agent Kaizen changes (see docs/autonomy.md).
+
+  kaizen-backup begin  --skill NAME --ledger TEXT [--run RUN_ID] FILE...
+        Back up FILEs (existing ones are copied; missing ones are recorded as created)
+        and print the change folder. Run BEFORE editing.
+  kaizen-backup finish CHANGE_DIR
+        Record each file's sha256 after the edit. Run AFTER editing and verifying.
+  kaizen-backup action CHANGE_DIR --did CMD --undo CMD
+        Record a non-file action (e.g. a package install) and its reverse command.
+  kaizen-backup list [--all]
+        List changes (newest first): change dir, run, skill, reverted, ledger text.
+  kaizen-backup undo [last|run|CHANGE_DIR] [--force]
+        Restore files; delete created files whose hash still matches; print recorded
+        actions' undo commands (it never runs them). A file changed since `finish` is a
+        conflict: nothing is restored unless --force.
+
+Backups live in KAIZEN_BACKUP_DIR (default ~/.claude/kaizen-backups).
+"""
+import argparse
+import datetime
+import hashlib
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+
+ROOT = Path(os.environ.get("KAIZEN_BACKUP_DIR", Path.home() / ".claude" / "kaizen-backups"))
+
+
+def sha(path):
+    path = Path(path)
+    return hashlib.sha256(path.read_bytes()).hexdigest() if path.is_file() else None
+
+
+def load(change):
+    return json.loads((Path(change) / "manifest.json").read_text())
+
+
+def save(change, manifest):
+    tmp = Path(change) / "manifest.json.tmp"
+    tmp.write_text(json.dumps(manifest, indent=2) + "\n")
+    tmp.replace(Path(change) / "manifest.json")
+
+
+def changes(include_reverted=True):
+    found = []
+    for manifest in ROOT.glob("*/manifest.json"):
+        data = json.loads(manifest.read_text())
+        if include_reverted or not data.get("reverted"):
+            found.append((manifest.parent, data))
+    return sorted(found, key=lambda item: (item[1]["run_id"], item[1]["change"]), reverse=True)
+
+
+def begin(args):
+    run_id = args.run or os.environ.get("KAIZEN_RUN_ID") or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    number = 1 + sum(1 for _, data in changes() if data["run_id"] == run_id)
+    change = ROOT / f"{run_id}-{number:02d}-{args.skill}"
+    (change / "files").mkdir(parents=True, exist_ok=False)
+    entries = []
+    for index, name in enumerate(args.files, 1):
+        path = Path(name).expanduser().resolve()
+        entry = {"path": str(path), "backup": None, "created": not path.exists(), "after_sha256": None}
+        if path.is_file():
+            entry["backup"] = f"files/{index}"
+            shutil.copy2(path, change / entry["backup"])
+        elif path.exists():
+            sys.exit(f"kaizen-backup: {path} is not a regular file")
+        entries.append(entry)
+    save(change, {"run_id": run_id, "change": number, "skill": args.skill, "ledger": args.ledger,
+                  "files": entries, "actions": [], "finished": False, "reverted": None})
+    print(change)
+
+
+def finish(args):
+    manifest = load(args.change)
+    for entry in manifest["files"]:
+        entry["after_sha256"] = sha(entry["path"])
+    manifest["finished"] = True
+    save(args.change, manifest)
+    print(f"finished {args.change}: {len(manifest['files'])} file(s) recorded")
+
+
+def action(args):
+    manifest = load(args.change)
+    manifest["actions"].append({"did": args.did, "undo": args.undo})
+    save(args.change, manifest)
+    print(f"recorded action in {args.change}")
+
+
+def list_changes(args):
+    for change, data in changes(include_reverted=args.all):
+        state = f"reverted {data['reverted']}" if data.get("reverted") else ("open" if data.get("finished") else "unfinished")
+        print(f"{change}\t{data['run_id']}\t{data['skill']}\t{state}\t{data['ledger']}")
+
+
+def targets(which):
+    open_changes = changes(include_reverted=False)
+    if not open_changes:
+        sys.exit("kaizen-backup: nothing to undo")
+    if which == "last":
+        return [open_changes[0]]
+    if which == "run":
+        run_id = open_changes[0][1]["run_id"]
+        return [item for item in open_changes if item[1]["run_id"] == run_id]
+    change = Path(which).expanduser()
+    change = change if change.is_absolute() else ROOT / change
+    return [(change, load(change))]
+
+
+def undo(args):
+    plan = targets(args.target)
+    conflicts = []
+    for change, data in plan:
+        if data.get("reverted"):
+            sys.exit(f"kaizen-backup: {change} was already reverted on {data['reverted']}")
+        for entry in data["files"]:
+            current, after = sha(entry["path"]), entry["after_sha256"]
+            if data.get("finished") and current != after:
+                conflicts.append(f"{entry['path']} changed after {change.name}")
+    if conflicts and not args.force:
+        print("CONFLICT (nothing restored; re-run with --force to overwrite):")
+        print("\n".join(f"  {line}" for line in conflicts))
+        return 2
+    for change, data in plan:  # newest change first
+        for entry in data["files"]:
+            path = Path(entry["path"])
+            if entry["created"]:
+                if path.exists() and (args.force or sha(path) == entry["after_sha256"]):
+                    path.unlink()
+                    print(f"removed created {path}")
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(change / entry["backup"], path)
+                print(f"restored {path}")
+        for act in data["actions"]:
+            print(f"ACTION to reverse by hand (not run): {act['undo']}   # was: {act['did']}")
+        data["reverted"] = datetime.date.today().isoformat()
+        save(change, data)
+        print(f"reverted {change.name}: {data['ledger']}")
+    return 0
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = parser.add_subparsers(dest="command", required=True)
+    p = sub.add_parser("begin")
+    p.add_argument("--skill", required=True)
+    p.add_argument("--ledger", required=True)
+    p.add_argument("--run")
+    p.add_argument("files", nargs="+")
+    p.set_defaults(func=begin)
+    p = sub.add_parser("finish")
+    p.add_argument("change")
+    p.set_defaults(func=finish)
+    p = sub.add_parser("action")
+    p.add_argument("change")
+    p.add_argument("--did", required=True)
+    p.add_argument("--undo", required=True)
+    p.set_defaults(func=action)
+    p = sub.add_parser("list")
+    p.add_argument("--all", action="store_true")
+    p.set_defaults(func=list_changes)
+    p = sub.add_parser("undo")
+    p.add_argument("target", nargs="?", default="last")
+    p.add_argument("--force", action="store_true")
+    p.set_defaults(func=undo)
+    args = parser.parse_args(argv)
+    ROOT.mkdir(parents=True, exist_ok=True)
+    return args.func(args) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

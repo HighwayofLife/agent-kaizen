@@ -25,6 +25,16 @@ Optional settings in the same file:
 - `maxChangesPerRun` (default 3) keeps each run's effect measurable: the next audit can only attribute a change in the numbers if few things changed at once.
 - `allowInstalls` (default false) lets `auto` install CLI tools such as rg, fd and jq with your package manager.
 
+## In `auto`, these are NOT reasons to skip a change
+
+The person chose `auto` so they wouldn't be asked. Don't invent extra conditions:
+- **"No measured saving yet."** Measuring comes after the change; that's what the ledger and the next audit are for. A reasoned expected effect is enough.
+- **"The user hasn't confirmed I may edit this file."** In `auto`, every file under the project and `~/.claude/` (CLAUDE.md, imported docs, agents, skills, the `~/.claude/orchestrator/` docs) and `~/.codex/AGENTS.md` is in scope, apart from the hard stops (permissions, hooks being removed, secrets).
+- **"It needs web access."** Web research (models, whats-new, roster research) is free and allowed. "Spending money" means buying a plan or paying for API calls, not reading docs.
+- **"It's a big change."** Make a smaller version that you can verify, for example trimming one section of one file.
+
+If a run ends with zero changes applied while low-risk proposals existed that weren't hard stops, the run failed its job. Apply at least the best one.
+
 ## Low-risk changes (`safe` applies these)
 
 Reversible and local, with no effect on what agents are allowed to do:
@@ -48,20 +58,18 @@ Reversible and local, with no effect on what agents are allowed to do:
 
 ## What every applied change gets, in every mode
 
-1. **Backup first.** Copy the original files to `~/.claude/kaizen-backups/<run_id>-<NN>-<skill>/`. `run_id` is the run's start time (`yyyymmdd-HHMMSS`), shared by every change in the run, and `NN` numbers the change within the run. Write a `manifest.json` there:
-   ```json
-   {"run_id": "20261029-101500", "change": 1, "skill": "trim-context", "ledger": "2026-10-29 deny unused MCP servers",
-    "files": [{"path": "/abs/path", "backup": "files/1", "created": false, "after_sha256": "<filled after applying>"}],
-    "actions": [{"did": "brew install fd", "undo": "brew uninstall fd"}],
-    "reverted": null}
-   ```
-2. **Apply** the change, then record each file's `after_sha256` (`shasum -a 256`) in the manifest. Undo uses it to tell its own edits from later ones. Anything that isn't a file edit (a package install with `allowInstalls`) goes in `actions`, with its reverse command.
+No exceptions: this includes the scaffolding `/agent-kaizen:start` creates, one-line edits to files such as `.gitignore`, and new files. A change without a manifest can't be undone, so it isn't made.
+
+Use the bundled script for the bookkeeping. Call `~/.claude/bin/kaizen-backup` if it exists, otherwise `${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-backup`. Use one plain command per Bash call: no `cd`, no variables, no `;` or `&&` chains, absolute paths only. Permission rules match single commands. Write file contents with the Edit and Write tools, never with shell redirects.
+
+1. **Backup first:** `kaizen-backup begin --skill <skill> --ledger "<ledger text>" <every file you will edit or create>`. Never list `docs/kaizen/LEDGER.md` itself: undo would restore it and erase the ledger row instead of marking it reverted. It copies the existing files, records the missing ones as created, and prints the change folder (`~/.claude/kaizen-backups/<run_id>-<NN>-<skill>/`, with `manifest.json`). Every change in one run shares a `run_id`: pass `--run <id>` from the first `begin`, or set `KAIZEN_RUN_ID`.
+2. **Apply** the change with Edit or Write. Record any non-file action, such as a package install with `allowInstalls`, with `kaizen-backup action <change folder> --did "<cmd>" --undo "<reverse cmd>"`.
 3. **Verify right away. No verification, no change:** if you can't run a change's verification (for example, the tool isn't permitted in this run), don't apply the change. List it as a proposal instead. Checks:
    - settings and other JSON parse with `jq`;
    - hooks pass their sample-input tests;
    - `claude plugin validate` or the project's checks pass where relevant;
    - agents and skills still have valid frontmatter.
-4. **Roll back automatically** if verification fails. The failure is reported, and the change is skipped.
+4. **Finish or roll back:** if verification passes, run `kaizen-backup finish <change folder>`, which records the after-hashes undo uses to detect later edits. If it fails, run `kaizen-backup undo <change folder> --force`, report the failure, and skip the change.
 5. **Ledger row** in `docs/kaizen/LEDGER.md`, with the backup folder, so `/agent-kaizen:undo` can reverse it.
 6. **Summary at the end:** what was applied, what was skipped and why (hard stop, cap reached, missing permission), and what was rolled back.
 
@@ -75,7 +83,7 @@ The autonomy mode decides what the *skills* will do. Claude Code's own permissio
   - `--disallowedTools`, which denies git commit and push, `rm`, `mv`, curl, package managers, `launchctl`, crontab, `sudo` and `env`, even if your own settings allow them;
   - `--strict-mcp-config`, so no MCP servers load.
 
-  It never uses `bypassPermissions`. Your settings' other allow rules still apply, so keep them narrow. `acceptEdits` covers files in the project. Edits elsewhere (for example `~/.claude/settings.json`) may be refused in a headless run; those changes are skipped and listed.
+  It never uses `bypassPermissions`. Your settings' other allow rules still apply, so keep them narrow. `acceptEdits` covers files in the project. Claude Code treats files under `~/.claude/` (your global CLAUDE.md, agents, settings, even `.reviewed` markers) as sensitive, and refuses to edit them in an unattended run. Those changes are rolled back if they were started, and listed as "do interactively". Run `/agent-kaizen:cycle yolo` in a normal session to apply them, approving the prompts for `~/.claude` files there.
 
 ## Undo
 
@@ -83,4 +91,4 @@ The autonomy mode decides what the *skills* will do. Claude Code's own permissio
 - `/agent-kaizen:undo <ledger row date or backup folder>` reverses a specific one.
 - `/agent-kaizen:undo run` reverses everything from the last run.
 
-Undo skips changes whose manifest already has `reverted` set. It treats a file whose current hash differs from `after_sha256` as a conflict and asks. It restores backed-up files, removes created files whose hash still matches, offers the reverse command for each recorded action (an uninstall is a deletion, so it asks), and then sets `reverted` in the manifest and marks the ledger row.
+`/agent-kaizen:undo` runs `kaizen-backup undo`. That command skips changes already reverted, and treats a file whose hash differs from the recorded after-hash as a conflict (nothing is restored without `--force`). It restores backups, deletes created files that are unchanged, and prints recorded actions' reverse commands without running them. The skill then marks the ledger row.
