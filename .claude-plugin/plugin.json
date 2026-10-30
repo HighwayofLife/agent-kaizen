@@ -1,6 +1,6 @@
 {
   "name": "agent-kaizen",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "A self-improving workflow for Claude Code (and optionally Codex): measure token use, trim context, route work to the cheapest capable model, and keep checking whether each change paid off.",
   "author": {
     "name": "HighwayofLife"

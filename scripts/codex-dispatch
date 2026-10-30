@@ -115,6 +115,7 @@ def main():
         brief = out / "brief.md"
         brief.write_text(preamble + "\n" + (locations.rstrip() + "\n\n" if locations else "") + task)
         runner = str(here / "codex-run")
+        failures = []
         for attempt in range(args.r + 1):
             log = out / f"codex-{attempt}.log"
             command = ([runner, "--resume", thread, args.e, str(brief)] if thread else
@@ -126,12 +127,32 @@ def main():
             if rc or not summary or any(line == "(no final message)" for line in summary):
                 reason = "; ".join(key_errors(log)) or "Codex returned no final message"
                 return report("CODEX FAILED", 2)
-            checks = []
-            for number, command in enumerate(args.k, 1):
-                log = out / f"check-{number}.log"
-                rc = run_logged(command, cwd, log, shell=True)
-                shutil.copyfile(log, out / f"check-{number}-round-{attempt}.log")
-                checks.append((number, command, rc, log))
+            selected = list(enumerate(args.k, 1)) if attempt == 0 else [
+                (number, command) for number, command, _, _ in failures]
+            results = {check[0]: check for check in checks}
+
+            def run_checks(selected, pass_name):
+                previous = {name: os.environ.get(name) for name in ("DISPATCH_ROUND", "DISPATCH_PASS")}
+                os.environ.update(DISPATCH_ROUND=str(attempt), DISPATCH_PASS=pass_name)
+                try:
+                    for number, command in selected:
+                        log = out / f"check-{number}.log"
+                        rc = run_logged(command, cwd, log, shell=True)
+                        shutil.copyfile(log, out / f"check-{number}-round-{attempt}.log")
+                        results[number] = (number, command, rc, log)
+                finally:
+                    for name, value in previous.items():
+                        if value is None:
+                            os.environ.pop(name, None)
+                        else:
+                            os.environ[name] = value
+
+            run_checks(selected, "initial" if attempt == 0 else "retry")
+            if attempt and all(not results[number][2] for number, _ in selected):
+                retried = {number for number, _ in selected}
+                run_checks([(number, command) for number, command in enumerate(args.k, 1)
+                            if number not in retried], "final")
+            checks = sorted(results.values())
             failures = [check for check in checks if check[2]]
             if not failures:
                 return report("DONE", 0)

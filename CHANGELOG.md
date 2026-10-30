@@ -2,6 +2,10 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.3.1 (2026-10-29)
+
+- codex-dispatch: resume rounds re-run only the failing checks, then confirm the checks that were skipped, once. Checks see `DISPATCH_ROUND` and `DISPATCH_PASS` (`initial`, `retry`, `final`) so project tooling can run cheaper checks while iterating.
+
 ## 0.3.0 (2026-10-29)
 
 Four new audit measurements, inspired by Microsoft's [TokenEconomizer](https://github.com/microsoft/TokenEconomizer), which acts on the same signals live inside each session. Agent Kaizen measures them offline at zero token cost and turns them into proposals:

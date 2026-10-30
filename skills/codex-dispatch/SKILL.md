@@ -28,7 +28,9 @@ in the repo):
    - Then runs each -k check command outside the Codex sandbox (the sandbox may have no
      network, and no engine or editor).
    - On a failed check, resumes the same thread (`codex exec resume <id>`) with the
-     failing output trimmed to the relevant lines. At most 2 rounds.
+     failing output trimmed to the relevant lines. At most 2 rounds. Retry only failed
+     checks; once they pass, confirm the skipped checks. Checks receive `DISPATCH_ROUND`
+     and `DISPATCH_PASS` (`initial`, `retry`, or `final`).
    - Writes full logs under out/dispatch/<timestamp>/ and prints at most 25 lines:
      model, thread id, Codex's summary, git diff --stat, each check PASS/FAIL, and
      STATUS: DONE | FAILED | BLOCKED.

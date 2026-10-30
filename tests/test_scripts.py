@@ -118,7 +118,7 @@ class ScriptTests(StubCase):
         self.dispatch()
         self.assertIn('preferred-model', self.calls()[1]['args'])
 
-    def test_checks_resume_and_rerun_all(self):
+    def test_checks_resume_and_confirm_skipped(self):
         check = executable(self.work / 'check', '''#!/usr/bin/env python3
 from pathlib import Path
 p = Path('check-count')
@@ -127,16 +127,53 @@ p.write_text(str(n+1))
 print('ERROR: fix example' if n == 0 else 'pass')
 raise SystemExit(1 if n == 0 else 0)
 ''')
-        result = self.dispatch('-k', './check', '-k', 'echo another >> all-checks')
+        result = self.dispatch('-k', './check', '-k', 'echo B-output; echo another >> all-checks')
         self.assertEqual(self.report(result)[-1], 'STATUS: DONE')
         self.assertEqual((self.work / 'check-count').read_text(), '2')
         self.assertEqual(len((self.work / 'all-checks').read_text().splitlines()), 2)
         calls = self.calls()
         self.assertEqual(calls[1]['args'][:3], ['exec', 'resume', 'test-thread'])
         self.assertIn('ERROR: fix example', calls[1]['prompt'])
+        self.assertNotIn('B-output', calls[1]['prompt'])
         self.assertNotIn('-m', calls[1]['args'])
         self.assertEqual(calls[0]['cwd'], str(self.work))
         self.assertTrue(list((self.work / 'out/dispatch').glob('*/check-1-round-0.log')))
+
+    def test_confirmation_failure_becomes_next_retry(self):
+        a = "echo $DISPATCH_ROUND/$DISPATCH_PASS >> a; [ $DISPATCH_ROUND != 0 ]"
+        b = "echo $DISPATCH_ROUND/$DISPATCH_PASS >> b; [ $DISPATCH_PASS != final ] || { echo ERROR: B-failed; exit 1; }"
+        result = self.dispatch('-k', a, '-k', b, '-r', '2')
+        self.assertEqual(self.report(result)[-1], 'STATUS: DONE')
+        self.assertEqual((self.work / 'a').read_text().splitlines(), ['0/initial', '1/retry', '2/final'])
+        self.assertEqual((self.work / 'b').read_text().splitlines(), ['0/initial', '1/final', '2/retry'])
+        self.assertIn('ERROR: B-failed', self.calls()[2]['prompt'])
+        self.assertNotIn('Check 1:', self.calls()[2]['prompt'])
+
+    def test_confirmation_failure_at_limit_reports_latest_results(self):
+        a = "[ $DISPATCH_ROUND != 0 ] || { echo ERROR: A-failed; exit 1; }"
+        b = "[ $DISPATCH_PASS != final ] || { echo ERROR: B-failed; exit 1; }"
+        lines = self.report(self.dispatch('-r', '1', '-k', a, '-k', b, code=1))
+        self.assertEqual(lines[-1], 'STATUS: CHECKS FAILING')
+        self.assertTrue(any('Check 1 PASS:' in line for line in lines))
+        self.assertTrue(any('Check 2 FAIL:' in line for line in lines))
+
+    def test_exhausted_retries_skip_passing_checks(self):
+        checks = ['echo failing >> a; exit 1', 'echo passing >> b', 'echo passing >> c']
+        lines = self.report(self.dispatch(*[arg for check in checks for arg in ('-k', check)], code=1))
+        self.assertEqual(lines[-1], 'STATUS: CHECKS FAILING')
+        self.assertEqual(len((self.work / 'a').read_text().splitlines()), 3)
+        self.assertEqual((self.work / 'b').read_text().splitlines(), ['passing'])
+        self.assertEqual((self.work / 'c').read_text().splitlines(), ['passing'])
+        out = next((self.work / 'out/dispatch').iterdir())
+        self.assertTrue((out / 'check-2-round-0.log').exists())
+        self.assertFalse((out / 'check-2-round-1.log').exists())
+        self.assertTrue(any('Check 2 PASS:' in line for line in lines))
+
+    def test_initial_success_runs_checks_once(self):
+        check = 'echo $DISPATCH_ROUND/$DISPATCH_PASS >> initial'
+        self.assertEqual(self.report(self.dispatch('-k', check, '-k', check))[-1], 'STATUS: DONE')
+        self.assertEqual((self.work / 'initial').read_text().splitlines(), ['0/initial', '0/initial'])
+        self.assertEqual(len(self.calls()), 1)
 
     def test_exhausted_checks_and_trimmed_resume(self):
         executable(self.work / 'check', '#!/usr/bin/env python3\nfor i in range(1000): print("ERROR: " + str(i) + "x"*3000)\nraise SystemExit(1)\n')
