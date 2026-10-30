@@ -2,6 +2,8 @@
 
 # Agent Kaizen
 
+[![CI](https://github.com/HighwayofLife/agent-kaizen/actions/workflows/ci.yml/badge.svg)](https://github.com/HighwayofLife/agent-kaizen/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 *Kaizen* (改善) is the practice of continuous improvement through small, measured changes. **Agent Kaizen** is a Claude Code plugin for a **self-improving AI development workflow**. It regularly measures how your agents spend tokens, turns and time, makes small targeted changes, checks whether each one paid off, and keeps looking for better tools, settings and models.
 
 It was built while developing a game with Claude Code coordinating Claude subagents and the OpenAI Codex CLI. It works for any project, with or without Codex.
