@@ -16,7 +16,7 @@ This is the entry point when you don't know which skill to run. It runs the loop
 
 1. **Find the state.** Read `docs/kaizen/LEDGER.md`. If there is no ledger, run `/agent-kaizen:start` first (in propose-only mode, just say it is missing). In a scheduled `propose-only` or `auto` run, read the report path given after the mode. Otherwise use the newest `token-audit-*.md` in `docs/kaizen/`, then in the folder printed as `reports` by `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled config show --for .`. Never use another project's report folder.
 2. **Measure.** Outside scheduled runs, if the newest report is older than 3 days and you can run commands, run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-audit --cwd . --days 14 --out docs/kaizen/`. Reports with different windows or scopes are not comparable; use the comparison the report itself prints.
-3. **Review.** Follow `${CLAUDE_PLUGIN_ROOT}/skills/review/SKILL.md`: fill in the measured effects, then keep, tune or revert.
+3. **Review.** Follow `${CLAUDE_PLUGIN_ROOT}/skills/review/SKILL.md`: fill in the measured effects, then keep, tune or revert. A project-scoped `usage-series` and `usage-compare --cutoff <change date>` may supply the measured rates instead of two audit windows.
 4. **Due checks.** Check the dates of the last runs:
    - models: if the last `models-*.md` audit or ledger entry is more than 30 days old, follow `${CLAUDE_PLUGIN_ROOT}/skills/models/SKILL.md`;
    - releases and tools: if the last whats-new run is more than 30 days old, follow `${CLAUDE_PLUGIN_ROOT}/skills/whats-new/SKILL.md`;

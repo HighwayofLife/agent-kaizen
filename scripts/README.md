@@ -214,3 +214,93 @@ python3 -m unittest discover -s tests -v
 Tests create a fake `codex` executable on PATH and synthetic transcripts in
 isolated temporary directories. No network, Docker, or real Codex session is
 used. All executable scripts are Python, so shellcheck does not apply.
+
+## usage-series
+
+Write `daily.csv` and `daily-agents.csv` to an explicit output directory. Dates
+are UTC; `--until` includes the whole day. The default starts 30 days ago and
+ends today. Empty days have zero measurements. With no selection, scan all
+projects. Repeat `--cwd` for directories and descendants, or `--project` for
+substrings (Claude project folder names; Codex recorded cwd). The two selection
+options cannot be combined. `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are honored.
+Subagent transcripts whose parent transcript is gone may be missed by `--cwd`.
+
+```bash
+usage-series --since 2026-10-01 --until 2026-10-30 --cwd . --out out/series
+usage-series --since 2026-10-01 --out out/series --git . \
+  --count-command 'codemap=^tools/codemap'
+```
+
+Main context includes fresh input, cache reads and cache writes. Wake-ups are
+main calls following task notifications. Main reads count completed `Read`
+requests with neither `offset` nor `limit`. Command regexes search the original
+Bash command in both main and subagent transcripts; each tool call counts once.
+Columns use `command_NAME`. Agent runs count each transcript once per day.
+`codex_sessions` counts each session once per active day; a session crossing
+midnight counts twice when daily counts are summed.
+The CSVs contain dates, agent-type labels and numbers, without paths or prompts.
+
+`claude_context_tokens` and `claude_output_tokens` include main and subagent
+usage across all Claude models. Context is input plus cache reads plus cache
+writes. `main_context_tokens` and `sub_context_tokens` split that context by
+main session and subagents. Zero-token `<synthetic>` rows are ignored.
+
+Costs use the adjacent `pricing.json`, including aliases, cache rates and
+context thresholds. Override it with `--pricing FILE`. Claude costs are grouped
+by family; Codex costs also have `cost_codex_model_MODEL` columns for priced
+models. Unknown models contribute zero cost with a warning. `unpriced_calls`
+counts calls whose model has no price that day; warnings list the model ids.
+Costs are API list price equivalents, not bills. Do not add model columns to family columns;
+`cost_total` already sums the family columns once.
+
+The highest numbered `CODEX_HOME/state_*.sqlite` is opened read-only. Only
+`created_at`, `model`, `cwd` and `tokens_used` are queried. A locked database is
+copied with its WAL and SHM into a temporary directory. Missing tables or
+columns produce one warning. `codex_threads_db`, `codex_tokens_db` and
+`codex_tokens_db_FAMILY` assign each thread's lifetime total to its creation day.
+These tokens include cached input and do not split cached, fresh and output
+usage, so they measure volume and cannot supply a price. They overlap session
+log usage; do not add them.
+
+Repeat `--git REPO` for optional activity. Non-merge commits across all refs are
+counted once by author date in UTC, including across repeated repositories.
+`lines_changed` sums insertions and deletions; binary files are skipped.
+Invalid repositories produce a warning.
+
+## usage-compare
+
+Compare days with at least 50 main calls on each side. The cutoff is the first
+after day; `--before-from` and `--after-to` are inclusive bounds. Totals and rates
+use only the listed active days. Average context is weighted by main calls;
+peak context is the maximum. Ratios are after / before; a zero denominator is
+`n/a`. Override the activity threshold with `--active-min-calls N`.
+
+```bash
+usage-compare --series out/series --cutoff 2026-10-20 --before-from 2026-10-01
+usage-compare --series out/series --cutoff 2026-10-20 --json
+usage-compare --cutoff 2026-10-20 --before-from 2026-10-01 \
+  --clean-split --cwd .
+```
+
+Fewer than three active days produces a warning. Each day with DB tokens but
+zero Codex log cost is excluded from Codex and total cost rates, including
+their call and commit denominators. Warnings list excluded dates and coverage.
+When no days remain, these costs show `n/a (logs missing)`. Claude metrics use
+all active days. Unpriced calls on either side produce a warning.
+Command counts appear per day and per main call.
+`Claude tokens/day` adds context and output. When both sources are present,
+`Claude + Codex DB tokens/day` and `tokens/commit` add Claude tokens to Codex DB
+tokens. This measures volume, not price; Codex DB tokens include cached input.
+JSON contains the same metrics, ratios, active days and warnings; unavailable
+numbers are `null` and the `unavailable` list identifies missing-log costs.
+
+`--clean-split` reads local Claude transcripts instead of `daily.csv`.
+`--series` is optional here. A window with zero main calls produces a warning.
+It keeps only files last written before the cutoff in the before set, including each
+subagent file independently. Both sets are filtered to their UTC windows.
+It calls the adjacent token-audit with both report and extract outputs in a
+temporary directory. Codex logs and DB totals are excluded from this mode.
+Rates use elapsed UTC days, not active days. The before window defaults to the
+30 days before the cutoff, and the after window ends now unless `--after-to`
+is set. Pass the original selection and pricing options again; CSVs do not
+store private scope information.

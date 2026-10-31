@@ -1,0 +1,211 @@
+#!/usr/bin/env python3
+"""Compare usage rates before and after a UTC cutoff date."""
+import argparse
+from collections import Counter
+import csv
+from datetime import datetime, timedelta, timezone
+from importlib.machinery import SourceFileLoader
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+
+SERIES = SourceFileLoader('kaizen_usage_series', str(Path(__file__).resolve().with_name('usage-series'))).load_module()
+
+
+def divide(value, denominator):
+    return value / denominator if denominator else None
+
+
+def window(rows, args, before, commands, git):
+    selected = [r for r in rows if (r['date'] < args.cutoff.date().isoformat()) == before
+                and (not args.before_from or r['date'] >= args.before_from.date().isoformat())
+                and (not args.after_to or r['date'] <= args.after_to.date().isoformat())
+                and float(r.get('main_calls') or 0) >= args.active_min_calls]
+    total = Counter()
+    for row in selected:
+        total.update({k: float(v or 0) for k, v in row.items() if k != 'date'})
+    days, calls = len(selected), total['main_calls']
+    claude = sum(total['cost_' + f] for f in SERIES.CLAUDE)
+    excluded = [r['date'] for r in selected if float(r.get('codex_tokens_db') or 0) > 0
+                and sum(float(r.get('cost_' + f) or 0) for f in SERIES.CODEX) == 0]
+    covered = [r for r in selected if r['date'] not in excluded]
+    cost_days = len(covered)
+    cost_calls = sum(float(r.get('main_calls') or 0) for r in covered)
+    cost_commits = sum(float(r.get('commits') or 0) for r in covered)
+    codex = sum(float(r.get('cost_' + f) or 0) for r in covered for f in SERIES.CODEX)
+    missing = bool(excluded) and not covered
+    combined = None if missing else codex + sum(
+        float(r.get('cost_' + f) or 0) for r in covered for f in SERIES.CLAUDE)
+    metrics = {
+        'main calls/day': divide(calls, days),
+        'avg context': divide(sum(float(r.get('main_avg_ctx') or 0) * float(r.get('main_calls') or 0) for r in selected), calls),
+        'peak context': max((float(r.get('main_peak_ctx') or 0) for r in selected), default=None),
+        'wake-ups/day': divide(total['wakeups'], days),
+        'images/day': divide(total['main_images'], days),
+        'Claude cost/day': divide(claude, days),
+        'Codex cost/day': None if missing else divide(codex, cost_days),
+        'total cost/day': divide(combined, cost_days) if combined is not None else None,
+        'Claude cost/main call': divide(claude, calls),
+        'Codex cost/main call': None if missing else divide(codex, cost_calls),
+        'total cost/main call': divide(combined, cost_calls) if combined is not None else None,
+        'Codex DB tokens/day': divide(total['codex_tokens_db'], days),
+    }
+    if rows and all('claude_context_tokens' in r and 'claude_output_tokens' in r for r in rows):
+        claude_tokens = total['claude_context_tokens'] + total['claude_output_tokens']
+        metrics['Claude tokens/day'] = divide(claude_tokens, days)
+        if all('codex_tokens_db' in r for r in rows):
+            tokens = claude_tokens + total['codex_tokens_db']
+            metrics['Claude + Codex DB tokens/day'] = divide(tokens, days)
+            if git:
+                metrics['tokens/commit'] = divide(tokens, total['commits'])
+    if git:
+        metrics.update({'commits/day': divide(total['commits'], days),
+                        'cost/commit': divide(combined, cost_commits) if combined is not None else None})
+    for name in commands:
+        metrics[name + '/day'] = divide(total[name], days)
+        metrics[name + '/main call'] = divide(total[name], calls)
+    warnings = []
+    side = 'before' if before else 'after'
+    if days < 3:
+        warnings.append(f'{side}: fewer than 3 active days ({days})')
+    if excluded:
+        warnings.append(f'{side}: Codex logs missing on {", ".join(excluded)}; '
+                        f'Codex and total cost use {cost_days} of {days} active days')
+    if total['unpriced_calls'] > 0:
+        warnings.append(f"{side}: {total['unpriced_calls']:g} unpriced calls; costs are incomplete")
+    unavailable = [k for k in metrics if missing and (k.startswith(('Codex cost', 'total cost')) or k == 'cost/commit')]
+    return dict(active_days=[r['date'] for r in selected], metrics=metrics,
+                logs_missing=missing, unavailable=unavailable), warnings
+
+
+def clean_split(args):
+    """Run isolated Claude audits; exclude every before file modified at/after cutoff."""
+    audit = Path(__file__).resolve().with_name('token-audit')
+    start = args.before_from or args.cutoff - timedelta(days=30)
+    stop = args.after_to + timedelta(days=1) if args.after_to else datetime.now(timezone.utc)
+    if stop <= args.cutoff:
+        raise ValueError('clean split after window is empty')
+    results = []
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary)
+        files = list(SERIES.claude_files(args))
+        projects = sorted({str(p.parent if m else p.parent.parent.parent) for p, m in files})
+        for side, since, until in (('before', start, args.cutoff), ('after', args.cutoff, stop)):
+            config = root / side / 'claude'
+            config.mkdir(parents=True)
+            # Stage filtered rows too: token-audit has no --until option.
+            for path, main in files:
+                if side == 'before' and path.stat().st_mtime >= args.cutoff.timestamp():
+                    continue
+                parent = path.parent if main else path.parent.parent.parent
+                # Only generated numeric directory names enter the temporary config.
+                project = config / 'projects' / str(projects.index(str(parent)))
+                relative = Path(path.name) if main else Path(path.parent.parent.name) / 'subagents' / path.name
+                target = project / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                with target.open('w') as stream:
+                    for row in SERIES.AUDIT.rows(path, since, Counter()):
+                        if isinstance(row.get('timestamp'), str) and SERIES.AUDIT.date_time(row['timestamp']) < until:
+                            stream.write(json.dumps(row) + '\n')
+                meta = path.with_suffix('.meta.json')
+                if not main and meta.is_file():
+                    shutil.copyfile(meta, target.with_suffix('.meta.json'))
+            env = dict(os.environ, CLAUDE_CONFIG_DIR=str(config), CODEX_HOME=str(root / 'empty-codex'))
+            command = [sys.executable, str(audit), '--json', '--since', since.strftime('%Y-%m-%d'),
+                       '--pricing', str(args.pricing), '--out', str(root / side / 'reports'),
+                       '--extract-out', str(root / side / 'extracts')]
+            run = subprocess.run(command, env=env, capture_output=True, text=True, check=True)
+            data = json.loads(run.stdout)
+            triggers = data['triggers']
+            calls = sum(c.get('calls', 0) for c in data['sessions'])
+            duration = (until - since).total_seconds() / 86400
+            main_context = sum(c.get('context', 0) for c in data['sessions'])
+            results.append(dict(window_days=duration, calls=calls, metrics={
+                'main calls/day': divide(calls, duration),
+                'avg context': divide(main_context, calls),
+                'peak context': max((c.get('peak', 0) for c in data['sessions']), default=0),
+                'wake-ups/day': divide(triggers.get('task notification', {}).get('calls', 0), duration),
+                'images/day': divide(data['images'], duration),
+                'Claude cost/day': divide(data['cost']['total'], duration),
+                'Claude cost/main call': divide(data['cost']['total'], calls),
+            }, active_days=[], unavailable=[], logs_missing=False))
+    return results
+
+
+def display(result):
+    print('metric                            before                  after       ratio')
+    before, after = result['before'], result['after']
+    for side, value in (('before', before), ('after', after)):
+        if result['mode'] == 'clean-split':
+            print(f"{side} window: {value['window_days']:.2f} UTC days")
+        else:
+            print(f"{side} active days ({len(value['active_days'])}): " + (', '.join(value['active_days']) or 'none'))
+    for metric, ratio in result['ratios'].items():
+        values = []
+        for window_data in (before, after):
+            value = window_data['metrics'][metric]
+            values.append('n/a (logs missing)' if metric in window_data['unavailable'] else
+                          'n/a' if value is None else f'{value:,.4f}'.rstrip('0').rstrip('.'))
+        print(f'{metric:30} {values[0]:>22} {values[1]:>22} {ratio if ratio is not None else "n/a":>10}')
+    for warning in result['warnings']:
+        print('Warning: ' + warning)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--series', type=Path)
+    parser.add_argument('--cutoff', type=SERIES.date, required=True, help='first after day (UTC)')
+    parser.add_argument('--before-from', type=SERIES.date)
+    parser.add_argument('--after-to', type=SERIES.date, help='inclusive last after day')
+    parser.add_argument('--active-min-calls', type=int, default=50)
+    parser.add_argument('--json', action='store_true')
+    parser.add_argument('--clean-split', action='store_true', help='isolated Claude file sets; rates per elapsed UTC day, not active day')
+    SERIES.selection(parser)
+    args = parser.parse_args()
+    if not args.clean_split and args.series is None:
+        parser.error('--series is required unless --clean-split is used')
+    if args.active_min_calls < 0:
+        parser.error('--active-min-calls must be nonnegative')
+    if args.before_from and args.before_from >= args.cutoff:
+        parser.error('--before-from must precede --cutoff')
+    if args.after_to and args.after_to < args.cutoff:
+        parser.error('--after-to must be on or after --cutoff')
+    try:
+        if args.clean_split:
+            before, after = clean_split(args)
+            warnings = ['clean split uses Claude transcripts only and elapsed UTC days; series active-day threshold does not apply']
+            for side, data in (('before', before), ('after', after)):
+                if not data['calls']:
+                    warnings.append(f'{side}: 0 calls in clean split window')
+        else:
+            with (args.series / 'daily.csv').open(newline='') as stream:
+                reader = csv.DictReader(stream)
+                fields = reader.fieldnames or []
+                if not {'date', 'main_calls'}.issubset(fields):
+                    raise ValueError('daily.csv needs date and main_calls columns')
+                rows = sorted(reader, key=lambda r: r['date'])
+            commands = [f for f in fields if f.startswith('command_')]
+            before, wb = window(rows, args, True, commands, 'commits' in fields)
+            after, wa = window(rows, args, False, commands, 'commits' in fields)
+            warnings = wb + wa
+        ratios = {key: round(after['metrics'][key] / value, 6)
+                  if value not in (None, 0) and after['metrics'][key] is not None else None
+                  for key, value in before['metrics'].items()}
+        result = dict(mode='clean-split' if args.clean_split else 'active-days', before=before,
+                      after=after, ratios=ratios, warnings=warnings)
+        if args.json:
+            print(json.dumps(result, indent=2, allow_nan=False))
+        else:
+            display(result)
+        return 0
+    except (OSError, ValueError, subprocess.CalledProcessError) as exc:
+        print(f'usage-compare: {exc}', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

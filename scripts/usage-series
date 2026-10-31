@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""Write numeric usage measurements by UTC day from local logs and state."""
+import argparse
+from collections import Counter, defaultdict
+import csv
+from datetime import datetime, timedelta, timezone
+from importlib.machinery import SourceFileLoader
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tempfile
+
+AUDIT = SourceFileLoader('kaizen_token_audit', str(Path(__file__).resolve().with_name('token-audit'))).load_module()
+CLAUDE = ('opus', 'sonnet', 'haiku', 'fable', 'claude_other')
+CODEX = ('sol', 'terra', 'astra', 'luna', 'codex_other')
+BASE = ('date main_calls main_avg_ctx main_peak_ctx wakeups wakeup_avg_ctx main_images '
+        'main_reads sub_calls spawns_total codex_sessions codex_threads_db codex_tokens_db '
+        'claude_context_tokens claude_output_tokens main_context_tokens sub_context_tokens unpriced_calls').split()
+
+
+def date(value):
+    return datetime.strptime(value, '%Y-%m-%d').replace(tzinfo=timezone.utc)
+
+
+def family(model, codex=False):
+    return next((key for key in (CODEX if codex else CLAUDE)[:-1] if key in model.lower()),
+                'codex_other' if codex else 'claude_other')
+
+
+def selection(parser):
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('--project', action='append', help='project substring (repeatable; any match)')
+    group.add_argument('--cwd', action='append', metavar='PATH', help='working directory and descendants (repeatable)')
+    parser.add_argument('--pricing', type=Path, default=Path(__file__).resolve().with_name('pricing.json'))
+
+
+def matches(raw, args, folder=None):
+    if args.cwd:
+        targets = [str(Path(p).expanduser().resolve()) for p in args.cwd]
+        if raw is None and folder:
+            return folder in {re.sub(r'[^a-zA-Z0-9]', '-', target) for target in targets}
+        return AUDIT.cwd_matches(raw, targets, {})
+    if args.project:
+        return any(p.casefold() in (folder if folder is not None else raw or '').casefold()
+                   for p in args.project)
+    return True
+
+
+def claude_files(args):
+    root = AUDIT.claude_home() / 'projects'
+    if not root.is_dir():
+        return
+    for project in sorted(p for p in root.iterdir() if p.is_dir()):
+        for pattern, main in (('*.jsonl', True), ('*/subagents/*.jsonl', False)):
+            for path in sorted(project.glob(pattern)):
+                parent = path if main else project / (path.parent.parent.name + '.jsonl')
+                if matches(AUDIT.cwd_of_file(parent), args, project.name):
+                    yield path, main
+
+
+def price_state(pricing):
+    return dict(_pricing=pricing, cost=dict(unpriced={}, components=Counter(), by_model=Counter(),
+                                          by_agent=Counter(), total=0))
+
+
+def scan_claude(path, main, args, days, agents, warnings, priced, seen):
+    agent = 'unknown'
+    if not main:
+        meta = path.with_suffix('.meta.json')
+        if meta.is_file():
+            try:
+                agent = json.loads(meta.read_text()).get('agentType') or 'unknown'
+                if not isinstance(agent, str) or not re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_-]{0,63}', agent):
+                    agent = 'unknown'
+            except (OSError, ValueError, AttributeError):
+                warnings['malformed agent metadata'] += 1
+    pending, tools, runs = None, {}, set()
+    for row in AUDIT.rows(path, args.since, warnings):
+        if not isinstance(row.get('timestamp'), str):
+            continue
+        ts = AUDIT.date_time(row['timestamp'])
+        if ts >= args.stop:
+            continue
+        day = ts.date().isoformat()
+        message = row.get('message') or {}
+        if not isinstance(message, dict):
+            continue
+        content = AUDIT.blocks(message)
+        if main and row.get('type') == 'user':
+            pending = ('tool result' if any(b.get('type') == 'tool_result' for b in content)
+                       else 'wakeup' if '<task-notification>' in str(message.get('content', '')) else 'human')
+        usage = message.get('usage')
+        ident = message.get('id')
+        if row.get('type') == 'assistant' and isinstance(usage, dict) and usage and (not ident or ('msg', ident) not in seen):
+            if ident:
+                seen.add(('msg', ident))
+            model = message.get('model') or 'unknown'
+            model = model if isinstance(model, str) else 'unknown'
+            if model == '<synthetic>' and not (AUDIT.context(usage) or usage.get('output_tokens')):
+                continue
+            days[day]['unpriced_calls'] += int(AUDIT.pricing_key(priced['_pricing'], model) is None)
+            context = AUDIT.context(usage)
+            days[day]['claude_context_tokens'] += context
+            days[day]['claude_output_tokens'] += usage.get('output_tokens', 0) or 0
+            days[day]['main_context_tokens' if main else 'sub_context_tokens'] += context
+            cost = AUDIT.price(priced, model, agent, usage)
+            days[day]['cost_' + family(model)] += cost
+            if main:
+                AUDIT.add(days[day + ':main'], usage)
+                if pending == 'wakeup':
+                    AUDIT.add(days[day + ':wakeup'], usage)
+                pending = None
+            else:
+                days[day]['sub_calls'] += 1
+                AUDIT.add(agents[day, agent], usage)
+                agents[day, agent]['cost'] += cost
+                runs.add(day)
+        for block in content:
+            kind = block.get('type')
+            ident = block.get('id') if kind == 'tool_use' else block.get('tool_use_id')
+            if kind not in ('tool_use', 'tool_result') or (ident and (kind, ident) in seen):
+                continue
+            if ident:
+                seen.add((kind, ident))
+            if kind == 'tool_use':
+                name = block.get('name')
+                inp = block.get('input') or {}
+                if not isinstance(inp, dict):
+                    continue
+                tools[ident] = (name, name == 'Read' and not any(k in inp for k in ('offset', 'limit')))
+                days[day]['spawns_total'] += int(name in ('Agent', 'Task'))
+                if name == 'Bash':
+                    command = inp.get('command', '')
+                    if isinstance(command, str):
+                        for label, regex in args.commands:
+                            days[day]['command_' + label] += int(bool(regex.search(command)))
+            elif main:
+                days[day]['main_images'] += AUDIT.image_count(block.get('content'))
+                days[day]['main_reads'] += int(tools.get(ident, (None, False))[1])
+    for day in runs:
+        agents[day, agent]['runs'] += 1
+
+
+def scan_codex(args, days, warnings, priced):
+    for path in sorted((AUDIT.codex_home() / 'sessions').glob('*/*/*/*.jsonl')):
+        if not matches(AUDIT.cwd_of_file(path), args):
+            # Codex stores cwd in payload, unlike Claude.
+            try:
+                with path.open() as stream:
+                    payload = json.loads(stream.readline(AUDIT.LINE_LIMIT)).get('payload') or {}
+                if not matches(payload.get('cwd'), args):
+                    continue
+            except (OSError, ValueError, AttributeError):
+                warnings['unreadable Codex header'] += 1
+                continue
+        previous, model, active = Counter(), 'unknown', set()
+        for row in AUDIT.rows(path, datetime.min.replace(tzinfo=timezone.utc), warnings, keep_model=True):
+            if not isinstance(row.get('timestamp'), str):
+                continue
+            payload = row.get('payload') or {}
+            if not isinstance(payload, dict):
+                continue
+            model = payload.get('model') or row.get('model') or model
+            info = payload.get('info') or {}
+            usage = info.get('total_token_usage') if isinstance(info, dict) else None
+            if payload.get('type') != 'token_count' or not isinstance(usage, dict):
+                continue
+            current = Counter({k: v for k, v in usage.items() if isinstance(v, (int, float))})
+            reset = any(current[k] < previous[k] for k in ('input_tokens', 'output_tokens'))
+            delta = current if reset else current - previous
+            previous = current
+            ts = AUDIT.date_time(row['timestamp'])
+            if not args.since <= ts < args.stop:
+                continue
+            day = ts.date().isoformat()
+            cost = AUDIT.price(priced, model, 'codex', delta, codex=True)
+            key = AUDIT.pricing_key(priced['_pricing'], model)
+            days[day]['unpriced_calls'] += int(key is None)
+            days[day]['cost_codex_model_' + key if key else 'cost_codex_other_model'] += cost
+            days[day]['cost_' + family(model, True)] += cost
+            active.add(day)
+        for day in active:
+            days[day]['codex_sessions'] += 1
+
+
+def database_rows(path, args):
+    # Explicit projection: never fetch thread titles, prompts, or previews.
+    with sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=0.1) as db:
+        return db.execute('SELECT created_at, model, cwd, tokens_used FROM threads '
+                          'WHERE created_at >= ? AND created_at < ?',
+                          (args.since.timestamp(), args.stop.timestamp())).fetchall()
+
+
+def scan_database(args, days, warnings):
+    files = [(int(m[1]), p) for p in AUDIT.codex_home().glob('state_*.sqlite')
+             for m in [re.fullmatch(r'state_(\d+)\.sqlite', p.name)] if m]
+    if not files:
+        return
+    path = max(files)[1]
+    try:
+        try:
+            records = database_rows(path, args)
+        except sqlite3.OperationalError as exc:
+            if not any(word in str(exc).lower() for word in ('locked', 'busy')):
+                raise
+            with tempfile.TemporaryDirectory() as temporary:
+                target = Path(temporary) / path.name
+                for suffix in ('', '-wal', '-shm'):
+                    source = Path(str(path) + suffix)
+                    if source.exists():
+                        shutil.copy2(source, Path(str(target) + suffix))
+                records = database_rows(target, args)
+        for created, model, cwd, tokens in records:
+            if not matches(cwd, args):
+                continue
+            if not isinstance(created, (int, float)) or not isinstance(tokens, (int, float)):
+                warnings['invalid database numeric values'] += 1
+                continue
+            day = datetime.fromtimestamp(created, timezone.utc).date().isoformat()
+            days[day]['codex_threads_db'] += 1
+            days[day]['codex_tokens_db'] += tokens
+            days[day]['codex_tokens_db_' + family(model or 'unknown', True)] += tokens
+    except (sqlite3.Error, OSError):
+        warnings['Codex state database unavailable or missing required table/columns'] += 1
+
+
+def scan_git(args, days, warnings):
+    seen = set()
+    for repo in args.git:
+        try:
+            result = subprocess.run(['git', '--no-pager', '-c', 'core.quotepath=off', '-C', str(repo),
+                                     'log', '--all', '--no-merges', '--format=COMMIT %H %at', '--numstat'],
+                                    capture_output=True, text=True, check=True)
+        except (OSError, subprocess.CalledProcessError):
+            warnings['git repository unavailable'] += 1
+            continue
+        day = None
+        for line in result.stdout.splitlines():
+            if line.startswith('COMMIT '):
+                _, ident, timestamp = line.split()
+                ts = datetime.fromtimestamp(int(timestamp), timezone.utc)
+                day = ts.date().isoformat() if args.since <= ts < args.stop and ident not in seen else None
+                seen.add(ident)
+                if day:
+                    days[day]['commits'] += 1
+            elif day:
+                parts = line.split('\t', 2)
+                if len(parts) == 3 and parts[0].isdigit() and parts[1].isdigit():
+                    days[day]['lines_changed'] += int(parts[0]) + int(parts[1])
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--since', type=date, default=(datetime.now(timezone.utc) - timedelta(days=30)).replace(hour=0, minute=0, second=0, microsecond=0))
+    parser.add_argument('--until', type=date, help='last UTC day, inclusive (default today)')
+    selection(parser)
+    parser.add_argument('--out', type=Path, required=True)
+    parser.add_argument('--git', type=Path, action='append', default=[])
+    parser.add_argument('--count-command', action='append', default=[], metavar='NAME=REGEX')
+    args = parser.parse_args()
+    args.stop = (args.until or datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)) + timedelta(days=1)
+    if args.stop <= args.since:
+        parser.error('--until must be on or after --since')
+    args.commands = []
+    for value in args.count_command:
+        name, separator, pattern = value.partition('=')
+        if not separator or not re.fullmatch(r'[a-z][a-z0-9_]{0,39}', name) or name in [n for n, _ in args.commands]:
+            parser.error('--count-command needs a unique lowercase NAME=REGEX')
+        try:
+            args.commands.append((name, re.compile(pattern)))
+        except re.error as exc:
+            parser.error(str(exc))
+    pricing, error = AUDIT.load_pricing(args.pricing.expanduser())
+    warnings = Counter()
+    if error:
+        warnings['pricing unavailable'] += 1
+    days, agents, seen, paths = defaultdict(Counter), defaultdict(Counter), set(), set()
+    priced = price_state(pricing)
+    for path, main_session in claude_files(args):
+        if path.resolve() not in paths:
+            paths.add(path.resolve())
+            scan_claude(path, main_session, args, days, agents, warnings, priced, seen)
+    scan_codex(args, days, warnings, priced)
+    scan_database(args, days, warnings)
+    scan_git(args, days, warnings)
+    if priced['cost']['unpriced']:
+        warnings['unpriced models; costs are incomplete: ' + ', '.join(sorted(priced['cost']['unpriced']))] += 1
+    model_fields = sorted({k for counter in days.values() for k in counter if k.startswith('cost_codex_model_')})
+    fields = (BASE + ['cost_' + f for f in CLAUDE + CODEX] + model_fields + ['cost_codex_other_model', 'cost_total']
+              + ['codex_tokens_db_' + f for f in CODEX] + ['command_' + n for n, _ in args.commands]
+              + (['commits', 'lines_changed'] if args.git else []))
+    args.out.mkdir(parents=True, exist_ok=True)
+    count = 0
+    with (args.out / 'daily.csv').open('w', newline='') as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        current = args.since
+        while current < args.stop:
+            day = current.date().isoformat()
+            counter = days[day]
+            main_usage, wakeup = days[day + ':main'], days[day + ':wakeup']
+            counter.update(main_calls=main_usage['calls'], main_avg_ctx=main_usage['context'] / max(main_usage['calls'], 1),
+                           main_peak_ctx=main_usage['peak'], wakeups=wakeup['calls'],
+                           wakeup_avg_ctx=wakeup['context'] / max(wakeup['calls'], 1))
+            counter['cost_total'] = sum(counter['cost_' + f] for f in CLAUDE + CODEX)
+            writer.writerow(dict(date=day, **{k: round(counter[k], 8) for k in fields if k != 'date'}))
+            count += 1
+            current += timedelta(days=1)
+    with (args.out / 'daily-agents.csv').open('w', newline='') as stream:
+        writer = csv.writer(stream)
+        writer.writerow(('date', 'agent_type', 'runs', 'calls', 'avg_context', 'cost'))
+        for (day, agent), usage in sorted(agents.items()):
+            writer.writerow((day, agent, usage['runs'], usage['calls'], usage['context'] / max(usage['calls'], 1), round(usage['cost'], 8)))
+    print(f'{count} days written; {sum(warnings.values())} warnings')
+    for warning, number in warnings.items():
+        print(f'Warning: {warning} ({number})')
+    print(args.out / 'daily.csv')
+    print(args.out / 'daily-agents.csv')
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

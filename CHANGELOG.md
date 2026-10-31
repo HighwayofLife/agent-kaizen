@@ -2,6 +2,15 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.6.0 (2026-10-31)
+
+- New `usage-series` writes daily UTC usage and agent measurements from local Claude and Codex logs. It supports project selection, command counts, and optional git activity.
+- Codex state database totals provide thread and token volumes when session logs are gone. They are not used to calculate prices.
+- New `usage-compare` compares rates before and after a change on active days. It flags missing Codex log costs. Optional `--clean-split` excludes before transcripts last written after the cutoff.
+- Daily exports include Claude token totals and unpriced call counts. Comparison cost rates exclude days with missing Codex logs and report the excluded dates. Clean split uses all main calls and warns on empty windows.
+- Review and cycle can use these comparisons for ledger measured effects.
+- Upgrade notes: none required.
+
 ## 0.5.0 (2026-10-30)
 
 - token-audit: the by-agent table shows each subagent type's cost share, models and effort mix. A new extract file per report holds the same numbers per agent type, plus a hint for types that might run on a cheaper model. New `--extract-out` defaults to the audits folder's `extracts/`, never `--out`.

@@ -49,7 +49,7 @@ So this plugin is built as a **loop**:
 
 <p align="center"><img src="assets/loop.svg" alt="The loop, clockwise around a ledger: 1 Measure: token-audit reads your session logs about every 3 days, a script that costs no tokens. 2 Review: Claude compares the audit with the ledger and proposes the next changes. 3 Change one thing: backed up, verified, and rolled back if it fails. 4 Re-measure: the next audit fills in the measured effect, and the change is kept, tuned or reverted. The ledger in the middle lists changes with their verdicts, including one that was reverted and retried." width="100%"></p>
 
-1. **Measure:** `scripts/token-audit` runs about every 3 days. It's a plain script, so it costs no tokens.
+1. **Measure:** `scripts/token-audit` runs about every 3 days. It's a plain script, so it costs no tokens. `scripts/usage-series` shows daily usage; `scripts/usage-compare` compares before and after a change.
 2. **Review:** `/agent-kaizen:review` or `/agent-kaizen:cycle` compares the audit with the ledger.
 3. **Change one thing** at a time, and log it in `LEDGER.md`.
 4. **Re-measure:** the next audit shows whether the change paid off, so you keep, tune or revert it.
@@ -197,7 +197,7 @@ skills/             the loop, one SKILL.md per step (plain Markdown; readable wi
 agents/             kaizen-auditor (propose-only)
 hooks/              audit-notice (enabled by the plugin), plus opt-in guardrails:
                     limit-big-read, block-image-read, subagent-context, after-compact
-scripts/            token-audit (+ pricing.json), kaizen-backup (backups + undo), codex-dispatch, codex-review,
+scripts/            token-audit (+ pricing.json), usage-series, usage-compare, kaizen-backup (backups + undo), codex-dispatch, codex-review,
                     dispatch-status, install-schedule, kaizen-scheduled
 templates/          starting points: global and project CLAUDE.md, orchestrator.md,
                     Codex AGENTS.md and config.toml, settings.example.json,
