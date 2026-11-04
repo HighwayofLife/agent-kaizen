@@ -55,6 +55,7 @@ class ScheduleTests(StubCase):
         self.env.pop('CODEX_HOME', None)
         self.env.pop('KAIZEN_REVIEW_MODEL', None)
         self.env.pop('KAIZEN_REVIEW_MAX_TURNS', None)
+        self.env.pop('CLAUDE_PLUGIN_ROOT', None)
         self.cron_file = self.root / 'crontab'
         self.env['CRON_FILE'] = str(self.cron_file)
         executable(self.bin / 'crontab', CRONTAB)
@@ -129,7 +130,10 @@ class ScheduleTests(StubCase):
                              (SCRIPTS / source).read_bytes())
         self.assertTrue(os.access(self.home / '.claude/bin/kaizen-scheduled', os.X_OK))
         self.assertTrue((self.home / '.claude/bin/kaizen-scheduled').is_symlink())
-        self.assertIn('0 drift, 0 broken', self.run_script('kaizen-link', '--check').stdout)
+        check = subprocess.run([sys.executable, str(self.home / '.claude/bin/kaizen-link'), '--check'],
+                               env=self.env, capture_output=True, text=True)
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        self.assertIn('0 drift, 0 broken', check.stdout)
         self.assertNotIn('old-', contents)
         self.isolated_remove_without_claude()
         self.assertEqual(self.cron_file.read_text(), foreign)
@@ -167,12 +171,41 @@ class ScheduleTests(StubCase):
                                 '--plugin-root', str(plugin)],
                                env=self.env, capture_output=True, text=True)
         self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        loader = importlib.machinery.SourceFileLoader('installed_scheduled', str(target / 'kaizen-scheduled'))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        with patch.dict(os.environ, self.env, clear=True):
+            options = module.command_options(module.argparse.Namespace(dry_run=True))
+            module.run_checks(custom / 'audits', options)
+        checks = next((custom / 'audits').glob('checks-*.md')).read_text()
+        drift = checks.split('## Drift\n\n', 1)[1].split('\n\n##', 1)[0]
+        self.assertIn('OK kaizen-scheduled', drift)
+        self.assertIn('kaizen-link: 0 drift, 0 broken', drift)
+        self.assertNotIn('unavailable:', drift)
         self.assertFalse((self.home / '.claude/hooks').exists())
         shutil.rmtree(plugin)
         for name in ('usage-series', 'kaizen-scheduled'):
             help_result = subprocess.run([sys.executable, str(target / name), '--help'],
                                          env=self.env, capture_output=True, text=True)
             self.assertEqual(help_result.returncode, 0, help_result.stderr)
+
+    def test_install_preserves_preexisting_runner_symlink_source(self):
+        target = self.home / '.claude/bin/kaizen-scheduled'
+        target.parent.mkdir(parents=True)
+        target.symlink_to(SCRIPTS / 'kaizen-scheduled')
+        original = target.read_bytes()
+        self.install()
+        self.assertTrue(target.is_symlink())
+        self.assertEqual((SCRIPTS / 'kaizen-scheduled').read_bytes(), original)
+        self.assertEqual(target.resolve(), SCRIPTS / 'kaizen-scheduled')
+        loader = importlib.machinery.SourceFileLoader('linked_scheduled', str(target))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        with patch.dict(os.environ, self.env, clear=True):
+            output = module.run_drift(module.argparse.Namespace(python=sys.executable))
+        self.assertIn('kaizen-link: 0 drift, 0 broken', output)
 
     def test_custom_bin_passes_explicit_hooks_dir(self):
         module = self.load_schedule()

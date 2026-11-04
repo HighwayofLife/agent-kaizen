@@ -353,6 +353,8 @@ def main(argv=None):
                 result = subprocess.run(link + flags)
                 if result.returncode:
                     return result.returncode
+            BIN.mkdir(parents=True, exist_ok=True)
+            (BIN / ".kaizen-plugin-root").write_text(str(HERE.parent) + "\n", encoding="utf-8")
         except OSError as error:
             print(f"install-schedule: kaizen-link failed ({error})", file=sys.stderr)
             return 2

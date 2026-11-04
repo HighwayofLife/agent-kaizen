@@ -27,6 +27,7 @@ class ScheduleStepsTests(StubCase):
         shutil.copy(SCRIPTS.parent / 'tests/fixtures/packets.jsonl',
                     write(self.project / 'out/packets.jsonl', ''))
         self.env.update(CLAUDE_CONFIG_DIR=str(self.config), CODEX_HOME=str(self.root / 'codex'))
+        self.env['CLAUDE_PLUGIN_ROOT'] = str(self.scripts.parent)
         self.env.pop('KAIZEN_SKIP_CHECKS', None)
         write(self.scripts / 'pricing.json', '{}')
         self.stub('token-audit', """
@@ -201,6 +202,82 @@ print('proposal')
             write(self.config / 'agent-kaizen.json', json.dumps({'notesLedger': {'csv': str(csv) + '('}}))
             with self.assertRaisesRegex(ValueError, 'cannot build deny rules'):
                 self.module.review_command(options, 'auto', 'report', 'session')
+
+    def test_invalid_raw_ledger_fails_closed(self):
+        for ledger in ({'csv': '/x', 'bogus': 1}, {'timeline': '/x'}, ['csv'], 'csv'):
+            with self.subTest(ledger=ledger):
+                write(self.config / 'agent-kaizen.json', json.dumps({'notesLedger': ledger}))
+                with patch.dict(os.environ, self.env, clear=True):
+                    options = self.module.command_options(self.module.argparse.Namespace(dry_run=True))
+                    with self.assertRaisesRegex(ValueError, 'notesLedger.*invalid'):
+                        self.module.review_command(options, 'auto', 'report', 'session')
+
+    def test_ledger_paths_must_be_absolute(self):
+        for name in ('csv', 'timeline'):
+            ledger = {'csv': str(self.root / 'ledger.csv'), name: 'relative/ledger'}
+            with self.subTest(name=name), patch.dict(os.environ, self.env, clear=True):
+                self.assertFalse(self.module.valid_value('notesLedger', ledger))
+                result = subprocess.run([sys.executable, str(self.runner), 'config', 'set',
+                                         'notesLedger=' + json.dumps(ledger)],
+                                        env=self.env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+                write(self.config / 'agent-kaizen.json', json.dumps({'notesLedger': ledger}))
+                with self.assertRaisesRegex(ValueError, 'absolute'):
+                    self.module.ledger_deny()
+                options = self.module.command_options(self.module.argparse.Namespace(dry_run=True))
+                with self.assertRaisesRegex(ValueError, 'absolute'):
+                    self.module.review_command(options, 'auto', 'report', 'session')
+        with patch.dict(os.environ, self.env, clear=True):
+            self.assertTrue(self.module.valid_value('notesLedger', {'csv': '~/ledger.csv'}))
+
+    def test_auto_backup_allows_only_non_restoring_subcommands(self):
+        self.stub('kaizen-backup', '')
+        with patch.dict(os.environ, self.env, clear=True):
+            options = self.module.command_options(self.module.argparse.Namespace(dry_run=True))
+            command = self.module.review_command(options, 'auto', 'report', 'session')
+        rules = command[command.index('--allowedTools') + 1].split(',')
+        backup = self.scripts / 'kaizen-backup'
+        expected = {f'Bash({prefix}{backup} {subcommand}:*)'
+                    for prefix in ('', 'python3 ', options.python + ' ')
+                    for subcommand in ('begin', 'finish', 'list')}
+        self.assertEqual({rule for rule in rules if 'kaizen-backup' in rule}, expected)
+
+    def test_ledger_symlink_names_and_targets_are_denied(self):
+        csv = write(self.root / 'ledger-target.csv', '')
+        timeline = write(self.root / 'timeline-target.md', '')
+        links = [self.root / 'ledger.csv', self.root / 'timeline.md']
+        for link, target in zip(links, (csv, timeline)):
+            link.symlink_to(target)
+        write(self.config / 'agent-kaizen.json', json.dumps({'notesLedger': {
+            'csv': str(links[0]), 'timeline': str(links[1])}}))
+        with patch.dict(os.environ, self.env, clear=True):
+            options = self.module.command_options(self.module.argparse.Namespace(dry_run=True))
+            command = self.module.review_command(options, 'auto', 'report', 'session')
+        deny = command[command.index('--disallowedTools') + 1].split(',')
+        for path in (*links, csv, timeline):
+            for tool in ('Edit', 'Write'):
+                self.assertIn(f'{tool}(//{path.as_posix().lstrip("/")})', deny)
+
+    def test_drift_uses_environment_plugin_root_before_install_record(self):
+        write(self.scripts / '.kaizen-plugin-root', str(self.root / 'old-plugin'))
+        self.stub('kaizen-link', """
+import os, sys
+assert sys.argv[1:] == ['--check', '--plugin-root', os.environ['CLAUDE_PLUGIN_ROOT']]
+print('checked environment plugin root')
+""")
+        with patch.dict(os.environ, self.env, clear=True):
+            options = self.module.command_options(self.module.argparse.Namespace(dry_run=True))
+            self.module.run_checks(self.audits, options)
+        self.assertIn('checked environment plugin root', self.check_text())
+        self.assertNotIn('unavailable:', self.check_text())
+
+    def test_drift_without_plugin_root_is_unavailable(self):
+        self.env.pop('CLAUDE_PLUGIN_ROOT')
+        with patch.dict(os.environ, self.env, clear=True):
+            options = self.module.command_options(self.module.argparse.Namespace(dry_run=True))
+            self.module.run_checks(self.audits, options)
+        self.assertIn('## Drift\n\nunavailable: plugin root unknown', self.check_text())
+        self.assertNotIn('DRIFT example', self.check_text())
 
     def test_new_report_retention_families(self):
         current = datetime(2026, 11, 4, tzinfo=timezone.utc)

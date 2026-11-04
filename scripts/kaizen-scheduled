@@ -77,10 +77,19 @@ def valid_project_commands(value):
 
 
 def valid_notes_ledger(value):
-    return (not value or (isinstance(value.get("csv"), str) and bool(value["csv"])
-            and all((key in ("csv", "timeline") and isinstance(item, str))
-                    or (key == "measureAfterDays" and type(item) is int and item >= 1)
-                    for key, item in value.items())))
+    if not isinstance(value, dict):
+        return False
+    if not value:
+        return True
+    if not isinstance(value.get("csv"), str) or not value["csv"]:
+        return False
+    try:
+        return all((key in ("csv", "timeline") and isinstance(item, str) and bool(item)
+                    and Path(item).expanduser().is_absolute())
+                   or (key == "measureAfterDays" and type(item) is int and item >= 1)
+                   for key, item in value.items())
+    except (ValueError, RuntimeError):
+        return False
 
 
 SCHEMA = {
@@ -610,8 +619,9 @@ def audit_command(options, out, project=None):
                       "--extract-out", str(extracts)]
 
 
-def deny_path(path):
-    path = Path(path).expanduser().resolve().as_posix()
+def deny_path(path, resolve=True):
+    path = Path(path).expanduser()
+    path = (path.resolve() if resolve else path).as_posix()
     # Rule syntax gives these characters meaning; fail closed rather than build a wrong rule.
     bad = sorted(set(path) & set(",()*?[]\\"))
     if bad:
@@ -635,24 +645,32 @@ def config_home_deny(project_dir=None):
 
 
 def ledger_deny():
-    ledger = effective()["notesLedger"]["value"]
-    return [f"{tool}({deny_path(ledger[name])})"
+    # notes-ledger reads the raw global value too: never use effective()'s fallback here.
+    ledger = load_config(global_config_path()).get("notesLedger", {})
+    if not valid_value("notesLedger", ledger):
+        raise ValueError("notesLedger is invalid: require csv and optional timeline paths "
+                         "absolute after expanduser, and only supported keys")
+    paths = dict.fromkeys(deny_path(ledger[name], resolve=resolve)
             for name in ("csv", "timeline") if ledger.get(name)
-            for tool in ("Edit", "Write")]
+            for resolve in (False, True))
+    return [f"{tool}({path})" for path in paths for tool in ("Edit", "Write")]
 
 
 def review_command(options, mode, report, session_id, project_dir=None):
     auto = mode == "auto"
     allowed = REVIEW_TOOLS
     if auto:
+        ledger_rules = ledger_deny()  # Validate before granting notes-ledger add.
         allowed_tools = ["Read", "Grep", "Glob", "Edit", "Write", "WebFetch", "WebSearch",
                          *READ_ONLY_BASH, "Bash(mkdir:*)", "Bash(diff:*)", "Bash(cd:*)"]
         # No cp or touch: deny rules don't cover them, so they could write protected config.
-        for path in (options.token_audit, HERE / "kaizen-backup"):
-            if path == options.token_audit or path.is_file():
-                allowed_tools.extend([f"Bash(python3 {path}:*)", f"Bash({options.python} {path}:*)"])
-                if path.name == "kaizen-backup":
-                    allowed_tools.append(f"Bash({path}:*)")
+        path = options.token_audit
+        allowed_tools.extend([f"Bash(python3 {path}:*)", f"Bash({options.python} {path}:*)"])
+        backup = HERE / "kaizen-backup"
+        if backup.is_file():
+            for subcommand in ("begin", "finish", "list"):
+                allowed_tools.extend(f"Bash({prefix}{backup} {subcommand}:*)"
+                                     for prefix in ("", "python3 ", options.python + " "))
         ledger = HERE / "notes-ledger"
         if ledger.is_file():
             allowed_tools.extend([f"Bash(python3 {ledger} add:*)",
@@ -667,7 +685,7 @@ def review_command(options, mode, report, session_id, project_dir=None):
     command.extend(["--allowedTools", allowed])
     if auto:
         command.extend(["--disallowedTools", ",".join([
-            HARD_STOP_DENY, *config_home_deny(project_dir), *ledger_deny()])])
+            HARD_STOP_DENY, *config_home_deny(project_dir), *ledger_rules])])
     return command + ["--permission-mode", "acceptEdits" if auto else "dontAsk"]
 
 
@@ -884,6 +902,31 @@ def step_stamp():
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
 
 
+def run_drift(options):
+    try:
+        sibling(None, "kaizen-link")
+    except FileNotFoundError:
+        return None
+    root = os.environ.get("CLAUDE_PLUGIN_ROOT")
+    if not root:
+        try:
+            # Keep the invocation directory: HERE follows symlinks into the source checkout.
+            record = Path(__file__).absolute().parent / ".kaizen-plugin-root"
+            root = record.read_text(encoding="utf-8").strip()
+        except FileNotFoundError:
+            root = None
+        except (OSError, UnicodeError) as error:
+            reason = f"cannot read installed plugin root: {error}"
+            log(f"step kaizen-link: failed ({reason})")
+            return "unavailable: " + reason
+    if not root:
+        reason = "plugin root unknown; set CLAUDE_PLUGIN_ROOT or re-run install-schedule --apply"
+        log(f"step kaizen-link: failed ({reason})")
+        return "unavailable: " + reason
+    return run_step("kaizen-link", options,
+                    ["--check", "--plugin-root", str(Path(root).expanduser())], (0, 1))
+
+
 def run_checks(audits, options):
     if os.environ.get("KAIZEN_SKIP_CHECKS") == "1":
         return
@@ -893,8 +936,10 @@ def run_checks(audits, options):
         repo_args = [arg for path in projects for arg in ("--repo", str(path))]
         project_args = [arg for path in projects for arg in ("--project", str(path))]
         sections = []
+        drift = run_drift(options)
+        if drift is not None:
+            sections.append(f"## Drift\n\n{drift}")
         for title, name, arguments, success in (
-                ("Drift", "kaizen-link", ["--check"], (0, 1)),
                 ("Stale rules", "rules-lint", repo_args, (0, 1)),
                 ("Notes ledger: measurements due", "notes-ledger", ["due", *project_args], (0,))):
             output = run_step(name, options, arguments, success)
