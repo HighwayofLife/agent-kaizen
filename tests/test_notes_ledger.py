@@ -55,6 +55,7 @@ class LedgerTests(unittest.TestCase):
         before = self.csv.read_bytes(), self.timeline.read_bytes()
         self.assertEqual(self.run_cli(*self.add_args(date='2026-10-18'), '--dry-run').returncode, 0)
         self.assertEqual(before, (self.csv.read_bytes(), self.timeline.read_bytes()))
+        self.assertFalse(Path(str(self.csv) + '.lock').exists())
         self.assertEqual(self.run_cli(*self.add_args(date='2026-10-18')).returncode, 0)
         self.assertTrue(self.timeline.read_text().startswith(TIMELINE))
         self.assertIn('## 2026-10-15 to 2026-10-21', self.timeline.read_text())
@@ -81,6 +82,14 @@ class LedgerTests(unittest.TestCase):
             _, err = p.communicate()
             self.assertEqual(p.returncode, 0, err)
         self.assertEqual(len(self.rows()), 3)
+        with self.csv.open(newline='') as stream:
+            lines = stream.readlines()
+        self.assertTrue(all(line.endswith('\n') and len(next(csv.reader([line]))) == 6 for line in lines))
+        timeline_lines = self.timeline.read_text().splitlines(keepends=True)
+        self.assertTrue(all(line.endswith('\n') for line in timeline_lines))
+        self.assertTrue(all(len(line.strip().strip('|').split('|')) == 4
+                            for line in timeline_lines if line.startswith('|')))
+
         for text in ('First', 'Second'):
             self.assertIn(text, self.timeline.read_text())
 
@@ -98,6 +107,42 @@ class LedgerTests(unittest.TestCase):
         for match in ('missing', ''):
             self.assertEqual(self.run_cli('set', '--match', match, '--measured', 'no').returncode, 2)
             self.assertEqual(before, (self.csv.read_bytes(), self.timeline.read_bytes()))
+
+    def test_retry_normalized_and_effect(self):
+        change = 'New | item\ncontinued'
+        self.assertEqual(self.run_cli(*self.add_args(change)).returncode, 0)
+        self.assertEqual(self.run_cli(*self.add_args(change)).returncode, 0)
+        self.assertEqual(self.timeline.read_text().count('New &#124; item continued'), 1)
+        before = self.csv.read_bytes()
+        result = self.run_cli('set', '--match', 'New | item', '--effect', 'worked', '--measured', 'yes')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.csv.read_bytes().startswith(before.split(b'2026-10-03')[0]))
+        # The first write has succeeded; retrying must also repair the timeline.
+        self.timeline.write_text(self.timeline.read_text().replace('| 2026-10-03 | New &#124; item continued | active | yes |', '| 2026-10-03 | New &#124; item continued | active | no |'))
+        self.assertEqual(self.run_cli('set', '--match', 'New | item', '--effect', 'worked', '--measured', 'yes').returncode, 0)
+        self.assertEqual(self.rows()[-1]['change'].count(' Result: worked'), 1)
+        self.assertEqual(self.run_cli(*self.add_args(change)).returncode, 0)
+        self.assertEqual(len(self.rows()), 2)
+
+    def test_set_preserves_other_csv_bytes(self):
+        self.assertEqual(self.run_cli(*self.add_args('Target')).returncode, 0)
+        self.assertEqual(self.run_cli(*self.add_args('Untouched')).returncode, 0)
+        before = self.csv.read_bytes().splitlines(keepends=True)
+        result = self.run_cli('set', '--match', 'Target', '--status', 'planned')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        after = self.csv.read_bytes().splitlines(keepends=True)
+        self.assertEqual(before[:2] + before[3:], after[:2] + after[3:])
+
+    def test_bad_config_and_ambiguous_message(self):
+        (self.root / 'agent-kaizen.json').write_text('[]')
+        result = self.run_cli(*self.add_args())
+        self.assertEqual(result.returncode, 3)
+        self.assertNotIn('Traceback', result.stderr)
+        (self.root / 'agent-kaizen.json').write_text(json.dumps({'notesLedger': {'csv': str(self.csv)}}))
+        self.assertEqual(self.run_cli(*self.add_args('Another')).returncode, 0)
+        result = self.run_cli('set', '--match', '', '--effect', 'x')
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('exactly one', result.stderr)
 
     def test_help(self):
         for args in (['--help'], ['add', '--help'], ['set', '--help']):

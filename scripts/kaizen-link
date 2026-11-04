@@ -58,7 +58,7 @@ def status(source, target, local):
         return "OK" if target.resolve() == source.resolve() else "DRIFT"
     if not target.exists():
         return "ABSENT"
-    return "OK" if same_copy(source, target) else "DRIFT"
+    return "OK" if source.exists() and same_copy(source, target) else "DRIFT"
 
 
 def backup(target):
@@ -93,7 +93,7 @@ def main():
     if args.restore_replaced and not args.unlink:
         parser.error("--restore-replaced requires --unlink")
     root = args.plugin_root.resolve()
-    if not (any((root / "scripts" / name).exists() for name in SCRIPTS.values())
+    if not args.unlink and not (any((root / "scripts" / name).exists() for name in SCRIPTS.values())
             or any((root / "hooks" / name).exists() for name in HOOKS)):
         parser.exit(2, "kaizen-link: no scripts or hooks sources under plugin root %s; use --plugin-root DIR\n" % root)
     if args.apply or args.unlink:

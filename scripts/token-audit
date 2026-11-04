@@ -67,7 +67,7 @@ def metadata_row(line, timestamp):
         "attachment": dict(type=attachment, **value)}))
 
 
-def rows(path, since, warnings, keep_model=False, keep_tools=False):
+def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None):
     """Timestamp and record-type gates run before decoding large content."""
     cutoff = since.strftime("%Y-%m-%dT%H:%M:%S")
     saved_shape, saved_deltas, before_user = None, [], False
@@ -75,12 +75,25 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False):
         with path.open("rb") as stream:
             for line in stream:
                 prefix = line[:1024]
+                if b'"timestamp"' not in prefix and not any(marker in line for marker in MARKERS):
+                    continue
+                if bounds is not None:
+                    match = TIMESTAMP.search(line)
+                    if not match:
+                        continue
+                    try:
+                        stamp = date_time(match[1].decode("ascii", "replace"))
+                        if bounds[0] is None or stamp < bounds[0]:
+                            bounds[0] = stamp
+                        if bounds[1] is None or stamp > bounds[1]:
+                            bounds[1] = stamp
+                    except (ValueError, TypeError, UnicodeError):
+                        warnings["malformed rows"] += 1
+                        continue
                 metadata = keep_tools and any(marker in prefix for marker in TOOL_METADATA)
                 if keep_tools and not (metadata or b'"message"' in prefix or MESSAGE_ROW.search(prefix) or b'"usage"' in prefix):
                     continue
-                if keep_model and not (b'"token_count"' in prefix or b'"user_message"' in prefix or b'"role":"user"' in prefix or b'"role": "user"' in prefix or b'"model"' in line):
-                    continue
-                if not any(marker in line for marker in MARKERS):
+                if keep_model and not (b'"token_count"' in prefix or b'"user_message"' in prefix or b'"role":"user"' in prefix or b'"role": "user"' in prefix or b'"model"' in line or (bounds is not None and b'"turn_context"' in prefix)):
                     continue
                 match = TIMESTAMP.search(line)
                 if not match:
@@ -100,7 +113,7 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False):
                               and b'<task-notification>' not in line):
                             before_user = True
                         continue
-                    if old and not (keep_model and (b'"model"' in line or b'"user_message"' in prefix or b'"role":"user"' in prefix or b'"role": "user"' in prefix)):
+                    if old and not (keep_model and (b'"model"' in line or b'"user_message"' in prefix or b'"role":"user"' in prefix or b'"role": "user"' in prefix or (bounds is not None and b'"turn_context"' in prefix))):
                         continue
                     if keep_tools and (saved_shape or saved_deltas or before_user):
                         for saved, ts in ([saved_shape] if saved_shape else []) + saved_deltas:
@@ -587,42 +600,10 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
         users = []
         prior_usage = Counter()
 
-        def session_rows():
-            nonlocal first, last
-            cutoff = since.strftime("%Y-%m-%dT%H:%M:%S")
-            try:
-                with path.open("rb") as stream:
-                    for line in stream:
-                        match = TIMESTAMP.search(line)
-                        if not match:
-                            continue
-                        try:
-                            timestamp = match[1].decode("ascii", "replace")
-                            stamp = date_time(timestamp)
-                            first = stamp if first is None or stamp < first else first
-                            last = stamp if last is None or stamp > last else last
-                            prefix = line[:1024]
-                            if not (b'"token_count"' in prefix or b'"user_message"' in prefix
-                                    or b'"role":"user"' in prefix or b'"role": "user"' in prefix
-                                    or b'"model"' in line or b'"turn_context"' in prefix):
-                                continue
-                            old = timestamp[:19] < cutoff if timestamp.endswith(("Z", "+00:00")) else stamp < since
-                            if old and not (b'"model"' in line or b'"user_message"' in prefix
-                                            or b'"role":"user"' in prefix or b'"role": "user"' in prefix
-                                            or b'"turn_context"' in prefix):
-                                continue
-                            row = json.loads(line)
-                            if isinstance(row, dict):
-                                if old:
-                                    row["_before_window"] = True
-                                yield row
-                        except (ValueError, TypeError, UnicodeError):
-                            data["warnings"]["malformed rows"] += 1
-            except OSError:
-                data["warnings"]["unreadable files"] += 1
+        bounds = [None, None]
         # Older session files can contain recent resumes. Keep earlier model
         # metadata, but count only sessions with a token_count in the window.
-        for row in session_rows():
+        for row in rows(path, since, data["warnings"], keep_model=True, bounds=bounds):
             payload = row.get("payload") or {}
             if not isinstance(payload, dict):
                 continue
@@ -652,6 +633,7 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                              if isinstance(value, (int, float))}
                     price(data, model, "codex", delta, codex=True)
                     prior_usage = Counter(usage)
+        first, last = bounds
         if final is not None:
             if brief is not None:
                 data["codex_briefs"][model].append(brief)
