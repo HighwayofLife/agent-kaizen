@@ -15,7 +15,7 @@ Schedule a global audit and an optional weekly project review.
 
 ## Task
 
-The global audit runs about every 3 days without tokens and writes `token-audit-<timestamp>.md` in `audits/` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`). The optional weekly review uses tokens: one headless Sonnet run per enrolled project with activity since its last review, with no project cap. It writes a `token-audit-<timestamp>.md` and `cycle-<yyyy-mm-dd>.md` per project in `audits/projects/<key>/` in that config dir. The SessionStart hook announces new reports. Jobs use launchd on macOS, or cron or systemd user timers on Linux. Windows users can run the scripts by hand.
+The global audit runs about every 3 days without tokens and writes `token-audit-<timestamp>.md` in `audits/` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`). The optional weekly review uses tokens: one headless Sonnet run per enrolled project with activity since its last review, with no project cap. It writes a `token-audit-<timestamp>.md` and `cycle-<yyyy-mm-dd>.md` per project in `audits/projects/<key>/` in that config dir. The scheduled audit also writes `audits/checks-<timestamp>.md`; project reviews also write `audits/projects/<key>/project-report-<timestamp>.md`. The SessionStart hook announces new reports. Jobs use launchd on macOS, or cron or systemd user timers on Linux. Windows users can run the scripts by hand.
 
 Global `enabled` defaults to true; false turns off all scheduled work. Global or project `schedule` is `active` (default, review only after activity), `always`, or `off` (no review or notice). Global or project `scheduledAutonomy` is `propose` (default) or `auto`. Project values override global ones. Interactive `autonomy` is separate and is not read by scheduled runs.
 
@@ -29,7 +29,7 @@ Installing or changing scheduled jobs is a hard stop in `${CLAUDE_PLUGIN_ROOT}/d
 
 Run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled review --dry-run`, show its output, and ask for a final OK. After approval, if the audit was accepted, run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/install-schedule --apply` with `--review` if the weekly review was accepted and `--auto none`, `--auto all`, or `--auto <dir>...` for answer 3. `--auto` implies `--review`; omit both flags if the weekly review was declined. For each project excluded in answer 4, run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled config set --for <dir> schedule=off`. For answer 5, run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled config set enabled=false` or `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled config set enabled=true` as requested. Use absolute project paths, one command per Bash call. Never edit JSON by hand. Write `schedule` or `scheduledAutonomy` only as a direct result of answers here or in `/agent-kaizen:start`, and never in a `propose-only` run.
 
-For scripted installs, `install-schedule` also accepts `--project-dir` (repeatable), `--model`, `--max-turns` and `--scheduler`; use `--remove` to remove jobs.
+`install-schedule --apply` installs scripts through `kaizen-link`. For scripted installs, `install-schedule` also accepts `--project-dir` (repeatable), `--model`, `--max-turns` and `--scheduler`; use `--remove` to remove jobs.
 
 Run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled audit` once by hand and check that the report appears in the audits folder. Start a new session and confirm the notice fires. Add a ledger row.
 

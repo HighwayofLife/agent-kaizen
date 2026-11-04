@@ -20,6 +20,7 @@ The main session evaluates, plans, delegates, verifies and integrates. **Delegat
 2. **Is the cause or approach known?** If not, investigate first (`<debugger agent>`).
 3. **More than one brief's worth?** Plan it (`<planner>` → `<plan reviewer>`), then hand engineers the brief files.
 4. **Which tier?** The cheapest that fits. Retry once with more effort before moving to a bigger model.
+5. **Kaizen rule.** Add every new self-improvement tool or process to the plugin so it runs on the plugin schedule. Record each change in the notes ledger with what changed, why and how to measure it; re-measure later.
 
 ## Routing (task → agent, model, effort)
 
