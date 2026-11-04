@@ -1,0 +1,178 @@
+#!/usr/bin/env python3
+"""Install, check, or unlink the plugin's scripts and hooks."""
+import argparse
+from datetime import datetime
+import json
+import os
+from pathlib import Path
+import shutil
+import sys
+
+
+# --- paths helper ---
+def claude_home():
+    return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+
+
+def claude_json():
+    root = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(root).expanduser() / ".claude.json" if root else Path.home() / ".claude.json"
+
+
+def codex_home():
+    return Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex").expanduser()
+# --- end paths helper ---
+
+
+SCRIPTS = {
+    "token-audit": "token-audit", "kaizen-token-audit": "token-audit",
+    "kaizen-scheduled": "kaizen-scheduled", "kaizen-backup": "kaizen-backup",
+    "pricing.json": "pricing.json", "kaizen-pricing.json": "pricing.json",
+    "rules-lint.patterns": "rules-lint.patterns", "install-schedule": "install-schedule",
+    "usage-series": "usage-series", "usage-compare": "usage-compare",
+    "rules-lint": "rules-lint", "packet-report": "packet-report",
+    "kaizen-project-report": "kaizen-project-report", "notes-ledger": "notes-ledger",
+    "kaizen-link": "kaizen-link", "codex-review": "codex-review",
+    "codex-dispatch": "codex-dispatch", "codex-run": "codex-run",
+    "codex_common.py": "codex_common.py", "dispatch-status": "dispatch-status",
+    "prompts": "prompts", "preambles": "preambles",
+}
+HOOKS = ("after-compact.sh", "block-image-read.sh", "limit-big-read.sh",
+         "subagent-context.sh", "session-notes.sh")
+
+
+def same_copy(source, target):
+    if source.is_dir():
+        if not target.is_dir():
+            return False
+        return all(same_copy(item, target / item.name) for item in source.iterdir())
+    return target.is_file() and source.read_bytes() == target.read_bytes()
+
+
+def status(source, target, local):
+    if local:
+        return "LOCAL"
+    if target.is_symlink():
+        if not target.exists():
+            return "BROKEN"
+        return "OK" if target.resolve() == source.resolve() else "DRIFT"
+    if not target.exists():
+        return "ABSENT"
+    return "OK" if same_copy(source, target) else "DRIFT"
+
+
+def backup(target):
+    base = target.with_name(target.name + ".replaced-" + datetime.now().strftime("%Y%m%d"))
+    candidate = base
+    number = 1
+    while candidate.exists() or candidate.is_symlink():
+        candidate = base.with_name(base.name + "-" + str(number))
+        number += 1
+    target.rename(candidate)
+    return candidate
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--bin", type=Path, default=claude_home() / "bin")
+    parser.add_argument("--hooks-dir", type=Path, default=claude_home() / "hooks")
+    parser.add_argument("--mode", choices=("auto", "link", "copy"), default="auto")
+    parser.add_argument("--only", help="comma-separated managed names")
+    actions = parser.add_mutually_exclusive_group()
+    actions.add_argument("--apply", action="store_true")
+    actions.add_argument("--check", action="store_true")
+    actions.add_argument("--unlink", action="store_true")
+    replacements = parser.add_mutually_exclusive_group()
+    replacements.add_argument("--replace", action="store_true")
+    replacements.add_argument("--replace-prefixed", action="store_true")
+    parser.add_argument("--restore-replaced", action="store_true")
+    parser.add_argument("--json", action="store_true")
+    parser.add_argument("--plugin-root", type=Path, default=Path(__file__).resolve().parent.parent,
+                        help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    root = args.plugin_root.resolve()
+    mode = args.mode
+    if mode == "auto":
+        mode = "copy" if "/plugins/cache/" in root.as_posix() + "/" else "link"
+    try:
+        settings_path = claude_home() / "agent-kaizen.json"
+        settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
+        local = settings.get("localScripts", [])
+        if not isinstance(local, list) or any(not isinstance(x, str) for x in local):
+            raise ValueError("localScripts must be a list of names")
+    except (OSError, ValueError, AttributeError) as exc:
+        parser.exit(2, "kaizen-link: cannot read settings: %s\n" % exc)
+    selected = set(args.only.split(",")) if args.only else None
+    entries = []
+    pairs = [(name, root / "scripts" / filename, args.bin / name, "bin")
+             for name, filename in SCRIPTS.items()]
+    pairs += [(name, root / "hooks" / name, args.hooks_dir / name, "hook") for name in HOOKS]
+    for name, source, target, kind in pairs:
+        if (selected is not None and name not in selected) or not source.exists():
+            continue
+        current = status(source, target, name in local)
+        detail = ""
+        if current == "LOCAL":
+            detail = "skip LOCAL " + name if (args.apply or args.unlink) else "would skip " + name
+        elif args.unlink:
+            if target.is_symlink() and target.resolve().is_relative_to(root):
+                target.unlink()
+                detail = "unlinked"
+            else:
+                detail = "skip"
+            if args.restore_replaced and not target.exists() and not target.is_symlink():
+                candidates = [p for p in target.parent.glob(name + ".replaced-*")
+                              if p.name[len(name) + len('.replaced-'):].split('-')[0].isdigit()]
+                if candidates:
+                    newest = max(candidates, key=lambda p: (p.stat().st_mtime_ns, p.name))
+                    newest.rename(target)
+                    detail = "restored " + newest.name
+        elif args.apply:
+            replace = args.replace or (args.replace_prefixed and name.startswith("kaizen-"))
+            if current in ("DRIFT", "BROKEN") and target.is_symlink():
+                target.unlink()
+                current = "ABSENT"
+            elif current == "DRIFT" and replace:
+                detail = "saved " + backup(target).name
+                current = "ABSENT"
+            if current == "ABSENT":
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if mode == "link":
+                    target.symlink_to(source, target_is_directory=source.is_dir())
+                elif source.is_dir():
+                    shutil.copytree(source, target, dirs_exist_ok=True)
+                else:
+                    shutil.copy2(source, target)
+                current = "OK"
+                detail = (detail + " " if detail else "") + mode + "ed"
+            elif current == "DRIFT":
+                detail = "re-run kaizen-link --apply --replace"
+        elif args.check:
+            if current == "DRIFT" and not target.is_symlink():
+                detail = "re-run kaizen-link --apply --replace"
+        else:
+            detail = "would " + ("skip" if current in ("OK", "LOCAL") or
+                                    (current == "DRIFT" and not target.is_symlink() and
+                                     not (args.replace or (args.replace_prefixed and name.startswith("kaizen-"))))
+                                    else mode) + " " + name
+        entries.append({"name": name, "kind": kind, "status": current, "detail": detail})
+    counts = {key.lower(): sum(e["status"] == key for e in entries)
+              for key in ("DRIFT", "BROKEN", "LOCAL")}
+    if args.json:
+        print(json.dumps({"entries": entries, **counts}))
+    else:
+        for entry in entries:
+            if not (args.apply or args.check or args.unlink):
+                print(entry["detail"])
+            elif entry["status"] == "LOCAL" and (args.apply or args.unlink):
+                print(entry["detail"])
+            else:
+                print("{} {}{}".format(entry["status"], entry["name"],
+                                      " " + entry["detail"] if entry["detail"] else ""))
+        if args.check:
+            print("kaizen-link: {drift} drift, {broken} broken, {local} local".format(**counts))
+    return 1 if args.check and counts["drift"] + counts["broken"] else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
