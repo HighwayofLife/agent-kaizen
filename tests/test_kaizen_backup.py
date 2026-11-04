@@ -1,9 +1,12 @@
 """kaizen-backup: begin/finish/undo round trips, created files, conflicts, runs."""
 import os
+import runpy
+import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'scripts' / 'kaizen-backup'
@@ -71,6 +74,54 @@ class KaizenBackupTests(unittest.TestCase):
         self.run_script('action', change, '--did', 'brew install fd', '--undo', 'brew uninstall fd')
         self.run_script('finish', change)
         self.assertIn('ACTION to reverse by hand (not run): brew uninstall fd', self.run_script('undo').stdout)
+
+    def test_begin_rejects_unsafe_run_and_skill(self):
+        for option in ('--run', '--skill'):
+            for value in ('../escape', '/absolute', 'a/b', 'a..b'):
+                with self.subTest(option=option, value=value):
+                    args = {'--run': 'run', '--skill': 'skill', option: value}
+                    result = self.run_script('begin', '--run', args['--run'], '--skill', args['--skill'],
+                                             '--ledger', 'test', self.tmp / 'file', ok=False)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn('must not contain', result.stderr)
+        self.assertFalse(list((self.tmp / 'backups').glob('*/manifest.json')))
+
+    def test_begin_rejects_nul_and_unsafe_environment_run(self):
+        with patch.dict(os.environ, self.env):
+            main = runpy.run_path(str(SCRIPT))['main']
+            for option in ('--run', '--skill'):
+                with self.subTest(option=option):
+                    args = {'--run': 'run', '--skill': 'skill', option: 'bad\0value'}
+                    self.assertEqual(main(['begin', '--run', args['--run'], '--skill', args['--skill'],
+                                           '--ledger', 'test', str(self.tmp / 'file')]), 2)
+        self.env['KAIZEN_RUN_ID'] = '../escape'
+        result = self.run_script('begin', '--skill', 'skill', '--ledger', 'test', self.tmp / 'file', ok=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+
+    def test_finish_rejects_outside_change_dir_and_symlink(self):
+        change = Path(self.change(self.tmp / 'file'))
+        outside = self.tmp / 'outside'
+        shutil.copytree(change, outside)
+        original = (outside / 'manifest.json').read_bytes()
+        link = self.tmp / 'backups/linked'
+        link.symlink_to(outside, target_is_directory=True)
+        for path in (outside, link, self.tmp / 'backups/../outside'):
+            with self.subTest(path=path):
+                result = self.run_script('finish', path, ok=False)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn('inside the backups root', result.stderr)
+                self.assertEqual((outside / 'manifest.json').read_bytes(), original)
+
+    def test_begin_rejects_change_dir_symlink_outside_root(self):
+        root = self.tmp / 'backups'
+        root.mkdir()
+        outside = self.tmp / 'outside'
+        (root / 'run-01-skill').symlink_to(outside, target_is_directory=True)
+        result = self.run_script('begin', '--run', 'run', '--skill', 'skill', '--ledger', 'test',
+                                 self.tmp / 'file', ok=False)
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn('inside the backups root', result.stderr)
+        self.assertFalse(outside.exists())
 
 
 if __name__ == '__main__':

@@ -9,8 +9,8 @@ review (--review). Reports live in <audits>/projects/<key>/.
 
 --scheduler auto uses launchd on macOS, otherwise cron when available, then
 systemd user timers when the user manager is running. Windows is unsupported.
---apply copies the runner, token-audit, kaizen-backup and pricing.json into
-<claude home>/bin so jobs survive plugin moves; re-run --apply to refresh.
+--apply installs managed scripts through kaizen-link into <claude home>/bin.
+Plugin cache installs use copies so jobs survive plugin moves; re-run to refresh.
 Claude home is CLAUDE_CONFIG_DIR or ~/.claude; Codex home is CODEX_HOME or ~/.codex.
 Jobs record PATH and those config variables when set, and use absolute Python.
 Without --apply or --remove, prints jobs and config commands without writing config.
@@ -25,6 +25,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 # --- paths helper ---
@@ -44,7 +45,12 @@ def codex_home():
 HERE = Path(__file__).resolve().parent
 AUDITS = claude_home().resolve() / "audits"
 BIN = claude_home().resolve() / "bin"
-AUDIT_NAME = "kaizen-token-audit"  # own name, so it never replaces another token-audit in ~/.claude/bin
+MANAGED_NAMES = (
+    "kaizen-scheduled", "kaizen-token-audit", "token-audit", "kaizen-backup",
+    "kaizen-pricing.json", "pricing.json", "kaizen-link", "rules-lint",
+    "rules-lint.patterns", "packet-report", "kaizen-project-report", "notes-ledger",
+    "usage-series", "usage-compare",
+)
 LABEL = "com.agent-kaizen"
 MARK = "# agent-kaizen"
 SCHEDULERS = ("auto", "launchd", "cron", "systemd")
@@ -336,15 +342,38 @@ def main(argv=None):
         parser.error("claude not found on PATH; install Claude Code or put it on PATH, then re-run")
     if args.remove or args.auto is not None:
         args.review = True
-    if args.apply:
+    record = BIN / ".kaizen-plugin-root"
+    if args.apply and not args.remove:
+        if record.is_symlink():
+            print(f"install-schedule: refusing symlinked plugin-root record: {record}", file=sys.stderr)
+            return 2
         AUDITS.mkdir(parents=True, exist_ok=True)
-        BIN.mkdir(parents=True, exist_ok=True)
-        shutil.copy2(HERE / "kaizen-scheduled", BIN / "kaizen-scheduled")
-        shutil.copy2(HERE / "token-audit", BIN / AUDIT_NAME)
-        shutil.copy2(HERE / "kaizen-backup", BIN / "kaizen-backup")
-        shutil.copy2(HERE / "pricing.json", BIN / "kaizen-pricing.json")
-        print(f"copied kaizen-scheduled to {BIN / 'kaizen-scheduled'} and token-audit to {BIN / AUDIT_NAME} and kaizen-backup to {BIN / 'kaizen-backup'} "
-              f"and pricing.json to {BIN / 'kaizen-pricing.json'}")
+        aliases = {"kaizen-token-audit": "token-audit", "kaizen-pricing.json": "pricing.json"}
+        names = [name for name in MANAGED_NAMES if (HERE / aliases.get(name, name)).exists()]
+        link = [str(Path(sys.executable).absolute()), str(HERE / "kaizen-link"),
+                "--bin", str(BIN), "--hooks-dir", str(BIN.parent / "hooks"),
+                "--mode", "auto", "--replace-prefixed", "--only", ",".join(names)]
+        try:
+            for flags in ([], ["--apply"]):
+                result = subprocess.run(link + flags)
+                if result.returncode:
+                    return result.returncode
+            BIN.mkdir(parents=True, exist_ok=True)
+            temporary = None
+            try:
+                if record.is_symlink():
+                    raise OSError(f"refusing symlinked plugin-root record: {record}")
+                with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=BIN,
+                                                 prefix=".kaizen-plugin-root-", delete=False) as output:
+                    temporary = Path(output.name)
+                    output.write(str(HERE.parent) + "\n")
+                os.replace(temporary, record)
+            finally:
+                if temporary is not None:
+                    temporary.unlink(missing_ok=True)
+        except OSError as error:
+            print(f"install-schedule: kaizen-link failed ({error})", file=sys.stderr)
+            return 2
     selected = jobs(args)
     if cleanup:
         status = cron(args, selected) if shutil.which("crontab") else 0
@@ -355,6 +384,12 @@ def main(argv=None):
         if args.apply and scheduler == "cron" and any(unit_dir().glob("agent-kaizen-*.timer")):
             print(f"note: agent-kaizen systemd timers are also installed in {unit_dir()}; "
                   "remove them with --scheduler systemd --remove", file=sys.stderr)
+    if args.remove:
+        try:
+            record.unlink(missing_ok=True)
+        except OSError as error:
+            print(f"install-schedule: cannot remove plugin-root record ({error})", file=sys.stderr)
+            return 2
     # Change the config only once the jobs are in place, so a failed install changes nothing.
     if status == 0 and args.auto is not None and not args.remove:
         status = configure_auto(args)

@@ -942,7 +942,8 @@ class ExecutionTests(DiscoveryCase):
         self.audit = executable(self.bin / 'stub token-audit', STUB_AUDIT)
         self.pricing = write(self.root / 'pricing.json', '{}')
         self.audit_record = self.root / 'audit-calls.jsonl'
-        self.env.update(AUDIT_RECORD=str(self.audit_record), STUB_AUDITS=str(self.audits))
+        self.env.update(AUDIT_RECORD=str(self.audit_record), STUB_AUDITS=str(self.audits),
+                        CLAUDE_PLUGIN_ROOT=str(SCRIPTS.parent))
         for name in ('STUB_EXIT', 'STUB_AUDIT_EXIT', 'STUB_KILL', 'STUB_FAIL_PROJECT',
                      'KAIZEN_REVIEW_MODEL', 'KAIZEN_REVIEW_MAX_TURNS'):
             self.env.pop(name, None)
@@ -1115,10 +1116,14 @@ class ExecutionTests(DiscoveryCase):
                     root = '//' + self.cfg.as_posix().lstrip('/')
                     for pattern in ('settings*.json', 'hooks/**', '**/*.json'):
                         self.assertIn(f'Edit({root}/{pattern})', rules)
-                    for helper in (self.audit, SCRIPTS / 'kaizen-backup'):
-                        self.assertIn(f'Bash(python3 {helper}:*)', allowed)
-                        self.assertIn(f'Bash({sys.executable} {helper}:*)', allowed)
-                    self.assertIn(f'Bash({SCRIPTS / "kaizen-backup"}:*)', allowed)
+                    self.assertIn(f'Bash(python3 {self.audit}:*)', allowed)
+                    self.assertIn(f'Bash({sys.executable} {self.audit}:*)', allowed)
+                    backup = SCRIPTS / 'kaizen-backup'
+                    for prefix in ('', 'python3 ', sys.executable + ' '):
+                        for subcommand in ('begin', 'finish', 'list'):
+                            self.assertIn(f'Bash({prefix}{backup} {subcommand}:*)', allowed)
+                        self.assertNotIn(f'Bash({prefix}{backup}:*)', allowed)
+                        self.assertNotIn(f'Bash({prefix}{backup} undo:*)', allowed)
                 else:
                     self.assertEqual(allowed, self.runner.REVIEW_TOOLS)
                 self.assertNotIn('bypassPermissions', argv)

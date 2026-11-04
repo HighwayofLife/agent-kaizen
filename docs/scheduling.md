@@ -41,7 +41,9 @@ scripts/install-schedule --apply --review
 scripts/install-schedule --remove
 ```
 
-The first installs the audit; the second adds the weekly review. `--apply` copies the runner, token-audit, kaizen-backup and pricing data into the Claude config directory's `bin/`, so jobs survive plugin updates. Re-run it after an update. Use `--model` and `--max-turns` to override the review defaults (Sonnet and 40 turns).
+The first installs the audit; the second adds the weekly review. `--apply` prints a plan, then installs managed scripts through `kaizen-link --mode auto --replace-prefixed` into the Claude config directory's `bin/`. Source checkouts use links; plugin cache installs use copies so jobs survive plugin moves. Differing `kaizen-` files are saved as `.replaced-<date>`; differing generic files are reported as DRIFT and left alone. The installer passes both `--bin` and `--hooks-dir` explicitly, so a custom bin never writes hooks into the default config home. Re-run it after an update. Use `--model` and `--max-turns` to override the review defaults (Sonnet and 40 turns).
+
+The installer records its source root in `bin/.kaizen-plugin-root`. The Drift check passes `--plugin-root` to `kaizen-link`, using `CLAUDE_PLUGIN_ROOT` when set, otherwise that record. If neither is known, Drift reports `unavailable` with a reason. If the source has moved, set `CLAUDE_PLUGIN_ROOT` or re-run the installer from its new location.
 
 ## Discovery and activity
 
@@ -65,7 +67,7 @@ Settings live in `agent-kaizen.json` in the Claude config directory and in each 
 | `retention` | Global only | `auto` (default), `off` keeps everything |
 | `retentionOverrides` | Global only | Object, default `{}`; for example `{"extracts":{"days":14}}` |
 | `projectCommands` | Global only | Object mapping absolute project paths (or `~/` paths) to `outcomeLog` relative paths and `shadowStatus`, `slowTests`, or `speedReport` argv lists; default `{}` |
-| `notesLedger` | Global only | Object with `csv` path, optional `timeline` path and positive integer `measureAfterDays`; default `{}` (off) |
+| `notesLedger` | Global only | Object with `csv` path, optional `timeline` path and positive integer `measureAfterDays`; paths must be absolute after `~` expansion; default `{}` (off) |
 | `calibrationLadder` | Global only | List of `model` or `model effort` strings; default `["haiku", "sonnet medium", "sonnet high", "opus high"]` |
 | `rulesLintFiles` | Global only | List of non-empty glob strings; default `[]` |
 | `localScripts` | Global only | List of non-empty strings without `/`; default `[]` |
@@ -84,10 +86,12 @@ The audits directory is `<Claude config dir>/audits`:
 ```text
 <audits>/token-audit-*.md
 <audits>/token-audit-*.reviewed
+<audits>/checks-*.md
 <audits>/extracts/*.extract.json
 <audits>/projects/index.json
 <audits>/projects/<key>/state.json
 <audits>/projects/<key>/token-audit-*.md
+<audits>/projects/<key>/project-report-*.md
 <audits>/projects/<key>/*.extract.json
 <audits>/projects/<key>/cycle-<date>.md
 <audits>/run.log
@@ -105,7 +109,7 @@ The runner tidies after each scheduled audit and review; interactive cycles run 
 |---|---|---|
 | `extracts` | `extracts/*.extract.json`, `projects/*/*.extract.json`, `projects/*/host-probe-*.json`, `projects/*/friction-inputs-*.json` | 30 days; 200 MB cap |
 | `markers` | `projects/*/cycle-*.failed.md`, `*.noticed-*`, `projects/*/*.noticed-*` | 30 days |
-| `reports` | `token-audit-*.md`, `projects/*/token-audit-*.md`, `projects/*/cycle-*.md` | 365 days; newest 5 per folder and family kept |
+| `reports` | `token-audit-*.md`, `projects/*/token-audit-*.md`, `projects/*/cycle-*.md`, `checks-*.md`, `projects/*/project-report-*.md` | 365 days; newest 5 per folder and family kept |
 
 A report's `.reviewed` marker is removed with it. Only regular files inside the audits folder are deleted; symlinks are skipped. Each deletion is logged: in `run.log` for scheduled runs, on screen for manual ones. Housekeeping does not touch `host-actions.json`, `host-fixes/`, `projects/index.json`, project `state.json` files, `run.log`, `kaizen-backups/`, transcripts, Codex sessions or project files.
 
@@ -119,9 +123,15 @@ The installer captures `PATH` and, when set, `CLAUDE_CONFIG_DIR` and `CODEX_HOME
 
 ## Unattended permissions
 
-The runner uses `--strict-mcp-config` and limits `--tools` to Read, Grep, Glob, WebFetch, WebSearch and Bash in propose mode. `--allowedTools` permits restricted read-only Bash: ls, wc, head, tail, rg, git status, git diff, git log, shasum, sha256sum and jq. It uses `--permission-mode dontAsk`.
+The runner uses `--strict-mcp-config` and limits `--tools` to Read, Grep, Glob, WebFetch, WebSearch and Bash in propose mode. `--allowedTools` permits ls, wc, head, tail, rg, git status, shasum, sha256sum and jq. The cycle and review steps do not need git log or git diff, so neither is allowed. It uses `--permission-mode dontAsk`.
 
-Auto mode adds Edit and Write, and permits mkdir, diff, cd, token-audit and kaizen-backup in addition to those read-only commands. It uses `--permission-mode acceptEdits` and `--disallowedTools` denies git push, git commit, git reset, git clean, gh, rm, rmdir, mv, curl, wget, launchctl, crontab, brew, npm, pip, pip3, sudo, env, printenv and chmod. It never uses bypassPermissions. Deny rules protect settings, hooks, plugins, skills, commands, bin, credentials and all `.json`, `.toml`, `.sh`, `.py` and `.js` files under both config homes, the Claude user config file, and the project’s `.claude/settings*.json`. Markdown instruction files, including `CLAUDE.md`, `agents/*.md`, rules, memory `MEMORY.md` and Codex `AGENTS.md`, remain editable. These rules cover Edit, Write and recognised file commands such as cat, sed, tee and redirects; they do not cover `cp` or scripts. See [autonomy.md](autonomy.md#permissions).
+Auto mode adds Edit and Write, and permits mkdir, diff, cd, token-audit and only `kaizen-backup begin`, `finish` and `list` in addition to those commands. `kaizen-backup undo` and all restores stay manual owner actions. It uses `--permission-mode acceptEdits` and `--disallowedTools` denies git push, git commit, git reset, git clean, gh, rm, rmdir, mv, curl, wget, launchctl, crontab, brew, npm, pip, pip3, sudo, env, printenv and chmod. It never uses bypassPermissions. Deny rules protect settings, hooks, plugins, skills, commands, bin, credentials and all `.json`, `.toml`, `.sh`, `.py` and `.js` files under both config homes, the Claude user config file, and the project’s `.claude/settings*.json`. Markdown instruction files, including `CLAUDE.md`, `agents/*.md`, rules, memory `MEMORY.md` and Codex `AGENTS.md`, remain editable. These rules cover Edit, Write and recognised file commands such as cat, sed, tee and redirects; they do not cover `cp` or scripts. See [autonomy.md](autonomy.md#permissions).
+
+Auto mode permits only `notes-ledger add`. It rejects an invalid raw `notesLedger` config before granting that rule. Both ledger paths must be absolute after `~` expansion; relative paths are rejected by config validation and review. Edit and Write deny rules cover both each unresolved absolute path and its resolved target, including symlinked csv and timeline files. Paths containing permission-rule metacharacters fail closed.
+
+Bash commands can write files; the ledger is protected by the post-run guard, not by permission rules.
+
+Before launching Claude in either auto or propose mode, the runner copies each configured ledger to a private run directory and records its size and sha256. The CSV must retain its original byte prefix, with growth limited to whole lines. The timeline must retain every old line in order, allowing `notes-ledger add` to insert rows through atomic replacement. Missing files, changed history or guard errors fail closed. The runner atomically restores damaged files from the snapshots, writes `ledger-violation` and the affected paths to the failed cycle report and project state, exits non-zero, and skips remaining projects and housekeeping. Snapshots remain under the project's audits folder after a violation for recovery; successful runs remove them. An unreadable configured ledger prevents Claude from launching.
 
 ## 0.3.x migration
 
