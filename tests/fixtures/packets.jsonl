@@ -1,0 +1,17 @@
+{"ts": "2026-01-01T12:00:00Z", "id": "sonnet-0", "model": "sonnet", "effort": "high", "status": "DONE", "area": "core", "wall_s": null}
+{"ts": "2026-01-02T12:00:00Z", "id": "sonnet-1", "model": "sonnet", "effort": "high", "status": "DONE", "area": "core", "wall_s": null}
+{"ts": "2026-01-03T12:00:00Z", "id": "sonnet-2", "model": "sonnet", "effort": "high", "status": "DONE", "area": "core", "wall_s": null}
+{"ts": "2026-01-04T12:00:00Z", "id": "sonnet-3", "model": "sonnet", "effort": "high", "status": "DONE", "area": "core", "wall_s": null}
+{"ts": "2026-01-05T12:00:00Z", "id": "sonnet-4", "model": "sonnet", "effort": "high", "status": "CHECKS FAILING", "area": "core", "wall_s": null}
+{"ts": "2026-01-06T12:00:00Z", "id": "sonnet-5", "model": "sonnet", "effort": "high", "status": "CHECKS FAILING", "area": "core", "wall_s": null}
+{"ts": "2026-01-07T12:00:00Z", "id": "sonnet-6", "model": "sonnet", "effort": "high", "status": "CHECKS FAILING", "area": "core", "wall_s": null}
+{"ts": "2026-01-08T12:00:00Z", "id": "sonnet-7", "model": "sonnet", "effort": "high", "status": "CHECKS FAILING", "area": "core", "wall_s": null}
+{"ts": "2026-01-01T12:00:00Z", "id": "opus-0", "model": "opus", "effort": "high", "status": "DONE", "area": "core", "wall_s": null}
+{"ts": "2026-01-02T12:00:00Z", "id": "opus-1", "model": "opus", "effort": "high", "status": "DONE", "area": "core", "wall_s": null}
+{"ts": "2026-01-03T12:00:00Z", "id": "opus-2", "model": "opus", "effort": "high", "status": "DONE", "area": "core", "wall_s": null}
+{"ts": "2026-01-04T12:00:00Z", "id": "opus-3", "model": "opus", "effort": "high", "status": "DONE", "area": "core", "wall_s": null}
+{"ts": "2026-01-05T12:00:00Z", "id": "opus-4", "model": "opus", "effort": "high", "status": "DONE", "area": "core", "wall_s": null}
+{"ts": "2026-01-06T12:00:00Z", "id": "opus-5", "model": "opus", "effort": "high", "status": "DONE", "area": "core", "wall_s": null}
+{"ts": "2026-01-07T12:00:00Z", "id": "opus-6", "model": "opus", "effort": "high", "status": "DONE", "area": "core", "wall_s": null}
+{"ts": "2026-01-08T12:00:00Z", "id": "opus-7", "model": "opus", "effort": "high", "status": "DONE", "area": "core", "wall_s": null}
+{"ts": "2026-02-01T12:00:00Z", "id": "repair", "model": "haiku", "effort": "low", "fix_origin": "batch-review", "fixes": ["sonnet-0"], "status": "DONE"}

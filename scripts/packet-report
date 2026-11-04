@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""Read-only packet outcomes and calibration proposals.
+
+JSON keys: groups, area_groups (model, effort, optional area, n, first_pass_n,
+first_pass, fix_rate, median_rounds, median_wall_s, median_lines); totals
+(packets, span_days, merges_per_day); fix_origins (origin: count); proposals
+(model, effort, optional area, direction); rule, disclaimer. Rates are fractions;
+null first_pass means no eligible samples. n includes fixes, but first_pass_n
+and first_pass exclude packets with a fix_origin. Span uses inclusive UTC dates.
+--since filters samples, while fixes from the entire file still inform rates.
+"""
+import argparse
+from collections import Counter, defaultdict
+from datetime import date, datetime, timezone
+import json
+import os
+from pathlib import Path
+from statistics import median
+import sys
+
+DEFAULT_LADDER = ['haiku', 'sonnet medium', 'sonnet high', 'opus high']
+RULE = 'Rules: n >= 8; UP if first-pass < 70% or fix rate > 30%; DOWN if first-pass >= 95% and no batch-review/final-audit fixes.'
+DISCLAIMER = 'Proposals only: the owner decides'
+
+
+def packet_date(row):
+    return datetime.fromisoformat(row['ts'].replace('Z', '+00:00')).astimezone(timezone.utc).date()
+
+
+def parse_ladder(value):
+    if not isinstance(value, list) or not value:
+        raise ValueError('ladder must be a nonempty list of rungs')
+    result = []
+    for rung in value:
+        if not isinstance(rung, str) or not 1 <= len(rung.split()) <= 2:
+            raise ValueError('each ladder rung must be a model or model and effort')
+        parts = rung.split()
+        result.append((parts[0], parts[1] if len(parts) == 2 else ''))
+    return result
+
+
+def summarize(rows, since=None, until=None, ladder=None):
+    ladder = ladder or parse_ladder(DEFAULT_LADDER)
+    models = {model for model, _ in ladder}
+    fixed = {packet for row in rows for packet in row['fixes'] if packet != row['id']}
+    audited = {packet for row in rows if row['fix_origin'] in ('batch-review', 'final-audit')
+               for packet in row['fixes'] if packet != row['id']}
+    selected = []
+    for row in rows:
+        day = packet_date(row)
+        if (since is not None and day < since) or (until is not None and day >= until):
+            continue
+        model = row['model']
+        if model not in models and model.split('-')[-1] in models:
+            model = model.split('-')[-1]
+        selected.append(dict(row, model=model))
+    proposals = []
+
+    def groups(keys):
+        buckets = defaultdict(list)
+        for row in selected:
+            buckets[tuple(row[key] for key in keys)].append(row)
+        result = []
+        for key, samples in sorted(buckets.items()):
+            eligible = [row for row in samples if row['fix_origin'] is None]
+            first = sum(row['status'] == 'DONE' and row['dispatches'] == 1 and row['rounds'] == 0
+                        for row in eligible) / len(eligible) if eligible else None
+            rate = sum(row['id'] in fixed for row in samples) / len(samples)
+            group = dict(zip(keys, key), n=len(samples), first_pass_n=len(eligible),
+                         first_pass=first, fix_rate=rate,
+                         median_rounds=median(row['rounds'] for row in samples),
+                         median_wall_s=median(walls) if (walls := [row['wall_s'] for row in samples if row['wall_s'] is not None]) else None,
+                         median_lines=median(row['lines'] for row in samples))
+            result.append(group)
+            rung = (group['model'], group['effort'])
+            if (group['model'], '') in ladder:
+                rung = (group['model'], '')
+            direction = None
+            if len(samples) >= 8 and rung in ladder:
+                if (first is not None and first < .70) or rate > .30:
+                    direction = 'UP'
+                elif first is not None and first >= .95 and not any(row['id'] in audited for row in samples):
+                    direction = 'DOWN'
+            if direction:
+                proposals.append(dict(zip(keys, key), direction=direction))
+        return result
+
+    overall = groups(('model', 'effort'))
+    areas = groups(('model', 'effort', 'area'))
+    dates = [packet_date(row) for row in selected]
+    span = (max(dates) - min(dates)).days + 1 if dates else 0
+    return dict(groups=overall, area_groups=areas,
+                totals=dict(packets=len(selected), span_days=span,
+                            merges_per_day=len(selected) / span if span else 0),
+                fix_origins=dict(sorted(Counter(row['fix_origin'] for row in selected
+                                               if row['fix_origin'] is not None).items())),
+                proposals=proposals, rule=RULE, disclaimer=DISCLAIMER)
+
+
+def render(result, markdown=False):
+    def bounded(rows, limit):
+        return rows if len(rows) <= limit else rows[:limit - 1] + [f'... {len(rows) - limit + 1} rows omitted']
+
+    lines = ['Packet outcomes']
+    if not result['totals']['packets']:
+        lines.append('No packet data yet')
+    header = 'model effort / area | n | first-pass % | fix rate % | median rounds | median wall min | median lines'
+    lines.append(('| ' + header + ' |') if markdown else header.replace(' | ', '  '))
+    if markdown:
+        lines.append('| --- | ---: | ---: | ---: | ---: | ---: | ---: |')
+    rows = []
+    for group in result['groups'] + result['area_groups']:
+        name = f"{group['model']} {group['effort']}" + (f" / {group['area']}" if 'area' in group else '')
+        first = 'unknown' if group['first_pass'] is None else f"{group['first_pass'] * 100:.1f}"
+        values = [name, str(group['n']), first, f"{group['fix_rate'] * 100:.1f}",
+                  f"{group['median_rounds']:g}", (f"{group['median_wall_s'] / 60:.1f}" if group['median_wall_s'] is not None else "unknown"), f"{group['median_lines']:g}"]
+        rows.append('| ' + ' | '.join(values) + ' |' if markdown else '  '.join(values))
+    lines += bounded(rows, 8)
+    total = result['totals']
+    lines += [f"Totals: {total['packets']} packets; {total['merges_per_day']:.2f} merges/day over {total['span_days']} days",
+              'Fix origins']
+    lines += bounded([f'{key}: {value}' for key, value in result['fix_origins'].items()] or ['none'], 3)
+    lines += ['Calibration proposals', result['rule']]
+    proposals = [f"{p['model']} {p['effort']}" + (f" / {p['area']}" if 'area' in p else '')
+                 + f": propose {p['direction']} one rung" for p in result['proposals']]
+    proposals += [f"{g['model']} {g['effort']}" + (f" / {g['area']}" if 'area' in g else '')
+                  + f": n={g['n']} (too few)" for g in result['groups'] + result['area_groups'] if g['n'] < 8]
+    lines += bounded(proposals or ['none'], 5)
+    return '\n'.join(lines + [result['disclaimer']])
+
+
+DEFAULTS = dict(fix_origin=None, fixes=[], dispatches=1, rounds=0,
+                status='unknown', wall_s=None, lines=0, area='mixed', risk='untagged')
+
+
+def read_rows(path):
+    rows = []
+    skipped = 0
+    try:
+        stream = path.open(encoding='utf-8')
+    except FileNotFoundError:
+        return rows
+    with stream:
+        for line in stream:
+            if not line.strip():
+                continue
+            try:
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError('row is not an object')
+                row = dict(DEFAULTS, **row)
+                if any(not isinstance(row[k], str) or not row[k] for k in ('ts', 'id', 'model', 'effort')):
+                    raise ValueError('missing or invalid required field')
+                packet_date(row)
+                if (not isinstance(row['fixes'], list) or
+                    any(not isinstance(x, str) for x in row['fixes']) or
+                    row['fix_origin'] is not None and not isinstance(row['fix_origin'], str) or
+                    not isinstance(row['area'], str) or not isinstance(row['status'], str) or
+                    any(not isinstance(row[k], (int, float)) or isinstance(row[k], bool)
+                        for k in ('dispatches', 'rounds', 'lines')) or
+                    row['wall_s'] is not None and (not isinstance(row['wall_s'], (int, float)) or isinstance(row['wall_s'], bool))):
+                    raise ValueError('invalid field')
+                rows.append(row)
+            except (ValueError, TypeError, KeyError, OverflowError):
+                skipped += 1
+    if skipped:
+        print(f'skipped {skipped} malformed rows', file=sys.stderr)
+    return rows
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument('--packets', type=Path)
+    source.add_argument('--project', type=Path)
+    parser.add_argument('--since', type=date.fromisoformat)
+    parser.add_argument('--until', type=date.fromisoformat)
+    parser.add_argument('--ladder', help='comma-separated model and optional effort rungs')
+    output = parser.add_mutually_exclusive_group()
+    output.add_argument('--markdown', action='store_true')
+    output.add_argument('--json', action='store_true')
+    args = parser.parse_args()
+    try:
+        if args.ladder is not None:
+            ladder = parse_ladder(args.ladder.split(','))
+        else:
+            config = Path(os.environ.get('CLAUDE_CONFIG_DIR', str(Path.home() / '.claude'))) / 'agent-kaizen.json'
+            try:
+                with config.open(encoding='utf-8') as stream:
+                    settings = json.load(stream)
+            except FileNotFoundError:
+                settings = {}
+            ladder = parse_ladder(settings.get('calibrationLadder', DEFAULT_LADDER))
+        path = args.packets or (args.project / 'out/packets.jsonl' if args.project else Path('out/packets.jsonl'))
+        result = summarize(read_rows(path), args.since, args.until, ladder)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError) as error:
+        print(f'packet-report: {error}', file=sys.stderr)
+        return 2
+    print(json.dumps(result, sort_keys=True) if args.json else render(result, args.markdown))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
