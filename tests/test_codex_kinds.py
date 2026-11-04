@@ -10,6 +10,22 @@ AUDIT = runpy.run_path(str(SCRIPTS / 'token-audit'))
 
 
 class CodexKindsTests(StubCase):
+    def test_duration_uses_extremes_and_counts_repeated_invalid_timestamps(self):
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        early = (now - timedelta(minutes=10)).isoformat()
+        late = now.isoformat()
+        jsonl(self.home / '.codex/sessions/2026/01/01/extremes.jsonl', [
+            dict(timestamp=late, type='turn_context', payload=dict(model='model-a')),
+            dict(timestamp='invalid', type='response_item', payload={}),
+            dict(timestamp='invalid', type='response_item', payload={}),
+            dict(timestamp=early, type='response_item', payload={}),
+            dict(timestamp=late, type='event_msg',
+                 payload=dict(type='token_count', info=dict(total_token_usage=dict(total_tokens=1)))),
+        ])
+        data = json.loads(self.run_script('token-audit', '--json').stdout)
+        self.assertEqual(data['codex_sessions'][0]['duration_s'], 600)
+        self.assertEqual(data['warnings']['malformed rows'], 2)
+
     def test_kinds_durations_and_json(self):
         now = datetime.now(timezone.utc).replace(microsecond=0)
         prompts = [('review-plan', 'VERDICT: APPROVE | REVISE'),
