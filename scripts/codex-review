@@ -4,6 +4,7 @@ import argparse
 import os
 from pathlib import Path
 import re
+import shlex
 import subprocess
 import sys
 
@@ -20,6 +21,7 @@ def arguments():
         p.add_argument("-C", default=os.getcwd())
         p.add_argument("--disable-mcp", action="append", default=[], metavar="NAME")
         if mode == "diff":
+            p.add_argument("--paths", nargs="+", default=[])
             target = p.add_mutually_exclusive_group()
             target.add_argument("--uncommitted", action="store_true")
             target.add_argument("--base")
@@ -98,6 +100,12 @@ def main():
             prompt = ("Review this repository's diff read-only. Do not edit files. "
                       "Read AGENTS.md/CLAUDE.md. Hunt for actionable bugs.\n" + prompt +
                       f"\nTarget: {target}\nFocus: {args.focus}\n")
+            if args.paths:
+                git_command = (f"git diff {shlex.quote(args.base)}...HEAD" if args.base else
+                               f"git show {shlex.quote(args.commit)}" if args.commit else "git diff HEAD")
+                paths = " ".join(shlex.quote(path) for path in args.paths)
+                prompt += f"Paths: review only `{git_command} -- {paths}`; ignore changes outside these paths.\n"
+                prompt += "Paths:\n" + "".join(f"- {path}\n" for path in args.paths)
         elif args.mode == "plan":
             plan = args.plan.expanduser().resolve()
             if not plan.exists():
