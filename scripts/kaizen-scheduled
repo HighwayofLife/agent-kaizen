@@ -135,20 +135,26 @@ def project_config_path(project_dir):
     return Path(project_dir) / "docs/kaizen/config.json"
 
 
-def load_config(path):
-    """Read a config object, treating missing or malformed files as empty."""
+def load_config(path, strict=False):
+    """Read a config object; strict reads reject errors other than a missing file."""
     path = Path(path)
     try:
         cfg = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return {}
-    except (ValueError, UnicodeError):
+    except (ValueError, UnicodeError) as error:
+        if strict:
+            raise ValueError(f"config: {path}: invalid JSON; scheduled review blocked") from error
         print(f"config: {path}: invalid JSON, using {{}}", file=sys.stderr)
         return {}
     except OSError as error:
+        if strict:
+            raise ValueError(f"config: {path}: {error}; scheduled review blocked") from error
         print(f"config: {path}: {error.strerror or error}, using {{}}", file=sys.stderr)
         return {}
     if not isinstance(cfg, dict):
+        if strict:
+            raise ValueError(f"config: {path}: expected a JSON object; scheduled review blocked")
         print(f"config: {path}: expected a JSON object, using {{}}", file=sys.stderr)
         return {}
     return cfg
@@ -646,7 +652,7 @@ def config_home_deny(project_dir=None):
 
 def ledger_paths():
     # notes-ledger reads the raw global value too: never use effective()'s fallback here.
-    ledger = load_config(global_config_path()).get("notesLedger", {})
+    ledger = load_config(global_config_path(), strict=True).get("notesLedger", {})
     if not valid_value("notesLedger", ledger):
         raise ValueError("notesLedger is invalid: require csv and optional timeline paths "
                          "absolute after expanduser, and only supported keys")
@@ -670,38 +676,32 @@ class LedgerGuard:
     def snapshot(self):
         for kind, path in ledger_paths().items():
             try:
-                if not path.is_file():
-                    raise ValueError("ledger is not a regular file")
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError("ledger must be a regular file, not a symlink")
                 data = path.read_bytes()
                 snapshot = self.folder / kind
                 snapshot.write_bytes(data)
                 self.entries.append({"kind": kind, "path": path, "snapshot": snapshot,
-                                     "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                                     "data": data, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
                                      "mode": stat.S_IMODE(path.stat().st_mode)})
             except (OSError, ValueError) as error:
                 raise ValueError(f"{path}: cannot snapshot ledger ({error})") from error
         (self.folder / "manifest.json").write_text(json.dumps([
             {key: str(value) if isinstance(value, Path) else value
-             for key, value in entry.items()} for entry in self.entries], indent=2) + "\n")
+             for key, value in entry.items() if key != "data"} for entry in self.entries], indent=2) + "\n")
 
     def verify(self):
         problems = []
         for entry in self.entries:
             path = entry["path"]
-            try:
-                old = entry["snapshot"].read_bytes()
-                if len(old) != entry["size"] or hashlib.sha256(old).hexdigest() != entry["sha256"]:
-                    raise ValueError("snapshot integrity check failed")
-            except (OSError, ValueError) as error:
-                problems.append(f"{path}: cannot verify snapshot ({error})")
-                continue
+            old = entry["data"]
             try:
                 if not path.is_file():
                     raise ValueError("ledger is missing or is not a regular file")
                 new = path.read_bytes()
                 if entry["kind"] == "timeline":
                     lines = iter(new.splitlines(keepends=True))
-                    valid = all(any(line == candidate for candidate in lines)
+                    valid = all(any(line.rstrip(b"\r\n") == candidate.rstrip(b"\r\n") for candidate in lines)
                                 for line in old.splitlines(keepends=True))
                 else:
                     valid = hashlib.sha256(new[:entry["size"]]).hexdigest() == entry["sha256"]
@@ -944,13 +944,13 @@ def run_audit(audits, options):
 
 
 def run_review(audits, project_dirs, options, clock):
-    result = None
+    safety = {"ledger_violation": False}
     try:
-        result = _run_review(audits, project_dirs, options, clock)
+        result = _run_review(audits, project_dirs, options, clock, safety)
         return result
     finally:
-        # _run_review returns 1 only for ledger violations; stop all later steps.
-        if result != 1:
+        # Reporting can raise after a violation; still stop all later steps.
+        if not safety["ledger_violation"]:
             scheduled_housekeep(audits)
 
 
@@ -1083,12 +1083,13 @@ def report_path(stdout):
     return Path(lines[0].strip()).expanduser().resolve()
 
 
-def _run_review(audits, project_dirs, options, clock):
+def _run_review(audits, project_dirs, options, clock, safety):
     """Review projects serially; failed/killed runs leave reviewed_at unchanged.
 
     Their Codex sessions and git commits still count as activity at the next gate;
     the project stays due because its review time did not move.
     """
+    load_config(global_config_path(), strict=True)
     projects, _ = discover(claude_home() / "projects", codex_home() / "sessions",
                            read_index(audits), project_dirs)
     write_index(audits, projects)
@@ -1167,6 +1168,7 @@ def _run_review(audits, project_dirs, options, clock):
         except (OSError, ValueError) as error:
             outcome = f"failed ({error})"
         if ledger_problems:
+            safety["ledger_violation"] = True
             outcome = "ledger-violation: " + "; ".join(ledger_problems)
             if temporary is not None:
                 with temporary.open("a", encoding="utf-8") as output:
@@ -1274,6 +1276,12 @@ def main(argv=None):
         housekeep(audits, effective(), args.dry_run)
         return 0
     if args.command in ("audit", "review"):
+        if args.command == "review":
+            try:
+                load_config(global_config_path(), strict=True)
+            except ValueError as error:
+                print(f"kaizen-scheduled: {error}", file=sys.stderr)
+                return 2
         if not getattr(args, "json", False) and effective()["enabled"]["value"] is False:
             log("skipped: disabled")
             return 0

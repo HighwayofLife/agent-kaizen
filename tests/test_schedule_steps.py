@@ -301,31 +301,119 @@ subprocess.run([sys.executable, os.environ['LEDGER_SCRIPT'], 'add', '--date', '2
                 self.assertEqual((self.csv.read_bytes(), self.timeline.read_bytes()), self.original_ledgers)
                 self.assert_ledger_violation()
 
-    def test_guard_fails_closed_on_unreadable_source_or_snapshot(self):
+    def test_guard_fails_closed_on_unreadable_source(self):
+        self.configure_ledgers()
         read_bytes = Path.read_bytes
-        for unreadable in ('source', 'snapshot'):
-            with self.subTest(unreadable=unreadable):
-                self.configure_ledgers()
-                self.record.unlink(missing_ok=True)
 
-                def guarded_read(path):
-                    if ((unreadable == 'source' and path == self.csv) or
-                            (unreadable == 'snapshot' and path.name == 'csv'
-                             and path.parent.name.startswith('.ledger-'))):
+        def guarded_read(path):
+            if path == self.csv:
+                raise PermissionError('unreadable fixture')
+            return read_bytes(path)
+
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch.object(Path, 'read_bytes', guarded_read), \
+                patch.object(self.module, 'scheduled_housekeep') as housekeep:
+            code = self.module.main(['review', '--force', '--project-dir', str(self.project),
+                                     '--claude', str(self.claude)])
+        self.assertEqual(code, 1)
+        housekeep.assert_not_called()
+        self.assertFalse(self.record.exists())
+        state = self.assert_ledger_violation()
+        self.assertIn('unreadable fixture', '\n'.join(state['ledger_errors']))
+
+    def test_guard_restores_when_run_truncates_ledgers_and_snapshots(self):
+        self.configure_ledgers()
+        executable(self.claude, '#!' + sys.executable + '\n' + """
+import json, pathlib, sys
+report = pathlib.Path(sys.argv[2].split(' ', 2)[2])
+snapshot = next(report.parent.glob('.ledger-*'))
+for entry in json.loads((snapshot / 'manifest.json').read_text()):
+    pathlib.Path(entry['path']).write_bytes(b'')
+    pathlib.Path(entry['snapshot']).write_bytes(b'')
+""")
+        self.guard_result(1)
+        self.assertEqual((self.csv.read_bytes(), self.timeline.read_bytes()), self.original_ledgers)
+        self.assert_ledger_violation()
+
+    def test_guard_rejects_symlinked_ledgers_before_launch(self):
+        for kind in ('csv', 'timeline'):
+            with self.subTest(kind=kind):
+                self.configure_ledgers()
+                path = getattr(self, kind)
+                target = path.with_suffix('.target')
+                path.rename(target)
+                path.symlink_to(target)
+                self.guard_result(1)
+                self.assertFalse(self.record.exists())
+                self.assertTrue(path.is_symlink())
+                self.assertEqual(target.read_bytes(), self.original_ledgers[kind == 'timeline'])
+                state = self.assert_ledger_violation()
+                self.assertIn('regular file, not a symlink', '\n'.join(state['ledger_errors']))
+                path.unlink()
+
+    def test_guard_accepts_timeline_last_line_without_newline(self):
+        self.configure_ledgers()
+        self.timeline.write_bytes(b'first\r\nlast')
+        executable(self.claude, '#!' + sys.executable + '\n' +
+                   'import os\nfrom pathlib import Path\n' +
+                   'Path(os.environ["TIMELINE"]).write_bytes(b"first\\ninserted\\nlast\\nnew row\\n")\n')
+        self.guard_result(0)
+        self.assertIn(b'new row', self.timeline.read_bytes())
+
+    def test_bad_global_config_blocks_review_and_cycle(self):
+        read_text = Path.read_text
+        for fixture in ('{', '[]', 'unreadable'):
+            with self.subTest(fixture=fixture):
+                path = write(self.config / 'agent-kaizen.json', fixture)
+
+                def guarded_read(candidate, *args, **kwargs):
+                    if candidate == path and fixture == 'unreadable':
                         raise PermissionError('unreadable fixture')
-                    return read_bytes(path)
+                    return read_text(candidate, *args, **kwargs)
 
                 with patch.dict(os.environ, self.env, clear=True), \
-                        patch.object(Path, 'read_bytes', guarded_read), \
+                        patch.object(Path, 'read_text', guarded_read), \
+                        patch.object(self.module, 'run_review') as review, \
                         patch.object(self.module, 'scheduled_housekeep') as housekeep:
                     code = self.module.main(['review', '--force', '--project-dir', str(self.project),
                                              '--claude', str(self.claude)])
-                self.assertEqual(code, 1)
+                    options = self.module.command_options(self.module.argparse.Namespace(dry_run=True))
+                    with self.assertRaisesRegex(ValueError, 'scheduled review blocked'):
+                        self.module.review_command(options, 'auto', 'report', 'session')
+                self.assertEqual(code, 2)
+                review.assert_not_called()
                 housekeep.assert_not_called()
-                self.assertEqual(self.record.exists(), unreadable == 'snapshot')
-                state = self.assert_ledger_violation()
-                self.assertIn(str(self.csv), '\n'.join(state['ledger_errors']))
-                self.assertIn('unreadable fixture', '\n'.join(state['ledger_errors']))
+                self.assertFalse(self.record.exists())
+
+    def test_violation_write_errors_skip_later_projects_and_housekeeping(self):
+        later = self.root / 'z-project'
+        (later / 'docs/kaizen').mkdir(parents=True)
+        original_open, original_state = Path.open, self.module.write_state
+        for failure in ('report', 'state'):
+            with self.subTest(failure=failure):
+                self.configure_ledgers()
+
+                def guarded_open(path, mode='r', *args, **kwargs):
+                    if failure == 'report' and path.name.startswith('cycle-') and mode == 'a':
+                        raise OSError('report write fixture')
+                    return original_open(path, mode, *args, **kwargs)
+
+                def guarded_state(project, state):
+                    if failure == 'state' and state.get('status') == 'ledger-violation':
+                        raise OSError('state write fixture')
+                    return original_state(project, state)
+
+                with patch.dict(os.environ, self.env, clear=True), \
+                        patch.object(self.module.LedgerGuard, 'verify', return_value=['violation fixture']), \
+                        patch.object(Path, 'open', guarded_open), \
+                        patch.object(self.module, 'write_state', guarded_state), \
+                        patch.object(self.module, 'scheduled_housekeep') as housekeep:
+                    code = self.module.main(['review', '--force', '--project-dir', str(self.project),
+                                             '--project-dir', str(later), '--claude', str(self.claude)])
+                self.assertEqual(code, 2)
+                housekeep.assert_not_called()
+                later_folder = self.audits / 'projects' / self.module.key(later)
+                self.assertFalse((later_folder / 'state.json').exists())
 
     def test_guard_error_stops_later_projects_and_housekeeping(self):
         self.configure_ledgers()
