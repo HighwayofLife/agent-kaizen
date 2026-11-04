@@ -61,7 +61,7 @@ out.write_text('project report regenerated')
 """)
         self.claude = executable(self.bin / 'claude', '#!' + sys.executable + "\n" + """
 import json, os, pathlib, sys
-report = pathlib.Path(sys.argv[2].split(' ', 2)[2])
+report = pathlib.Path(sys.argv[2].rsplit(' notes-ledger-path=', 1)[0].split(' ', 2)[2])
 assert report.read_text() == 'token report'
 assert list(report.parent.glob('project-report-*.md'))[0].read_text() == 'project report regenerated'
 pathlib.Path(os.environ['RECORD']).write_text(json.dumps(sys.argv[1:]))
@@ -149,7 +149,7 @@ print('proposal')
         self.review('--propose-only', '--force')
         command = json.loads(self.record.read_text())
         report = self.audits / 'projects' / self.module.key(self.project) / 'token-audit-stub.md'
-        self.assertEqual(command[1], f'/agent-kaizen:cycle propose-only {report}')
+        self.assertEqual(command[1], f'/agent-kaizen:cycle propose-only {report} notes-ledger-path={self.scripts}/notes-ledger')
         self.assertEqual(command[command.index('--allowedTools') + 1], self.module.REVIEW_TOOLS)
         self.assertEqual(command[command.index('--tools') + 1], self.module.REVIEW_AVAILABLE)
         self.assertNotIn('--disallowedTools', command)
@@ -188,6 +188,9 @@ print('proposal')
             options = self.module.command_options(self.module.argparse.Namespace(dry_run=True))
             command = self.module.review_command(options, 'auto', 'report', 'session', self.project)
             allowed = command[command.index('--allowedTools') + 1]
+            ledger_path = command[command.index('-p') + 1].split('notes-ledger-path=', 1)[1]
+            self.assertEqual(ledger_path, str(self.scripts / 'notes-ledger'))
+            self.assertIn(f'Bash(python3 {ledger_path} add:*)', allowed)
             for python in ('python3', options.python):
                 self.assertIn(f'Bash({python} {self.scripts}/notes-ledger add:*)', allowed)
             self.assertNotIn('notes-ledger set', allowed)
@@ -262,7 +265,7 @@ print('model returned success')
                 self.env['LEDGER_SCRIPT'] = str(self.scripts / 'notes-ledger')
                 executable(self.claude, '#!' + sys.executable + '\n' + """
 import hashlib, json, os, pathlib, stat, subprocess, sys
-report = pathlib.Path(sys.argv[2].split(' ', 2)[2])
+report = pathlib.Path(sys.argv[2].rsplit(' notes-ledger-path=', 1)[0].split(' ', 2)[2])
 snapshot = next(report.parent.glob('.ledger-*'))
 assert stat.S_IMODE(snapshot.stat().st_mode) == 0o700
 manifest = json.loads((snapshot / 'manifest.json').read_text())
@@ -325,7 +328,7 @@ subprocess.run([sys.executable, os.environ['LEDGER_SCRIPT'], 'add', '--date', '2
         self.configure_ledgers()
         executable(self.claude, '#!' + sys.executable + '\n' + """
 import json, pathlib, sys
-report = pathlib.Path(sys.argv[2].split(' ', 2)[2])
+report = pathlib.Path(sys.argv[2].rsplit(' notes-ledger-path=', 1)[0].split(' ', 2)[2])
 snapshot = next(report.parent.glob('.ledger-*'))
 for entry in json.loads((snapshot / 'manifest.json').read_text()):
     pathlib.Path(entry['path']).write_bytes(b'')

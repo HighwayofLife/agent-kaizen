@@ -18,7 +18,7 @@ class SessionNotesTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.bin = self.root / 'bin'
         self.bin.mkdir()
-        for name in ('bash', 'jq', 'python3', 'awk', 'tail', 'timeout'):
+        for name in ('bash', 'jq', 'python3', 'awk', 'tail', 'timeout', 'sleep', 'mktemp', 'cat', 'rm'):
             target = shutil.which(name)
             if target:
                 (self.bin / name).symlink_to(target)
@@ -68,6 +68,12 @@ class SessionNotesTests(unittest.TestCase):
     @unittest.skipUnless(shutil.which('timeout'), 'timeout is required')
     def test_dispatch_timeout(self):
         self.stub('dispatch-status', 'while :; do :; done')
+        self.env['SESSION_NOTES_TIMEOUT'] = '0.1'
+        self.assertEqual(self.context(), '')
+
+    def test_dispatch_timeout_without_timeout_commands(self):
+        (self.bin / 'timeout').unlink(missing_ok=True)
+        self.stub('dispatch-status', 'sleep 3')
         self.env['SESSION_NOTES_TIMEOUT'] = '0.1'
         self.assertEqual(self.context(), '')
 

@@ -1006,7 +1006,7 @@ class ExecutionTests(DiscoveryCase):
             session_id = self.values(argv, '--session-id')[0]
             self.assertEqual(str(uuid.UUID(session_id)), session_id)
             report = self.folder(path) / 'token-audit-stub.md'
-            self.assertEqual(self.values(argv, '-p'), [f'/agent-kaizen:cycle propose-only {report}'])
+            self.assertEqual(self.values(argv, '-p'), [f'/agent-kaizen:cycle propose-only {report} notes-ledger-path={SCRIPTS}/notes-ledger'])
             self.assertEqual(self.values(argv, '--model'), ['test-model'])
             self.assertEqual(self.values(argv, '--max-turns'), ['6'])
             self.assertIn('--strict-mcp-config', argv)
@@ -1359,7 +1359,7 @@ class ExecutionTests(DiscoveryCase):
                                  '--days', '7', '--out', str(self.folder(path)), '--pricing', str(self.pricing),
                                  '--extract-out', str(self.audits / 'extracts')])
         self.assertEqual(review[0], str(self.claude))
-        self.assertEqual(self.values(review, '-p'), ['/agent-kaizen:cycle propose-only <report path from audit stdout>'])
+        self.assertEqual(self.values(review, '-p'), [f'/agent-kaizen:cycle propose-only <report path from audit stdout> notes-ledger-path={SCRIPTS}/notes-ledger'])
         uuid.UUID(self.values(review, '--session-id')[0])
         self.assertEqual(before, {p: p.read_bytes() if p.is_file() else None for p in self.root.rglob('*')})
 

@@ -10,7 +10,7 @@ omitClaudeMd: true
 You run the agent-kaizen cycle in **propose-only** mode. Follow `${CLAUDE_PLUGIN_ROOT}/skills/cycle/SKILL.md`. Follow its review, models and whats-new references as needed.
 
 Rules:
-- First read the newest global `checks-*.md` and this project's `project-report-*.md` when present. Prefer these precomputed files. If either is missing, use `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-project-report --project .` for the project report, or `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-link --check`, `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/rules-lint` and `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/notes-ledger due` for checks. These are read-only except for effects of configured project commands; inspect those commands first.
+- First read the newest global `checks-*.md` and this project's `project-report-*.md` when present. Scheduled runs use these precomputed reports and must not run `kaizen-project-report`, `kaizen-link --check`, `rules-lint` or `notes-ledger due`, even if a report is missing. In interactive runs, if either report is missing, use `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-project-report --project .` for the project report, or `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-link --check`, `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/rules-lint` and `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/notes-ledger due` for checks. Inspect configured project commands first.
 - Parse transcripts and sessions with `${CLAUDE_PLUGIN_ROOT}/scripts/token-audit` or a short script, never by reading them.
 - You have no Edit or Write tool. Use Bash only to run token-audit and read-only commands (git log, ls, rg). Never change settings, agents, hooks, CLAUDE.md or AGENTS.md.
 - Return the proposal as Markdown; the caller saves it.

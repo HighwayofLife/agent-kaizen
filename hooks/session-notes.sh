@@ -20,8 +20,21 @@ dispatch=$(find_tool dispatch-status)
 if [ -n "$dispatch" ]; then
   if command -v timeout >/dev/null 2>&1; then
     ds=$(timeout "${SESSION_NOTES_TIMEOUT:-20}" "$dispatch" 2>/dev/null)
+  elif command -v gtimeout >/dev/null 2>&1; then
+    ds=$(gtimeout "${SESSION_NOTES_TIMEOUT:-20}" "$dispatch" 2>/dev/null)
   else
-    ds=$("$dispatch" 2>/dev/null)
+    ds=$(
+      tmp=$(mktemp) || exit 0
+      "$dispatch" >"$tmp" 2>/dev/null &
+      pid=$!
+      (sleep "${SESSION_NOTES_TIMEOUT:-20}"; kill "$pid" 2>/dev/null) >/dev/null 2>&1 &
+      watchdog=$!
+      wait "$pid" 2>/dev/null
+      kill "$watchdog" 2>/dev/null
+      wait "$watchdog" 2>/dev/null
+      cat "$tmp"
+      rm -f "$tmp"
+    )
   fi
   ds=$(printf '%s\n' "$ds" | awk '
     /^RUNNING/ {s="r"; next} /^DIRTY WORKTREES/ {s="d"; next} /^[A-Z]/ {s=""; next}
