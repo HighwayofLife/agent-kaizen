@@ -35,6 +35,7 @@ INJECTED_PREFIXES = ("# AGENTS.md instructions", "<environment_context>", "<user
                      "<user_action>", "<turn_aborted>", "<image", "</image>")
 USER_ROW = re.compile(rb'"type"\s*:\s*"user"')
 MESSAGE_ROW = re.compile(rb'"type"\s*:\s*"(?:user|assistant)"')
+CODEX_ROW = re.compile(rb'"(?:token_count|user_message|role"\s*:\s*"user|turn_context)"')
 TOOL_METADATA = (b'"api-request-shape"', b'"deferred_tools_delta"', b'"mcp_instructions_delta"')
 EXIT_HEADER = re.compile(r"^Exit code\s*:?\s*(-?\d+)\s*$", re.I)
 BENIGN_EXITS = {"grep": {1}, "rg": {1}, "test": {1}, "[": {1}, "diff": {1}, "cmp": {1},
@@ -67,27 +68,38 @@ def metadata_row(line, timestamp):
         "attachment": dict(type=attachment, **value)}))
 
 
-def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None):
+def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None, first_row=None):
     """Timestamp and record-type gates run before decoding large content."""
     cutoff = since.strftime("%Y-%m-%dT%H:%M:%S")
     saved_shape, saved_deltas, before_user = None, [], False
+    last_prefix, last_timestamp, last_stamp = None, None, None
     try:
         with path.open("rb") as stream:
-            for line in stream:
+            for line_number, line in enumerate(stream):
                 prefix = line[:1024]
-                if b'"timestamp"' not in prefix and not any(marker in line for marker in MARKERS):
+                if (bounds is not None and last_stamp is not None and line.startswith(last_prefix)
+                        and keep_model and not keep_tools and not CODEX_ROW.search(prefix)
+                        and b'"model"' not in line):
+                    continue
+                if bounds is None and b'"timestamp"' not in prefix and not any(marker in line for marker in MARKERS):
                     continue
                 if bounds is not None:
-                    match = TIMESTAMP.search(line)
-                    if not match:
-                        continue
-                    try:
-                        stamp = date_time(match[1].decode("ascii", "replace"))
-                        if bounds[0] is None or stamp < bounds[0]:
-                            bounds[0] = stamp
-                        if bounds[1] is None or stamp > bounds[1]:
-                            bounds[1] = stamp
-                    except (ValueError, TypeError, UnicodeError):
+                    if last_prefix is None or not line.startswith(last_prefix):
+                        match = TIMESTAMP.search(line)
+                        if not match:
+                            continue
+                        last_prefix = line[:match.end()]
+                        last_timestamp = match[1].decode("ascii", "replace")
+                        try:
+                            last_stamp = date_time(last_timestamp)
+                        except (ValueError, TypeError, UnicodeError):
+                            last_stamp = None
+                        if last_stamp is not None:
+                            if bounds[0] is None or last_stamp < bounds[0]:
+                                bounds[0] = last_stamp
+                            if bounds[1] is None or last_stamp > bounds[1]:
+                                bounds[1] = last_stamp
+                    if last_stamp is None:
                         warnings["malformed rows"] += 1
                         continue
                 metadata = keep_tools and any(marker in prefix for marker in TOOL_METADATA)
@@ -95,10 +107,13 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None)
                     continue
                 if keep_model and not (b'"token_count"' in prefix or b'"user_message"' in prefix or b'"role":"user"' in prefix or b'"role": "user"' in prefix or b'"model"' in line or (bounds is not None and b'"turn_context"' in prefix)):
                     continue
-                match = TIMESTAMP.search(line)
-                if not match:
-                    continue
-                timestamp = match[1].decode("ascii", "replace")
+                if bounds is not None:
+                    timestamp = last_timestamp
+                else:
+                    match = TIMESTAMP.search(line)
+                    if not match:
+                        continue
+                    timestamp = match[1].decode("ascii", "replace")
                 try:
                     old = (timestamp[:19] < cutoff if timestamp.endswith(("Z", "+00:00"))
                            else date_time(timestamp) < since)
@@ -124,7 +139,8 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None)
                         if before_user:
                             yield dict(type="user", message={}, _before_window=True)
                         saved_shape, saved_deltas, before_user = None, [], False
-                    row = metadata_row(line, timestamp) if metadata else json.loads(line)
+                    row = (metadata_row(line, timestamp) if metadata else
+                           first_row if line_number == 0 and first_row is not None else json.loads(line))
                     if isinstance(row, dict):
                         if old:
                             row["_before_window"] = True
@@ -585,13 +601,17 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
     for path in root.glob("*/*/*/*.jsonl"):
         if too_old(path, since):
             continue
+        first_row = None
         if cwd is not None:
             try:
                 with path.open("rb") as stream:
-                    row = json.loads(stream.readline(LINE_LIMIT))
+                    first_line = stream.readline(LINE_LIMIT)
+                    row = json.loads(first_line)
                 payload = row.get("payload") if isinstance(row, dict) else None
                 if not isinstance(payload, dict) or not cwd_matches(payload.get("cwd"), cwd, realpaths):
                     continue
+                if len(first_line) < LINE_LIMIT or first_line.endswith(b'\n'):
+                    first_row = row
             except (OSError, ValueError, RecursionError):
                 continue
         data["codex_files_scanned"] += 1
@@ -603,7 +623,7 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
         bounds = [None, None]
         # Older session files can contain recent resumes. Keep earlier model
         # metadata, but count only sessions with a token_count in the window.
-        for row in rows(path, since, data["warnings"], keep_model=True, bounds=bounds):
+        for row in rows(path, since, data["warnings"], keep_model=True, bounds=bounds, first_row=first_row):
             payload = row.get("payload") or {}
             if not isinstance(payload, dict):
                 continue
