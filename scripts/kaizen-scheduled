@@ -61,6 +61,28 @@ def valid_relative_paths(value):
         for path in value)
 
 
+def valid_project_commands(value):
+    def valid_command(name, command):
+        if name == "outcomeLog":
+            return (isinstance(command, str) and bool(command) and not command.startswith("/")
+                    and ".." not in command)
+        return (name in ("shadowStatus", "slowTests", "speedReport")
+                and isinstance(command, list) and bool(command)
+                and all(isinstance(arg, str) for arg in command))
+
+    return all(isinstance(path, str) and (path.startswith("/") or path.startswith("~"))
+               and isinstance(commands, dict)
+               and all(valid_command(name, command) for name, command in commands.items())
+               for path, commands in value.items())
+
+
+def valid_notes_ledger(value):
+    return (not value or ("csv" in value
+            and all((key in ("csv", "timeline") and isinstance(item, str))
+                    or (key == "measureAfterDays" and type(item) is int and item >= 1)
+                    for key, item in value.items())))
+
+
 SCHEMA = {
     "enabled": {"kind": "bool", "default": True, "global_only": True},
     "schedule": {"kind": "enum", "default": "active", "choices": ("active", "always", "off")},
@@ -68,6 +90,15 @@ SCHEMA = {
     "retention": {"kind": "enum", "default": "auto", "choices": ("auto", "off"), "global_only": True},
     "retentionOverrides": {"kind": "object", "default": {}, "global_only": True,
                            "check": valid_retention_overrides},
+    "projectCommands": {"kind": "object", "default": {}, "global_only": True,
+                        "check": valid_project_commands},
+    "notesLedger": {"kind": "object", "default": {}, "global_only": True,
+                    "check": valid_notes_ledger},
+    "calibrationLadder": {"kind": "strings", "default": ["haiku", "sonnet medium", "sonnet high", "opus high"],
+                          "global_only": True, "check": lambda value: all(len(item.split()) in (1, 2) for item in value)},
+    "rulesLintFiles": {"kind": "strings", "default": [], "global_only": True},
+    "localScripts": {"kind": "strings", "default": [], "global_only": True,
+                     "check": lambda value: all("/" not in item for item in value)},
 }
 DEFAULTS = {name: spec["default"] for name, spec in SCHEMA.items()}
 CHOICES = {name: spec["choices"] for name, spec in SCHEMA.items() if spec["kind"] == "enum"}
@@ -127,6 +158,9 @@ def valid_value(name, value):
         return isinstance(value, dict) and spec["check"](value)
     if kind == "paths":
         return valid_relative_paths(value)
+    if kind == "strings":
+        return (isinstance(value, list) and all(isinstance(item, str) and bool(item.strip()) for item in value)
+                and ("check" not in spec or spec["check"](value)))
     return False
 
 
@@ -1015,7 +1049,7 @@ def main(argv=None):
                 if value not in ("true", "false"):
                     parser.error(f"invalid value for {name}: {value}; use true or false")
                 value = value == "true"
-            elif kind in ("int", "object", "paths"):
+            elif kind in ("int", "object", "paths", "strings"):
                 try:
                     value = int(value) if kind == "int" else json.loads(value)
                 except ValueError:

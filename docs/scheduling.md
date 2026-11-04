@@ -64,9 +64,14 @@ Settings live in `agent-kaizen.json` in the Claude config directory and in each 
 | `scheduledAutonomy` | Global or project | `propose` (default), `auto` |
 | `retention` | Global only | `auto` (default), `off` keeps everything |
 | `retentionOverrides` | Global only | Object, default `{}`; for example `{"extracts":{"days":14}}` |
+| `projectCommands` | Global only | Object mapping absolute project paths (or `~/` paths) to `outcomeLog` relative paths and `shadowStatus`, `slowTests`, or `speedReport` argv lists; default `{}` |
+| `notesLedger` | Global only | Object with `csv` path, optional `timeline` path and positive integer `measureAfterDays`; default `{}` (off) |
+| `calibrationLadder` | Global only | List of `model` or `model effort` strings; default `["haiku", "sonnet medium", "sonnet high", "opus high"]` |
+| `rulesLintFiles` | Global only | List of non-empty glob strings; default `[]` |
+| `localScripts` | Global only | List of non-empty strings without `/`; default `[]` |
 | `autonomy` | Global or project | Interactive mode; scheduled runs do not read it |
 
-Global `enabled=false` takes precedence over everything. Otherwise, project settings override global settings, which override defaults. Project values for `retention` and `retentionOverrides` are ignored with a warning. A tracked project config applies to teammates too; put personal choices in the global file.
+Global `enabled=false` takes precedence over everything. Otherwise, project settings override global settings, which override defaults. Project values for global-only keys are ignored with a warning. A tracked project config applies to teammates too; put personal choices in the global file.
 
 Use `kaizen-scheduled config set [--for DIR] KEY=VALUE...` to merge settings. `/agent-kaizen:schedule` and `/agent-kaizen:start` ask for your choices and run the relevant commands.
 

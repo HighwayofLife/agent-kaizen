@@ -51,6 +51,14 @@ class RunnerTests(StubCase):
             "scheduledAutonomy": {"value": "propose", "source": "default"},
             "retention": {"value": "auto", "source": "default"},
             "retentionOverrides": {"value": {}, "source": "default"},
+            "projectCommands": {"value": {}, "source": "default"},
+            "notesLedger": {"value": {}, "source": "default"},
+            "calibrationLadder": {
+                "value": ["haiku", "sonnet medium", "sonnet high", "opus high"],
+                "source": "default",
+            },
+            "rulesLintFiles": {"value": [], "source": "default"},
+            "localScripts": {"value": [], "source": "default"},
             "reports": None,
         })
         self.assertEqual(result.stderr, "")
