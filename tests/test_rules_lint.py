@@ -84,6 +84,35 @@ class RulesLintTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2)
         self.assertIn("rules-lint: bad pattern", result.stderr)
 
+    def test_settings_object_and_escaped_prefixes(self):
+        write(self.claude / "agent-kaizen.json", "[1]")
+        result = self.run_lint("--repo", self.repo)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("JSON object", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.claude = self.root / "claude[1]"
+        self.repo = self.root / "repo[1]"
+        write(self.claude / "agent-kaizen.json", json.dumps({"rulesLintFiles": ["extra/*.md"]}))
+        write(self.claude / "extra/a.md", "old wording")
+        write(self.claude / "CLAUDE.md", "old wording")
+        write(self.claude / "kaizen-rules-lint.txt", "old wording")
+        write(self.repo / "AGENTS.md", "old wording")
+        result = self.run_lint("--repo", self.repo, "--json")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["count"], 3)
+
+    def test_pattern_sources_excluded_even_when_explicitly_selected(self):
+        repo_patterns = self.repo / "docs/kaizen/rules-lint.txt"
+        script = self.root / "rules-lint"
+        shutil.copy(LINT, script)
+        builtin_patterns = script.with_name("rules-lint.patterns")
+        write(builtin_patterns, "old wording\n")
+        write(repo_patterns, "old wording\n")
+        write(self.claude / "agent-kaizen.json", json.dumps({"rulesLintFiles": [str(repo_patterns), str(builtin_patterns)]}))
+        result = self.run_lint("--repo", self.repo, "--json", script=script)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["hits"], [])
+
     def test_usage_and_help(self):
         self.assertEqual(self.run_lint("--bogus").returncode, 2)
         self.assertEqual(self.run_lint("--repo").returncode, 2)

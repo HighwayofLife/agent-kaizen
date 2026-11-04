@@ -88,9 +88,18 @@ def main():
     parser.add_argument("--restore-replaced", action="store_true")
     parser.add_argument("--json", action="store_true")
     parser.add_argument("--plugin-root", type=Path, default=Path(__file__).resolve().parent.parent,
-                        help=argparse.SUPPRESS)
+                        metavar="DIR", help="plugin root containing scripts and hooks")
     args = parser.parse_args()
+    if args.restore_replaced and not args.unlink:
+        parser.error("--restore-replaced requires --unlink")
     root = args.plugin_root.resolve()
+    if not (any((root / "scripts" / name).exists() for name in SCRIPTS.values())
+            or any((root / "hooks" / name).exists() for name in HOOKS)):
+        parser.exit(2, "kaizen-link: no scripts or hooks sources under plugin root %s; use --plugin-root DIR\n" % root)
+    if args.apply or args.unlink:
+        for destination in (args.bin, args.hooks_dir):
+            if destination.resolve().is_relative_to(root):
+                parser.exit(2, "kaizen-link: destination resolves inside plugin root: %s\n" % destination)
     mode = args.mode
     if mode == "auto":
         mode = "copy" if "/plugins/cache/" in root.as_posix() + "/" else "link"
@@ -108,7 +117,7 @@ def main():
              for name, filename in SCRIPTS.items()]
     pairs += [(name, root / "hooks" / name, args.hooks_dir / name, "hook") for name in HOOKS]
     for name, source, target, kind in pairs:
-        if (selected is not None and name not in selected) or not source.exists():
+        if (selected is not None and name not in selected) or (not args.unlink and not source.exists()):
             continue
         current = status(source, target, name in local)
         detail = ""

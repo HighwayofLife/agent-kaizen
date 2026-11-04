@@ -31,23 +31,25 @@ def patterns(paths):
 
 
 def scan_files(home, repos):
-    globs = [str(home / "CLAUDE.md"), str(home / "agents" / "*.md")]
+    globs = [glob.escape(str(home)) + "/CLAUDE.md", glob.escape(str(home)) + "/agents/*.md"]
     settings = home / "agent-kaizen.json"
     try:
         with settings.open(encoding="utf-8", errors="replace") as source:
             config = json.load(source)
     except FileNotFoundError:
         config = {}
+    if not isinstance(config, dict):
+        raise ValueError("settings must be a JSON object")
     extra = config.get("rulesLintFiles", [])
     if not isinstance(extra, list) or not all(isinstance(item, str) for item in extra):
         raise ValueError("rulesLintFiles must be a list of strings")
     for item in extra:
         path = Path(item).expanduser()
-        globs.append(str(path if path.is_absolute() else home / path))
+        globs.append(str(path) if path.is_absolute() else glob.escape(str(home)) + "/" + str(path))
     for repo in repos:
         for item in ("CLAUDE.md", "AGENTS.md", "docs/agents/*.md",
                      ".claude/agent-context/*.md", ".claude/agents/*.md"):
-            globs.append(str(repo / item))
+            globs.append(glob.escape(str(repo)) + "/" + item)
     excluded = {Path(__file__).resolve().with_name("rules-lint.patterns")}
     excluded.update((repo / "docs/kaizen/rules-lint.txt").resolve() for repo in repos)
     seen = set()
