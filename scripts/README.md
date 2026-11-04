@@ -304,3 +304,60 @@ Rates use elapsed UTC days, not active days. The before window defaults to the
 30 days before the cutoff, and the after window ends now unless `--after-to`
 is set. Pass the original selection and pricing options again; CSVs do not
 store private scope information.
+
+## kaizen-link
+
+Install or check managed scripts and hooks. Cache installs use copies; `localScripts` marks intentional differences.
+
+```text
+usage: kaizen-link [-h] [--bin BIN] [--hooks-dir HOOKS_DIR]
+                   [--mode {auto,link,copy}] [--only ONLY]
+                   [--apply | --check | --unlink]
+                   [--replace | --replace-prefixed] [--restore-replaced]
+                   [--json] [--plugin-root DIR]
+```
+
+Example: `kaizen-link --check`.
+
+## packet-report
+
+Read outcomes and propose calibration changes using the [outcome log contract](../docs/outcome-log.md).
+
+```text
+usage: packet-report [-h] [--packets PACKETS | --project PROJECT]
+                     [--since SINCE] [--until UNTIL] [--ladder LADDER]
+                     [--markdown | --json]
+```
+
+Example: `packet-report --project . --markdown`.
+
+## kaizen-project-report
+
+Report outcomes, calibration proposals, configured command output and pending ledger rows for an enrolled project. Global `projectCommands` supplies argv lists; each command has a 120-second timeout.
+
+```text
+usage: kaizen-project-report [-h] --project PROJECT [--since SINCE]
+                             [--out OUT] [--json] [--verbose]
+```
+
+Example: `kaizen-project-report --project .`.
+
+## rules-lint
+
+Find stale wording using `rules-lint.patterns`, the user file `kaizen-rules-lint.txt` in the Claude config directory, and each project's `docs/kaizen/rules-lint.txt`. Global `rulesLintFiles` adds files to scan.
+
+```text
+usage: rules-lint [-h] [--repo DIR] [--json]
+```
+
+Example: `rules-lint --repo .`.
+
+## notes-ledger
+
+Record changes, update them, or propose due measurements. Configure paths in global `notesLedger`; unattended runs may only use `add`.
+
+```text
+usage: notes-ledger [-h] {add,set,due} ...
+```
+
+Example: `notes-ledger due`.

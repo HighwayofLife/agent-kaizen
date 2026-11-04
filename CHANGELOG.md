@@ -2,6 +2,20 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.7.0 (2026-11-04)
+
+- `kaizen-link` links or copies managed scripts and hooks; `--check` reports drift, `localScripts` marks intended differences, and `--apply --replace` saves differing files with a `.replaced-<date>` suffix. Plugin cache installs use copies.
+- `packet-report` reads project outcomes from `out/packets.jsonl`; the contract and `Risk`, `Fix-Origin`, and `Fixes` trailers are in `docs/outcome-log.md`. For groups of at least 8, it proposes UP below 70% first-pass or above 30% fix rate, and DOWN at 95% first-pass or higher with no audit fixes. Proposals are not applied automatically.
+- `kaizen-project-report` combines packet outcomes, calibration proposals, configured command output and pending ledger rows. Global `projectCommands` configures argv lists with a 120-second timeout.
+- `rules-lint` uses bundled, user and project pattern files and the global `rulesLintFiles` setting to find stale wording.
+- `notes-ledger` adds and updates changes and proposes due measurements through `add`, `set` and `due`. Global `notesLedger` configures it; unattended runs may only use `add`.
+- `token-audit` section 7b groups Codex sessions by kind, model and effort with durations. `codex-review diff --paths` limits review paths, `dispatch-status` reports dirty worktrees, and `hooks/session-notes.sh` is opt-in via `templates/settings.example.json`.
+- Scheduled runs write `checks-*.md` and project reports; `KAIZEN_SKIP_CHECKS=1` skips checks. Project enrolment uses `docs/kaizen/` in place of the older private project registry.
+- The global-only settings `projectCommands`, `notesLedger`, `calibrationLadder`, `rulesLintFiles` and `localScripts` configure these tools.
+- `install-schedule --apply` prints the link plan and saves differing `kaizen-` files with a `.replaced-<date>` suffix; other differing files are reported and left alone. `review --propose-only --force` supports restricted reviews of selected projects; `audit` discovers enrolled projects and writes `projects/index.json`.
+- Skills and templates add the Kaizen rule and planning rules A, B and C.
+- Upgrade notes: re-run `install-schedule --apply` to install the new scripts, then run `kaizen-link --check`. Owners of private script copies in the config directory should compare them with `kaizen-link --check` before replacing them. Use `localScripts` to keep intended differences quiet.
+
 ## 0.6.0 (2026-10-31)
 
 - New `usage-series` writes daily UTC usage and agent measurements from local Claude and Codex logs. It supports project selection, command counts, and optional git activity.

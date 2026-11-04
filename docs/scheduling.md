@@ -45,6 +45,10 @@ The first installs the audit; the second adds the weekly review. `--apply` print
 
 The installer records its source root in `bin/.kaizen-plugin-root`. The Drift check passes `--plugin-root` to `kaizen-link`, using `CLAUDE_PLUGIN_ROOT` when set, otherwise that record. If neither is known, Drift reports `unavailable` with a reason. If the source has moved, set `CLAUDE_PLUGIN_ROOT` or re-run the installer from its new location.
 
+### Install through links
+
+`kaizen-link` installs managed scripts and hooks as links, or as copies when the plugin is in a cache. Run `kaizen-link --check` to report drift; list intentional differences in `localScripts`. `--apply --replace` saves differing files with a `.replaced-<date>` suffix before replacement.
+
 ## Discovery and activity
 
 Enrolled projects have a `docs/kaizen/` directory. Discovery reads the newest five Claude Code transcripts in each project folder (of any age), Codex sessions from the last 30 days, and a registry of previously seen projects. A session in a subfolder maps to its enrolled project. Linked git worktrees of a repository count as one project. Repeat `--project-dir DIR` to replace discovery with selected projects.
