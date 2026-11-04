@@ -17,6 +17,15 @@
   "hooks": {
     "SessionStart": [
       {
+        "matcher": "startup|resume",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash ~/.claude/hooks/session-notes.sh"
+          }
+        ]
+      },
+      {
         "matcher": "compact",
         "hooks": [
           {
