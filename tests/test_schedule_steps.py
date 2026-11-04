@@ -15,13 +15,7 @@ from test_scripts import SCRIPTS, StubCase, executable, write
 
 
 # Independent pins: adding a Bash grant requires reviewing its exec/write flags.
-PROPOSE_BASH = (
-    'Bash(ls:*)',         # Lists metadata; no command execution or output-file flag.
-    'Bash(head:*)',       # Reads initial bytes/lines; writes only stdout.
-    'Bash(tail:*)',       # Reads final bytes/lines (or follows); writes only stdout.
-    'Bash(shasum:*)',     # Reads/hashes/checks files; no exec or output-file flag.
-    'Bash(sha256sum:*)',  # Reads/hashes/checks files; no exec or output-file flag.
-)
+PROPOSE_BASH = ()
 AUTO_BASH = PROPOSE_BASH + (
     'Bash({backup} begin:*)',           # Copies inputs only into the protected backup root.
     'Bash(python3 {backup} begin:*)',   # Same fixed helper, not arbitrary Python code.

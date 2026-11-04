@@ -115,8 +115,7 @@ CHOICES = {name: spec["choices"] for name, spec in SCHEMA.items() if spec["kind"
 HERE = Path(__file__).resolve().parent
 # Keep in sync with the independently pinned permission tests. Search with Grep:
 # rg can execute preprocessors, and git can execute repository-configured helpers.
-READ_ONLY_BASH = ["Bash(ls:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(shasum:*)",
-                  "Bash(sha256sum:*)"]
+READ_ONLY_BASH = []
 REVIEW_AVAILABLE = "Read,Grep,Glob,Bash"
 REVIEW_TOOLS = ",".join(["Read", "Grep", "Glob", *READ_ONLY_BASH])
 AUTO_AVAILABLE = "Read,Grep,Glob,Edit,Write,Bash"

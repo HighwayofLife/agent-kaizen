@@ -181,6 +181,19 @@ class ScheduleTests(StubCase):
         self.assertIn('skip LOCAL notes-ledger', result.stdout)
         self.assertFalse((target / 'notes-ledger').exists())
 
+    def test_cache_install_replaces_stale_credentials_module(self):
+        plugin = self.root / 'plugins/cache/agent-kaizen/version'
+        shutil.copytree(SCRIPTS, plugin / 'scripts')
+        command = [sys.executable, str(plugin / 'scripts/install-schedule'), '--scheduler', 'cron', '--apply']
+        first = subprocess.run(command, env=self.env, capture_output=True, text=True)
+        self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+        installed = self.home / '.claude/bin/kaizen_credentials.py'
+        installed.write_text('stale module')
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(installed.read_bytes(), (plugin / 'scripts/kaizen_credentials.py').read_bytes())
+        self.assertEqual(next(installed.parent.glob('kaizen_credentials.py.replaced-*')).read_text(), 'stale module')
+
     def test_cache_install_reports_unresolved_dependency_drift(self):
         plugin = self.root / 'plugins/cache/agent-kaizen/version'
         shutil.copytree(SCRIPTS, plugin / 'scripts')

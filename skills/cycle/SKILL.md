@@ -12,7 +12,7 @@ This is the entry point when you don't know which skill to run. It runs the loop
 
 **Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `agent-kaizen.json` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`), else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
-Scheduled runs search with Grep and locate/read files with Glob and Read. Use the supplied reports for git state and measurements. Do not use Bash rg, git, wc, diff, cd, mkdir, token-audit, arbitrary scripts or shell redirection. Auto runs may use only the supplied backup begin/finish/list and notes-ledger add helpers in addition to the read-only Bash list in `${CLAUDE_PLUGIN_ROOT}/docs/scheduling.md`. The runner handles rollback; report a failed check and leave its backup unfinished or finish it with `--verification failed`.
+Scheduled runs search with Grep and locate/read files with Glob and Read. Use the supplied reports for git state and measurements. Do not use Bash rg, git, wc, diff, cd, mkdir, token-audit, arbitrary scripts or shell redirection. Auto runs may use only the supplied backup begin/finish/list and notes-ledger add helpers. The runner handles rollback; report a failed check and leave its backup unfinished or finish it with `--verification failed`.
 
 ## Task
 
