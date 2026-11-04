@@ -41,7 +41,7 @@ scripts/install-schedule --apply --review
 scripts/install-schedule --remove
 ```
 
-The first installs the audit; the second adds the weekly review. `--apply` copies the runner, token-audit, kaizen-backup and pricing data into the Claude config directory's `bin/`, so jobs survive plugin updates. Re-run it after an update. Use `--model` and `--max-turns` to override the review defaults (Sonnet and 40 turns).
+The first installs the audit; the second adds the weekly review. `--apply` prints a plan, then installs managed scripts through `kaizen-link --mode auto --replace-prefixed` into the Claude config directory's `bin/`. Source checkouts use links; plugin cache installs use copies so jobs survive plugin moves. Differing `kaizen-` files are saved as `.replaced-<date>`; differing generic files are reported as DRIFT and left alone. The installer passes both `--bin` and `--hooks-dir` explicitly, so a custom bin never writes hooks into the default config home. Re-run it after an update. Use `--model` and `--max-turns` to override the review defaults (Sonnet and 40 turns).
 
 ## Discovery and activity
 
@@ -84,10 +84,12 @@ The audits directory is `<Claude config dir>/audits`:
 ```text
 <audits>/token-audit-*.md
 <audits>/token-audit-*.reviewed
+<audits>/checks-*.md
 <audits>/extracts/*.extract.json
 <audits>/projects/index.json
 <audits>/projects/<key>/state.json
 <audits>/projects/<key>/token-audit-*.md
+<audits>/projects/<key>/project-report-*.md
 <audits>/projects/<key>/*.extract.json
 <audits>/projects/<key>/cycle-<date>.md
 <audits>/run.log
@@ -105,7 +107,7 @@ The runner tidies after each scheduled audit and review; interactive cycles run 
 |---|---|---|
 | `extracts` | `extracts/*.extract.json`, `projects/*/*.extract.json`, `projects/*/host-probe-*.json`, `projects/*/friction-inputs-*.json` | 30 days; 200 MB cap |
 | `markers` | `projects/*/cycle-*.failed.md`, `*.noticed-*`, `projects/*/*.noticed-*` | 30 days |
-| `reports` | `token-audit-*.md`, `projects/*/token-audit-*.md`, `projects/*/cycle-*.md` | 365 days; newest 5 per folder and family kept |
+| `reports` | `token-audit-*.md`, `projects/*/token-audit-*.md`, `projects/*/cycle-*.md`, `checks-*.md`, `projects/*/project-report-*.md` | 365 days; newest 5 per folder and family kept |
 
 A report's `.reviewed` marker is removed with it. Only regular files inside the audits folder are deleted; symlinks are skipped. Each deletion is logged: in `run.log` for scheduled runs, on screen for manual ones. Housekeeping does not touch `host-actions.json`, `host-fixes/`, `projects/index.json`, project `state.json` files, `run.log`, `kaizen-backups/`, transcripts, Codex sessions or project files.
 

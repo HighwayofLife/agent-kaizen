@@ -51,10 +51,11 @@ class RulesLintTest(unittest.TestCase):
         result = self.run_lint("--repo", self.repo, "--json")
         self.assertEqual(result.returncode, 1, result.stderr)
         hits = json.loads(result.stdout)["hits"]
-        self.assertEqual(len(hits), 3)
+        self.assertEqual(len(hits), 4)
         self.assertEqual({(Path(h["path"]).name, h["line"]) for h in hits},
-                         {("CLAUDE.md", 2), ("AGENTS.md", 1), ("AGENTS.md", 2)})
+                         {("CLAUDE.md", 2), ("CLAUDE.md", 3), ("AGENTS.md", 1), ("AGENTS.md", 2)})
         self.assertIn(r"project-repos\.txt", {h["pattern"] for h in hits})
+        self.assertIn("copies the runner, token-audit", {h["pattern"] for h in hits})
 
     def test_text_output_and_global_root(self):
         write(self.claude / "kaizen-rules-lint.txt", "old wording\n")

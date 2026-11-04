@@ -109,12 +109,15 @@ class ScheduleTests(StubCase):
             for key in ('CLAUDE_CONFIG_DIR', 'CODEX_HOME'):
                 self.assertIn(f'{key}={self.env[key]}', tokens)
 
-    def test_apply_twice_remove_preserves_foreign_lines_and_copies(self):
+    def test_apply_twice_remove_preserves_foreign_lines_and_links(self):
         foreign = 'PATH=/x\n5 4 * * * echo foreign\n'
         write(self.cron_file, foreign + '0 9 */3 * * old-audit # agent-kaizen-audit\n'
               + '0 9 * * 1 claude -p old-cycle # agent-kaizen-review\n')
         for _ in range(2):
-            self.run_script('install-schedule', '--scheduler', 'cron', '--apply', '--review')
+            result = self.run_script('install-schedule', '--scheduler', 'cron', '--apply', '--review')
+            self.assertIn('would ', result.stdout)
+            self.assertIn('OK kaizen-scheduled', result.stdout)
+            self.assertLess(result.stdout.index('would '), result.stdout.index('OK kaizen-scheduled'))
             contents = self.cron_file.read_text()
             self.assertTrue(contents.startswith(foreign))
             self.assertEqual(contents.count('PATH='), 3)  # foreign + two inline assignments
@@ -125,9 +128,64 @@ class ScheduleTests(StubCase):
             self.assertEqual((self.home / '.claude/bin' / target).read_bytes(),
                              (SCRIPTS / source).read_bytes())
         self.assertTrue(os.access(self.home / '.claude/bin/kaizen-scheduled', os.X_OK))
+        self.assertTrue((self.home / '.claude/bin/kaizen-scheduled').is_symlink())
+        self.assertIn('0 drift, 0 broken', self.run_script('kaizen-link', '--check').stdout)
         self.assertNotIn('old-', contents)
         self.isolated_remove_without_claude()
         self.assertEqual(self.cron_file.read_text(), foreign)
+
+    def test_install_replaces_prefixed_preserves_generic_and_existing_link(self):
+        target = self.home / '.claude/bin'
+        original = (SCRIPTS / 'kaizen-scheduled').read_bytes()
+        write(target / 'kaizen-scheduled', 'old runner')
+        write(target / 'rules-lint', 'foreign tool')
+        (target / 'kaizen-backup').symlink_to(SCRIPTS / 'kaizen-backup')
+        write(self.home / '.claude/agent-kaizen.json', '{"localScripts":["notes-ledger"]}')
+        result = self.install()
+        self.assertEqual(next(target.glob('kaizen-scheduled.replaced-*')).read_text(), 'old runner')
+        self.assertTrue((target / 'kaizen-scheduled').is_symlink())
+        self.assertEqual((SCRIPTS / 'kaizen-scheduled').read_bytes(), original)
+        self.assertEqual((target / 'rules-lint').read_text(), 'foreign tool')
+        self.assertFalse(list(target.glob('rules-lint.replaced-*')))
+        self.assertIn('DRIFT rules-lint', result.stdout)
+        self.assertIn('skip LOCAL notes-ledger', result.stdout)
+        self.assertFalse((target / 'notes-ledger').exists())
+
+    def test_cache_install_copies_dependencies_and_survives_plugin_move(self):
+        plugin = self.root / 'plugins/cache/agent-kaizen/version'
+        shutil.copytree(SCRIPTS, plugin / 'scripts')
+        custom = self.root / 'custom-config'
+        self.env['CLAUDE_CONFIG_DIR'] = str(custom)
+        result = subprocess.run([sys.executable, str(plugin / 'scripts/install-schedule'),
+                                 '--scheduler', 'cron', '--apply'],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        target = custom / 'bin'
+        self.assertIn('would copy kaizen-scheduled', result.stdout)
+        self.assertFalse((target / 'kaizen-scheduled').is_symlink())
+        check = subprocess.run([sys.executable, str(target / 'kaizen-link'), '--check',
+                                '--plugin-root', str(plugin)],
+                               env=self.env, capture_output=True, text=True)
+        self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+        self.assertFalse((self.home / '.claude/hooks').exists())
+        shutil.rmtree(plugin)
+        for name in ('usage-series', 'kaizen-scheduled'):
+            help_result = subprocess.run([sys.executable, str(target / name), '--help'],
+                                         env=self.env, capture_output=True, text=True)
+            self.assertEqual(help_result.returncode, 0, help_result.stderr)
+
+    def test_custom_bin_passes_explicit_hooks_dir(self):
+        module = self.load_schedule()
+        module.BIN = self.root / 'other/bin'
+        with patch.dict(os.environ, self.env, clear=True), patch.object(module.subprocess, 'run') as run:
+            run.return_value = subprocess.CompletedProcess([], 0)
+            with patch.object(module, 'cron', return_value=0):
+                self.assertEqual(module.main(['--scheduler', 'cron', '--apply']), 0)
+        commands = [call.args[0] for call in run.call_args_list]
+        for command in commands:
+            self.assertEqual(command[command.index('--hooks-dir') + 1], str(self.root / 'other/hooks'))
+            self.assertIn('--replace-prefixed', command)
+            self.assertNotIn('--replace', command)
 
     def isolated_remove_without_claude(self):
         empty = self.root / 'empty-bin'
@@ -267,8 +325,9 @@ class ScheduleTests(StubCase):
     def test_nonzero_crontab_ignores_stdout(self):
         schedule = self.load_schedule()
         result = subprocess.CompletedProcess(['crontab', '-l'], 1, stdout='discard this\n')
+        ok = subprocess.CompletedProcess([], 0)
         with patch.object(schedule.shutil, 'which', return_value=str(self.bin / 'crontab')), \
-                patch.object(schedule.subprocess, 'run', side_effect=[result, subprocess.CompletedProcess([], 0)]) as run:
+                patch.object(schedule.subprocess, 'run', side_effect=[ok, ok, result, ok]) as run:
             self.assertEqual(schedule.main(['--scheduler', 'cron', '--apply']), 0)
         self.assertNotIn('discard this', run.call_args.kwargs['input'])
 
