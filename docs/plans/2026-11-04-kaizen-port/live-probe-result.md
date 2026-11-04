@@ -11,3 +11,16 @@ Script: `live-probe-real-config.py <repo>`. It uses the real Claude login, becau
 | Write in the project (positive control) | allowed | allowed |
 
 The repo test `tests/test_schedule_live_probe.py` uses a temp HOME and cannot log in. Follow-up: switch it to this real-config approach.
+
+## Probe 2 (after the round-4 review)
+
+| Case | main | round 4 |
+|---|---|---|
+| Bash `cat` of a credential decoy | not run | denied |
+| Bash `grep -r` over the config home | **allowed** | **allowed, decoy printed** |
+| Write new `~/.claude/*.md` (expected allowed) | denied | denied |
+| Write `<project>/.claude/rules/*.md` (expected allowed) | denied | denied |
+
+Conclusions:
+- Built-in read-only Bash commands can read past the Read denies, so deny lists alone cannot keep secrets in. Round 5 removes the exfiltration channel instead.
+- Claude Code protects `.claude` instruction paths in `-p` mode, so unattended auto runs have never been able to edit CLAUDE.md or rule files, including on main. The docs must say this.

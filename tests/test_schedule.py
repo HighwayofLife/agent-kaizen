@@ -223,7 +223,7 @@ class ScheduleTests(StubCase):
         self.assertNotIn('unavailable:', drift)
         self.assertFalse((self.home / '.claude/hooks').exists())
         shutil.rmtree(plugin)
-        for name in ('usage-series', 'kaizen-scheduled'):
+        for name in ('usage-series', 'kaizen-scheduled', 'kaizen-backup'):
             help_result = subprocess.run([sys.executable, str(target / name), '--help'],
                                          env=self.env, capture_output=True, text=True)
             self.assertEqual(help_result.returncode, 0, help_result.stderr)

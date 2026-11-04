@@ -19,6 +19,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import shlex
 import shutil
 import stat
@@ -116,22 +117,18 @@ HERE = Path(__file__).resolve().parent
 # rg can execute preprocessors, and git can execute repository-configured helpers.
 READ_ONLY_BASH = ["Bash(ls:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(shasum:*)",
                   "Bash(sha256sum:*)"]
-REVIEW_AVAILABLE = "Read,Grep,Glob,WebFetch,WebSearch,Bash"
-REVIEW_TOOLS = ",".join(["Read", "Grep", "Glob", "WebFetch", "WebSearch", *READ_ONLY_BASH])
-AUTO_AVAILABLE = "Read,Grep,Glob,Edit,Write,WebFetch,WebSearch,Bash"
+REVIEW_AVAILABLE = "Read,Grep,Glob,Bash"
+REVIEW_TOOLS = ",".join(["Read", "Grep", "Glob", *READ_ONLY_BASH])
+AUTO_AVAILABLE = "Read,Grep,Glob,Edit,Write,Bash"
 GIT_DENY = ["Edit(**/.git/**)", "Write(**/.git/**)"]
-# Credential paths denied to Read/Edit/Write in both scheduled modes. Config
-# patterns are top-level; project dotenv patterns cover every directory.
-# Keep this list in sync with docs/scheduling.md and the independent test pin.
-CREDENTIAL_PATHS = {
-    "config": (".credentials.json", "auth.json", "*token*.json", "*secret*.json"),
-    "home": (".ssh/**", ".aws/**", ".gnupg/**", ".netrc", ".config/gh/**", ".docker/config.json"),
-    "project": ("**/.env", "**/.env.*"),
-}
+# Load beside the resolved script, for linked and copied installations alike.
+CREDENTIALS = runpy.run_path(str(HERE / "kaizen_credentials.py"))
+CREDENTIAL_PATHS = CREDENTIALS["CREDENTIAL_PATHS"]
 HARD_STOP_DENY = ",".join(f"Bash({command}:*)" for command in (
     "git push", "git commit", "git reset", "git clean", "gh", "rm", "rmdir", "mv", "curl", "wget",
     "launchctl", "crontab", "brew", "npm", "pip", "pip3", "sudo", "env", "printenv", "chmod",
-    "cp", "touch", "mkdir", "sed", "dd", "install", "ln", "truncate", "perl", "python3 -c", "python"))
+    "cp", "touch", "mkdir", "sed", "dd", "install", "ln", "truncate", "perl", "python3 -c", "python",
+    "grep", "egrep", "fgrep", "rg", "find", "cat", "strings", "xxd", "od", "base64"))
 
 
 def audits_dir():
@@ -652,7 +649,7 @@ def deny_path(path, resolve=True):
 
 
 def config_home_deny(project_dir=None):
-    """Protect config state while leaving Markdown instructions editable."""
+    """Protect config state; Claude Code separately protects instruction paths."""
     rules = []
     for home in (claude_home(), codex_home()):
         for root in dict.fromkeys(deny_path(home, resolve=value) for value in (False, True)):
@@ -669,23 +666,8 @@ def config_home_deny(project_dir=None):
 
 
 def credential_deny(project_dir=None):
-    roots = {"config": (claude_home(), codex_home()), "home": (Path.home(),),
-             "project": (Path(project_dir) if project_dir is not None else Path.cwd(),)}
-    paths = {}
-    for scope, patterns in CREDENTIAL_PATHS.items():
-        for root in roots[scope]:
-            for pattern in patterns:
-                parts = pattern.split("/")
-                first_glob = next((n for n, part in enumerate(parts) if "*" in part), len(parts))
-                base = root.joinpath(*parts[:first_glob])
-                suffix = "/" + "/".join(parts[first_glob:]) if first_glob < len(parts) else ""
-                for resolve in (False, True):
-                    paths[deny_path(root, resolve=resolve) + "/" + pattern] = None
-                    paths[deny_path(base, resolve=resolve) + suffix] = None
-                # Also protect targets of existing top-level token/secret symlinks.
-                if scope == "config" and first_glob < len(parts):
-                    for match in root.glob(pattern):
-                        paths[deny_path(match)] = None
+    paths = dict.fromkeys(deny_path(base, resolve=False) + suffix
+                          for base, suffix in CREDENTIALS["credential_paths"](project_dir))
     return [f"{tool}({path})" for path in paths for tool in ("Read", "Edit", "Write")]
 
 
@@ -717,7 +699,7 @@ def backup_root():
 
 def backup_deny():
     paths = dict.fromkeys(deny_path(backup_root(), resolve=resolve) for resolve in (False, True))
-    return [f"{tool}({path}/**)" for path in paths for tool in ("Edit", "Write")]
+    return [f"{tool}({path}/**)" for path in paths for tool in ("Read", "Edit", "Write")]
 
 
 class LedgerGuard:
@@ -793,8 +775,7 @@ def review_command(options, mode, report, session_id, project_dir=None):
     allowed = REVIEW_TOOLS
     if auto:
         ledger_rules = ledger_deny()  # Validate before granting notes-ledger add.
-        backup_rules = backup_deny()
-        allowed_tools = ["Read", "Grep", "Glob", "WebFetch", "WebSearch",
+        allowed_tools = ["Read", "Grep", "Glob",
                          *auto_edit_allow(project_dir), *READ_ONLY_BASH]
         # File-writing Bash tools bypass Edit/Write denies; grant only the scoped helpers.
         backup = HERE / "kaizen-backup"
@@ -813,9 +794,10 @@ def review_command(options, mode, report, session_id, project_dir=None):
         if path.is_dir():
             command.extend(["--add-dir", str(path.resolve())])
     command.extend(["--allowedTools", allowed])
-    denied = credential_deny(project_dir)
+    denied = [*credential_deny(project_dir), HARD_STOP_DENY]
     if auto:
-        denied.extend([HARD_STOP_DENY, *GIT_DENY, *config_home_deny(project_dir), *ledger_rules, *backup_rules])
+        denied.extend([*GIT_DENY, *config_home_deny(project_dir), *ledger_rules])
+    denied.extend(backup_deny())
     command.extend(["--disallowedTools", ",".join(denied)])
     return command + ["--permission-mode", "default" if auto else "dontAsk"]
 

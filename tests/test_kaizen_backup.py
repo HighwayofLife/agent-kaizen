@@ -21,13 +21,77 @@ class KaizenBackupTests(unittest.TestCase):
 
     def run_script(self, *args, ok=True):
         result = subprocess.run([sys.executable, str(SCRIPT), *map(str, args)], env=self.env,
-                                capture_output=True, text=True)
+                                cwd=self.tmp, capture_output=True, text=True)
         if ok:
             self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
         return result
 
     def change(self, *files, run='r1', skill='trim'):
         return self.run_script('begin', '--skill', skill, '--ledger', 'test change', '--run', run, *files).stdout.strip()
+
+    def test_begin_refuses_credential_paths_before_copying_any_file(self):
+        home = self.tmp / 'home'
+        config, codex = self.tmp / 'claude', self.tmp / 'codex'
+        self.env.update(HOME=str(home), CLAUDE_CONFIG_DIR=str(config), CODEX_HOME=str(codex))
+        paths = [root / name for root in (config, codex)
+                 for name in ('.credentials.json', 'auth.json', 'access-token.json', 'client-secret.json')]
+        paths += [home / name for name in ('.ssh/id_probe', '.aws/nested/config', '.gnupg/key',
+                                          '.netrc', '.config/gh/hosts.yml', '.docker/config.json')]
+        paths += [self.tmp / name for name in ('.env', '.env.example', 'nested/.env', 'nested/.env.local')]
+        safe = self.tmp / 'safe.md'
+        safe.write_text('ordinary instructions')
+        for path in paths:
+            with self.subTest(path=path):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text('credential decoy')
+                result = self.run_script('begin', '--skill', 'test', '--ledger', 'test', safe, path, ok=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('refusing to back up credential path', result.stderr)
+                self.assertNotIn('credential decoy', result.stdout + result.stderr)
+                self.assertEqual(list((self.tmp / 'backups').iterdir()), [])
+
+    def test_begin_refuses_missing_credentials_and_symlink_aliases(self):
+        config = self.tmp / 'config'
+        config.mkdir()
+        self.env['CLAUDE_CONFIG_DIR'] = str(config)
+        credential = config / 'access-token.json'
+        target = self.tmp / 'plain.json'
+        target.write_text('decoy')
+        credential.symlink_to(target)
+        alias = self.tmp / 'alias.md'
+        alias.symlink_to(credential)
+        ssh = self.tmp / 'ssh-target'
+        ssh.mkdir()
+        home = self.tmp / 'home'
+        home.mkdir()
+        (home / '.ssh').symlink_to(ssh, target_is_directory=True)
+        self.env['HOME'] = str(home)
+        for path in (config / 'auth.json', credential, target, alias, ssh / 'missing-key'):
+            with self.subTest(path=path):
+                result = self.run_script('begin', '--skill', 'test', '--ledger', 'test', path, ok=False)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('refusing to back up credential path', result.stderr)
+                self.assertEqual(list((self.tmp / 'backups').iterdir()), [])
+
+    def test_begin_keeps_config_credential_globs_top_level(self):
+        config = self.tmp / 'config'
+        self.env['CLAUDE_CONFIG_DIR'] = str(config)
+        path = config / 'docs/token-notes.json'
+        path.parent.mkdir(parents=True)
+        path.write_text('ordinary notes')
+        change = Path(self.change(path))
+        self.assertEqual((change / 'files/1').read_text(), 'ordinary notes')
+
+    def test_begin_treats_credential_roots_as_literal_paths(self):
+        config = self.tmp / 'config[probe],literal'
+        config.mkdir()
+        self.env['CLAUDE_CONFIG_DIR'] = str(config)
+        path = config / 'auth.json'
+        path.write_text('decoy')
+        result = self.run_script('begin', '--skill', 'test', '--ledger', 'test', path, ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('refusing to back up credential path', result.stderr)
+        self.assertEqual(list((self.tmp / 'backups').iterdir()), [])
 
     def test_edit_and_create_round_trip(self):
         edited, created = self.tmp / 'CLAUDE.md', self.tmp / 'new.md'
@@ -93,6 +157,7 @@ class KaizenBackupTests(unittest.TestCase):
         installed.mkdir()
         copied = installed / 'kaizen-backup'
         shutil.copy2(SCRIPT, copied)
+        shutil.copy2(SCRIPT.with_name('kaizen_credentials.py'), installed / 'kaizen_credentials.py')
         plugin = self.tmp / 'plugin'
         plugin.mkdir()
         (installed / '.kaizen-plugin-root').write_text(str(plugin))

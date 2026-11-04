@@ -44,6 +44,7 @@ CREDENTIAL_PATHS = {
 FILE_COMMAND_DENIES = (
     'cp', 'touch', 'mkdir', 'sed', 'dd', 'install', 'ln', 'truncate', 'perl', 'python3 -c', 'python',
 )
+READ_COMMAND_DENIES = ('grep', 'egrep', 'fgrep', 'rg', 'find', 'cat', 'strings', 'xxd', 'od', 'base64')
 
 
 class ScheduleStepsTests(StubCase):
@@ -53,6 +54,7 @@ class ScheduleStepsTests(StubCase):
         self.scripts.mkdir(parents=True)
         self.runner = self.scripts / 'kaizen-scheduled'
         shutil.copy2(SCRIPTS / 'kaizen-scheduled', self.runner)
+        shutil.copy2(SCRIPTS / 'kaizen_credentials.py', self.scripts / 'kaizen_credentials.py')
         self.config = self.root / 'config'
         self.audits = self.config / 'audits'
         self.project = self.root / 'project'
@@ -615,6 +617,15 @@ path.symlink_to(target)
                                            ledger=self.scripts / 'notes-ledger', python=options.python)
                                 for rule in pinned}
                     self.assertEqual(bash, expected)
+                    available = command[command.index('--tools') + 1].split(',')
+                    tools = ['Read', 'Grep', 'Glob']
+                    self.assertEqual(available, tools + (['Edit', 'Write'] if mode == 'auto' else []) + ['Bash'])
+                    allowed = command[command.index('--allowedTools') + 1].split(',')
+                    self.assertNotIn('WebFetch', allowed)
+                    self.assertNotIn('WebSearch', allowed)
+                    deny = command[command.index('--disallowedTools') + 1].split(',')
+                    for name in READ_COMMAND_DENIES + ('curl', 'wget'):
+                        self.assertIn(f'Bash({name}:*)', deny)
                     if mode == 'auto':
                         deny = command[command.index('--disallowedTools') + 1].split(',')
                         for tool in ('Edit', 'Write'):
@@ -640,7 +651,7 @@ path.symlink_to(target)
             command = self.module.review_command(options, 'auto', 'report', 'session', self.project)
         allowed = command[command.index('--allowedTools') + 1].split(',')
         denied = command[command.index('--disallowedTools') + 1].split(',')
-        for name in FILE_COMMAND_DENIES:
+        for name in FILE_COMMAND_DENIES + READ_COMMAND_DENIES:
             self.assertIn(f'Bash({name}:*)', denied)
 
         def matches_prefix(rule, invocation):
@@ -718,11 +729,17 @@ path.symlink_to(target)
         self.env['KAIZEN_BACKUP_DIR'] = str(alias)
         with patch.dict(os.environ, self.env, clear=True):
             options = self.module.command_options(self.module.argparse.Namespace(dry_run=True))
-            command = self.module.review_command(options, 'auto', 'report', 'session')
-        deny = command[command.index('--disallowedTools') + 1].split(',')
-        for root in (resolved, alias):
-            for tool in ('Edit', 'Write'):
-                self.assertIn(f'{tool}(//{root.as_posix().lstrip("/")}/**)', deny)
+            for mode in ('auto', 'propose-only'):
+                command = self.module.review_command(options, mode, 'report', 'session')
+                deny = command[command.index('--disallowedTools') + 1].split(',')
+                for root in (resolved, alias):
+                    for tool in ('Read', 'Edit', 'Write'):
+                        self.assertIn(f'{tool}(//{root.as_posix().lstrip("/")}/**)', deny)
+
+    def test_scheduled_instructions_skip_web_checks(self):
+        for name in ('skills/cycle/SKILL.md', 'agents/kaizen-auditor.md'):
+            text = (SCRIPTS.parent / name).read_text()
+            self.assertIn('Scheduled runs skip model and release web checks; interactive runs keep them.', text)
 
     def backup_cycle(self, finish='no', exit_code='0'):
         shutil.copy2(SCRIPTS / 'kaizen-backup', self.scripts / 'kaizen-backup')

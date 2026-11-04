@@ -3,7 +3,7 @@
 
   kaizen-backup begin  --skill NAME --ledger TEXT [--run RUN_ID] FILE...
         Back up FILEs (existing ones are copied; missing ones are recorded as created)
-        and print the change folder. Run BEFORE editing.
+        and print the change folder. Credential paths are refused. Run BEFORE editing.
   kaizen-backup finish CHANGE_DIR [--verification passed|failed]
         Record each file's sha256 after the edit. Run AFTER editing and verifying.
   kaizen-backup action CHANGE_DIR --did CMD --undo CMD
@@ -22,11 +22,13 @@ import datetime
 import hashlib
 import json
 import os
+import runpy
 import shutil
 import sys
 from pathlib import Path
 
 ROOT = Path(os.environ.get("KAIZEN_BACKUP_DIR", Path.home() / ".claude" / "kaizen-backups")).expanduser().resolve()
+is_credential = runpy.run_path(str(Path(__file__).resolve().with_name("kaizen_credentials.py")))["is_credential"]
 
 
 def sha(path):
@@ -104,6 +106,10 @@ def validate_entry(change, entry, roots=()):
 
 
 def begin(args):
+    # Preflight every input before copying anything or creating a change folder.
+    for name in args.files:
+        if is_credential(name):
+            raise ValueError(f"refusing to back up credential path: {name}")
     created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     run_id = args.run or os.environ.get("KAIZEN_RUN_ID") or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     valid_id(run_id)

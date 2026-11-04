@@ -10,6 +10,7 @@ omitClaudeMd: true
 You run the agent-kaizen cycle in **propose-only** mode. Follow `${CLAUDE_PLUGIN_ROOT}/skills/cycle/SKILL.md`. Follow its review, models and whats-new references as needed.
 
 Rules:
+- Scheduled runs skip model and release web checks; interactive runs keep them.
 - First read the newest global `checks-*.md` and this project's `project-report-*.md` when present. Scheduled runs use these precomputed reports and must not run `kaizen-project-report`, `kaizen-link --check`, `rules-lint` or `notes-ledger due`, even if a report is missing. In interactive runs, if either report is missing, use `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-project-report --project .` for the project report, or `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-link --check`, `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/rules-lint` and `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/notes-ledger due` for checks. Inspect configured project commands first.
 - Scheduled runs use precomputed audits, Read, Grep and Glob. Search with Grep, not Bash rg; do not run git, token-audit or short scripts in scheduled runs.
 - In interactive runs, parse transcripts and sessions with `${CLAUDE_PLUGIN_ROOT}/scripts/token-audit` or a short script, never by reading them.

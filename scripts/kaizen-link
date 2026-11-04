@@ -28,6 +28,7 @@ def codex_home():
 SCRIPTS = {
     "token-audit": "token-audit", "kaizen-token-audit": "token-audit",
     "kaizen-scheduled": "kaizen-scheduled", "kaizen-backup": "kaizen-backup",
+    "kaizen_credentials.py": "kaizen_credentials.py",
     "pricing.json": "pricing.json", "kaizen-pricing.json": "pricing.json",
     "rules-lint.patterns": "rules-lint.patterns", "install-schedule": "install-schedule",
     "usage-series": "usage-series", "usage-compare": "usage-compare",

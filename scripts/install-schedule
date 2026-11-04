@@ -47,6 +47,7 @@ AUDITS = claude_home().resolve() / "audits"
 BIN = claude_home().resolve() / "bin"
 MANAGED_NAMES = (
     "kaizen-scheduled", "kaizen-token-audit", "token-audit", "kaizen-backup",
+    "kaizen_credentials.py",
     "kaizen-pricing.json", "pricing.json", "kaizen-link", "rules-lint",
     "rules-lint.patterns", "packet-report", "kaizen-project-report", "notes-ledger",
     "usage-series", "usage-compare",

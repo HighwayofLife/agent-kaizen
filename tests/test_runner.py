@@ -1165,11 +1165,12 @@ class ExecutionTests(DiscoveryCase):
                 with self.assertRaisesRegex(ValueError, "cannot build deny rules: path contains ',':"):
                     self.runner.review_command(options, 'auto', 'report', 'session', project)
                 if name == 'claude_json':
-                    # The user config file has only auto-mode edit denies; credential
-                    # paths still require disallowedTools in propose mode.
+                    # Propose mode keeps credential/backup and command hard stops,
+                    # but has no edit deny for the user config file.
                     command = self.runner.review_command(options, 'propose-only', 'report', 'session', project)
                     self.assertEqual(self.values(command, '--disallowedTools'),
-                                     [','.join(self.runner.credential_deny(project))])
+                                     [','.join([*self.runner.credential_deny(project),
+                                                self.runner.HARD_STOP_DENY, *self.runner.backup_deny()])])
                 else:
                     with self.assertRaisesRegex(ValueError, "cannot build deny rules: path contains ',':"):
                         self.runner.review_command(options, 'propose-only', 'report', 'session', project)

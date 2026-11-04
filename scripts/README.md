@@ -16,7 +16,7 @@ chmod +x ~/.claude/bin/codex-{dispatch,run,review} ~/.claude/bin/{token-audit,di
 
 Alternatively, symlink each executable into `~/.claude/bin/` (using absolute
 paths to this checkout). Executables resolve their real location, so keep
-`codex_common.py`, `codex-run`, `preambles/` and `prompts/` beside the originals.
+`kaizen_credentials.py`, `codex_common.py`, `codex-run`, `preambles/` and `prompts/` beside the originals.
 Add `~/.claude/bin` to PATH. The commands below assume that installation.
 The Bash examples use caller-selected log files; create their parent directories
 before starting background jobs. Claude Code should use Bash's background

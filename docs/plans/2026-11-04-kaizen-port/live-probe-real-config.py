@@ -14,7 +14,12 @@ cases=[
  ('Read','file_path', str(decoy), None, True),
  ('Write','file_path', str(project/'.git'/'hooks'/'post-checkout'), project/'.git'/'hooks'/'post-checkout', True),
  ('Write','file_path', str(project/'ok.txt'), project/'ok.txt', False),
+ ('Bash','command', f'cat {decoy}', None, True),
+ ('Bash','command', f'grep -r PROBE-DECOY {home}/.claude/', None, True),
+ ('Write','file_path', str(home/'.claude'/f'kaizen-probe-{u}.md'), home/'.claude'/f'kaizen-probe-{u}.md', False),
+ ('Write','file_path', str(project/'.claude'/'rules'/f'probe-{u}.md'), project/'.claude'/'rules'/f'probe-{u}.md', False),
 ]
+cases = cases[int(os.environ.get('PROBE_FROM','0')):]
 env=dict(os.environ); env.pop('CLAUDECODE', None)
 try:
   for tool, field, value, path, expect_deny in cases:
@@ -33,7 +38,7 @@ try:
     ok = (denied and not exists and not leaked) if expect_deny else (exists and not denied)
     print(f"{'PASS' if ok else 'FAIL'} {tool} expect_deny={expect_deny} denied={denied} exists={exists} leaked={leaked} rc={r.returncode} turns={p.get('num_turns')}")
 finally:
-  for f in [home/'.claude'/f'kaizen-probe-{u}.json', decoy]:
+  for f in [home/'.claude'/f'kaizen-probe-{u}.json', home/'.claude'/f'kaizen-probe-{u}.md', decoy]:
     if f.exists(): f.unlink()
   if (backup_root/f'probe-{u}').exists(): shutil.rmtree(backup_root/f'probe-{u}')
   shutil.rmtree(project, ignore_errors=True)
