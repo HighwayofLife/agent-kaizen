@@ -398,6 +398,35 @@ for entry in json.loads((snapshot / 'manifest.json').read_text()):
                 self.assertIn('regular file, not a symlink', '\n'.join(state['ledger_errors']))
                 path.unlink()
 
+    def test_guard_reports_ledger_parent_symlink_without_writing_through_it(self):
+        self.configure_ledgers()
+        folder = self.root / 'ledgers'
+        folder.mkdir()
+        csv, timeline = folder / self.csv.name, folder / self.timeline.name
+        self.csv.rename(csv)
+        self.timeline.rename(timeline)
+        self.csv, self.timeline = csv, timeline
+        write(self.config / 'agent-kaizen.json', json.dumps({
+            'scheduledAutonomy': 'auto', 'notesLedger': {
+                'csv': str(csv), 'timeline': str(timeline)}}))
+        self.env['LEDGER_PARENT'] = str(folder)
+        executable(self.claude, '#!' + sys.executable + '\n' + """
+import os, pathlib, shutil
+folder = pathlib.Path(os.environ['LEDGER_PARENT'])
+saved = folder.with_name('saved-ledgers')
+outside = folder.with_name('outside-ledgers')
+folder.rename(saved)
+shutil.copytree(saved, outside)
+folder.symlink_to(outside, target_is_directory=True)
+""")
+        self.guard_result(1)
+        self.assertTrue(folder.is_symlink())
+        self.assertEqual((csv.read_bytes(), timeline.read_bytes()), self.original_ledgers)
+        state = self.assert_ledger_violation()
+        self.assertTrue(all('resolved path changed' in error for error in state['ledger_errors']))
+        self.assertTrue(all('refusing to restore through it' in error for error in state['ledger_errors']))
+        self.assertFalse(list((self.root / 'outside-ledgers').glob('.kaizen-restore-*')))
+
     def test_guard_restores_identical_replacement_symlinks_after_launch(self):
         for kind in ('csv', 'timeline'):
             with self.subTest(kind=kind):
@@ -540,6 +569,39 @@ path.symlink_to(target)
                     for subcommand in ('begin', 'finish', 'list')}
         self.assertEqual({rule for rule in rules if 'kaizen-backup' in rule}, expected)
 
+    def test_auto_bash_grants_only_read_tools_and_scoped_writers(self):
+        self.stub('kaizen-backup', '')
+        with patch.dict(os.environ, self.env, clear=True):
+            options = self.module.command_options(self.module.argparse.Namespace(dry_run=True))
+            command = self.module.review_command(options, 'auto', 'report', 'session')
+        readonly = {f'Bash({name}:*)' for name in (
+            'ls', 'wc', 'head', 'tail', 'rg', 'git status', 'shasum', 'sha256sum', 'jq')}
+        self.assertEqual(set(self.module.READ_ONLY_BASH), readonly)
+        review_bash = {rule for rule in self.module.REVIEW_TOOLS.split(',') if rule.startswith('Bash(')}
+        self.assertEqual(review_bash, readonly)
+        scoped = {f'Bash({prefix}{self.scripts}/kaizen-backup {subcommand}:*)'
+                  for prefix in ('', 'python3 ', options.python + ' ')
+                  for subcommand in ('begin', 'finish', 'list')}
+        scoped.update(f'Bash({python} {self.scripts}/notes-ledger add:*)'
+                      for python in ('python3', options.python))
+        bash = {rule for rule in command[command.index('--allowedTools') + 1].split(',')
+                if rule.startswith('Bash(')}
+        self.assertEqual(bash, readonly | {'Bash(cd:*)', 'Bash(diff:*)'} | scoped)
+
+    def test_backup_root_deny_covers_resolved_and_unresolved_trees(self):
+        resolved = self.root / 'real-backups'
+        resolved.mkdir()
+        alias = self.root / 'backup-alias'
+        alias.symlink_to(resolved, target_is_directory=True)
+        self.env['KAIZEN_BACKUP_DIR'] = str(alias)
+        with patch.dict(os.environ, self.env, clear=True):
+            options = self.module.command_options(self.module.argparse.Namespace(dry_run=True))
+            command = self.module.review_command(options, 'auto', 'report', 'session')
+        deny = command[command.index('--disallowedTools') + 1].split(',')
+        for root in (resolved, alias):
+            for tool in ('Edit', 'Write'):
+                self.assertIn(f'{tool}(//{root.as_posix().lstrip("/")}/**)', deny)
+
     def backup_cycle(self, finish='no', exit_code='0'):
         shutil.copy2(SCRIPTS / 'kaizen-backup', self.scripts / 'kaizen-backup')
         self.env.update(KAIZEN_BACKUP_DIR=str(self.root / 'backups'),
@@ -568,6 +630,103 @@ sys.exit(int(os.environ['CYCLE_EXIT']))
     def backup_state(self):
         folder = self.audits / 'projects' / self.module.key(self.project)
         return folder, json.loads((folder / 'state.json').read_text())
+
+    def test_protected_backup_copy_cannot_be_edited_then_restored(self):
+        self.backup_cycle()
+        protected = write(self.config / 'settings.json', '{"protected":true}')
+        self.env['TARGET'] = str(protected)
+        root = self.root / 'real-backups'
+        root.mkdir()
+        alias = self.root / 'backup-alias'
+        alias.symlink_to(root, target_is_directory=True)
+        self.env.update(KAIZEN_BACKUP_DIR=str(alias), EXPECTED_BACKUP_ROOT=str(root))
+        executable(self.claude, self.claude.read_text().replace(
+            "    target.write_text('applied ' + str(number))", """
+    import fnmatch
+    print('pinned backup root:', os.environ['KAIZEN_BACKUP_DIR'] == os.environ['EXPECTED_BACKUP_ROOT'])
+    copy = change / 'files/1'
+    rules = sys.argv[sys.argv.index('--disallowedTools') + 1].split(',')
+    blocked = []
+    # Simulate model Edit/Write permission checks against the actual runner command.
+    for tool in ('Edit', 'Write'):
+        denied = any(fnmatch.fnmatch('//' + copy.as_posix().lstrip('/'), rule[len(tool) + 1:-1])
+                     for rule in rules if rule.startswith(tool + '('))
+        if not denied:
+            copy.write_text('crafted settings')
+        blocked.append(denied)
+    print('blocked backup edits:', blocked)
+"""))
+        self.guard_result(0)
+        self.assertEqual(protected.read_text(), '{"protected":true}')
+        folder, state = self.backup_state()
+        self.assertEqual(state['status'], 'rolled-back')
+        report = next(folder.glob('cycle-*.failed.md')).read_text()
+        self.assertIn('blocked backup edits: [True, True]', report)
+        self.assertIn('pinned backup root: True', report)
+
+    def test_forged_preexisting_dirs_cannot_claim_runner_ownership(self):
+        self.backup_cycle()
+        old_target = write(self.project / 'old.md', 'old original')
+        preexisting = []
+        for name in ('same', 'moved', 'replaced'):
+            result = subprocess.run([sys.executable, self.env['BACKUP_SCRIPT'], 'begin', '--run', name,
+                                     '--skill', 'trim', '--ledger', 'old', str(old_target)],
+                                    env=self.env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            preexisting.append(result.stdout.strip())
+        old_target.write_text('current must stay')
+        self.env['PREEXISTING'] = json.dumps(preexisting)
+        injection = """
+import datetime, shutil
+old = [pathlib.Path(name) for name in json.loads(os.environ['PREEXISTING'])]
+moved = old[1].with_name('renamed-old-dir')
+old[1].rename(moved)
+retired = old[2].with_name('retired-old-dir')
+old[2].rename(retired)
+shutil.copytree(retired, old[2])  # same old name, different inode
+for folder in (old[0], moved, old[2], retired):
+    manifest = folder / 'manifest.json'
+    data = json.loads(manifest.read_text())
+    data.update(run_id=os.environ['KAIZEN_RUN_ID'], session_id=os.environ['KAIZEN_SESSION_ID'],
+                created_at=datetime.datetime.now(datetime.timezone.utc).isoformat())
+    manifest.write_text(json.dumps(data))
+"""
+        executable(self.claude, self.claude.read_text().replace('changes = []', injection + '\nchanges = []'))
+        self.guard_result(0)
+        self.assertEqual(old_target.read_text(), 'current must stay')
+        for manifest in (self.root / 'backups').glob('*/manifest.json'):
+            data = json.loads(manifest.read_text())
+            if data['ledger'] == 'old':
+                self.assertIsNone(data['reverted'])
+
+    def test_malformed_preexisting_manifest_does_not_block_cycle_rollback(self):
+        self.backup_cycle()
+        old = self.root / 'backups/old'
+        old.mkdir(parents=True)
+        self.env['OLD_MANIFEST'] = str(old / 'manifest.json')
+        executable(self.claude, self.claude.read_text().replace("print('cycle output')", """
+pathlib.Path(os.environ['OLD_MANIFEST']).write_text('{broken')
+print('cycle output')
+"""))
+        self.guard_result(0)
+        self.assertEqual(Path(self.env['TARGET']).read_text(), 'original')
+        self.assertEqual(self.backup_state()[1]['status'], 'rolled-back')
+
+    def test_rollback_symlink_refusal_fails_run_without_touching_target(self):
+        self.backup_cycle()
+        victim = write(self.root / 'victim.md', 'untouched')
+        self.env['VICTIM'] = str(victim)
+        executable(self.claude, self.claude.read_text().replace("print('cycle output')", """
+target.unlink()
+target.symlink_to(os.environ['VICTIM'])
+print('cycle output')
+"""))
+        self.guard_result(1)
+        self.assertEqual(victim.read_text(), 'untouched')
+        self.assertTrue(Path(self.env['TARGET']).is_symlink())
+        folder, state = self.backup_state()
+        self.assertEqual(state['status'], 'failed')
+        self.assertIn('symlink', next(folder.glob('cycle-*.failed.md')).read_text())
 
     def test_auto_rolls_back_unfinished_and_failed_verification_newest_first(self):
         for finish in ('no', 'failed'):

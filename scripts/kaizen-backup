@@ -35,11 +35,14 @@ def sha(path):
 
 
 def load(change):
+    refuse_symlinks(Path(change) / "manifest.json")
     return json.loads((Path(change) / "manifest.json").read_text())
 
 
 def save(change, manifest):
     tmp = Path(change) / "manifest.json.tmp"
+    refuse_symlinks(tmp)
+    refuse_symlinks(Path(change) / "manifest.json")
     tmp.write_text(json.dumps(manifest, indent=2) + "\n")
     tmp.replace(Path(change) / "manifest.json")
 
@@ -60,9 +63,42 @@ def valid_id(value):
 
 
 def change_dir(path):
-    path = Path(path).expanduser().resolve()
-    if ROOT.resolve() not in path.parents:
-        raise ValueError(f"CHANGE_DIR must be inside the backups root: {path}")
+    raw = Path(path).expanduser().absolute()
+    resolved = raw.resolve()
+    if ROOT.resolve() not in resolved.parents:
+        raise ValueError(f"CHANGE_DIR must be inside the backups root: {resolved}")
+    refuse_symlinks(raw)
+    return resolved
+
+
+def refuse_symlinks(path, roots=()):
+    for part in (path, *path.parents):
+        if part.is_symlink():
+            if any(part.resolve() == root or root in part.resolve().parents for root in roots):
+                raise ValueError(f"refusing to restore through symlink into plugin root: {path}; "
+                                 "run kaizen-link --unlink --restore-replaced first")
+            raise ValueError(f"refusing to access target through symlink: {path} ({part})")
+
+
+def validate_entry(change, entry, roots=()):
+    if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+        raise ValueError("entry path must be an absolute normalised string")
+    name = entry["path"]
+    path = Path(name)
+    if not path.is_absolute() or str(path) != name or ".." in path.parts or "\0" in name:
+        raise ValueError(f"entry path must be absolute and normalised without ..: {name}")
+    refuse_symlinks(path, roots)
+    if not isinstance(entry.get("created"), bool):
+        raise ValueError(f"entry created flag must be boolean: {name}")
+    if not entry["created"] or entry.get("backup") is not None:
+        if not isinstance(entry.get("backup"), str):
+            raise ValueError(f"entry backup must name a file inside its change directory: {name}")
+        backup = change / entry["backup"]
+        if change.resolve() not in backup.resolve().parents:
+            raise ValueError(f"entry backup must resolve inside its change directory: {backup}")
+        refuse_symlinks(backup)
+        if not backup.is_file():
+            raise ValueError(f"entry backup is not a regular file: {backup}")
     return path
 
 
@@ -76,7 +112,9 @@ def begin(args):
     (change / "files").mkdir(parents=True, exist_ok=False)
     entries = []
     for index, name in enumerate(args.files, 1):
-        path = Path(name).expanduser().resolve()
+        raw = Path(name).expanduser().absolute()
+        refuse_symlinks(raw)
+        path = raw.resolve()
         entry = {"path": str(path), "backup": None, "created": not path.exists(), "after_sha256": None}
         if path.is_file():
             entry["backup"] = f"files/{index}"
@@ -94,7 +132,7 @@ def finish(args):
     args.change = change_dir(args.change)
     manifest = load(args.change)
     for entry in manifest["files"]:
-        entry["after_sha256"] = sha(entry["path"])
+        entry["after_sha256"] = sha(validate_entry(args.change, entry, plugin_roots()))
     manifest["finished"] = True
     manifest["verification"] = args.verification
     save(args.change, manifest)
@@ -115,6 +153,11 @@ def list_changes(args):
 
 
 def targets(which):
+    if which not in ("last", "run"):
+        change = Path(which).expanduser()
+        change = change if change.is_absolute() else ROOT / change
+        change = change_dir(change)
+        return [(change, load(change))]
     open_changes = changes(include_reverted=False)
     if not open_changes:
         sys.exit("kaizen-backup: nothing to undo")
@@ -123,9 +166,6 @@ def targets(which):
     if which == "run":
         run_id = open_changes[0][1]["run_id"]
         return [item for item in open_changes if item[1]["run_id"] == run_id]
-    change = Path(which).expanduser()
-    change = change if change.is_absolute() else ROOT / change
-    return [(change, load(change))]
 
 
 def plugin_roots():
@@ -149,15 +189,10 @@ def undo(args):
     for change, data in plan:
         if data.get("reverted"):
             sys.exit(f"kaizen-backup: {change} was already reverted on {data['reverted']}")
+        change = change_dir(change)
         for entry in data["files"]:
-            if not entry["created"]:
-                path = Path(entry["path"])
-                for part in (path, *path.parents):
-                    if part.is_symlink() and any(part.resolve() == root or root in part.resolve().parents
-                                                 for root in roots):
-                        raise ValueError(f"refusing to restore through symlink into plugin root: {path}; "
-                                         "run kaizen-link --unlink --restore-replaced first")
-            current, after = sha(entry["path"]), entry["after_sha256"]
+            path = validate_entry(change, entry, roots)
+            current, after = sha(path), entry["after_sha256"]
             if data.get("finished") and current != after:
                 conflicts.append(f"{entry['path']} changed after {change.name}")
     if conflicts and not args.force:
@@ -166,7 +201,7 @@ def undo(args):
         return 2
     for change, data in plan:  # newest change first
         for entry in data["files"]:
-            path = Path(entry["path"])
+            path = validate_entry(change, entry, roots)
             if entry["created"]:
                 if path.exists() and (args.force or sha(path) == entry["after_sha256"]):
                     path.unlink()

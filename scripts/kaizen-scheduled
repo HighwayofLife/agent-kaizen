@@ -671,6 +671,15 @@ def ledger_deny():
     return [f"{tool}({path})" for path in paths for tool in ("Edit", "Write")]
 
 
+def backup_root():
+    return Path(os.environ.get("KAIZEN_BACKUP_DIR", Path.home() / ".claude" / "kaizen-backups")).expanduser()
+
+
+def backup_deny():
+    paths = dict.fromkeys(deny_path(backup_root(), resolve=resolve) for resolve in (False, True))
+    return [f"{tool}({path}/**)" for path in paths for tool in ("Edit", "Write")]
+
+
 class LedgerGuard:
     """Snapshot configured ledgers before Claude; verify before accepting its output."""
 
@@ -686,7 +695,7 @@ class LedgerGuard:
                 data = path.read_bytes()
                 snapshot = self.folder / kind
                 snapshot.write_bytes(data)
-                self.entries.append({"kind": kind, "path": path, "snapshot": snapshot,
+                self.entries.append({"kind": kind, "path": path, "resolved": path.resolve(), "snapshot": snapshot,
                                      "data": data, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
                                      "mode": stat.S_IMODE(path.stat().st_mode)})
             except (OSError, ValueError) as error:
@@ -701,6 +710,8 @@ class LedgerGuard:
             path = entry["path"]
             old = entry["data"]
             try:
+                if path.resolve() != entry["resolved"]:
+                    raise ValueError("ledger resolved path changed (parent symlink replacement)")
                 if path.is_symlink() or not path.is_file():
                     raise ValueError("ledger is missing or is not a regular file (symlinks are forbidden)")
                 new = path.read_bytes()
@@ -718,6 +729,8 @@ class LedgerGuard:
                 message = f"{path}: {error}"
                 temporary = None
                 try:
+                    if path.parent.resolve() != entry["resolved"].parent:
+                        raise OSError("ledger parent changed; refusing to restore through it")
                     with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".kaizen-restore-",
                                                      delete=False) as output:
                         temporary = Path(output.name)
@@ -740,11 +753,10 @@ def review_command(options, mode, report, session_id, project_dir=None):
     allowed = REVIEW_TOOLS
     if auto:
         ledger_rules = ledger_deny()  # Validate before granting notes-ledger add.
+        backup_rules = backup_deny()
         allowed_tools = ["Read", "Grep", "Glob", "Edit", "Write", "WebFetch", "WebSearch",
-                         *READ_ONLY_BASH, "Bash(mkdir:*)", "Bash(diff:*)", "Bash(cd:*)"]
-        # No cp or touch: deny rules don't cover them, so they could write protected config.
-        path = options.token_audit
-        allowed_tools.extend([f"Bash(python3 {path}:*)", f"Bash({options.python} {path}:*)"])
+                         *READ_ONLY_BASH, "Bash(diff:*)", "Bash(cd:*)"]
+        # File-writing Bash tools bypass Edit/Write denies; grant only the scoped helpers.
         backup = HERE / "kaizen-backup"
         if backup.is_file():
             for subcommand in ("begin", "finish", "list"):
@@ -763,7 +775,7 @@ def review_command(options, mode, report, session_id, project_dir=None):
     command.extend(["--allowedTools", allowed])
     if auto:
         command.extend(["--disallowedTools", ",".join([
-            HARD_STOP_DENY, *config_home_deny(project_dir), *ledger_rules])])
+            HARD_STOP_DENY, *config_home_deny(project_dir), *ledger_rules, *backup_rules])])
     return command + ["--permission-mode", "acceptEdits" if auto else "dontAsk"]
 
 
@@ -1086,13 +1098,26 @@ def report_path(stdout):
     return Path(lines[0].strip()).expanduser().resolve()
 
 
-def rollback_auto_changes(options, run_id, session_id, started):
+def backup_directories(root):
+    """Record directory names and identities outside model-controlled manifests."""
+    paths, inodes = set(), set()
+    for path in root.iterdir():
+        info = path.lstat()
+        if stat.S_ISDIR(info.st_mode):
+            paths.add(path.resolve())
+            inodes.add((info.st_dev, info.st_ino))
+    return paths, inodes
+
+
+def rollback_auto_changes(options, run_id, session_id, started, root, before):
     """Undo only this cycle's unfinished or failed changes, newest first."""
-    root = Path(os.environ.get("KAIZEN_BACKUP_DIR", Path.home() / ".claude" / "kaizen-backups"))
     pending, messages, problems = [], [], []
     for manifest in root.glob("*/manifest.json"):
         try:
             if manifest.is_symlink() or manifest.parent.is_symlink():
+                continue
+            info = manifest.parent.stat()
+            if manifest.parent.resolve() in before[0] or (info.st_dev, info.st_ino) in before[1]:
                 continue
             data = json.loads(manifest.read_text(encoding="utf-8"))
             created = parse_time(data.get("created_at"))
@@ -1106,7 +1131,8 @@ def rollback_auto_changes(options, run_id, session_id, started):
     for _, change in sorted(pending, reverse=True):
         try:
             result = subprocess.run([options.python, str(HERE / "kaizen-backup"), "undo", str(change), "--force"],
-                                    capture_output=True, text=True)
+                                    capture_output=True, text=True,
+                                    env=dict(os.environ, KAIZEN_BACKUP_DIR=str(root)))
             if result.returncode:
                 detail = (result.stderr or result.stdout).strip()
                 raise ValueError(f"exit {result.returncode}: {detail}")
@@ -1170,7 +1196,12 @@ def _run_review(audits, project_dirs, options, clock, safety):
         guard = None
         try:
             run_id = started.astimezone().strftime("%Y%m%d-%H%M%S") + "-" + session_id
-            env = dict(os.environ, KAIZEN_RUN_ID=run_id, KAIZEN_SESSION_ID=session_id)
+            root = backup_root().resolve()
+            env = dict(os.environ, KAIZEN_RUN_ID=run_id, KAIZEN_SESSION_ID=session_id,
+                       KAIZEN_BACKUP_DIR=str(root))
+            if mode == "auto":
+                root.mkdir(parents=True, exist_ok=True)
+                before = backup_directories(root)
             with (audits / "run.log").open("a", encoding="utf-8") as errors, tempfile.NamedTemporaryFile(
                     mode="w", encoding="utf-8", dir=project.folder,
                     prefix=proposal.name + ".", delete=False) as output:
@@ -1188,7 +1219,8 @@ def _run_review(audits, project_dirs, options, clock, safety):
                     finally:
                         if mode == "auto":
                             try:
-                                rollbacks, rollback_problems = rollback_auto_changes(options, run_id, session_id, started)
+                                rollbacks, rollback_problems = rollback_auto_changes(
+                                    options, run_id, session_id, started, root, before)
                             except Exception as error:
                                 rollback_problems.append(f"rollback failed: {error}")
                         try:

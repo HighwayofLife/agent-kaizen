@@ -15,7 +15,8 @@ SCRIPT = Path(__file__).resolve().parents[1] / 'scripts' / 'kaizen-backup'
 
 class KaizenBackupTests(unittest.TestCase):
     def setUp(self):
-        self.tmp = Path(tempfile.mkdtemp())
+        self.tmp = Path(tempfile.mkdtemp()).resolve()
+        self.addCleanup(shutil.rmtree, self.tmp)
         self.env = {**os.environ, 'KAIZEN_BACKUP_DIR': str(self.tmp / 'backups')}
 
     def run_script(self, *args, ok=True):
@@ -67,6 +68,7 @@ class KaizenBackupTests(unittest.TestCase):
                 other.write_text('other original')
                 change = Path(self.change(other, target))
                 other.write_text('other changed')
+                self.run_script('finish', change)
                 source_dir = plugin / folder.name
                 source_dir.mkdir()
                 source = source_dir / 'tool'
@@ -77,7 +79,6 @@ class KaizenBackupTests(unittest.TestCase):
                     folder.symlink_to(source_dir, target_is_directory=True)
                 else:
                     target.symlink_to(source)
-                self.run_script('finish', change)
                 for flags in ((), ('--force',)):
                     result = self.run_script('undo', change, *flags, ok=False)
                     self.assertEqual(result.returncode, 2)
@@ -177,6 +178,104 @@ class KaizenBackupTests(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertIn('inside the backups root', result.stderr)
         self.assertFalse(outside.exists())
+
+    def test_undo_explicit_dir_ignores_malformed_old_manifest(self):
+        target = self.tmp / 'target'
+        target.write_text('original')
+        change = self.change(target)
+        target.write_text('changed')
+        old = self.tmp / 'backups/old'
+        old.mkdir()
+        (old / 'manifest.json').write_text('{broken')
+        self.run_script('undo', change, '--force')
+        self.assertEqual(target.read_text(), 'original')
+
+    def test_undo_rejects_non_absolute_or_non_normalised_entries_before_restoring(self):
+        target = self.tmp / 'target'
+        target.write_text('original')
+        change = Path(self.change(target, self.tmp / 'created'))
+        manifest = change / 'manifest.json'
+        data = json.loads(manifest.read_text())
+        target.write_text('changed')
+        for name in ('relative', str(self.tmp / 'child/../created'),
+                     str(self.tmp) + '//created', str(self.tmp) + '/./created'):
+            with self.subTest(path=name):
+                data['files'][1]['path'] = name
+                manifest.write_text(json.dumps(data))
+                result = self.run_script('undo', change, '--force', ok=False)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn('absolute and normalised', result.stderr)
+                self.assertEqual(target.read_text(), 'changed')
+                self.assertIsNone(json.loads(manifest.read_text())['reverted'])
+
+    def test_undo_rejects_backup_outside_its_own_dir_before_restoring(self):
+        target = self.tmp / 'target'
+        target.write_text('original')
+        change = Path(self.change(target))
+        target.write_text('changed')
+        outside = self.tmp / 'outside'
+        outside.write_text('crafted')
+        link = change / 'files/link'
+        link.symlink_to(outside)
+        manifest = change / 'manifest.json'
+        data = json.loads(manifest.read_text())
+        for name in (str(outside), '../../outside', 'files/link'):
+            with self.subTest(backup=name):
+                data['files'][0]['backup'] = name
+                manifest.write_text(json.dumps(data))
+                result = self.run_script('undo', change, '--force', ok=False)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn('inside its change directory', result.stderr)
+                self.assertEqual(target.read_text(), 'changed')
+
+    def test_undo_rejects_all_target_symlinks_including_created_entries(self):
+        for created in (False, True):
+            for parent_link in (False, True):
+                with self.subTest(created=created, parent_link=parent_link):
+                    folder = self.tmp / f'target-{created}-{parent_link}'
+                    folder.mkdir()
+                    target, other = folder / 'file', self.tmp / 'other'
+                    if not created:
+                        target.write_text('original')
+                    other.write_text('original')
+                    change = Path(self.change(other, target))
+                    other.write_text('changed')
+                    outside = self.tmp / f'outside-{created}-{parent_link}'
+                    outside.mkdir()
+                    victim = outside / 'file'
+                    victim.write_text('untouched')
+                    target.unlink(missing_ok=True)
+                    if parent_link:
+                        folder.rmdir()
+                        folder.symlink_to(outside, target_is_directory=True)
+                    else:
+                        target.symlink_to(victim)
+                    result = self.run_script('undo', change, '--force', ok=False)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn('symlink', result.stderr)
+                    self.assertEqual(victim.read_text(), 'untouched')
+                    self.assertEqual(other.read_text(), 'changed')
+                    self.assertTrue((folder if parent_link else target).is_symlink())
+                    self.assertIsNone(json.loads((change / 'manifest.json').read_text())['reverted'])
+
+    def test_begin_refuses_symlink_targets_and_parents(self):
+        outside = self.tmp / 'outside'
+        outside.mkdir()
+        victim = outside / 'file'
+        victim.write_text('untouched')
+        parent = self.tmp / 'parent'
+        parent.symlink_to(outside, target_is_directory=True)
+        link = self.tmp / 'link'
+        link.symlink_to(victim)
+        for target in (link, parent / 'file', parent / 'created'):
+            with self.subTest(target=target):
+                result = self.run_script('begin', '--run', 'run', '--skill', 'skill', '--ledger', 'test',
+                                         target, ok=False)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn('symlink', result.stderr)
+                self.assertEqual(victim.read_text(), 'untouched')
+                # Failed begins leave no manifest; remove their empty directories before retrying.
+                shutil.rmtree(self.tmp / 'backups')
 
 
 if __name__ == '__main__':
