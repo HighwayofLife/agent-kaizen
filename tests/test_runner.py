@@ -1108,7 +1108,8 @@ class ExecutionTests(DiscoveryCase):
                     rules = self.expected_config_deny(path)
                     self.assertEqual(len(rules), 28)
                     self.assertEqual(self.values(argv, '--disallowedTools'),
-                                     [','.join([self.runner.HARD_STOP_DENY, *rules, *self.runner.backup_deny()])])
+                                     [','.join([self.runner.HARD_STOP_DENY, 'Edit(**/.git/**)',
+                                                'Write(**/.git/**)', *rules, *self.runner.backup_deny()])])
                     for rule in rules:
                         self.assertFalse(rule.startswith('Write('))
                         for text in ('.md', 'CLAUDE', 'agents', 'rules'):
@@ -1198,7 +1199,8 @@ class ExecutionTests(DiscoveryCase):
         output = self.review('--dry-run').stdout
         command = shlex.split(next(line.split('review command: ', 1)[1]
                                    for line in output.splitlines() if 'review command: ' in line))
-        expected = ','.join([self.runner.HARD_STOP_DENY, *self.expected_config_deny(path),
+        expected = ','.join([self.runner.HARD_STOP_DENY, 'Edit(**/.git/**)', 'Write(**/.git/**)',
+                             *self.expected_config_deny(path),
                              *self.runner.backup_deny()])
         self.assertEqual(self.values(command, '--disallowedTools'), [expected])
         self.assertEqual(before, {p: p.read_bytes() if p.is_file() else None for p in self.root.rglob('*')})

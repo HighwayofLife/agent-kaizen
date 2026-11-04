@@ -26,7 +26,7 @@ import shutil
 import sys
 from pathlib import Path
 
-ROOT = Path(os.environ.get("KAIZEN_BACKUP_DIR", Path.home() / ".claude" / "kaizen-backups"))
+ROOT = Path(os.environ.get("KAIZEN_BACKUP_DIR", Path.home() / ".claude" / "kaizen-backups")).expanduser().resolve()
 
 
 def sha(path):
@@ -63,21 +63,19 @@ def valid_id(value):
 
 
 def change_dir(path):
-    raw = Path(path).expanduser().absolute()
-    resolved = raw.resolve()
-    if ROOT.resolve() not in resolved.parents:
+    resolved = Path(path).expanduser().resolve()
+    if ROOT not in resolved.parents:
         raise ValueError(f"CHANGE_DIR must be inside the backups root: {resolved}")
-    refuse_symlinks(raw)
     return resolved
 
 
 def refuse_symlinks(path, roots=()):
-    for part in (path, *path.parents):
-        if part.is_symlink():
-            if any(part.resolve() == root or root in part.resolve().parents for root in roots):
-                raise ValueError(f"refusing to restore through symlink into plugin root: {path}; "
-                                 "run kaizen-link --unlink --restore-replaced first")
-            raise ValueError(f"refusing to access target through symlink: {path} ({part})")
+    resolved = path.resolve()
+    if path.is_symlink() or resolved != path:
+        if any(resolved == root or root in resolved.parents for root in roots):
+            raise ValueError(f"refusing to restore through symlink into plugin root: {path}; "
+                             "run kaizen-link --unlink --restore-replaced first")
+        raise ValueError(f"refusing to access target through symlink: {path}")
 
 
 def validate_entry(change, entry, roots=()):
@@ -90,6 +88,9 @@ def validate_entry(change, entry, roots=()):
     refuse_symlinks(path, roots)
     if not isinstance(entry.get("created"), bool):
         raise ValueError(f"entry created flag must be boolean: {name}")
+    # Preflight all targets before undo changes anything, including with --force.
+    if path.is_dir():
+        raise ValueError(f"entry target is a directory: {path}")
     if not entry["created"] or entry.get("backup") is not None:
         if not isinstance(entry.get("backup"), str):
             raise ValueError(f"entry backup must name a file inside its change directory: {name}")
@@ -112,9 +113,8 @@ def begin(args):
     (change / "files").mkdir(parents=True, exist_ok=False)
     entries = []
     for index, name in enumerate(args.files, 1):
-        raw = Path(name).expanduser().absolute()
-        refuse_symlinks(raw)
-        path = raw.resolve()
+        # User paths may use a symlinked home or /tmp; store their canonical target.
+        path = Path(name).expanduser().resolve()
         entry = {"path": str(path), "backup": None, "created": not path.exists(), "after_sha256": None}
         if path.is_file():
             entry["backup"] = f"files/{index}"

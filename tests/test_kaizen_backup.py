@@ -258,7 +258,7 @@ class KaizenBackupTests(unittest.TestCase):
                     self.assertTrue((folder if parent_link else target).is_symlink())
                     self.assertIsNone(json.loads((change / 'manifest.json').read_text())['reverted'])
 
-    def test_begin_refuses_symlink_targets_and_parents(self):
+    def test_begin_resolves_symlink_targets_and_parents(self):
         outside = self.tmp / 'outside'
         outside.mkdir()
         victim = outside / 'file'
@@ -269,13 +269,103 @@ class KaizenBackupTests(unittest.TestCase):
         link.symlink_to(victim)
         for target in (link, parent / 'file', parent / 'created'):
             with self.subTest(target=target):
-                result = self.run_script('begin', '--run', 'run', '--skill', 'skill', '--ledger', 'test',
-                                         target, ok=False)
+                change = Path(self.change(target))
+                entry = json.loads((change / 'manifest.json').read_text())['files'][0]
+                self.assertEqual(entry['path'], str(target.resolve()))
+                self.assertEqual(entry['created'], not target.exists())
+                self.assertEqual(victim.read_text(), 'untouched')
+
+    def test_round_trip_with_symlinked_home_and_default_backup_root(self):
+        home = self.tmp / 'home'
+        home.mkdir()
+        linked = self.tmp / 'linked-home'
+        linked.symlink_to(home, target_is_directory=True)
+        self.env.update(HOME=str(linked))
+        self.env.pop('KAIZEN_BACKUP_DIR')
+        target, created = home / 'CLAUDE.md', home / 'new.md'
+        target.write_text('original')
+        change = Path(self.change('~/CLAUDE.md', '~/new.md'))
+        self.assertEqual(change.parent, home / '.claude/kaizen-backups')
+        self.assertEqual([entry['path'] for entry in json.loads((change / 'manifest.json').read_text())['files']],
+                         [str(target), str(created)])
+        target.write_text('changed')
+        created.write_text('created')
+        self.run_script('finish', linked / '.claude/kaizen-backups' / change.name)
+        self.run_script('undo', 'last')
+        self.assertEqual(target.read_text(), 'original')
+        self.assertFalse(created.exists())
+
+    def test_round_trip_with_backup_root_behind_symlink(self):
+        actual = self.tmp / 'actual-backups'
+        actual.mkdir()
+        linked = self.tmp / 'linked-backups'
+        linked.symlink_to(actual, target_is_directory=True)
+        self.env['KAIZEN_BACKUP_DIR'] = str(linked)
+        target = self.tmp / 'CLAUDE.md'
+        for which in ('last', 'run', 'explicit'):
+            with self.subTest(which=which):
+                target.write_text('original')
+                change = Path(self.change(target))
+                self.assertEqual(change.parent, actual)
+                target.write_text('changed')
+                self.run_script('finish', linked / change.name)
+                self.run_script('undo', linked / change.name if which == 'explicit' else which)
+                self.assertEqual(target.read_text(), 'original')
+
+    def test_finish_rejects_replacement_symlinks(self):
+        for parent_link in (False, True):
+            with self.subTest(parent_link=parent_link):
+                folder = self.tmp / f'target-{parent_link}'
+                folder.mkdir()
+                target = folder / 'file'
+                target.write_text('original')
+                change = Path(self.change(target))
+                original = (change / 'manifest.json').read_bytes()
+                outside = self.tmp / f'outside-{parent_link}'
+                outside.mkdir()
+                (outside / 'file').write_text('untouched')
+                target.unlink()
+                if parent_link:
+                    folder.rmdir()
+                    folder.symlink_to(outside, target_is_directory=True)
+                else:
+                    target.symlink_to(outside / 'file')
+                result = self.run_script('finish', change, ok=False)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn('symlink', result.stderr)
-                self.assertEqual(victim.read_text(), 'untouched')
-                # Failed begins leave no manifest; remove their empty directories before retrying.
-                shutil.rmtree(self.tmp / 'backups')
+                self.assertEqual((change / 'manifest.json').read_bytes(), original)
+
+    def test_undo_preflights_directory_targets_before_any_restore(self):
+        for created in (False, True):
+            for populated in (False, True):
+                with self.subTest(created=created, populated=populated):
+                    target = self.tmp / f'target-{created}-{populated}'
+                    if not created:
+                        target.write_text('original')
+                    # A bad target in an older change must block the whole run's undo.
+                    older = Path(self.change(target))
+                    other = self.tmp / 'other'
+                    other.write_text('original')
+                    newer = Path(self.change(other))
+                    other.write_text('changed')
+                    self.run_script('finish', older)
+                    self.run_script('finish', newer)
+                    target.unlink(missing_ok=True)
+                    target.mkdir()
+                    if populated:
+                        (target / 'child').write_text('untouched')
+                    for flags in ((), ('--force',)):
+                        result = self.run_script('undo', 'run', *flags, ok=False)
+                        self.assertEqual(result.returncode, 2, result.stderr)
+                        self.assertIn('target is a directory', result.stderr)
+                        self.assertEqual(other.read_text(), 'changed')
+                        self.assertTrue(target.is_dir())
+                        if populated:
+                            self.assertEqual((target / 'child').read_text(), 'untouched')
+                        for change in (older, newer):
+                            self.assertIsNone(json.loads((change / 'manifest.json').read_text())['reverted'])
+                    # Keep the next subtest's run independent of the rejected one.
+                    shutil.rmtree(self.tmp / 'backups')
 
 
 if __name__ == '__main__':

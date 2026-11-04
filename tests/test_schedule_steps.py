@@ -14,6 +14,30 @@ from unittest.mock import patch
 from test_scripts import SCRIPTS, StubCase, executable, write
 
 
+# Independent pins: adding a Bash grant requires reviewing its exec/write flags.
+PROPOSE_BASH = (
+    'Bash(ls:*)',         # Lists metadata; no command execution or output-file flag.
+    'Bash(head:*)',       # Reads initial bytes/lines; writes only stdout.
+    'Bash(tail:*)',       # Reads final bytes/lines (or follows); writes only stdout.
+    'Bash(shasum:*)',     # Reads/hashes/checks files; no exec or output-file flag.
+    'Bash(sha256sum:*)',  # Reads/hashes/checks files; no exec or output-file flag.
+    'Bash(jq:*)',         # JSON filters have no system/exec/file-write primitive.
+)
+AUTO_BASH = PROPOSE_BASH + (
+    'Bash({backup} begin:*)',           # Copies inputs only into the protected backup root.
+    'Bash(python3 {backup} begin:*)',   # Same fixed helper, not arbitrary Python code.
+    'Bash({python} {backup} begin:*)',  # Same fixed helper with the runner's interpreter.
+    'Bash({backup} finish:*)',          # Writes only a validated backup manifest.
+    'Bash(python3 {backup} finish:*)',  # Same manifest-only operation.
+    'Bash({python} {backup} finish:*)',  # Same manifest-only operation.
+    'Bash({backup} list:*)',            # Prints backup metadata only.
+    'Bash(python3 {backup} list:*)',    # Same metadata-only operation.
+    'Bash({python} {backup} list:*)',   # Same metadata-only operation.
+    'Bash(python3 {ledger} add:*)',     # Appends to configured ledgers; no exec/path override.
+    'Bash({python} {ledger} add:*)',    # Same scoped writer with the runner's interpreter.
+)
+
+
 class ScheduleStepsTests(StubCase):
     def setUp(self):
         super().setUp()
@@ -569,24 +593,23 @@ path.symlink_to(target)
                     for subcommand in ('begin', 'finish', 'list')}
         self.assertEqual({rule for rule in rules if 'kaizen-backup' in rule}, expected)
 
-    def test_auto_bash_grants_only_read_tools_and_scoped_writers(self):
+    def test_each_mode_has_exact_vetted_bash_grants(self):
         self.stub('kaizen-backup', '')
         with patch.dict(os.environ, self.env, clear=True):
             options = self.module.command_options(self.module.argparse.Namespace(dry_run=True))
-            command = self.module.review_command(options, 'auto', 'report', 'session')
-        readonly = {f'Bash({name}:*)' for name in (
-            'ls', 'wc', 'head', 'tail', 'rg', 'git status', 'shasum', 'sha256sum', 'jq')}
-        self.assertEqual(set(self.module.READ_ONLY_BASH), readonly)
-        review_bash = {rule for rule in self.module.REVIEW_TOOLS.split(',') if rule.startswith('Bash(')}
-        self.assertEqual(review_bash, readonly)
-        scoped = {f'Bash({prefix}{self.scripts}/kaizen-backup {subcommand}:*)'
-                  for prefix in ('', 'python3 ', options.python + ' ')
-                  for subcommand in ('begin', 'finish', 'list')}
-        scoped.update(f'Bash({python} {self.scripts}/notes-ledger add:*)'
-                      for python in ('python3', options.python))
-        bash = {rule for rule in command[command.index('--allowedTools') + 1].split(',')
-                if rule.startswith('Bash(')}
-        self.assertEqual(bash, readonly | {'Bash(cd:*)', 'Bash(diff:*)'} | scoped)
+            for mode, pinned in (('propose-only', PROPOSE_BASH), ('auto', AUTO_BASH)):
+                with self.subTest(mode=mode):
+                    command = self.module.review_command(options, mode, 'report', 'session')
+                    bash = {rule for rule in command[command.index('--allowedTools') + 1].split(',')
+                            if rule.startswith('Bash(')}
+                    expected = {rule.format(backup=self.scripts / 'kaizen-backup',
+                                           ledger=self.scripts / 'notes-ledger', python=options.python)
+                                for rule in pinned}
+                    self.assertEqual(bash, expected)
+                    if mode == 'auto':
+                        deny = command[command.index('--disallowedTools') + 1].split(',')
+                        for tool in ('Edit', 'Write'):
+                            self.assertIn(f'{tool}(**/.git/**)', deny)
 
     def test_backup_root_deny_covers_resolved_and_unresolved_trees(self):
         resolved = self.root / 'real-backups'

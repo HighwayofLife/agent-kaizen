@@ -112,12 +112,14 @@ SCHEMA = {
 DEFAULTS = {name: spec["default"] for name, spec in SCHEMA.items()}
 CHOICES = {name: spec["choices"] for name, spec in SCHEMA.items() if spec["kind"] == "enum"}
 HERE = Path(__file__).resolve().parent
-READ_ONLY_BASH = ["Bash(ls:*)", "Bash(wc:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(rg:*)",
-                  "Bash(git status:*)", "Bash(shasum:*)",
+# Keep in sync with the independently pinned permission tests. Search with Grep:
+# rg can execute preprocessors, and git can execute repository-configured helpers.
+READ_ONLY_BASH = ["Bash(ls:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(shasum:*)",
                   "Bash(sha256sum:*)", "Bash(jq:*)"]
 REVIEW_AVAILABLE = "Read,Grep,Glob,WebFetch,WebSearch,Bash"
 REVIEW_TOOLS = ",".join(["Read", "Grep", "Glob", "WebFetch", "WebSearch", *READ_ONLY_BASH])
 AUTO_AVAILABLE = "Read,Grep,Glob,Edit,Write,WebFetch,WebSearch,Bash"
+GIT_DENY = ["Edit(**/.git/**)", "Write(**/.git/**)"]
 HARD_STOP_DENY = ",".join(f"Bash({command}:*)" for command in (
     "git push", "git commit", "git reset", "git clean", "gh", "rm", "rmdir", "mv", "curl", "wget",
     "launchctl", "crontab", "brew", "npm", "pip", "pip3", "sudo", "env", "printenv", "chmod"))
@@ -755,7 +757,7 @@ def review_command(options, mode, report, session_id, project_dir=None):
         ledger_rules = ledger_deny()  # Validate before granting notes-ledger add.
         backup_rules = backup_deny()
         allowed_tools = ["Read", "Grep", "Glob", "Edit", "Write", "WebFetch", "WebSearch",
-                         *READ_ONLY_BASH, "Bash(diff:*)", "Bash(cd:*)"]
+                         *READ_ONLY_BASH]
         # File-writing Bash tools bypass Edit/Write denies; grant only the scoped helpers.
         backup = HERE / "kaizen-backup"
         if backup.is_file():
@@ -775,7 +777,7 @@ def review_command(options, mode, report, session_id, project_dir=None):
     command.extend(["--allowedTools", allowed])
     if auto:
         command.extend(["--disallowedTools", ",".join([
-            HARD_STOP_DENY, *config_home_deny(project_dir), *ledger_rules, *backup_rules])])
+            HARD_STOP_DENY, *GIT_DENY, *config_home_deny(project_dir), *ledger_rules, *backup_rules])])
     return command + ["--permission-mode", "acceptEdits" if auto else "dontAsk"]
 
 
