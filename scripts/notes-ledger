@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import subprocess
 import tempfile
 
 HEADER = ['date', 'category', 'change', 'source', 'status', 'measured']
@@ -198,6 +199,147 @@ def set_row(args, csv_path, timeline_path):
             atomic_write(timeline_path, timeline_data)
 
 
+
+INTENSITY = ('claude_context_per_call', 'claude_output_per_call',
+             'image_reads_per_100_calls', 'brief_chars_median',
+             'codex_tokens_per_session', 'codex_brief_chars_median')
+SCOPE_KEYS = {'codex', 'cwd', 'project', 'project_dirs', 'v', 'window'}
+
+
+def audit_reports():
+    root = claude_home() / 'audits'
+    paths = list(root.glob('token-audit-*.md'))
+    paths += list((root / 'projects').glob('*/token-audit-*.md'))
+    reports = []
+    for path in paths:
+        match = re.match(r'token-audit-(\d{8}T\d{6}.*Z|\d{4}-\d{2}-\d{2})\.md$', path.name)
+        if not match:
+            continue
+        try:
+            stamp = match[1]
+            day = dt.datetime.strptime(stamp[:8], '%Y%m%d').date() if 'T' in stamp else dt.date.fromisoformat(stamp)
+            headline = scope = None
+            with path.open(encoding='utf-8') as stream:
+                for line in stream:
+                    for tag in ('headline', 'scope'):
+                        prefix = '<!-- token-audit-' + tag + ' '
+                        if line.startswith(prefix) and line.rstrip().endswith(' -->'):
+                            value = json.loads(line[len(prefix):].rstrip()[:-4])
+                            if tag == 'headline':
+                                headline = value
+                            else:
+                                scope = value
+            if isinstance(headline, dict) and isinstance(scope, dict) and set(scope) == SCOPE_KEYS:
+                reports.append((day, path.name, path.parent == root, scope, headline))
+        except (OSError, ValueError, TypeError):
+            continue
+    return reports
+
+
+def packet_comparisons(projects, settings, date):
+    comparisons = []
+    commands = settings.get('projectCommands', {})
+    for raw in projects:
+        project = Path(raw).expanduser().resolve()
+        options = next((v for k, v in commands.items() if Path(k).expanduser().resolve() == project), {})
+        log = project / options.get('outcomeLog', 'out/packets.jsonl')
+        if not log.is_file():
+            continue
+        results = []
+        for flag in ('--until', '--since'):
+            result = subprocess.run([sys.executable, str(Path(__file__).resolve().parent / 'packet-report'),
+                                     '--packets', str(log), flag, date, '--json'],
+                                    capture_output=True, text=True, check=True)
+            results.append(json.loads(result.stdout))
+        before, after = results
+        item = {'project': str(project), 'before_n': before['totals']['packets'],
+                'after_n': after['totals']['packets']}
+        if min(item['before_n'], item['after_n']) < 8:
+            item['reason'] = 'too few packets'
+        else:
+            item['before_groups'] = before['groups']
+            item['after_groups'] = after['groups']
+        comparisons.append(item)
+    return comparisons
+
+
+def due(args):
+    try:
+        with (claude_home() / 'agent-kaizen.json').open(encoding='utf-8') as stream:
+            settings = json.load(stream)
+    except FileNotFoundError:
+        settings = {}
+    ledger = settings.get('notesLedger', {})
+    if not isinstance(ledger, dict) or not ledger.get('csv'):
+        print('notes-ledger: not configured')
+        return
+    days = ledger.get('measureAfterDays', 7)
+    if type(days) is not int or days < 1:
+        days = 7
+    _, _, rows = read_csv(Path(ledger['csv']).expanduser())
+    reports = audit_reports()
+    for row, _, _ in rows[1:]:
+        if row[4] != 'active' or row[5] != 'no':
+            continue
+        day = dt.date.fromisoformat(row[0])
+        measure = row[2].partition('Measure:')[2]
+        item = {'date': row[0], 'change': row[2], 'measure': measure,
+                'intensity': {}, 'packets': []}
+        if (dt.date.today() - day).days < days:
+            item['reason'] = 'row too new'
+        else:
+            before = [r for r in reports if r[0] < day]
+            after = [r for r in reports if r[0] > day]
+            pairs = [(b, a) for b in before for a in after if b[3] == a[3]]
+            eligible = [(b, a) for b, a in pairs if sum(r[3] == a[3] for r in after) >= 2]
+            if not pairs:
+                item['reason'] = 'no comparable scope' if before and after else 'too few reports'
+            elif not eligible:
+                item['reason'] = 'too few reports'
+            else:
+                b, a = max(eligible, key=lambda pair: (pair[1][2] and pair[0][2], pair[1][0], pair[1][1], pair[0][0], pair[0][1]))
+                for key in INTENSITY:
+                    old, new = b[4].get(key), a[4].get(key)
+                    if type(old) in (int, float) and type(new) in (int, float):
+                        item['intensity'][key] = {'before': old, 'after': new,
+                                                  'percent_change': (new - old) / old * 100 if old else None}
+                item['before_report'], item['after_report'] = b[1], a[1]
+                item['scope'] = a[3]
+                item['after_report_count'] = sum(r[3] == a[3] for r in after)
+                item['packets'] = packet_comparisons(args.project, settings, row[0])
+                if not item['intensity']:
+                    item['reason'] = 'no comparable intensity values'
+                else:
+                    values = [f"{k} {v['before']} → {v['after']} (" +
+                              (f"{v['percent_change']:+.1f}%" if v['percent_change'] is not None else 'percent unavailable') + ')'
+                              for k, v in item['intensity'].items()]
+                    item['proposal'] = '; '.join(values) + f"; audit reports n={item['after_report_count']} after"
+                    for packet in item['packets']:
+                        if 'reason' not in packet:
+                            for side in ('before', 'after'):
+                                for group in packet[side + '_groups']:
+                                    item['proposal'] += (f"; {packet['project']} {side} {group['model']} {group['effort']}"
+                                                         f" n={group['n']}, first-pass={group['first_pass']},"
+                                                         f" fix rate={group['fix_rate']}, median wall s={group['median_wall_s']}")
+        if args.json:
+            print(json.dumps(item, sort_keys=True))
+            continue
+        print(f"Row: {row[0]} {row[2][:80]}")
+        print('Measure:' + measure)
+        for key, value in item['intensity'].items():
+            percent = f"{value['percent_change']:+.1f}%" if value['percent_change'] is not None else 'percent unavailable'
+            print(f"{key}: {value['before']} → {value['after']} ({percent})")
+        for packet in item['packets']:
+            print('Project: ' + packet['project'])
+            if 'reason' in packet:
+                print(f"too few packets (before n={packet['before_n']}, after n={packet['after_n']})")
+            else:
+                for side in ('before', 'after'):
+                    for group in packet[side + '_groups']:
+                        print(f"{side} {group['model']} {group['effort']}: n={group['n']}, first-pass={group['first_pass']}, fix rate={group['fix_rate']}, median wall s={group['median_wall_s']}")
+        print(('Not enough data: ' + item['reason']) if 'reason' in item else
+              ('Proposed measured effect: ' + item['proposal']))
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='command', required=True)
@@ -212,13 +354,19 @@ def main():
     s.add_argument('--measured', choices=('yes', 'no'))
     s.add_argument('--effect')
     s.add_argument('--dry-run', action='store_true')
+    d = sub.add_parser('due', help='propose measurements for active changes')
+    d.add_argument('--project', action='append', default=[])
+    d.add_argument('--json', action='store_true')
     args = parser.parse_args()
     try:
+        if args.command == 'due':
+            due(args)
+            return 0
         csv_path, timeline_path = config()
         with open(str(csv_path) + '.lock', 'a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             (add if args.command == 'add' else set_row)(args, csv_path, timeline_path)
-    except (OSError, ValueError, RuntimeError, json.JSONDecodeError) as exc:
+    except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         print('notes-ledger: {}'.format(exc), file=sys.stderr)
         return 1 if isinstance(exc, (OSError, RuntimeError)) else 2
     return 0

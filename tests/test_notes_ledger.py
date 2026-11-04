@@ -104,5 +104,80 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(self.run_cli(*args).returncode, 0)
 
 
+class DueTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.csv = self.root / 'changes.csv'
+        self.csv.write_text(HEADER + '2020-01-10,test,Change Measure: count,manual,active,no\n')
+        self.config = self.root / 'agent-kaizen.json'
+        self.config.write_text(json.dumps({'notesLedger': {'csv': str(self.csv)}}))
+        self.env = dict(os.environ, CLAUDE_CONFIG_DIR=str(self.root))
+        self.scope = dict(codex='all', cwd=None, project=None, project_dirs=[], v=1, window='7d')
+
+    def run_due(self, *args):
+        return subprocess.run(['python3', str(SCRIPT), 'due', *args], env=self.env,
+                              capture_output=True, text=True)
+
+    def report(self, date, scope=None, value=10):
+        path = self.root / 'audits' / ('token-audit-' + date + '.md')
+        path.parent.mkdir(exist_ok=True)
+        text = '<!-- token-audit-headline ' + json.dumps({'claude_context_per_call': value, 'claude_calls': 999}) + ' -->\n'
+        if scope is not False:
+            text += '<!-- token-audit-scope ' + json.dumps(scope or self.scope) + ' -->\n'
+        path.write_text(text)
+
+    def test_proposal_packets_and_read_only(self):
+        import hashlib
+        self.report('2020-01-01', value=10)
+        self.report('2020-01-11', value=15)
+        self.report('2020-01-12', value=20)
+        project = self.root / 'project'
+        log = project / 'out' / 'packets.jsonl'
+        log.parent.mkdir(parents=True)
+        rows = [dict(ts=f'2020-01-{day:02}T12:00:00Z', id=str(i), model='sonnet', effort='medium',
+                     status='DONE', dispatches=1, rounds=0, wall_s=60)
+                for day in (1, 11) for i in range(day * 100, day * 100 + 8)]
+        log.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+        files = [p for p in self.root.rglob('*') if p.is_file()]
+        hashes = {p: hashlib.sha256(p.read_bytes()).digest() for p in files}
+        result = self.run_due('--project', str(project), '--json')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        item = json.loads(result.stdout)
+        self.assertEqual(item['intensity']['claude_context_per_call']['percent_change'], 100)
+        self.assertNotIn('claude_calls', item['intensity'])
+        self.assertEqual(item['packets'][0]['before_n'], 8)
+        self.assertIn('n=8', item['proposal'])
+        self.assertEqual(hashes, {p: hashlib.sha256(p.read_bytes()).digest() for p in self.root.rglob('*') if p.is_file()})
+
+    def test_incompatible_and_missing_scope(self):
+        self.report('2020-01-01', scope=False)
+        self.report('2020-01-02', scope=dict(self.scope, window='30d'))
+        self.report('2020-01-11')
+        self.report('2020-01-12')
+        self.assertEqual(json.loads(self.run_due('--json').stdout)['reason'], 'no comparable scope')
+
+    def test_too_few_and_filters(self):
+        self.report('2020-01-01')
+        self.report('2020-01-11')
+        self.csv.write_text(self.csv.read_text() + '2020-01-10,test,Done,manual,active,yes\n'
+                            + '2020-01-10,test,Planned,manual,planned,no\n'
+                            + '2999-01-01,test,Future,manual,active,no\n')
+        items = [json.loads(line) for line in self.run_due('--json').stdout.splitlines()]
+        self.assertEqual([item['reason'] for item in items], ['too few reports', 'row too new'])
+        self.report('2020-01-12')
+        project = self.root / 'project'
+        log = project / 'out' / 'packets.jsonl'
+        log.parent.mkdir(parents=True)
+        log.write_text('')
+        self.assertEqual(json.loads(self.run_due('--project', str(project), '--json').stdout.splitlines()[0])['packets'][0]['reason'], 'too few packets')
+
+    def test_unconfigured(self):
+        self.config.unlink()
+        result = self.run_due()
+        self.assertEqual((result.returncode, result.stdout.strip()), (0, 'notes-ledger: not configured'))
+
+
 if __name__ == '__main__':
     unittest.main()
