@@ -108,6 +108,24 @@ class LinkTests(unittest.TestCase):
         (self.bin / "token-audit").write_text("stale")
         self.assertEqual(self.run_link("--check", "--only", "token-audit", root=fake).returncode, 1)
 
+    def test_copy_rules_lint_finds_bundled_patterns(self):
+        self.env["HOME"] = str(self.home)
+        result = self.run_link("--apply", "--mode", "copy")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("rules-lint", "rules-lint.patterns"):
+            self.assertTrue((self.bin / name).is_file())
+            self.assertFalse((self.bin / name).is_symlink())
+        repo = self.home / "fixture"
+        repo.mkdir()
+        fixture = repo / "CLAUDE.md"
+        fixture.write_text("Use project-repos.txt to find projects.\n")
+        result = self.run_script(self.bin / "rules-lint", "--repo", str(repo), "--json")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        report = json.loads(result.stdout)
+        self.assertEqual(report["count"], 1)
+        self.assertEqual(report["hits"][0]["path"], str(fixture))
+        self.assertIn("project-repos.txt", report["hits"][0]["text"])
+
     def test_unlink_and_restore(self):
         self.bin.mkdir()
         (self.bin / "token-audit").write_text("original")
