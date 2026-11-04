@@ -113,7 +113,7 @@ DEFAULTS = {name: spec["default"] for name, spec in SCHEMA.items()}
 CHOICES = {name: spec["choices"] for name, spec in SCHEMA.items() if spec["kind"] == "enum"}
 HERE = Path(__file__).resolve().parent
 READ_ONLY_BASH = ["Bash(ls:*)", "Bash(wc:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(rg:*)",
-                  "Bash(git status:*)", "Bash(git diff:*)", "Bash(git log:*)", "Bash(shasum:*)",
+                  "Bash(git status:*)", "Bash(shasum:*)",
                   "Bash(sha256sum:*)", "Bash(jq:*)"]
 REVIEW_AVAILABLE = "Read,Grep,Glob,WebFetch,WebSearch,Bash"
 REVIEW_TOOLS = ",".join(["Read", "Grep", "Glob", "WebFetch", "WebSearch", *READ_ONLY_BASH])
@@ -644,16 +644,89 @@ def config_home_deny(project_dir=None):
     return rules
 
 
-def ledger_deny():
+def ledger_paths():
     # notes-ledger reads the raw global value too: never use effective()'s fallback here.
     ledger = load_config(global_config_path()).get("notesLedger", {})
     if not valid_value("notesLedger", ledger):
         raise ValueError("notesLedger is invalid: require csv and optional timeline paths "
                          "absolute after expanduser, and only supported keys")
-    paths = dict.fromkeys(deny_path(ledger[name], resolve=resolve)
-            for name in ("csv", "timeline") if ledger.get(name)
+    return {name: Path(ledger[name]).expanduser() for name in ("csv", "timeline") if ledger.get(name)}
+
+
+def ledger_deny():
+    paths = dict.fromkeys(deny_path(path, resolve=resolve)
+            for path in ledger_paths().values()
             for resolve in (False, True))
     return [f"{tool}({path})" for path in paths for tool in ("Edit", "Write")]
+
+
+class LedgerGuard:
+    """Snapshot configured ledgers before Claude; verify before accepting its output."""
+
+    def __init__(self, folder):
+        self.folder = folder
+        self.entries = []
+
+    def snapshot(self):
+        for kind, path in ledger_paths().items():
+            try:
+                if not path.is_file():
+                    raise ValueError("ledger is not a regular file")
+                data = path.read_bytes()
+                snapshot = self.folder / kind
+                snapshot.write_bytes(data)
+                self.entries.append({"kind": kind, "path": path, "snapshot": snapshot,
+                                     "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
+                                     "mode": stat.S_IMODE(path.stat().st_mode)})
+            except (OSError, ValueError) as error:
+                raise ValueError(f"{path}: cannot snapshot ledger ({error})") from error
+        (self.folder / "manifest.json").write_text(json.dumps([
+            {key: str(value) if isinstance(value, Path) else value
+             for key, value in entry.items()} for entry in self.entries], indent=2) + "\n")
+
+    def verify(self):
+        problems = []
+        for entry in self.entries:
+            path = entry["path"]
+            try:
+                old = entry["snapshot"].read_bytes()
+                if len(old) != entry["size"] or hashlib.sha256(old).hexdigest() != entry["sha256"]:
+                    raise ValueError("snapshot integrity check failed")
+            except (OSError, ValueError) as error:
+                problems.append(f"{path}: cannot verify snapshot ({error})")
+                continue
+            try:
+                if not path.is_file():
+                    raise ValueError("ledger is missing or is not a regular file")
+                new = path.read_bytes()
+                if entry["kind"] == "timeline":
+                    lines = iter(new.splitlines(keepends=True))
+                    valid = all(any(line == candidate for candidate in lines)
+                                for line in old.splitlines(keepends=True))
+                else:
+                    valid = hashlib.sha256(new[:entry["size"]]).hexdigest() == entry["sha256"]
+                    if len(new) > entry["size"]:
+                        valid = valid and (not old or old.endswith(b"\n")) and new.endswith(b"\n")
+                if not valid:
+                    raise ValueError("ledger history changed or growth is not whole lines")
+            except (OSError, ValueError) as error:
+                message = f"{path}: {error}"
+                temporary = None
+                try:
+                    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".kaizen-restore-",
+                                                     delete=False) as output:
+                        temporary = Path(output.name)
+                        output.write(old)
+                        os.fchmod(output.fileno(), entry["mode"])
+                    os.replace(temporary, path)
+                    message += "; restored snapshot"
+                except OSError as restore_error:
+                    message += f"; restore failed ({restore_error}); snapshot: {entry['snapshot']}"
+                finally:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+                problems.append(message)
+        return problems
 
 
 def review_command(options, mode, report, session_id, project_dir=None):
@@ -871,10 +944,14 @@ def run_audit(audits, options):
 
 
 def run_review(audits, project_dirs, options, clock):
+    result = None
     try:
-        return _run_review(audits, project_dirs, options, clock)
+        result = _run_review(audits, project_dirs, options, clock)
+        return result
     finally:
-        scheduled_housekeep(audits)
+        # _run_review returns 1 only for ledger violations; stop all later steps.
+        if result != 1:
+            scheduled_housekeep(audits)
 
 
 def run_step(name, options, arguments, success=(0,)):
@@ -1053,15 +1130,35 @@ def _run_review(audits, project_dirs, options, clock):
         failed = proposal.with_suffix(".failed.md")
         temporary = None
         succeeded = False
+        ledger_problems = []
+        guard = None
         try:
             env = dict(os.environ, KAIZEN_RUN_ID=started.astimezone().strftime("%Y%m%d-%H%M%S"))
             with (audits / "run.log").open("a", encoding="utf-8") as errors, tempfile.NamedTemporaryFile(
                     mode="w", encoding="utf-8", dir=project.folder,
                     prefix=proposal.name + ".", delete=False) as output:
                 temporary = Path(output.name)
-                result = subprocess.run(review_command(options, mode, report, session_id, project.canonical),
-                                        cwd=project.canonical, env=env, stdout=output, stderr=errors)
-            if result.returncode == 0:
+                # mkdtemp creates a private (0700) state directory for this run.
+                try:
+                    guard = LedgerGuard(Path(tempfile.mkdtemp(dir=project.folder, prefix=".ledger-")))
+                    guard.snapshot()
+                except Exception as error:
+                    ledger_problems.append(str(error))
+                if not ledger_problems:
+                    try:
+                        result = subprocess.run(review_command(options, mode, report, session_id, project.canonical),
+                                                cwd=project.canonical, env=env, stdout=output, stderr=errors)
+                    finally:
+                        try:
+                            ledger_problems.extend(guard.verify())
+                            if not ledger_problems:
+                                shutil.rmtree(guard.folder)
+                        except Exception as error:
+                            paths = ", ".join(str(entry["path"]) for entry in guard.entries)
+                            ledger_problems.append(f"{paths}: ledger guard failed ({error}); snapshots: {guard.folder}")
+            if ledger_problems:
+                outcome = "ledger-violation: " + "; ".join(ledger_problems)
+            elif result.returncode == 0:
                 os.replace(temporary, proposal)
                 succeeded = True
                 outcome = f"reviewed ({mode})"
@@ -1069,11 +1166,20 @@ def _run_review(audits, project_dirs, options, clock):
                 outcome = f"failed (exit {result.returncode})"
         except (OSError, ValueError) as error:
             outcome = f"failed ({error})"
+        if ledger_problems:
+            outcome = "ledger-violation: " + "; ".join(ledger_problems)
+            if temporary is not None:
+                with temporary.open("a", encoding="utf-8") as output:
+                    output.write("\n" + outcome + "\n")
         exited = clock()
         if succeeded:
+            state.pop("ledger_errors", None)
             state.update(reviewed_at=timestamp(exited), status="ok", report=str(report), proposal=str(proposal))
         else:
-            state.update(status="failed", last_error_at=timestamp(exited))
+            state.update(status="ledger-violation" if ledger_problems else "failed",
+                         last_error_at=timestamp(exited))
+            if ledger_problems:
+                state["ledger_errors"] = ledger_problems
             if temporary is not None:
                 try:
                     os.replace(temporary, failed)
@@ -1082,6 +1188,8 @@ def _run_review(audits, project_dirs, options, clock):
                     outcome += f"; output: {temporary} (could not save as {failed}: {error})"
         write_state(project, state)
         log(f"{project.canonical}: {outcome}")
+        if ledger_problems:
+            return 1
     return 0
 
 

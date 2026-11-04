@@ -191,6 +191,10 @@ print('proposal')
             for python in ('python3', options.python):
                 self.assertIn(f'Bash({python} {self.scripts}/notes-ledger add:*)', allowed)
             self.assertNotIn('notes-ledger set', allowed)
+            self.assertNotIn('Bash(git log:*)', allowed)
+            self.assertNotIn('Bash(git diff:*)', allowed)
+            self.assertNotIn('Bash(git log:*)', self.module.REVIEW_TOOLS)
+            self.assertNotIn('Bash(git diff:*)', self.module.REVIEW_TOOLS)
             deny = command[command.index('--disallowedTools') + 1].split(',')
             for path in (csv, timeline):
                 for tool in ('Edit', 'Write'):
@@ -202,6 +206,141 @@ print('proposal')
             write(self.config / 'agent-kaizen.json', json.dumps({'notesLedger': {'csv': str(csv) + '('}}))
             with self.assertRaisesRegex(ValueError, 'cannot build deny rules'):
                 self.module.review_command(options, 'auto', 'report', 'session')
+
+    def configure_ledgers(self, mode='auto'):
+        from test_notes_ledger import HEADER, TIMELINE
+        self.csv = write(self.root / 'ledger.csv', HEADER + '2026-10-01,test,Existing,manual,active,no\n')
+        self.timeline = write(self.root / 'timeline.md', TIMELINE)
+        self.original_ledgers = self.csv.read_bytes(), self.timeline.read_bytes()
+        write(self.config / 'agent-kaizen.json', json.dumps({
+            'scheduledAutonomy': mode, 'notesLedger': {
+                'csv': str(self.csv), 'timeline': str(self.timeline)}}))
+        self.env.update(CSV=str(self.csv), TIMELINE=str(self.timeline))
+
+    def guard_result(self, code):
+        result = subprocess.run([sys.executable, str(self.runner), 'review', '--force',
+                                 '--project-dir', str(self.project), '--claude', str(self.claude)],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+        return result
+
+    def assert_ledger_violation(self):
+        folder = self.audits / 'projects' / self.module.key(self.project)
+        state = json.loads((folder / 'state.json').read_text())
+        self.assertEqual(state['status'], 'ledger-violation')
+        self.assertNotIn('reviewed_at', state)
+        self.assertTrue(state['ledger_errors'])
+        self.assertIn('ledger-violation', next(folder.glob('cycle-*.failed.md')).read_text())
+        self.assertFalse(list(folder.glob('cycle-????-??-??.md')))
+        return state
+
+    def test_guard_restores_git_log_truncation_in_both_modes(self):
+        for mode in ('auto', 'propose'):
+            with self.subTest(mode=mode):
+                self.configure_ledgers(mode)
+                executable(self.claude, '#!' + sys.executable + '\n' + """
+import os, subprocess
+subprocess.run(['git', 'init', '-q'], check=True)
+env = dict(os.environ, GIT_AUTHOR_NAME='Test', GIT_COMMITTER_NAME='Test',
+           GIT_AUTHOR_EMAIL='test@example.invalid', GIT_COMMITTER_EMAIL='test@example.invalid')
+subprocess.run(['git', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-qm', 'fixture'],
+               env=env, check=True)
+subprocess.run(['git', 'log', '--output=' + os.environ['CSV']], check=True)
+print('model returned success')
+""")
+                result = self.guard_result(1)
+                self.assertIn('restored snapshot', result.stdout)
+                self.assertEqual(self.csv.read_bytes(), self.original_ledgers[0])
+                state = self.assert_ledger_violation()
+                self.assertIn(str(self.csv), '\n'.join(state['ledger_errors']))
+
+    def test_guard_accepts_real_notes_ledger_add(self):
+        shutil.copy2(SCRIPTS / 'notes-ledger', self.scripts / 'notes-ledger')
+        for mode in ('auto', 'propose'):
+            with self.subTest(mode=mode):
+                self.configure_ledgers(mode)
+                self.env['LEDGER_SCRIPT'] = str(self.scripts / 'notes-ledger')
+                executable(self.claude, '#!' + sys.executable + '\n' + """
+import hashlib, json, os, pathlib, stat, subprocess, sys
+report = pathlib.Path(sys.argv[2].split(' ', 2)[2])
+snapshot = next(report.parent.glob('.ledger-*'))
+assert stat.S_IMODE(snapshot.stat().st_mode) == 0o700
+manifest = json.loads((snapshot / 'manifest.json').read_text())
+assert {entry['kind'] for entry in manifest} == {'csv', 'timeline'}
+for entry in manifest:
+    original = pathlib.Path(entry['path']).read_bytes()
+    assert pathlib.Path(entry['snapshot']).read_bytes() == original
+    assert entry['size'] == len(original)
+    assert entry['sha256'] == hashlib.sha256(original).hexdigest()
+subprocess.run([sys.executable, os.environ['LEDGER_SCRIPT'], 'add', '--date', '2026-10-03',
+                '--category', 'test', '--change', 'New change', '--why', 'because',
+                '--measure', 'count', '--source', 'manual'], check=True)
+""")
+                self.guard_result(0)
+                self.assertTrue(self.csv.read_bytes().startswith(self.original_ledgers[0]))
+                self.assertIn(b'New change', self.csv.read_bytes())
+                self.assertIn(b'New change', self.timeline.read_bytes())
+                self.assertFalse(self.timeline.read_bytes().startswith(self.original_ledgers[1]))
+                folder = self.audits / 'projects' / self.module.key(self.project)
+                self.assertEqual(json.loads((folder / 'state.json').read_text())['status'], 'ok')
+                self.assertFalse(list(folder.glob('.ledger-*')))
+
+    def test_guard_restores_missing_changed_or_partial_ledgers(self):
+        mutations = ["csv.unlink()", "csv.write_bytes(b'x' * len(csv.read_bytes()))",
+                     "csv.write_bytes(csv.read_bytes() + b'partial')",
+                     "timeline.write_bytes(b''.join(reversed(timeline.read_bytes().splitlines(keepends=True))))",
+                     "timeline.unlink()"]
+        for mutation in mutations:
+            with self.subTest(mutation=mutation):
+                self.configure_ledgers()
+                executable(self.claude, '#!' + sys.executable + '\n' +
+                           'import os\nfrom pathlib import Path\n' +
+                           'csv, timeline = Path(os.environ["CSV"]), Path(os.environ["TIMELINE"])\n' +
+                           mutation + '\n')
+                self.guard_result(1)
+                self.assertEqual((self.csv.read_bytes(), self.timeline.read_bytes()), self.original_ledgers)
+                self.assert_ledger_violation()
+
+    def test_guard_fails_closed_on_unreadable_source_or_snapshot(self):
+        read_bytes = Path.read_bytes
+        for unreadable in ('source', 'snapshot'):
+            with self.subTest(unreadable=unreadable):
+                self.configure_ledgers()
+                self.record.unlink(missing_ok=True)
+
+                def guarded_read(path):
+                    if ((unreadable == 'source' and path == self.csv) or
+                            (unreadable == 'snapshot' and path.name == 'csv'
+                             and path.parent.name.startswith('.ledger-'))):
+                        raise PermissionError('unreadable fixture')
+                    return read_bytes(path)
+
+                with patch.dict(os.environ, self.env, clear=True), \
+                        patch.object(Path, 'read_bytes', guarded_read), \
+                        patch.object(self.module, 'scheduled_housekeep') as housekeep:
+                    code = self.module.main(['review', '--force', '--project-dir', str(self.project),
+                                             '--claude', str(self.claude)])
+                self.assertEqual(code, 1)
+                housekeep.assert_not_called()
+                self.assertEqual(self.record.exists(), unreadable == 'snapshot')
+                state = self.assert_ledger_violation()
+                self.assertIn(str(self.csv), '\n'.join(state['ledger_errors']))
+                self.assertIn('unreadable fixture', '\n'.join(state['ledger_errors']))
+
+    def test_guard_error_stops_later_projects_and_housekeeping(self):
+        self.configure_ledgers()
+        later = self.root / 'z-project'
+        (later / 'docs/kaizen').mkdir(parents=True)
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch.object(self.module.LedgerGuard, 'verify', side_effect=RuntimeError('guard error')), \
+                patch.object(self.module, 'scheduled_housekeep') as housekeep:
+            code = self.module.main(['review', '--force', '--project-dir', str(self.project),
+                                     '--project-dir', str(later), '--claude', str(self.claude)])
+        self.assertEqual(code, 1)
+        housekeep.assert_not_called()
+        self.assert_ledger_violation()
+        later_folder = self.audits / 'projects' / self.module.key(later)
+        self.assertFalse((later_folder / 'state.json').exists())
 
     def test_invalid_raw_ledger_fails_closed(self):
         for ledger in ({'csv': '/x', 'bogus': 1}, {'timeline': '/x'}, ['csv'], 'csv'):

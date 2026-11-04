@@ -135,8 +135,34 @@ class ScheduleTests(StubCase):
         self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
         self.assertIn('0 drift, 0 broken', check.stdout)
         self.assertNotIn('old-', contents)
+        record = self.home / '.claude/bin/.kaizen-plugin-root'
+        self.assertTrue(record.is_file())
         self.isolated_remove_without_claude()
         self.assertEqual(self.cron_file.read_text(), foreign)
+        self.assertFalse(record.exists())
+
+    def test_install_refuses_symlinked_plugin_root_record(self):
+        target = write(self.root / 'plugin-source', 'untouched\n')
+        record = self.home / '.claude/bin/.kaizen-plugin-root'
+        record.parent.mkdir()
+        for destination in (target, self.root / 'missing'):
+            with self.subTest(destination=destination):
+                record.symlink_to(destination)
+                result = self.run_script('install-schedule', '--scheduler', 'cron', '--apply', code=2)
+                self.assertIn('refusing symlinked plugin-root record', result.stderr)
+                self.assertEqual(target.read_text(), 'untouched\n')
+                self.assertFalse((self.root / 'missing').exists())
+                self.assertTrue(record.is_symlink())
+                record.unlink()
+
+    def test_remove_unlinks_symlinked_plugin_root_record(self):
+        target = write(self.root / 'plugin-source', 'untouched\n')
+        record = self.home / '.claude/bin/.kaizen-plugin-root'
+        record.parent.mkdir()
+        record.symlink_to(target)
+        self.run_script('install-schedule', '--scheduler', 'cron', '--remove')
+        self.assertFalse(record.is_symlink())
+        self.assertEqual(target.read_text(), 'untouched\n')
 
     def test_install_replaces_prefixed_preserves_generic_and_existing_link(self):
         target = self.home / '.claude/bin'
