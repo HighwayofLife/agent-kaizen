@@ -73,3 +73,7 @@ Tool schemas count as context too.
 - **Rules that agents never see don't help.** After the code map shipped, agents still used it rarely: 5 codemap calls against about 137 grep calls. The rule was in `CLAUDE.md`, which the lean subagents no longer loaded. It had to go into the role context files and the Codex preamble, and the dispatch script now inserts the code locations into the prompt automatically.
 - **Guardrails need an override.** The first big-read guard denied whole-file reads with no way around them. Agents that really needed the whole file (to review or rewrite it) got stuck, so the deny message now spells out the override.
 - **Measure before and after.** Every change gets a ledger row, and the next audit fills in the measured effect. Some changes we expected to help barely moved the numbers. Without the ledger we'd have kept them on faith.
+
+## Keeping tools in one place
+
+Copies in the config directory and the plugin drifted in both directions. Scheduled jobs ran old copies after the plugin moved on. A project-specific audit section needed a project-neutral log contract.
