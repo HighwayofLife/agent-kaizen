@@ -62,3 +62,14 @@ Per step: done/skipped; which branch; drift before/after; failures; owner decisi
 
 ## Suggested agent / model / effort
 sonnet-engineer, Sonnet, medium (Codex cannot write `~/.claude`). Risk: high (replaces live tooling and scheduled jobs; per-packet review).
+
+## Owner decisions (2026-11-04), which settle this brief's open choices
+- **Launchd: Branch A (switch now) is approved.**
+  - Unload the old jobs and move their plists to `~/.claude/audits/retired-launchagents/`, recording the reverse `launchctl` commands via `kaizen-backup action`.
+  - Install the plugin's scheduled jobs with `install-schedule`.
+  - `kaizen-token-audit` leaves `localScripts` as part of Branch A.
+  - The Branch B (deferred) wording is not used.
+- **New World keeps `auto` mode.** The owner explicitly authorises this project-config write.
+  - Before changing anything, add the New World project config file that holds the mode to this packet's `kaizen-backup begin` file list.
+  - Set or keep `auto` through the plugin's supported command, not by hand-editing the file, and record it in the migration notes.
+  - This relies on packet 09's ledger integrity guard (09-fix2), which must be merged first.
