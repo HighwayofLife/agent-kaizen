@@ -4,7 +4,7 @@
   kaizen-backup begin  --skill NAME --ledger TEXT [--run RUN_ID] FILE...
         Back up FILEs (existing ones are copied; missing ones are recorded as created)
         and print the change folder. Run BEFORE editing.
-  kaizen-backup finish CHANGE_DIR
+  kaizen-backup finish CHANGE_DIR [--verification passed|failed]
         Record each file's sha256 after the edit. Run AFTER editing and verifying.
   kaizen-backup action CHANGE_DIR --did CMD --undo CMD
         Record a non-file action (e.g. a package install) and its reverse command.
@@ -67,6 +67,7 @@ def change_dir(path):
 
 
 def begin(args):
+    created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     run_id = args.run or os.environ.get("KAIZEN_RUN_ID") or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     valid_id(run_id)
     valid_id(args.skill)
@@ -84,7 +85,8 @@ def begin(args):
             sys.exit(f"kaizen-backup: {path} is not a regular file")
         entries.append(entry)
     save(change, {"run_id": run_id, "change": number, "skill": args.skill, "ledger": args.ledger,
-                  "files": entries, "actions": [], "finished": False, "reverted": None})
+                  "created_at": created_at, "session_id": os.environ.get("KAIZEN_SESSION_ID"),
+                  "files": entries, "actions": [], "finished": False, "verification": None, "reverted": None})
     print(change)
 
 
@@ -94,6 +96,7 @@ def finish(args):
     for entry in manifest["files"]:
         entry["after_sha256"] = sha(entry["path"])
     manifest["finished"] = True
+    manifest["verification"] = args.verification
     save(args.change, manifest)
     print(f"finished {args.change}: {len(manifest['files'])} file(s) recorded")
 
@@ -125,13 +128,35 @@ def targets(which):
     return [(change, load(change))]
 
 
+def plugin_roots():
+    source = Path(__file__).resolve().parent.parent
+    roots = {source} if (source / ".claude-plugin/plugin.json").is_file() else set()
+    if os.environ.get("CLAUDE_PLUGIN_ROOT"):
+        roots.add(Path(os.environ["CLAUDE_PLUGIN_ROOT"]).expanduser().resolve())
+    try:
+        recorded = (Path(__file__).absolute().parent / ".kaizen-plugin-root").read_text().strip()
+        if recorded:
+            roots.add(Path(recorded).expanduser().resolve())
+    except FileNotFoundError:
+        pass
+    return roots
+
+
 def undo(args):
     plan = targets(args.target)
+    roots = plugin_roots()
     conflicts = []
     for change, data in plan:
         if data.get("reverted"):
             sys.exit(f"kaizen-backup: {change} was already reverted on {data['reverted']}")
         for entry in data["files"]:
+            if not entry["created"]:
+                path = Path(entry["path"])
+                for part in (path, *path.parents):
+                    if part.is_symlink() and any(part.resolve() == root or root in part.resolve().parents
+                                                 for root in roots):
+                        raise ValueError(f"refusing to restore through symlink into plugin root: {path}; "
+                                         "run kaizen-link --unlink --restore-replaced first")
             current, after = sha(entry["path"]), entry["after_sha256"]
             if data.get("finished") and current != after:
                 conflicts.append(f"{entry['path']} changed after {change.name}")
@@ -169,6 +194,7 @@ def main(argv=None):
     p.set_defaults(func=begin)
     p = sub.add_parser("finish")
     p.add_argument("change")
+    p.add_argument("--verification", choices=("passed", "failed"), default="passed")
     p.set_defaults(func=finish)
     p = sub.add_parser("action")
     p.add_argument("change")

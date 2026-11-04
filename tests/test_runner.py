@@ -560,9 +560,9 @@ class DiscoveryTests(DiscoveryCase):
         output = self.preview()
         self.assertEqual(output.count("project: "), 3)
         self.assertIn("  paths: " + ", ".join(map(str, sorted([main, worktree, unmentioned]))), output)
-        # A run from one linked worktree uses that enrolled directory as canonical.
+        # Selecting only a worktree still operates on the canonical enrolled repo.
         selected = self.discover([worktree])[0][0]
-        self.assertEqual(selected.canonical, worktree)
+        self.assertEqual(selected.canonical, main)
         self.assertEqual(selected.paths, project.paths)
         self.runner.write_index(self.audits, projects)
         index = self.runner.read_index(self.audits)
@@ -1224,7 +1224,8 @@ class ExecutionTests(DiscoveryCase):
         self.assertEqual(call['env']['CLAUDE_CONFIG_DIR'], str(self.cfg))
         self.assertEqual(call['env']['CODEX_HOME'], str(self.cx))
         fixed = self.runner.parse_time('2026-10-01T12:00:00Z')
-        self.assertEqual(call['env']['KAIZEN_RUN_ID'], fixed.astimezone().strftime('%Y%m%d-%H%M%S'))
+        session = self.values(call['argv'], '--session-id')[0]
+        self.assertEqual(call['env']['KAIZEN_RUN_ID'], fixed.astimezone().strftime('%Y%m%d-%H%M%S') + '-' + session)
         self.assertEqual(self.values(call['argv'], '--add-dir'), [str(self.cfg)])
         self.cx.mkdir()
         write(path / 'docs/kaizen/config.json', '{"schedule":"always"}')

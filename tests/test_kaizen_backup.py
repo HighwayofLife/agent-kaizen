@@ -1,5 +1,6 @@
 """kaizen-backup: begin/finish/undo round trips, created files, conflicts, runs."""
 import os
+import json
 import runpy
 import shutil
 import subprocess
@@ -52,6 +53,60 @@ class KaizenBackupTests(unittest.TestCase):
         self.assertEqual(target.read_text(), '{"a": 1, "user": true}\n')
         self.run_script('undo', '--force')
         self.assertEqual(target.read_text(), '{}\n')
+
+    def test_undo_refuses_plugin_symlinks_even_with_force_before_any_restore(self):
+        plugin = self.tmp / 'plugin'
+        plugin.mkdir()
+        self.env['CLAUDE_PLUGIN_ROOT'] = str(plugin)
+        for parent_link in (False, True):
+            with self.subTest(parent_link=parent_link):
+                folder = self.tmp / ('linked-parent' if parent_link else 'linked-file')
+                folder.mkdir()
+                target, other = folder / 'tool', self.tmp / 'other'
+                target.write_text('local original')
+                other.write_text('other original')
+                change = Path(self.change(other, target))
+                other.write_text('other changed')
+                source_dir = plugin / folder.name
+                source_dir.mkdir()
+                source = source_dir / 'tool'
+                source.write_text('plugin source')
+                target.unlink()
+                if parent_link:
+                    folder.rmdir()
+                    folder.symlink_to(source_dir, target_is_directory=True)
+                else:
+                    target.symlink_to(source)
+                self.run_script('finish', change)
+                for flags in ((), ('--force',)):
+                    result = self.run_script('undo', change, *flags, ok=False)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn('symlink into plugin root', result.stderr)
+                    self.assertIn('--unlink --restore-replaced', result.stderr)
+                    self.assertEqual(source.read_text(), 'plugin source')
+                    self.assertEqual(other.read_text(), 'other changed')
+                    self.assertIsNone(json.loads((change / 'manifest.json').read_text())['reverted'])
+
+    def test_copied_backup_uses_installed_plugin_root_for_symlink_refusal(self):
+        installed = self.tmp / 'bin'
+        installed.mkdir()
+        copied = installed / 'kaizen-backup'
+        shutil.copy2(SCRIPT, copied)
+        plugin = self.tmp / 'plugin'
+        plugin.mkdir()
+        (installed / '.kaizen-plugin-root').write_text(str(plugin))
+        self.env.pop('CLAUDE_PLUGIN_ROOT', None)
+        target, source = self.tmp / 'tool', plugin / 'tool'
+        target.write_text('local original')
+        change = self.change(target)
+        source.write_text('plugin source')
+        target.unlink()
+        target.symlink_to(source)
+        result = subprocess.run([sys.executable, str(copied), 'undo', change, '--force'],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('symlink into plugin root', result.stderr)
+        self.assertEqual(source.read_text(), 'plugin source')
 
     def test_undo_run_reverts_every_change_in_newest_run(self):
         one, two, other = (self.tmp / n for n in ('one', 'two', 'other'))

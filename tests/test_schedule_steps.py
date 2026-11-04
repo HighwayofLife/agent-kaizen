@@ -8,6 +8,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import sys
+import unittest
 from unittest.mock import patch
 
 from test_scripts import SCRIPTS, StubCase, executable, write
@@ -125,6 +126,49 @@ print('proposal')
         index = json.loads((self.audits / 'projects/index.json').read_text())['projects']
         self.assertEqual(index[str(self.project)], self.module.key(self.project))
         self.assertEqual(len(list(self.audits.glob('projects/*/project-report-*.md'))), 1)
+
+    @unittest.skipUnless(shutil.which('git'), 'git required')
+    def test_worktree_reports_and_checks_use_only_canonical_project(self):
+        self.env.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+                        GIT_AUTHOR_NAME='Test', GIT_AUTHOR_EMAIL='test@example.invalid',
+                        GIT_COMMITTER_NAME='Test', GIT_COMMITTER_EMAIL='test@example.invalid')
+        write(self.project / 'docs/kaizen/config.json', '{}')
+        worktree = self.root / 'worktree'
+        for args in (('init',), ('add', 'docs'), ('commit', '-m', 'enroll'),
+                     ('worktree', 'add', '-b', 'linked', str(worktree))):
+            subprocess.run(['git', '-C', str(self.project), *args], env=self.env,
+                           capture_output=True, check=True)
+        # Stale instructions exist only on the worktree branch, as in the audit finding.
+        write(worktree / 'docs/agents/history.md', 'project-repos.txt\n')
+        shutil.copy2(SCRIPTS / 'rules-lint', self.scripts / 'rules-lint')
+        shutil.copy2(SCRIPTS / 'rules-lint.patterns', self.scripts / 'rules-lint.patterns')
+        self.env['REPORT_RECORD'] = str(self.root / 'report-calls')
+        self.stub('kaizen-project-report', """
+import os, pathlib, sys
+project = sys.argv[sys.argv.index('--project') + 1]
+with open(os.environ['REPORT_RECORD'], 'a') as calls: calls.write(project + '\\n')
+pathlib.Path(sys.argv[sys.argv.index('--out') + 1]).write_text(project)
+""")
+        self.stub('notes-ledger', """
+import sys
+print(' '.join(sys.argv[1:]))
+""")
+        # A stale index may contain just the worktree, or both paths with one shared key.
+        for paths in ((worktree,), (self.project, worktree)):
+            with self.subTest(paths=paths):
+                write(self.audits / 'projects/index.json', json.dumps({
+                    'v': 1, 'projects': {str(path): self.module.key(self.project) for path in paths}}))
+                Path(self.env['REPORT_RECORD']).unlink(missing_ok=True)
+                self.run_scheduled('audit')
+                self.assertEqual(Path(self.env['REPORT_RECORD']).read_text().splitlines(),
+                                 [str(self.project)])
+                checks = self.check_text()
+                self.assertIn('rules-lint: 0 stale-rule hit(s)', checks)
+                self.assertIn('due --project ' + str(self.project), checks)
+                self.assertNotIn(str(worktree), checks)
+                reports = list(self.audits.glob('projects/*/project-report-*.md'))
+                self.assertTrue(reports)
+                self.assertTrue(all(path.read_text() == str(self.project) for path in reports))
 
     def test_skip_checks_and_missing_siblings(self):
         self.index()
@@ -354,6 +398,30 @@ for entry in json.loads((snapshot / 'manifest.json').read_text()):
                 self.assertIn('regular file, not a symlink', '\n'.join(state['ledger_errors']))
                 path.unlink()
 
+    def test_guard_restores_identical_replacement_symlinks_after_launch(self):
+        for kind in ('csv', 'timeline'):
+            with self.subTest(kind=kind):
+                self.configure_ledgers()
+                self.env['REPLACE_LEDGER'] = kind.upper()
+                executable(self.claude, '#!' + sys.executable + '\n' + """
+import os, pathlib
+path = pathlib.Path(os.environ[os.environ['REPLACE_LEDGER']])
+target = path.with_suffix('.target')
+target.write_bytes(path.read_bytes())
+path.unlink()
+path.symlink_to(target)
+""")
+                path = getattr(self, kind)
+                try:
+                    self.guard_result(1)
+                    self.assertFalse(path.is_symlink())
+                    self.assertEqual(path.read_bytes(), self.original_ledgers[kind == 'timeline'])
+                    self.assertEqual(path.with_suffix('.target').read_bytes(), path.read_bytes())
+                    self.assert_ledger_violation()
+                finally:
+                    if path.is_symlink():
+                        path.unlink()
+
     def test_guard_accepts_timeline_last_line_without_newline(self):
         self.configure_ledgers()
         self.timeline.write_bytes(b'first\r\nlast')
@@ -471,6 +539,134 @@ for entry in json.loads((snapshot / 'manifest.json').read_text()):
                     for prefix in ('', 'python3 ', options.python + ' ')
                     for subcommand in ('begin', 'finish', 'list')}
         self.assertEqual({rule for rule in rules if 'kaizen-backup' in rule}, expected)
+
+    def backup_cycle(self, finish='no', exit_code='0'):
+        shutil.copy2(SCRIPTS / 'kaizen-backup', self.scripts / 'kaizen-backup')
+        self.env.update(KAIZEN_BACKUP_DIR=str(self.root / 'backups'),
+                        BACKUP_SCRIPT=str(self.scripts / 'kaizen-backup'),
+                        FINISH_BACKUP=finish, CYCLE_EXIT=exit_code,
+                        CHANGE_RECORD=str(self.root / 'changes.json'),
+                        TARGET=str(write(self.project / 'instructions.md', 'original')))
+        write(self.config / 'agent-kaizen.json', '{"scheduledAutonomy":"auto"}')
+        executable(self.claude, '#!' + sys.executable + '\n' + """
+import json, os, pathlib, subprocess, sys
+def backup(*args):
+    return subprocess.check_output([sys.executable, os.environ['BACKUP_SCRIPT'], *map(str, args)], text=True).strip()
+target = pathlib.Path(os.environ['TARGET'])
+changes = []
+for number in range(2):
+    change = pathlib.Path(backup('begin', '--skill', 'trim', '--ledger', 'test', target))
+    changes.append(str(change))
+    target.write_text('applied ' + str(number))
+    if os.environ['FINISH_BACKUP'] != 'no':
+        backup('finish', change, '--verification', os.environ['FINISH_BACKUP'])
+pathlib.Path(os.environ['CHANGE_RECORD']).write_text(json.dumps(changes))
+print('cycle output')
+sys.exit(int(os.environ['CYCLE_EXIT']))
+""")
+
+    def backup_state(self):
+        folder = self.audits / 'projects' / self.module.key(self.project)
+        return folder, json.loads((folder / 'state.json').read_text())
+
+    def test_auto_rolls_back_unfinished_and_failed_verification_newest_first(self):
+        for finish in ('no', 'failed'):
+            for exit_code in ('0', '1'):
+                with self.subTest(finish=finish, exit_code=exit_code):
+                    self.backup_cycle(finish, exit_code)
+                    self.guard_result(0)
+                    self.assertEqual(Path(self.env['TARGET']).read_text(), 'original')
+                    folder, state = self.backup_state()
+                    self.assertEqual(state['status'], 'rolled-back')
+                    self.assertNotIn('reviewed_at', state)
+                    report = next(folder.glob('cycle-*.failed.md')).read_text()
+                    changes = json.loads(Path(self.env['CHANGE_RECORD']).read_text())
+                    self.assertLess(report.index('rolled-back: ' + changes[1]),
+                                    report.index('rolled-back: ' + changes[0]))
+                    for change in changes:
+                        self.assertTrue(json.loads((Path(change) / 'manifest.json').read_text())['reverted'])
+
+    def test_auto_keeps_finished_verified_backups(self):
+        self.backup_cycle('passed')
+        self.guard_result(0)
+        self.assertEqual(Path(self.env['TARGET']).read_text(), 'applied 1')
+        folder, state = self.backup_state()
+        self.assertEqual(state['status'], 'ok')
+        self.assertNotIn('rolled-back', next(folder.glob('cycle-????-??-??.md')).read_text())
+        for change in json.loads(Path(self.env['CHANGE_RECORD']).read_text()):
+            self.assertIsNone(json.loads((Path(change) / 'manifest.json').read_text())['reverted'])
+
+    def test_auto_matches_session_when_begin_overrides_run_id(self):
+        self.backup_cycle()
+        executable(self.claude, self.claude.read_text().replace(
+            "'--ledger', 'test', target", "'--ledger', 'test', '--run', 'explicit-run', target"))
+        self.guard_result(0)
+        self.assertEqual(Path(self.env['TARGET']).read_text(), 'original')
+        self.assertEqual(self.backup_state()[1]['status'], 'rolled-back')
+
+    def test_auto_never_rolls_back_other_runs_or_old_backups(self):
+        self.backup_cycle()
+        original = self.claude.read_text()
+        # Create unrelated backups after this run starts, and an old backup with matching ids.
+        injection = """
+other = target.with_name('other.md')
+other.write_text('other original')
+foreign = pathlib.Path(backup('begin', '--skill', 'trim', '--ledger', 'other', '--run', 'another-run', other))
+manifest = foreign / 'manifest.json'
+data = json.loads(manifest.read_text())
+data['session_id'] = 'another-session'
+manifest.write_text(json.dumps(data))
+other.write_text('other applied')
+old = target.with_name('old.md')
+old.write_text('old original')
+previous = pathlib.Path(backup('begin', '--skill', 'trim', '--ledger', 'old', old))
+manifest = previous / 'manifest.json'
+data = json.loads(manifest.read_text())
+data['created_at'] = '2000-01-01T00:00:00+00:00'
+manifest.write_text(json.dumps(data))
+old.write_text('old applied')
+"""
+        executable(self.claude, original.replace('changes = []', injection + '\nchanges = []'))
+        self.guard_result(0)
+        self.assertEqual((self.project / 'other.md').read_text(), 'other applied')
+        self.assertEqual((self.project / 'old.md').read_text(), 'old applied')
+        self.assertEqual(Path(self.env['TARGET']).read_text(), 'original')
+        untouched = [json.loads(path.read_text()) for path in (self.root / 'backups').glob('*/manifest.json')
+                     if json.loads(path.read_text())['ledger'] in ('other', 'old')]
+        self.assertEqual(len(untouched), 2)
+        self.assertTrue(all(data['reverted'] is None for data in untouched))
+
+    def test_auto_rollback_failure_fails_run_and_keeps_backup(self):
+        self.backup_cycle()
+        original = self.claude.read_text()
+        executable(self.claude, original.replace("print('cycle output')", """
+# Prevent undo of one entry without deleting its backup directory or manifest.
+data = json.loads((pathlib.Path(changes[-1]) / 'manifest.json').read_text())
+(pathlib.Path(changes[-1]) / data['files'][0]['backup']).unlink()
+print('cycle output')
+"""))
+        self.guard_result(1)
+        folder, state = self.backup_state()
+        self.assertEqual(state['status'], 'failed')
+        self.assertNotIn('reviewed_at', state)
+        self.assertIn('rollback failed:', next(folder.glob('cycle-*.failed.md')).read_text())
+        change = Path(json.loads(Path(self.env['CHANGE_RECORD']).read_text())[-1])
+        self.assertTrue(change.is_dir())
+        self.assertIsNone(json.loads((change / 'manifest.json').read_text())['reverted'])
+
+    def test_rollback_scan_error_does_not_skip_ledger_verification(self):
+        self.configure_ledgers()
+        executable(self.claude, '#!' + sys.executable + '\n' + """
+import os, pathlib
+pathlib.Path(os.environ['CSV']).write_bytes(b'')
+""")
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch.object(self.module, 'rollback_auto_changes', side_effect=OSError('scan error')):
+            code = self.module.main(['review', '--force', '--project-dir', str(self.project),
+                                     '--claude', str(self.claude)])
+        self.assertEqual(code, 1)
+        self.assertEqual(self.csv.read_bytes(), self.original_ledgers[0])
+        self.assert_ledger_violation()
 
     def test_ledger_symlink_names_and_targets_are_denied(self):
         csv = write(self.root / 'ledger-target.csv', '')

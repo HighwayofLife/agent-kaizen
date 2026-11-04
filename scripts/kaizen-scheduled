@@ -320,15 +320,20 @@ def discover(claude_root, codex_root, index, project_dirs=None):
 
     projects = []
     for (kind, common), directories in groups.items():
-        canonical = (common.parent if kind == "git" and common.name == ".git"
-                     and common.parent in directories else directories[0])
         paths = set(directories)
-        worktrees = _git(canonical, "worktree", "list", "--porcelain")
+        listed = []
+        worktrees = _git(directories[0], "worktree", "list", "--porcelain")
         for line in (worktrees or "").splitlines():
             if line.startswith("worktree "):
                 path = Path(line[len("worktree "):]).resolve()
                 if path.is_dir():
+                    listed.append(path)
                     paths.add(path)
+        canonical = (common.parent if kind == "git" and common.name == ".git"
+                     else listed[0] if kind == "git" and listed else directories[0])
+        if not (canonical / "docs/kaizen").is_dir():
+            not_enrolled.add(str(canonical))
+            continue
         projects.append(Project(canonical, paths))
     return sorted(projects, key=lambda project: project.canonical), sorted(not_enrolled)
 
@@ -696,8 +701,8 @@ class LedgerGuard:
             path = entry["path"]
             old = entry["data"]
             try:
-                if not path.is_file():
-                    raise ValueError("ledger is missing or is not a regular file")
+                if path.is_symlink() or not path.is_file():
+                    raise ValueError("ledger is missing or is not a regular file (symlinks are forbidden)")
                 new = path.read_bytes()
                 if entry["kind"] == "timeline":
                     lines = iter(new.splitlines(keepends=True))
@@ -1004,14 +1009,14 @@ def run_drift(options):
                     ["--check", "--plugin-root", str(Path(root).expanduser())], (0, 1))
 
 
-def run_checks(audits, options):
+def run_checks(audits, options, projects=None):
     if os.environ.get("KAIZEN_SKIP_CHECKS") == "1":
         return
     try:
-        projects = [Path(path) for path in sorted(read_index(audits))
-                    if Path(path).is_dir() and (Path(path) / "docs/kaizen").is_dir()]
-        repo_args = [arg for path in projects for arg in ("--repo", str(path))]
-        project_args = [arg for path in projects for arg in ("--project", str(path))]
+        if projects is None:
+            projects, _ = discover(claude_home() / "projects", codex_home() / "sessions", read_index(audits))
+        repo_args = [arg for project in projects for arg in ("--repo", str(project.canonical))]
+        project_args = [arg for project in projects for arg in ("--project", str(project.canonical))]
         sections = []
         drift = run_drift(options)
         if drift is not None:
@@ -1048,11 +1053,9 @@ def audit_steps(audits, options):
     try:
         projects, _ = discover(claude_home() / "projects", codex_home() / "sessions", read_index(audits))
         write_index(audits, projects)
-        run_checks(audits, options)
-        for path, project_key in sorted(read_index(audits).items()):
-            project = Path(path)
-            if project.is_dir() and (project / "docs/kaizen").is_dir():
-                run_project_report(audits, project, project_key, options)
+        run_checks(audits, options, projects)
+        for project in projects:
+            run_project_report(audits, project.canonical, project.key, options)
     except (OSError, ValueError) as error:
         log(f"step projects: failed ({error})")
 
@@ -1083,6 +1086,36 @@ def report_path(stdout):
     return Path(lines[0].strip()).expanduser().resolve()
 
 
+def rollback_auto_changes(options, run_id, session_id, started):
+    """Undo only this cycle's unfinished or failed changes, newest first."""
+    root = Path(os.environ.get("KAIZEN_BACKUP_DIR", Path.home() / ".claude" / "kaizen-backups"))
+    pending, messages, problems = [], [], []
+    for manifest in root.glob("*/manifest.json"):
+        try:
+            if manifest.is_symlink() or manifest.parent.is_symlink():
+                continue
+            data = json.loads(manifest.read_text(encoding="utf-8"))
+            created = parse_time(data.get("created_at"))
+            if (data.get("run_id") != run_id and data.get("session_id") != session_id
+                    or created is None or created <= started or data.get("reverted")):
+                continue
+            if not data.get("finished") or data.get("verification") == "failed":
+                pending.append((created, manifest.parent))
+        except (OSError, ValueError, AttributeError) as error:
+            problems.append(f"rollback failed: {manifest.parent}: {error}")
+    for _, change in sorted(pending, reverse=True):
+        try:
+            result = subprocess.run([options.python, str(HERE / "kaizen-backup"), "undo", str(change), "--force"],
+                                    capture_output=True, text=True)
+            if result.returncode:
+                detail = (result.stderr or result.stdout).strip()
+                raise ValueError(f"exit {result.returncode}: {detail}")
+            messages.append(f"rolled-back: {change}")
+        except (OSError, ValueError) as error:
+            problems.append(f"rollback failed: {change}: {error}")
+    return messages, problems
+
+
 def _run_review(audits, project_dirs, options, clock, safety):
     """Review projects serially; failed/killed runs leave reviewed_at unchanged.
 
@@ -1093,7 +1126,8 @@ def _run_review(audits, project_dirs, options, clock, safety):
     projects, _ = discover(claude_home() / "projects", codex_home() / "sessions",
                            read_index(audits), project_dirs)
     write_index(audits, projects)
-    run_checks(audits, options)
+    run_checks(audits, options, projects)
+    rollback_failed = False
     cache = {}
     for project in sorted(projects, key=lambda project: project.canonical):
         project.folder = audits / "projects" / project.key
@@ -1132,9 +1166,11 @@ def _run_review(audits, project_dirs, options, clock, safety):
         temporary = None
         succeeded = False
         ledger_problems = []
+        rollbacks, rollback_problems = [], []
         guard = None
         try:
-            env = dict(os.environ, KAIZEN_RUN_ID=started.astimezone().strftime("%Y%m%d-%H%M%S"))
+            run_id = started.astimezone().strftime("%Y%m%d-%H%M%S") + "-" + session_id
+            env = dict(os.environ, KAIZEN_RUN_ID=run_id, KAIZEN_SESSION_ID=session_id)
             with (audits / "run.log").open("a", encoding="utf-8") as errors, tempfile.NamedTemporaryFile(
                     mode="w", encoding="utf-8", dir=project.folder,
                     prefix=proposal.name + ".", delete=False) as output:
@@ -1150,6 +1186,11 @@ def _run_review(audits, project_dirs, options, clock, safety):
                         result = subprocess.run(review_command(options, mode, report, session_id, project.canonical),
                                                 cwd=project.canonical, env=env, stdout=output, stderr=errors)
                     finally:
+                        if mode == "auto":
+                            try:
+                                rollbacks, rollback_problems = rollback_auto_changes(options, run_id, session_id, started)
+                            except Exception as error:
+                                rollback_problems.append(f"rollback failed: {error}")
                         try:
                             ledger_problems.extend(guard.verify())
                             if not ledger_problems:
@@ -1157,8 +1198,14 @@ def _run_review(audits, project_dirs, options, clock, safety):
                         except Exception as error:
                             paths = ", ".join(str(entry["path"]) for entry in guard.entries)
                             ledger_problems.append(f"{paths}: ledger guard failed ({error}); snapshots: {guard.folder}")
+                        for message in [*rollbacks, *rollback_problems]:
+                            output.write("\n" + message + "\n")
             if ledger_problems:
                 outcome = "ledger-violation: " + "; ".join(ledger_problems)
+            elif rollback_problems:
+                outcome = "; ".join(rollback_problems)
+            elif rollbacks:
+                outcome = "rolled-back"
             elif result.returncode == 0:
                 os.replace(temporary, proposal)
                 succeeded = True
@@ -1167,6 +1214,9 @@ def _run_review(audits, project_dirs, options, clock, safety):
                 outcome = f"failed (exit {result.returncode})"
         except (OSError, ValueError) as error:
             outcome = f"failed ({error})"
+        rollback_failed = rollback_failed or bool(rollback_problems)
+        if rollbacks and not rollback_problems:
+            outcome = "rolled-back"
         if ledger_problems:
             safety["ledger_violation"] = True
             outcome = "ledger-violation: " + "; ".join(ledger_problems)
@@ -1178,7 +1228,8 @@ def _run_review(audits, project_dirs, options, clock, safety):
             state.pop("ledger_errors", None)
             state.update(reviewed_at=timestamp(exited), status="ok", report=str(report), proposal=str(proposal))
         else:
-            state.update(status="ledger-violation" if ledger_problems else "failed",
+            state.update(status="ledger-violation" if ledger_problems else
+                         "failed" if rollback_problems or not rollbacks else "rolled-back",
                          last_error_at=timestamp(exited))
             if ledger_problems:
                 state["ledger_errors"] = ledger_problems
@@ -1192,7 +1243,7 @@ def _run_review(audits, project_dirs, options, clock, safety):
         log(f"{project.canonical}: {outcome}")
         if ledger_problems:
             return 1
-    return 0
+    return 1 if rollback_failed else 0
 
 
 def write_config(path, updates):
