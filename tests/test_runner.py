@@ -977,21 +977,20 @@ class ExecutionTests(DiscoveryCase):
 
     def expected_config_deny(self, project=None):
         rules = []
-        for home in (self.cfg.resolve(), self.cx.resolve()):
-            root = '//' + home.as_posix().lstrip('/')
-            rules.extend([
-                f'Edit({root}/settings*.json)', f'Edit({root}/hooks/**)',
-                f'Edit({root}/plugins/**)', f'Edit({root}/skills/**)',
-                f'Edit({root}/commands/**)', f'Edit({root}/bin/**)',
-                f'Edit({root}/**/*.json)', f'Edit({root}/**/*.toml)',
-                f'Edit({root}/**/*.sh)', f'Edit({root}/**/*.py)', f'Edit({root}/**/*.js)',
-                f'Edit({root}/.credentials*)', f'Edit({root}/auth.json)',
-            ])
-        config = (self.cfg / '.claude.json').resolve().as_posix().lstrip('/')
-        rules.append(f'Edit(//{config})')
+        for home in (self.cfg, self.cx):
+            for path in dict.fromkeys((home, home.resolve())):
+                root = '//' + path.as_posix().lstrip('/')
+                for pattern in ('settings*.json', 'hooks/**', 'plugins/**', 'skills/**',
+                                'commands/**', 'bin/**', '**/*.json', '**/*.toml', '**/*.sh',
+                                '**/*.py', '**/*.js', '.credentials*', 'auth.json', '**/.git/**'):
+                    rules.extend(f'{tool}({root}/{pattern})' for tool in ('Edit', 'Write'))
+        for path in dict.fromkeys((self.cfg / '.claude.json', (self.cfg / '.claude.json').resolve())):
+            config = path.as_posix().lstrip('/')
+            rules.extend(f'{tool}(//{config})' for tool in ('Edit', 'Write'))
         if project is not None:
-            root = project.resolve().as_posix().lstrip('/')
-            rules.append(f'Edit(//{root}/.claude/settings*.json)')
+            for path in dict.fromkeys((project, project.resolve())):
+                root = path.as_posix().lstrip('/')
+                rules.extend(f'{tool}(//{root}/.claude/settings*.json)' for tool in ('Edit', 'Write'))
         return rules
 
     def test_two_due_projects_have_independent_commands_outputs_and_state(self):
@@ -1096,8 +1095,8 @@ class ExecutionTests(DiscoveryCase):
                 argv = self.calls()[-1]['argv']
                 self.assertIn(f'/agent-kaizen:cycle {mode} ', self.values(argv, '-p')[0])
                 auto = mode == 'auto'
-                self.assertEqual(self.values(argv, '--permission-mode'), ['acceptEdits' if auto else 'dontAsk'])
-                self.assertEqual('--disallowedTools' in argv, auto)
+                self.assertEqual(self.values(argv, '--permission-mode'), ['default' if auto else 'dontAsk'])
+                self.assertIn('--disallowedTools', argv)
                 self.assertEqual(self.values(argv, '--tools'), [self.runner.AUTO_AVAILABLE if auto else self.runner.REVIEW_AVAILABLE])
                 self.assertEqual(self.values(argv, '--model'), ['sonnet'])
                 self.assertEqual(self.values(argv, '--max-turns'), ['40'])
@@ -1106,12 +1105,11 @@ class ExecutionTests(DiscoveryCase):
                     self.assertIn(tool, allowed)
                 if auto:
                     rules = self.expected_config_deny(path)
-                    self.assertEqual(len(rules), 28)
                     self.assertEqual(self.values(argv, '--disallowedTools'),
-                                     [','.join([self.runner.HARD_STOP_DENY, 'Edit(**/.git/**)',
+                                     [','.join([*self.runner.credential_deny(path),
+                                                self.runner.HARD_STOP_DENY, 'Edit(**/.git/**)',
                                                 'Write(**/.git/**)', *rules, *self.runner.backup_deny()])])
                     for rule in rules:
-                        self.assertFalse(rule.startswith('Write('))
                         for text in ('.md', 'CLAUDE', 'agents', 'rules'):
                             self.assertNotIn(text, rule)
                     root = '//' + self.cfg.as_posix().lstrip('/')
@@ -1139,16 +1137,19 @@ class ExecutionTests(DiscoveryCase):
             rules = self.runner.config_home_deny()
         root = '//' + self.home.resolve().as_posix().lstrip('/')
         self.assertEqual(rules[0], f'Edit({root}/.claude/settings*.json)')
-        self.assertEqual(rules[13], f'Edit({root}/.codex/settings*.json)')
-        self.assertEqual(rules[-1], f'Edit({root}/.claude.json)')
+        for tool in ('Edit', 'Write'):
+            self.assertIn(f'{tool}({root}/.codex/settings*.json)', rules)
+            self.assertIn(f'{tool}({root}/.claude.json)', rules)
         target = self.root / 'actual config'
         target.mkdir()
         self.cfg.symlink_to(target, target_is_directory=True)
         with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(self.cfg)}):
             rules = self.runner.config_home_deny()
-        root = '//' + target.as_posix().lstrip('/')
-        self.assertEqual(rules[0], f'Edit({root}/settings*.json)')
-        self.assertEqual(rules[-1], f'Edit({root}/.claude.json)')
+        for path in (self.cfg, target):
+            root = '//' + path.as_posix().lstrip('/')
+            for tool in ('Edit', 'Write'):
+                self.assertIn(f'{tool}({root}/settings*.json)', rules)
+                self.assertIn(f'{tool}({root}/.claude.json)', rules)
 
     def test_permission_comma_paths_fail_closed_before_claude(self):
         path = self.due('comma home')
@@ -1163,8 +1164,15 @@ class ExecutionTests(DiscoveryCase):
                     patch.object(self.runner, 'claude_json', return_value=user_config):
                 with self.assertRaisesRegex(ValueError, "cannot build deny rules: path contains ',':"):
                     self.runner.review_command(options, 'auto', 'report', 'session', project)
-                self.assertNotIn('--disallowedTools', self.runner.review_command(
-                    options, 'propose-only', 'report', 'session', project))
+                if name == 'claude_json':
+                    # The user config file has only auto-mode edit denies; credential
+                    # paths still require disallowedTools in propose mode.
+                    command = self.runner.review_command(options, 'propose-only', 'report', 'session', project)
+                    self.assertEqual(self.values(command, '--disallowedTools'),
+                                     [','.join(self.runner.credential_deny(project))])
+                else:
+                    with self.assertRaisesRegex(ValueError, "cannot build deny rules: path contains ',':"):
+                        self.runner.review_command(options, 'propose-only', 'report', 'session', project)
         self.env['CODEX_HOME'] = str(self.root / 'bad,codex')
         result = self.review('--project-dir', path)
         self.assertIn(f"{path}: failed (cannot build deny rules: path contains ',':", result.stdout)
@@ -1199,7 +1207,8 @@ class ExecutionTests(DiscoveryCase):
         output = self.review('--dry-run').stdout
         command = shlex.split(next(line.split('review command: ', 1)[1]
                                    for line in output.splitlines() if 'review command: ' in line))
-        expected = ','.join([self.runner.HARD_STOP_DENY, 'Edit(**/.git/**)', 'Write(**/.git/**)',
+        expected = ','.join([*self.runner.credential_deny(path),
+                             self.runner.HARD_STOP_DENY, 'Edit(**/.git/**)', 'Write(**/.git/**)',
                              *self.expected_config_deny(path),
                              *self.runner.backup_deny()])
         self.assertEqual(self.values(command, '--disallowedTools'), [expected])

@@ -21,7 +21,6 @@ PROPOSE_BASH = (
     'Bash(tail:*)',       # Reads final bytes/lines (or follows); writes only stdout.
     'Bash(shasum:*)',     # Reads/hashes/checks files; no exec or output-file flag.
     'Bash(sha256sum:*)',  # Reads/hashes/checks files; no exec or output-file flag.
-    'Bash(jq:*)',         # JSON filters have no system/exec/file-write primitive.
 )
 AUTO_BASH = PROPOSE_BASH + (
     'Bash({backup} begin:*)',           # Copies inputs only into the protected backup root.
@@ -35,6 +34,15 @@ AUTO_BASH = PROPOSE_BASH + (
     'Bash({python} {backup} list:*)',   # Same metadata-only operation.
     'Bash(python3 {ledger} add:*)',     # Appends to configured ledgers; no exec/path override.
     'Bash({python} {ledger} add:*)',    # Same scoped writer with the runner's interpreter.
+)
+
+CREDENTIAL_PATHS = {
+    'config': ('.credentials.json', 'auth.json', '*token*.json', '*secret*.json'),
+    'home': ('.ssh/**', '.aws/**', '.gnupg/**', '.netrc', '.config/gh/**', '.docker/config.json'),
+    'project': ('**/.env', '**/.env.*'),
+}
+FILE_COMMAND_DENIES = (
+    'cp', 'touch', 'mkdir', 'sed', 'dd', 'install', 'ln', 'truncate', 'perl', 'python3 -c', 'python',
 )
 
 
@@ -220,7 +228,8 @@ print(' '.join(sys.argv[1:]))
         self.assertEqual(command[1], f'/agent-kaizen:cycle propose-only {report} notes-ledger-path={self.scripts}/notes-ledger')
         self.assertEqual(command[command.index('--allowedTools') + 1], self.module.REVIEW_TOOLS)
         self.assertEqual(command[command.index('--tools') + 1], self.module.REVIEW_AVAILABLE)
-        self.assertNotIn('--disallowedTools', command)
+        self.assertIn(f'Read(//{self.project.as_posix().lstrip("/")}/**/.env)',
+                      command[command.index('--disallowedTools') + 1].split(','))
         self.assertEqual(command[command.index('--permission-mode') + 1], 'dontAsk')
 
     def test_force_preserves_off_and_disabled_and_requires_selection(self):
@@ -610,6 +619,96 @@ path.symlink_to(target)
                         deny = command[command.index('--disallowedTools') + 1].split(',')
                         for tool in ('Edit', 'Write'):
                             self.assertIn(f'{tool}(**/.git/**)', deny)
+
+    def test_auto_uses_default_permissions_and_scoped_edits(self):
+        with patch.dict(os.environ, self.env, clear=True):
+            options = self.module.command_options(self.module.argparse.Namespace(dry_run=True))
+            command = self.module.review_command(options, 'auto', 'report', 'session', self.project)
+        self.assertEqual(command[command.index('--permission-mode') + 1], 'default')
+        allowed = command[command.index('--allowedTools') + 1].split(',')
+        self.assertNotIn('Edit', allowed)
+        self.assertNotIn('Write', allowed)
+        expected = {f'{tool}(//{path.as_posix().lstrip("/")}/**)'
+                    for path in (self.project, self.config, self.root / 'codex')
+                    for tool in ('Edit', 'Write')}
+        self.assertEqual({rule for rule in allowed if rule.startswith(('Edit(', 'Write('))}, expected)
+
+    def test_file_command_hard_stops_preserve_exact_python_helpers(self):
+        self.stub('kaizen-backup', '')
+        with patch.dict(os.environ, self.env, clear=True):
+            options = self.module.command_options(self.module.argparse.Namespace(dry_run=True))
+            command = self.module.review_command(options, 'auto', 'report', 'session', self.project)
+        allowed = command[command.index('--allowedTools') + 1].split(',')
+        denied = command[command.index('--disallowedTools') + 1].split(',')
+        for name in FILE_COMMAND_DENIES:
+            self.assertIn(f'Bash({name}:*)', denied)
+
+        def matches_prefix(rule, invocation):
+            # Check the command-prefix contract; the opt-in live probe checks the CLI itself.
+            if not rule.startswith('Bash(') or not rule.endswith(':*)'):
+                return False
+            prefix = rule[5:-3]
+            return invocation == prefix or invocation.startswith(prefix + ' ')
+
+        for python in ('python3', options.python):
+            for helper, operation in (('notes-ledger', 'add'), ('kaizen-backup', 'begin'),
+                                      ('kaizen-backup', 'finish'), ('kaizen-backup', 'list')):
+                invocation = f'{python} {self.scripts / helper} {operation} --help'
+                self.assertTrue(any(matches_prefix(rule, invocation) for rule in allowed), invocation)
+                self.assertFalse(any(matches_prefix(rule, invocation) for rule in denied), invocation)
+        for invocation in ('python3 -c pass', 'python arbitrary.py', 'cp source target'):
+            self.assertTrue(any(matches_prefix(rule, invocation) for rule in denied), invocation)
+            self.assertFalse(any(matches_prefix(rule, invocation) for rule in allowed), invocation)
+
+    def test_config_git_and_settings_denies_cover_aliases_and_targets(self):
+        for name in ('CLAUDE_CONFIG_DIR', 'CODEX_HOME'):
+            target = self.root / (name.lower() + '-target')
+            target.mkdir()
+            alias = self.root / (name.lower() + '-alias')
+            alias.symlink_to(target, target_is_directory=True)
+            self.env[name] = str(alias)
+        with patch.dict(os.environ, self.env, clear=True):
+            options = self.module.command_options(self.module.argparse.Namespace(dry_run=True))
+            command = self.module.review_command(options, 'auto', 'report', 'session', self.project)
+        denied = command[command.index('--disallowedTools') + 1].split(',')
+        allowed = command[command.index('--allowedTools') + 1].split(',')
+        for name in ('CLAUDE_CONFIG_DIR', 'CODEX_HOME'):
+            alias = Path(self.env[name])
+            for path in (alias, alias.resolve()):
+                root = '//' + path.as_posix().lstrip('/')
+                for tool in ('Edit', 'Write'):
+                    self.assertIn(f'{tool}({root}/**/.git/**)', denied)
+                    self.assertIn(f'{tool}({root}/settings*.json)', denied)
+                    self.assertIn(f'{tool}({root}/**)', allowed)
+
+    def test_both_modes_pin_credentials_and_deny_resolved_and_unresolved_paths(self):
+        self.assertEqual(self.module.CREDENTIAL_PATHS, CREDENTIAL_PATHS)
+        config_target = self.root / 'real-config'
+        config_target.mkdir()
+        alias = self.root / 'config-alias'
+        alias.symlink_to(config_target, target_is_directory=True)
+        self.env['CLAUDE_CONFIG_DIR'] = str(alias)
+        ssh_target = self.root / 'real-ssh'
+        ssh_target.mkdir()
+        (self.home / '.ssh').symlink_to(ssh_target, target_is_directory=True)
+        credential = write(self.root / 'credential-target', 'private')
+        for name in ('.credentials.json', 'access-token.json', 'client-secret.json'):
+            (config_target / name).symlink_to(credential)
+        with patch.dict(os.environ, self.env, clear=True):
+            options = self.module.command_options(self.module.argparse.Namespace(dry_run=True))
+            for mode in ('auto', 'propose-only'):
+                command = self.module.review_command(options, mode, 'report', 'session', self.project)
+                denied = set(command[command.index('--disallowedTools') + 1].split(','))
+                roots = {'config': (alias, config_target, self.root / 'codex'),
+                         'home': (self.home,), 'project': (self.project,)}
+                for scope, patterns in CREDENTIAL_PATHS.items():
+                    for root in roots[scope]:
+                        for pattern in patterns:
+                            for tool in ('Read', 'Edit', 'Write'):
+                                self.assertIn(f'{tool}(//{root.as_posix().lstrip("/")}/{pattern})', denied)
+                for path, suffix in ((ssh_target, '/**'), (credential, '')):
+                    for tool in ('Read', 'Edit', 'Write'):
+                        self.assertIn(f'{tool}(//{path.as_posix().lstrip("/")}{suffix})', denied)
 
     def test_backup_root_deny_covers_resolved_and_unresolved_trees(self):
         resolved = self.root / 'real-backups'

@@ -115,14 +115,23 @@ HERE = Path(__file__).resolve().parent
 # Keep in sync with the independently pinned permission tests. Search with Grep:
 # rg can execute preprocessors, and git can execute repository-configured helpers.
 READ_ONLY_BASH = ["Bash(ls:*)", "Bash(head:*)", "Bash(tail:*)", "Bash(shasum:*)",
-                  "Bash(sha256sum:*)", "Bash(jq:*)"]
+                  "Bash(sha256sum:*)"]
 REVIEW_AVAILABLE = "Read,Grep,Glob,WebFetch,WebSearch,Bash"
 REVIEW_TOOLS = ",".join(["Read", "Grep", "Glob", "WebFetch", "WebSearch", *READ_ONLY_BASH])
 AUTO_AVAILABLE = "Read,Grep,Glob,Edit,Write,WebFetch,WebSearch,Bash"
 GIT_DENY = ["Edit(**/.git/**)", "Write(**/.git/**)"]
+# Credential paths denied to Read/Edit/Write in both scheduled modes. Config
+# patterns are top-level; project dotenv patterns cover every directory.
+# Keep this list in sync with docs/scheduling.md and the independent test pin.
+CREDENTIAL_PATHS = {
+    "config": (".credentials.json", "auth.json", "*token*.json", "*secret*.json"),
+    "home": (".ssh/**", ".aws/**", ".gnupg/**", ".netrc", ".config/gh/**", ".docker/config.json"),
+    "project": ("**/.env", "**/.env.*"),
+}
 HARD_STOP_DENY = ",".join(f"Bash({command}:*)" for command in (
     "git push", "git commit", "git reset", "git clean", "gh", "rm", "rmdir", "mv", "curl", "wget",
-    "launchctl", "crontab", "brew", "npm", "pip", "pip3", "sudo", "env", "printenv", "chmod"))
+    "launchctl", "crontab", "brew", "npm", "pip", "pip3", "sudo", "env", "printenv", "chmod",
+    "cp", "touch", "mkdir", "sed", "dd", "install", "ln", "truncate", "perl", "python3 -c", "python"))
 
 
 def audits_dir():
@@ -646,15 +655,44 @@ def config_home_deny(project_dir=None):
     """Protect config state while leaving Markdown instructions editable."""
     rules = []
     for home in (claude_home(), codex_home()):
-        root = deny_path(home)
-        for pattern in ("settings*.json", "hooks/**", "plugins/**", "skills/**", "commands/**",
-                        "bin/**", "**/*.json", "**/*.toml", "**/*.sh", "**/*.py", "**/*.js",
-                        ".credentials*", "auth.json"):
-            rules.append(f"Edit({root}/{pattern})")
-    rules.append(f"Edit({deny_path(claude_json())})")
+        for root in dict.fromkeys(deny_path(home, resolve=value) for value in (False, True)):
+            for pattern in ("settings*.json", "hooks/**", "plugins/**", "skills/**", "commands/**",
+                            "bin/**", "**/*.json", "**/*.toml", "**/*.sh", "**/*.py", "**/*.js",
+                            ".credentials*", "auth.json", "**/.git/**"):
+                rules.extend(f"{tool}({root}/{pattern})" for tool in ("Edit", "Write"))
+    for path in dict.fromkeys(deny_path(claude_json(), resolve=value) for value in (False, True)):
+        rules.extend(f"{tool}({path})" for tool in ("Edit", "Write"))
     if project_dir is not None:
-        rules.append(f"Edit({deny_path(project_dir)}/.claude/settings*.json)")
+        for root in dict.fromkeys(deny_path(project_dir, resolve=value) for value in (False, True)):
+            rules.extend(f"{tool}({root}/.claude/settings*.json)" for tool in ("Edit", "Write"))
     return rules
+
+
+def credential_deny(project_dir=None):
+    roots = {"config": (claude_home(), codex_home()), "home": (Path.home(),),
+             "project": (Path(project_dir) if project_dir is not None else Path.cwd(),)}
+    paths = {}
+    for scope, patterns in CREDENTIAL_PATHS.items():
+        for root in roots[scope]:
+            for pattern in patterns:
+                parts = pattern.split("/")
+                first_glob = next((n for n, part in enumerate(parts) if "*" in part), len(parts))
+                base = root.joinpath(*parts[:first_glob])
+                suffix = "/" + "/".join(parts[first_glob:]) if first_glob < len(parts) else ""
+                for resolve in (False, True):
+                    paths[deny_path(root, resolve=resolve) + "/" + pattern] = None
+                    paths[deny_path(base, resolve=resolve) + suffix] = None
+                # Also protect targets of existing top-level token/secret symlinks.
+                if scope == "config" and first_glob < len(parts):
+                    for match in root.glob(pattern):
+                        paths[deny_path(match)] = None
+    return [f"{tool}({path})" for path in paths for tool in ("Read", "Edit", "Write")]
+
+
+def auto_edit_allow(project_dir=None):
+    roots = (Path(project_dir) if project_dir is not None else Path.cwd(), claude_home(), codex_home())
+    paths = dict.fromkeys(deny_path(root, resolve=value) for root in roots for value in (False, True))
+    return [f"{tool}({path}/**)" for path in paths for tool in ("Edit", "Write")]
 
 
 def ledger_paths():
@@ -756,8 +794,8 @@ def review_command(options, mode, report, session_id, project_dir=None):
     if auto:
         ledger_rules = ledger_deny()  # Validate before granting notes-ledger add.
         backup_rules = backup_deny()
-        allowed_tools = ["Read", "Grep", "Glob", "Edit", "Write", "WebFetch", "WebSearch",
-                         *READ_ONLY_BASH]
+        allowed_tools = ["Read", "Grep", "Glob", "WebFetch", "WebSearch",
+                         *auto_edit_allow(project_dir), *READ_ONLY_BASH]
         # File-writing Bash tools bypass Edit/Write denies; grant only the scoped helpers.
         backup = HERE / "kaizen-backup"
         if backup.is_file():
@@ -775,10 +813,11 @@ def review_command(options, mode, report, session_id, project_dir=None):
         if path.is_dir():
             command.extend(["--add-dir", str(path.resolve())])
     command.extend(["--allowedTools", allowed])
+    denied = credential_deny(project_dir)
     if auto:
-        command.extend(["--disallowedTools", ",".join([
-            HARD_STOP_DENY, *GIT_DENY, *config_home_deny(project_dir), *ledger_rules, *backup_rules])])
-    return command + ["--permission-mode", "acceptEdits" if auto else "dontAsk"]
+        denied.extend([HARD_STOP_DENY, *GIT_DENY, *config_home_deny(project_dir), *ledger_rules, *backup_rules])
+    command.extend(["--disallowedTools", ",".join(denied)])
+    return command + ["--permission-mode", "default" if auto else "dontAsk"]
 
 
 # Patterns are relative to audits; each wildcard matches one path component.
