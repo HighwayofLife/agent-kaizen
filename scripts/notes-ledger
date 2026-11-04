@@ -25,7 +25,8 @@ def claude_home():
 def config():
     try:
         with (claude_home() / 'agent-kaizen.json').open(encoding='utf-8') as f:
-            ledger = json.load(f).get('notesLedger', {})
+            settings = json.load(f)
+            ledger = settings.get('notesLedger', {}) if isinstance(settings, dict) else {}
     except FileNotFoundError:
         ledger = {}
     if not isinstance(ledger, dict) or not ledger.get('csv'):
@@ -89,17 +90,22 @@ def timeline_info(path):
     return data, lines, headings, rows
 
 
+def timeline_cell(text):
+    return text.replace('|', '&#124;').replace('\n', ' ').replace('\r', ' ')
+
+
 def equivalent(short, full):
-    short = html.unescape(short)
-    return bool(short) and (short in full or full.startswith(short))
+    short = timeline_cell(html.unescape(short))
+    full = timeline_cell(full)
+    return bool(short) and short in full
 
 
 def timeline_add(path, date, change):
     data, lines, headings, rows = timeline_info(path)
-    if any(row[0] == date and bool(row[1]) and change.startswith(html.unescape(row[1])) for _, row in rows):
+    if any(row[0] == date and bool(row[1]) and timeline_cell(change).startswith(timeline_cell(html.unescape(row[1]))) for _, row in rows):
         return None
     day = dt.date.fromisoformat(date)
-    cell = change.replace('|', '&#124;').replace('\n', ' ').replace('\r', ' ')
+    cell = timeline_cell(change)
     row = '| {} | {} | {} | {} |\n'
     # Status is filled by the caller.
     return data, lines, headings, day, cell, row
@@ -112,7 +118,7 @@ def add(args, csv_path, timeline_path):
     data, _, records = read_csv(csv_path)
     change = '{} Why: {} Measure: {}'.format(args.change, args.why, args.measure)
     row = [args.date, args.category, change, args.source, args.status, 'no']
-    csv_exists = any(r[0] == args.date and bool(r[2]) and change.startswith(r[2]) for r, _, _ in records[1:])
+    csv_exists = any(r[0] == args.date and bool(r[2]) and (change.startswith(r[2]) or r[2].startswith(change)) for r, _, _ in records[1:])
     timeline = timeline_add(timeline_path, args.date, change) if timeline_path else None
     if csv_exists and timeline is None:
         print('already recorded')
@@ -121,7 +127,7 @@ def add(args, csv_path, timeline_path):
     if timeline:
         original, lines, headings, day, cell, template = timeline
         # The shorter timeline text is the change itself, with table delimiters escaped.
-        cell = args.change.replace('|', '&#124;').replace('\n', ' ').replace('\r', ' ')
+        cell = timeline_cell(args.change)
         entry = template.format(args.date, cell, args.status, 'no')
         covering = [(n, start, end) for n, start, end in headings if start <= day <= end]
         if covering:
@@ -172,7 +178,9 @@ def set_row(args, csv_path, timeline_path):
     if args.measured is not None:
         new[5] = args.measured
     if args.effect is not None:
-        new[2] += ' Result: ' + args.effect
+        suffix = ' Result: ' + args.effect
+        if not new[2].endswith(suffix):
+            new[2] += suffix
     timeline_data = None
     if timeline_path:
         _, timeline_lines, _, rows = timeline_info(timeline_path)
@@ -363,9 +371,13 @@ def main():
             due(args)
             return 0
         csv_path, timeline_path = config()
-        with open(str(csv_path) + '.lock', 'a') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
-            (add if args.command == 'add' else set_row)(args, csv_path, timeline_path)
+        action = add if args.command == 'add' else set_row
+        if args.dry_run:
+            action(args, csv_path, timeline_path)
+        else:
+            with open(str(csv_path) + '.lock', 'a') as lock:
+                fcntl.flock(lock, fcntl.LOCK_EX)
+                action(args, csv_path, timeline_path)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         print('notes-ledger: {}'.format(exc), file=sys.stderr)
         return 1 if isinstance(exc, (OSError, RuntimeError)) else 2

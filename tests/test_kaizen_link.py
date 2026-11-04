@@ -30,6 +30,18 @@ class LinkTests(unittest.TestCase):
     def settings(self, names):
         (self.home / "agent-kaizen.json").write_text(json.dumps({"localScripts": names}))
 
+    def test_unlink_after_sources_removed(self):
+        fake = self.home / 'plugin'
+        shutil.copytree(ROOT / 'scripts', fake / 'scripts')
+        self.assertEqual(self.run_link('--apply', root=fake).returncode, 0)
+        (self.bin / 'token-audit').unlink()
+        (self.bin / 'token-audit').write_text('owner file')
+        shutil.rmtree(fake)
+        result = self.run_link('--unlink', root=fake)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.bin / 'token-audit').read_text(), 'owner file')
+        self.assertFalse((self.bin / 'codex-review').is_symlink())
+
     def test_help_empty_and_plan(self):
         self.assertEqual(self.run_link("--help").returncode, 0)
         result = self.run_link("--check", "--json")

@@ -96,6 +96,21 @@ class ProjectReportTests(unittest.TestCase):
             replace.assert_called_once()
             self.assertNotEqual(Path(replace.call_args.args[0]), destination)
 
+    def test_output_mode_and_invalid_commands(self):
+        destination = self.root / 'report.md'
+        for mask in (0o022, 0o077):
+            result = subprocess.run([sys.executable, str(SCRIPT), '--project', str(self.project),
+                                     '--out', str(destination)], env=self.env, capture_output=True,
+                                    preexec_fn=lambda: os.umask(mask))
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(destination.stat().st_mode & 0o777, 0o644 & ~mask)
+        for value in ([], {str(self.project): []}):
+            (self.root / 'agent-kaizen.json').write_text(json.dumps({'projectCommands': value}))
+            result = self.invoke()
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('projectCommands', result.stderr)
+            self.assertNotIn('Traceback', result.stderr)
+
     def test_unenrolled(self):
         shutil.rmtree(self.project / 'docs/kaizen')
         result = self.invoke()

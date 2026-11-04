@@ -107,9 +107,13 @@ def main():
         config = {}
     except (OSError, ValueError) as error:
         parser.exit(2, f'global config unavailable: {error}\n')
+    if not isinstance(config, dict) or not isinstance(config.get('projectCommands', {}), dict):
+        parser.exit(2, 'projectCommands must be a dict\n')
     commands = {}
     for key, value in config.get('projectCommands', {}).items():
         if Path(key).expanduser().resolve() == project:
+            if not isinstance(value, dict):
+                parser.exit(2, 'projectCommands entry must be a dict\n')
             commands = value
             break
     sections = packet_sections(project, commands.get('outcomeLog', 'out/packets.jsonl'),
@@ -130,6 +134,9 @@ def main():
                                              delete=False) as stream:
                 name = stream.name
                 stream.write(output)
+                mask = os.umask(0)
+                os.umask(mask)
+                os.fchmod(stream.fileno(), 0o644 & ~mask)
             os.replace(name, args.out)
         finally:
             if name and os.path.exists(name):
