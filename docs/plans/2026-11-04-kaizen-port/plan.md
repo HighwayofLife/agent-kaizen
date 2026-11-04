@@ -97,7 +97,22 @@ File ownership per group:
 
 Packet 13 runs on the owner's machine after packet 12 (installed plugin at 0.7.0): `kaizen-link --check`, `rules-lint`, `kaizen-scheduled audit` with and without `KAIZEN_SKIP_CHECKS` (timing) and for real (must create `projects/index.json`), a permission rehearsal for the auto-mode lists, `kaizen-scheduled review --project-dir <New World> --propose-only --force` (one headless Sonnet run, restricted by the runner), `notes-ledger due`. Output is redacted to `~` paths, pasted below, and the repository tests are re-run. The plan is not done until that run is clean.
 
-Result: (to be filled by packet 13)
+Result (packet 13, 2026-11-04):
+```
+1 kaizen-link --check: 0 drift, 0 broken, 10 local
+2 rules-lint --repo NewWorld: 0 stale-rule hit(s)
+3 audit timing: KAIZEN_SKIP_CHECKS=1 2.7 s; with checks 9.1 s; difference 6.4 s (under 10 s)
+4 real audit: ok ~/.claude/audits/token-audit-20261104T214811Z.md
+  checks-20261104T214808Z.md 3507 B (## Drift: all OK; ## Stale rules: 3 hits, NewWorld worktrees docs/agents/history.md:12)
+  projects/NewWorld-40274b3cf94e/project-report-20261104T214811Z.md 777 B (sections: Packet outcomes, Calibration proposals, Project ledger rows pending)
+  projects/index.json 1792 B (created)
+5 rehearsal: notes-ledger add allowed True, set allowed False; Edit/Write denied for agent-field-notes data/changes.csv and findings/changes-timeline.md
+  notes-ledger add --dry-run: would add: 2026-11-04,tooling,gate rehearsal Why: x Measure: y,gate,active,no (ledger repo unchanged)
+6 review --project-dir NewWorld --propose-only --force (54 s): NewWorld: reviewed (propose-only)
+  projects/NewWorld-40274b3cf94e/cycle-2026-11-04.md 5895 B, 65 lines; covers state, drift 0/0, calibration (one rung after 8 packets), stale rules (false positive), ledger baseline proposals
+7 notes-ledger due: rows from 2026-10-15 on: "Not enough data: too few reports"
+```
+Verdict: clean
 
 ## Risks and mitigations
 
