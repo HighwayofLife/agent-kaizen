@@ -277,6 +277,8 @@ def due(args):
             settings = json.load(stream)
     except FileNotFoundError:
         settings = {}
+    if not isinstance(settings, dict):
+        settings = {}
     ledger = settings.get('notesLedger', {})
     if not isinstance(ledger, dict) or not ledger.get('csv'):
         print('notes-ledger: not configured')
@@ -286,10 +288,14 @@ def due(args):
         days = 7
     _, _, rows = read_csv(Path(ledger['csv']).expanduser())
     reports = audit_reports()
-    for row, _, _ in rows[1:]:
+    for row, start, _ in rows[1:]:
         if row[4] != 'active' or row[5] != 'no':
             continue
-        day = dt.date.fromisoformat(row[0])
+        try:
+            day = dt.date.fromisoformat(row[0])
+        except ValueError:
+            print(f'notes-ledger: skipping row {start + 1}: invalid date {row[0]!r}', file=sys.stderr)
+            continue
         measure = row[2].partition('Measure:')[2]
         item = {'date': row[0], 'change': row[2], 'measure': measure,
                 'intensity': {}, 'packets': []}

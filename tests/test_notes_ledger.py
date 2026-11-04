@@ -222,6 +222,21 @@ class DueTests(unittest.TestCase):
         self.config.unlink()
         result = self.run_due()
         self.assertEqual((result.returncode, result.stdout.strip()), (0, 'notes-ledger: not configured'))
+        for value in ([], 'x'):
+            with self.subTest(value=value):
+                self.config.write_text(json.dumps(value))
+                result = self.run_due()
+                self.assertEqual((result.returncode, result.stdout.strip()), (0, 'notes-ledger: not configured'))
+
+    def test_invalid_date_skips_only_that_row(self):
+        self.csv.write_text(self.csv.read_text() + 'bad-date,test,Broken,manual,active,no\n'
+                            + '2999-01-01,test,Future,manual,active,no\n')
+        result = self.run_due('--json')
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(len(result.stderr.splitlines()), 1)
+        self.assertIn('row 3', result.stderr)
+        self.assertIn('bad-date', result.stderr)
+        self.assertEqual(len(result.stdout.splitlines()), 2)
 
 
 if __name__ == '__main__':

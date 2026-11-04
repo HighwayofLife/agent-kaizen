@@ -731,6 +731,7 @@ class LedgerGuard:
 
 def review_command(options, mode, report, session_id, project_dir=None):
     auto = mode == "auto"
+    ledger = HERE / "notes-ledger"
     allowed = REVIEW_TOOLS
     if auto:
         ledger_rules = ledger_deny()  # Validate before granting notes-ledger add.
@@ -744,12 +745,11 @@ def review_command(options, mode, report, session_id, project_dir=None):
             for subcommand in ("begin", "finish", "list"):
                 allowed_tools.extend(f"Bash({prefix}{backup} {subcommand}:*)"
                                      for prefix in ("", "python3 ", options.python + " "))
-        ledger = HERE / "notes-ledger"
         if ledger.is_file():
             allowed_tools.extend([f"Bash(python3 {ledger} add:*)",
                                   f"Bash({options.python} {ledger} add:*)"])
         allowed = ",".join(allowed_tools)
-    command = [options.claude, "-p", f"/agent-kaizen:cycle {mode} {report}",
+    command = [options.claude, "-p", f"/agent-kaizen:cycle {mode} {report} notes-ledger-path={ledger}",
                "--session-id", session_id, "--model", options.model, "--max-turns", str(options.max_turns),
                "--tools", AUTO_AVAILABLE if auto else REVIEW_AVAILABLE, "--strict-mcp-config"]
     for path in (claude_home(), codex_home()):
