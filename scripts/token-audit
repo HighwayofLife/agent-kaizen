@@ -582,18 +582,60 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
             except (OSError, ValueError, RecursionError):
                 continue
         data["codex_files_scanned"] += 1
-        model, final, brief = "unknown", None, None
+        model, final, brief, effort = "unknown", None, None, None
+        first = last = None
+        users = []
         prior_usage = Counter()
+
+        def session_rows():
+            nonlocal first, last
+            cutoff = since.strftime("%Y-%m-%dT%H:%M:%S")
+            try:
+                with path.open("rb") as stream:
+                    for line in stream:
+                        match = TIMESTAMP.search(line)
+                        if not match:
+                            continue
+                        try:
+                            timestamp = match[1].decode("ascii", "replace")
+                            stamp = date_time(timestamp)
+                            first = stamp if first is None or stamp < first else first
+                            last = stamp if last is None or stamp > last else last
+                            prefix = line[:1024]
+                            if not (b'"token_count"' in prefix or b'"user_message"' in prefix
+                                    or b'"role":"user"' in prefix or b'"role": "user"' in prefix
+                                    or b'"model"' in line or b'"turn_context"' in prefix):
+                                continue
+                            old = timestamp[:19] < cutoff if timestamp.endswith(("Z", "+00:00")) else stamp < since
+                            if old and not (b'"model"' in line or b'"user_message"' in prefix
+                                            or b'"role":"user"' in prefix or b'"role": "user"' in prefix
+                                            or b'"turn_context"' in prefix):
+                                continue
+                            row = json.loads(line)
+                            if isinstance(row, dict):
+                                if old:
+                                    row["_before_window"] = True
+                                yield row
+                        except (ValueError, TypeError, UnicodeError):
+                            data["warnings"]["malformed rows"] += 1
+            except OSError:
+                data["warnings"]["unreadable files"] += 1
         # Older session files can contain recent resumes. Keep earlier model
         # metadata, but count only sessions with a token_count in the window.
-        for row in rows(path, since, data["warnings"], keep_model=True):
+        for row in session_rows():
             payload = row.get("payload") or {}
             if not isinstance(payload, dict):
                 continue
+            if row.get("type") == "turn_context" and effort is None:
+                effort = payload.get("effort") or payload.get("reasoning_effort") or "n/a"
             if row.get("model"):
                 model = row["model"]
             if payload.get("model"):
                 model = payload["model"]
+            if row.get("type") == "event_msg" and payload.get("type") == "user_message":
+                users.append(payload.get("message") or "")
+            if row.get("type") == "response_item" and payload.get("role") == "user":
+                users.extend(item.get("text") or "" for item in payload.get("content") or [] if isinstance(item, dict))
             if row.get("type") == "event_msg" and payload.get("type") == "user_message" and brief is None:
                 brief = len(payload.get("message") or "")
             if row.get("type") == "response_item" and payload.get("role") == "user" and brief is None:
@@ -613,6 +655,14 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
         if final is not None:
             if brief is not None:
                 data["codex_briefs"][model].append(brief)
+            text = " ".join(users)
+            kind = ("review-plan" if "VERDICT: APPROVE | REVISE" in text else
+                    "review-diff" if "VERDICT: NO ISSUES" in text else
+                    "planner" if "as the engineering planner" in text else
+                    "engineer" if "You are working in a git repository. Read AGENTS" in text else "other")
+            tokens = final.get("total_tokens", final.get("input_tokens", 0) + final.get("output_tokens", 0))
+            data["codex_sessions"].append(dict(kind=kind, model=model, effort=effort or "n/a", tokens=tokens,
+                                               duration_s=(last - first).total_seconds() if first and last and first != last else None))
             total = data["codex"][model]
             total.update(sessions=1, input=final.get("input_tokens", 0),
                          cached_input=final.get("cached_input_tokens", 0),
@@ -624,7 +674,7 @@ def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=No
     data = dict(models=defaultdict(Counter), sessions=[], agents=defaultdict(list),
                 triggers=defaultdict(Counter), tool_chars=Counter(), tool_counts=Counter(),
                 images=0, bash=defaultdict(Counter), bash_chars=defaultdict(Counter),
-                codex=defaultdict(Counter), briefs=defaultdict(list), codex_briefs=defaultdict(list), warnings=Counter(), codex_files_scanned=0)
+                codex=defaultdict(Counter), codex_sessions=[], briefs=defaultdict(list), codex_briefs=defaultdict(list), warnings=Counter(), codex_files_scanned=0)
     data.update(cost=dict(total=0, by_agent=Counter(), by_model=Counter(), components=Counter(),
                           unpriced={}, pricing_error=pricing_error),
                 deferred_tools_unused=0, stuck_turns=dict(turns=0, flagged_turns=0, tool_calls=0, cost=0, signatures=[]),
@@ -1075,6 +1125,19 @@ def report(data, out, scope):
                       f"{data['codex_briefs'][name]['median']:g}" if name in data["codex_briefs"] else
                       f"{cell(name)} | {c['sessions']} | {c['input']} ({c['cached_input']}) | {c['output']} | {c['tokens']} | -"
                       for name, c in sorted(data["codex"].items(), key=lambda pair: -pair[1]["tokens"])]))
+    kinds = defaultdict(list)
+    for session in data["codex_sessions"]:
+        kinds[(session["kind"], session["model"], session["effort"])].append(session)
+    kind_rows = []
+    for (kind, model, effort), group in sorted(kinds.items(), key=lambda pair: -sum(s["tokens"] for s in pair[1])):
+        durations = [s["duration_s"] for s in group if s["duration_s"] is not None]
+        median = f"{statistics.median(durations) / 60:.1f}" if durations else "n/a"
+        hours = f"{sum(durations) / 3600:.1f}" if durations else "n/a"
+        kind_rows.append(f"{kind} | {cell(model)} | {cell(effort)} | {len(group)} | {median} | {hours} | {sum(s['tokens'] for s in group)}")
+    if len(kind_rows) > 12:
+        kind_rows = kind_rows[:12] + [f"… {len(kind_rows) - 12} more kind/model/effort rows omitted; use --json for all details."]
+    sections.append(("7b. Codex by kind, model and effort",
+                     ["Kind | Model | Effort | Sessions | Median min | Total hours | Tokens"], kind_rows))
     match, other = previous_audit(out, scope)
     volume = ("claude_calls", "claude_context", "claude_output", "codex_sessions", "codex_tokens", "image_reads")
     intensity = ("claude_context_per_call", "claude_output_per_call", "image_reads_per_100_calls",
