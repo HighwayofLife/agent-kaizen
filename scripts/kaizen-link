@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
 
 
@@ -72,6 +73,43 @@ def backup(target):
     return candidate
 
 
+def stale_caches(root):
+    """Find installed plugin caches that differ from the selected source."""
+    registry = claude_home() / "plugins/installed_plugins.json"
+    if not registry.exists():
+        return []
+    try:
+        plugins = json.loads(registry.read_text()).get("plugins", {})
+        name = json.loads((root / ".claude-plugin/plugin.json").read_text())["name"]
+    except (OSError, ValueError, KeyError, AttributeError):
+        return []
+    try:
+        result = subprocess.run(["git", "-C", str(root), "ls-files", "-z"],
+                                capture_output=True, check=True)
+        files = [Path(os.fsdecode(item)) for item in result.stdout.split(b"\0") if item]
+    except (OSError, subprocess.SubprocessError):
+        files = [p.relative_to(root) for p in root.rglob("*") if p.is_file()]
+    files = [p for p in files if not any(part in {".git", "out", "docs", "tests"} for part in p.parts)]
+    stale = []
+    for plugin, installs in plugins.items():
+        if plugin.split("@", 1)[0] != name or not isinstance(installs, list):
+            continue
+        for install in installs:
+            if not isinstance(install, dict) or not install.get("installPath"):
+                continue
+            cache = Path(install["installPath"]).expanduser()
+            if cache.resolve() == root:
+                continue
+            try:
+                different = any(not (root / p).is_file() or not (cache / p).is_file()
+                                or (root / p).read_bytes() != (cache / p).read_bytes() for p in files)
+            except OSError:
+                different = True
+            if different:
+                stale.append(plugin)
+    return sorted(set(stale))
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin", type=Path, default=claude_home() / "bin")
@@ -87,12 +125,21 @@ def main():
     replacements.add_argument("--replace-prefixed", action="store_true")
     parser.add_argument("--restore-replaced", action="store_true")
     parser.add_argument("--json", action="store_true")
-    parser.add_argument("--plugin-root", type=Path, default=Path(__file__).resolve().parent.parent,
+    parser.add_argument("--plugin-root", type=Path, default=None,
                         metavar="DIR", help="plugin root containing scripts and hooks")
     args = parser.parse_args()
     if args.restore_replaced and not args.unlink:
         parser.error("--restore-replaced requires --unlink")
-    root = args.plugin_root.resolve()
+    root = args.plugin_root
+    if root is None:
+        root = Path(__file__).resolve().parent.parent
+        record = Path(__file__).absolute().parent / ".kaizen-plugin-root"
+        if not (root / "scripts").is_dir() and record.is_file():
+            try:
+                root = Path(record.read_text().strip()).expanduser()
+            except OSError as exc:
+                parser.exit(2, "kaizen-link: cannot read plugin-root record: %s\n" % exc)
+    root = root.resolve()
     if not args.unlink and not (any((root / "scripts" / name).exists() for name in SCRIPTS.values())
             or any((root / "hooks" / name).exists() for name in HOOKS)):
         parser.exit(2, "kaizen-link: no scripts or hooks sources under plugin root %s; use --plugin-root DIR\n" % root)
@@ -165,6 +212,10 @@ def main():
                                      not (args.replace or (args.replace_prefixed and name.startswith("kaizen-"))))
                                     else mode) + " " + name
         entries.append({"name": name, "kind": kind, "status": current, "detail": detail})
+    if args.check:
+        for plugin in stale_caches(root):
+            entries.append({"name": plugin, "kind": "cache", "status": "STALE-CACHE",
+                            "detail": "claude plugin uninstall {0} && claude plugin install {0}, or bump the version".format(plugin)})
     counts = {key.lower(): sum(e["status"] == key for e in entries)
               for key in ("DRIFT", "BROKEN", "LOCAL")}
     if args.json:
@@ -180,7 +231,8 @@ def main():
                                       " " + entry["detail"] if entry["detail"] else ""))
         if args.check:
             print("kaizen-link: {drift} drift, {broken} broken, {local} local".format(**counts))
-    return 1 if args.check and counts["drift"] + counts["broken"] else 0
+    return 1 if args.check and (counts["drift"] + counts["broken"] or
+                                any(e["status"] == "STALE-CACHE" for e in entries)) else 0
 
 
 if __name__ == "__main__":

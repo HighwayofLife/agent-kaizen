@@ -110,6 +110,9 @@ def main():
     if not isinstance(config, dict) or not isinstance(config.get('projectCommands', {}), dict):
         parser.exit(2, 'projectCommands must be a dict\n')
     commands = {}
+    for key in config.get('projectCommands', {}):
+        if not Path(key).expanduser().is_absolute():
+            parser.exit(2, f'projectCommands key must be absolute: {key!r}\n')
     for key, value in config.get('projectCommands', {}).items():
         if Path(key).expanduser().resolve() == project:
             if not isinstance(value, dict):

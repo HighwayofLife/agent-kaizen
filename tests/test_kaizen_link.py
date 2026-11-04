@@ -30,6 +30,25 @@ class LinkTests(unittest.TestCase):
     def settings(self, names):
         (self.home / "agent-kaizen.json").write_text(json.dumps({"localScripts": names}))
 
+    def test_stale_installed_cache(self):
+        self.env['HOME'] = str(self.home)
+        plugin = self.home / 'source'
+        shutil.copytree(ROOT, plugin, ignore=shutil.ignore_patterns('.git', 'out'))
+        cache = self.home / 'cache'
+        shutil.copytree(plugin, cache)
+        registry = self.home / 'plugins/installed_plugins.json'
+        registry.parent.mkdir()
+        name = json.loads((plugin / '.claude-plugin/plugin.json').read_text())['name'] + '@market'
+        registry.write_text(json.dumps({'plugins': {name: [{'installPath': str(cache)}]}}))
+        self.assertEqual(self.run_link('--check', root=plugin).returncode, 0)
+        (cache / 'scripts/kaizen-link').write_text('old')
+        result = self.run_link('--check', root=plugin)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn('STALE-CACHE ' + name, result.stdout)
+        self.assertIn('claude plugin uninstall ' + name, result.stdout)
+        registry.unlink()
+        self.assertEqual(self.run_link('--check', root=plugin).returncode, 0)
+
     def test_unlink_after_sources_removed(self):
         fake = self.home / 'plugin'
         shutil.copytree(ROOT / 'scripts', fake / 'scripts')
