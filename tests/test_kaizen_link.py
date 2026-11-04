@@ -138,6 +138,66 @@ class LinkTests(unittest.TestCase):
         self.assertFalse((self.bin / "preambles").is_symlink())
         self.assertTrue(foreign.is_symlink())
 
+    def test_root_validation_and_help(self):
+        copied = self.home / "copied-link"
+        shutil.copy(LINK, copied)
+        result = subprocess.run(["python3", str(copied), "--check"], env=self.env,
+                                text=True, capture_output=True)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("--plugin-root", result.stderr)
+        self.assertIn("--plugin-root DIR", self.run_link("--help").stdout)
+        result = subprocess.run(["python3", str(copied), "--plugin-root", str(ROOT), "--check"],
+                                env=self.env, text=True, capture_output=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.run_link("--restore-replaced").returncode, 2)
+
+    def test_mutation_rejects_destinations_inside_root(self):
+        fake = self.home / "plugin"
+        (fake / "scripts").mkdir(parents=True)
+        (fake / "scripts/token-audit").write_text("source")
+        alias = self.home / "alias"
+        alias.symlink_to(fake, target_is_directory=True)
+        for action in ("--apply", "--unlink"):
+            for option in ("--bin", "--hooks-dir"):
+                result = self.run_link(action, option, str(alias / "nested"), root=fake)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("inside plugin root", result.stderr)
+        self.assertFalse((fake / "nested").exists())
+
+    def test_unlink_removed_source_and_regular_file(self):
+        fake = self.home / "plugin"
+        (fake / "scripts").mkdir(parents=True)
+        source = fake / "scripts/token-audit"
+        source.write_text("source")
+        (fake / "scripts/kaizen-backup").write_text("other source")
+        self.assertEqual(self.run_link("--apply", "--only", "token-audit", root=fake).returncode, 0)
+        source.unlink()
+        self.assertEqual(self.run_link("--unlink", root=fake).returncode, 0)
+        self.assertFalse((self.bin / "token-audit").is_symlink())
+        (self.bin / "token-audit").write_text("user")
+        self.run_link("--unlink", root=fake)
+        self.assertEqual((self.bin / "token-audit").read_text(), "user")
+
+    def test_auto_link_directory_and_json_drift(self):
+        result = self.run_link("--apply", "--mode", "auto", "--only", "preambles")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        target = self.bin / "preambles"
+        self.assertTrue(target.is_symlink())
+        self.assertEqual(self.run_link("--check", "--only", "preambles").returncode, 0)
+        target.unlink()
+        target.mkdir()
+        (target / "custom").write_text("old")
+        result = self.run_link("--check", "--json", "--only", "preambles")
+        self.assertEqual(result.returncode, 1)
+        data = json.loads(result.stdout)
+        self.assertEqual(set(data), {"entries", "drift", "broken", "local"})
+        self.assertEqual(data["drift"], 1)
+        self.assertEqual(set(data["entries"][0]), {"name", "kind", "status", "detail"})
+        self.assertEqual(data["entries"][0]["status"], "DRIFT")
+        self.run_link("--apply", "--replace", "--mode", "link", "--only", "preambles")
+        self.assertTrue(target.is_symlink())
+        self.assertEqual(next(self.bin.glob("preambles.replaced-*/custom")).read_text(), "old")
+
     def test_rollback_order(self):
         for unlink_first in (False, True):
             with self.subTest(unlink_first=unlink_first):

@@ -47,8 +47,8 @@ class ConfigKeysTests(unittest.TestCase):
         invalid = {
             "projectCommands": [{"/work/proj": {"shadowStatus": "python3"}},
                                 {"/work/proj": {"outcomeLog": "out/../x"}},
-                                {"relative": {}}, {"/work/proj": {"unknown": []}}],
-            "notesLedger": [{"csv": "~/notes.csv", "measureAfterDays": 0}, {"timeline": "x"}],
+                                {"relative": {}}, {"~user/project": {}}, {"/work/proj": {"unknown": []}}],
+            "notesLedger": [{"csv": "~/notes.csv", "measureAfterDays": 0}, {"timeline": "x"}, {"csv": ""}],
             "calibrationLadder": [["model effort extra"], [""]],
             "rulesLintFiles": [[1], [""]],
             "localScripts": [["tools/check"], [""]],

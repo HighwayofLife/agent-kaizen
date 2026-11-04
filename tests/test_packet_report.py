@@ -44,6 +44,38 @@ class PacketReportTests(unittest.TestCase):
             self.assertEqual(self.run_report('--since', 'bad').returncode, 2)
             self.assertEqual(self.run_report('--packets', path.parent).returncode, 2)
 
+    def test_until_markdown_normalization_and_audit_guard(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'packets.jsonl'
+            rows = [dict(ts='2026-01-01T00:00:00Z', id=str(i), model='gpt-6.1-terra',
+                         effort='high', status='DONE') for i in range(8)]
+            rows.append(dict(ts='2026-01-02T00:00:00Z', id='audit', model='other',
+                             effort='high', fixes=['0'], fix_origin='final-audit'))
+            path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            result = self.run_report('--packets', path, '--until', '2026-01-02',
+                                     '--ladder', 'terra high', '--json')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertEqual(data['totals']['packets'], 8)
+            self.assertEqual(data['groups'][0]['model'], 'terra')
+            self.assertEqual(data['groups'][0]['fix_rate'], 1 / 8)
+            self.assertFalse(any(p['direction'] == 'DOWN' for p in data['proposals']))
+            rendered = self.run_report('--packets', path, '--markdown')
+            self.assertEqual(rendered.returncode, 0, rendered.stderr)
+            self.assertIn('| model effort / area | n |', rendered.stdout)
+            self.assertIn('| --- | ---:', rendered.stdout)
+
+    def test_unreadable_file(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'packets.jsonl'
+            path.write_text('{}\n')
+            path.chmod(0)
+            if os.access(path, os.R_OK):
+                self.skipTest('current user can read chmod 000 files')
+            result = self.run_report('--packets', path)
+            self.assertEqual(result.returncode, 2)
+            self.assertTrue(result.stderr)
+
     def test_ladder_config_override_and_project(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
