@@ -14,22 +14,27 @@ This is the entry point when you don't know which skill to run. It runs the loop
 
 ## Task
 
-1. **Find the state.** Read `docs/kaizen/LEDGER.md`. If there is no ledger, run `/agent-kaizen:start` first (in propose-only mode, just say it is missing). In a scheduled `propose-only` or `auto` run, read the report path given after the mode. Otherwise use the newest `token-audit-*.md` in `docs/kaizen/`, then in the folder printed as `reports` by `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled config show --for .`. Never use another project's report folder.
+Add every new self-improvement tool or process to the plugin so it runs on the plugin schedule. Record each change in the notes ledger with what changed, why and how to measure it; re-measure later.
+
+1. **Find the state.** Read `docs/kaizen/LEDGER.md`. If there is no ledger, run `/agent-kaizen:start` first (in propose-only mode, just say it is missing). In a scheduled `propose-only` or `auto` run, read the report path given after the mode. Otherwise use the newest `token-audit-*.md` in `docs/kaizen/`, then in the folder printed as `reports` by `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled config show --for .`. Never use another project's report folder. Also read the newest `checks-*.md` in the global audits folder and `project-report-*.md` in this project's report folder when present.
 2. **Measure.** Outside scheduled runs, if the newest report is older than 3 days and you can run commands, run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-audit --cwd . --days 14 --out docs/kaizen/`. Reports with different windows or scopes are not comparable; use the comparison the report itself prints.
 3. **Review.** Follow `${CLAUDE_PLUGIN_ROOT}/skills/review/SKILL.md`: fill in the measured effects, then keep, tune or revert. A project-scoped `usage-series` and `usage-compare --cutoff <change date>` may supply the measured rates instead of two audit windows.
-4. **Due checks.** Check the dates of the last runs:
+4. **Outcomes and checks.** Propose calibration changes from the project report, up or down one rung only. For `DRIFT` or `BROKEN` lines, propose `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-link --apply`, or add the name to `localScripts` if the difference is intended. Fix stale-rule wording or its pattern. Propose measurements from `notes-ledger due`; never run `notes-ledger set` without the owner's OK.
+5. **Due checks.** Check the dates of the last runs:
    - models: if the last `models-*.md` audit or ledger entry is more than 30 days old, follow `${CLAUDE_PLUGIN_ROOT}/skills/models/SKILL.md`;
    - releases and tools: if the last whats-new run is more than 30 days old, follow `${CLAUDE_PLUGIN_ROOT}/skills/whats-new/SKILL.md`;
    - roster: if `docs/kaizen/model-roster.md` is missing or more than 60 days old, or the audit shows a pool hitting its limits, suggest `/agent-kaizen:roster re-evaluate`;
    - context surface: if the last trim is more than 60 days old, or the audit shows a jump in fixed context, suggest `/agent-kaizen:trim-context`.
-5. **Propose.** At most 5 next changes across everything above, ranked by expected saving per unit of effort. For each: the skill that implements it, the risk, and how the next audit will measure it.
-6. **Act.**
+6. **Propose.** At most 5 next changes across everything above, ranked by expected saving per unit of effort. For each: the skill that implements it, the risk, and how the next audit will measure it.
+7. **Act.**
    - **`propose` mode:** wait for my OK, then run the approved changes one at a time, each with a ledger row.
    - **`safe` and `auto` modes:** don't stop at a proposal list. Take the top proposals the mode allows, up to `maxChangesPerRun`, and carry each one out now. Follow the implementing skill's `SKILL.md` in `${CLAUDE_PLUGIN_ROOT}/skills/<skill>/` in the same mode, with backup, verify, roll back on failure, and a ledger row. "Needs the user's decision" is a reason to skip only for a hard stop, or for a change you can't verify in this run. Pick a smaller, verifiable version of the change when one exists. For example, trim one instruction file rather than all of them.
    - Read "In `auto`, these are NOT reasons to skip a change" in `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md` before deciding to skip anything.
    - **`propose-only`:** print the proposal and stop.
 
-7. **Tidy.** Outside scheduled runs, run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled housekeep` once. Mention in the summary how many of the plugin's own old files it removed. In a scheduled run the runner does this; skip it. Use `--dry-run` first if the user asked to see what would go.
+8. **Record.** After each applied change, add a project ledger row and run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/notes-ledger add --date <date> --category <category> --change <change> --why <why> --measure <measurement> --source <source>` when `notesLedger` is configured. Exit 3 means not configured; skip it.
+
+9. **Tidy.** Outside scheduled runs, run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled housekeep` once. Mention in the summary how many of the plugin's own old files it removed. In a scheduled run the runner does this; skip it. Use `--dry-run` first if the user asked to see what would go.
 
 ## Done when
 

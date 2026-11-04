@@ -31,6 +31,8 @@ Rules:
   appear on several lines; de-duplicate by message id before summing.
 - Cost is roughly context size × number of turns, so report both.
 
+Use the token-audit report for usage and cost sections. When present, use this project's `project-report-*.md` for outcomes, calibration proposals, shadow reviews, slow tests, speed and pending project-ledger rows. Use the global audits folder's `checks-*.md` for drift, stale rules and notes-ledger measurements due.
+
 Report, for the last 14 days:
 1. Main sessions: turns, peak and median context, total tokens by kind.
 2. Per subagent type: spawns, median and p90 tool calls, median context, total tokens.

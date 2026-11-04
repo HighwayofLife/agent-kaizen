@@ -39,6 +39,10 @@ Set up a planning pipeline for work bigger than one change.
 5. One plan-review pass (a different model from the planner, if possible) before any
    coding starts. Its findings go back to the planner once.
 
+6. A packet to speed development or cut tokens or cost names a before/after measurement command in its acceptance criteria (a report script, benchmark or `--explain`). Take the baseline before the change; unit tests alone do not show the saving.
+7. A plan that adds or changes tooling ends with an end-to-end packet that runs the new tools once on real input and pastes trimmed output into its plan row. The plan is not done until that run is clean.
+8. A packet that changes a contract (flag, trailer, file format or rule wording) adds the old wording to the `rules-lint` stale list and its test fixture in the same packet, and fixes every hit.
+
 Update or create the planner and plan-reviewer agent definitions and the routing rows in
 CLAUDE.md. Show the diffs, wait for my OK. Then write a sample plan for my next real
 feature so we can try it. Add a ledger row.

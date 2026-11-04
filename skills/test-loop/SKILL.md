@@ -40,6 +40,8 @@ Then propose a tiered system, with an estimate of the time saved per item:
    prove it works on this repo before relying on it. Ours never selected anything, and
    we fell back to the tiers above.
 
+A slow-test report command can be named in `projectCommands.<project>.slowTests` in the global config; its output appears in the project report.
+
 Wait for my OK, then implement one tier at a time with tests for the scripts. Add a
 ledger row per tier.
 

@@ -23,6 +23,7 @@ before it and docs/kaizen/LEDGER.md.
 
 1. For every ledger row without a measured effect: fill it in from the audits, then say
    keep, tune or revert. Record API-equivalent dollars alongside tokens when available.
+   The project report and `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/notes-ledger due` may also supply measurement sources; measurement proposals only, the owner approves.
    You may instead run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/usage-series
    --since <baseline date> --out <report folder>/series`
    with the project's `--cwd`, then `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/usage-compare
