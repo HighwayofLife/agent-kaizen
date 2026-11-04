@@ -1,0 +1,3 @@
+# Follow-ups found during the port (not in a packet yet)
+
+- 2026-11-04 kz-02: `codex-dispatch` printed `STATUS: DONE` when Codex stopped with a question and changed nothing. This is a false green, and the orchestrator nearly landed nothing. Proposal: when the tracked diff is empty and the final message contains a question or "stopped", report `STATUS: NEEDS-DECISION` (or `NO-CHANGE`). Add the check to the dispatch report, and add a test. The script is local (`localScripts`), so the change goes into `~/.claude/bin/codex-dispatch`, with a backup. Measure how often NO-CHANGE fires and how many wasted wake-ups it saves.

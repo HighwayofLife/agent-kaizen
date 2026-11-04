@@ -48,3 +48,7 @@ Files changed, test counts, any step you could not wire and why. Do not commit o
 
 ## Suggested agent / model / effort
 codex-engineer, Sol, high (orchestrator decision: unattended permission allow and deny lists are security-sensitive). Risk: high (changes what an unattended job runs and its permissions; per-packet review before merge).
+
+## Delta from the group A batch review (2026-11-04)
+- `install-schedule` still installs with `shutil.copy2`. Once links exist, this raises `SameFileError` or overwrites the plugin source. Route every install through `kaizen-link` (`--replace-prefixed` for `kaizen-` names) and remove the direct copy path. Add a test with a pre-existing symlinked bin entry.
+- `kaizen-link --bin DIR` alone still writes hooks into the real `<claude home>/hooks`. Pass `--hooks-dir` explicitly wherever `install-schedule` targets a non-default bin, and document this in docs/scheduling.md.
