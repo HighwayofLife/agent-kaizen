@@ -1,8 +1,55 @@
 #!/usr/bin/env python3
 """Show running dispatch commands and the latest saved report per repository."""
 import argparse
+import os
 from pathlib import Path
 import subprocess
+import time
+
+
+def git(directory, *arguments):
+    try:
+        return subprocess.run(['git', '-C', str(directory), *arguments],
+                              stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+    except OSError:
+        return None
+
+
+def worktrees(directory):
+    result = git(directory, 'worktree', 'list', '--porcelain', '-z')
+    if result is None or result.returncode:
+        return [directory]
+    return [Path(field[9:].decode(errors='surrogateescape'))
+            for field in result.stdout.split(b'\0') if field.startswith(b'worktree ')]
+
+
+def dirty_row(directory):
+    result = git(directory, 'status', '--porcelain', '-z', '--untracked-files=all', '--', '.', ':!out')
+    if result is None or result.returncode:
+        return None
+    fields = result.stdout.split(b'\0')
+    paths = []
+    index = 0
+    while index < len(fields) and fields[index]:
+        entry = fields[index]
+        paths.append(Path(os.fsdecode(entry[3:])))
+        index += 2 if b'R' in entry[:2] or b'C' in entry[:2] else 1
+    if not paths:
+        return None
+    times = []
+    for path in paths:
+        candidate = directory / path
+        while not candidate.exists() and candidate != candidate.parent:
+            candidate = candidate.parent
+        try:
+            times.append(candidate.stat().st_mtime)
+        except OSError:
+            continue
+    seconds = max(0, time.time() - max(times, default=time.time()))
+    age = f'{int(seconds / 86400)}d' if seconds >= 86400 else f'{int(seconds / 3600)}h' if seconds >= 3600 else f'{int(seconds / 60)}m'
+    result = git(directory, 'log', '-1', '--format=%s')
+    subject = result.stdout.decode(errors='replace').strip()[:70] if result and result.returncode == 0 else ''
+    return f'{directory}: {len(paths)} paths, {age}, {subject}'
 
 
 def main():
@@ -27,6 +74,21 @@ def main():
         latest = max(reports, key=lambda p: (p.stat().st_mtime_ns, str(p)))
         status = [line for line in latest.read_text(errors='replace').splitlines() if line.startswith('STATUS:')]
         print(f'{root}: {status[-1] if status else "STATUS: unknown"} ({latest})')
+    print('\nDIRTY WORKTREES (uncommitted paths outside out/, newest change age)')
+    directories = args.directories or worktrees(Path.cwd())
+    seen = set()
+    for directory in directories:
+        root = directory.expanduser().resolve()
+        # Status paths are relative to Git's repository root.
+        result = git(root, 'rev-parse', '--show-toplevel')
+        if result and result.returncode == 0:
+            root = Path(os.fsdecode(result.stdout.rstrip(b'\n'))).resolve()
+        if root in seen:
+            continue
+        seen.add(root)
+        row = dirty_row(root)
+        if row:
+            print(row)
     return 0
 
 
