@@ -15,7 +15,7 @@ class LinkTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
-        self.home = Path(self.temp.name)
+        self.home = Path(self.temp.name).resolve()
         self.bin = self.home / "bin"
         self.env = dict(os.environ, CLAUDE_CONFIG_DIR=str(self.home),
                         KAIZEN_BACKUP_DIR=str(self.home / "backups"))
@@ -250,9 +250,16 @@ class LinkTests(unittest.TestCase):
                 if unlink_first:
                     self.run_link("--unlink", "--only", "token-audit", root=fake)
                 result = self.run_script(backup, "undo", change)
+                if not unlink_first:
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("symlink", result.stderr)
+                    self.assertTrue(installed.is_symlink())
+                    self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), before)
+                    self.run_link("--unlink", "--only", "token-audit", root=fake)
+                    result = self.run_script(backup, "undo", change)
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertEqual(installed.read_text(), "original user file")
-                self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest() == before, unlink_first)
+                self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), before)
 
 
 if __name__ == "__main__":

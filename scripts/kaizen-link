@@ -28,6 +28,7 @@ def codex_home():
 SCRIPTS = {
     "token-audit": "token-audit", "kaizen-token-audit": "token-audit",
     "kaizen-scheduled": "kaizen-scheduled", "kaizen-backup": "kaizen-backup",
+    "kaizen_credentials.py": "kaizen_credentials.py",
     "pricing.json": "pricing.json", "kaizen-pricing.json": "pricing.json",
     "rules-lint.patterns": "rules-lint.patterns", "install-schedule": "install-schedule",
     "usage-series": "usage-series", "usage-compare": "usage-compare",
@@ -184,7 +185,7 @@ def main():
                     newest.rename(target)
                     detail = "restored " + newest.name
         elif args.apply:
-            replace = args.replace or (args.replace_prefixed and name.startswith("kaizen-"))
+            replace = args.replace or (args.replace_prefixed and name.startswith(("kaizen-", "kaizen_")))
             if current in ("DRIFT", "BROKEN") and target.is_symlink():
                 target.unlink()
                 current = "ABSENT"
@@ -209,7 +210,7 @@ def main():
         else:
             detail = "would " + ("skip" if current in ("OK", "LOCAL") or
                                     (current == "DRIFT" and not target.is_symlink() and
-                                     not (args.replace or (args.replace_prefixed and name.startswith("kaizen-"))))
+                                     not (args.replace or (args.replace_prefixed and name.startswith(("kaizen-", "kaizen_")))))
                                     else mode) + " " + name
         entries.append({"name": name, "kind": kind, "status": current, "detail": detail})
     if args.check:

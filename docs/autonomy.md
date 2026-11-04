@@ -31,8 +31,8 @@ Optional settings in the same file:
 
 The person chose `auto` so they wouldn't be asked. Don't invent extra conditions:
 - **"No measured saving yet."** Measuring comes after the change; that's what the ledger and the next audit are for. A reasoned expected effect is enough.
-- **"The user hasn't confirmed I may edit this file."** In `auto`, every file under the project and `~/.claude/` (CLAUDE.md, imported docs, agents, skills, the `~/.claude/orchestrator/` docs) and `~/.codex/AGENTS.md` is in scope, apart from the hard stops (permissions, hooks being removed, secrets). In scheduled runs only Markdown instruction files under the config homes are writable (see Permissions).
-- **"It needs web access."** Web research (models, whats-new, roster research) is free and allowed. "Spending money" means buying a plan or paying for API calls, not reading docs.
+- **"The user hasn't confirmed I may edit this file."** In `auto`, every file under the project and `~/.claude/` (CLAUDE.md, imported docs, agents, skills, the `~/.claude/orchestrator/` docs) and `~/.codex/AGENTS.md` is in scope, apart from the hard stops (permissions, hooks being removed, secrets). Scheduled auto runs cannot edit `.claude` instruction files, including CLAUDE.md and `.claude/rules`: Claude Code protects them in `-p` mode. They edit only other files and report instruction-file proposals for the owner (see Permissions).
+- **"It needs web access."** Interactive web research (models, whats-new, roster research) is free and allowed. Scheduled runs have no network egress and skip model and release web checks. "Spending money" means buying a plan or paying for API calls, not reading docs.
 - **"It's a big change."** Make a smaller version that you can verify, for example trimming one section of one file.
 
 If a run ends with zero changes applied while low-risk proposals existed that weren't hard stops, the run failed its job. Apply at least the best one.
@@ -44,7 +44,7 @@ Reversible and local, with no effect on what agents are allowed to do:
 - Shortening or deduplicating instruction files (CLAUDE.md, AGENTS.md, agent and skill descriptions), **as long as no rule is dropped**. Merged rules stay word-for-word in the diff.
 - Adding a tools-before-tokens line, a code-map line or a topic-doc pointer to instructions.
 - Adding one short, confirmed repo-fact line to a project's CLAUDE.md.
-- Editing Markdown instruction files under the Claude and Codex homes (CLAUDE.md, agents/*.md, rules/**/*.md, memory MEMORY.md files, Codex AGENTS.md), in scheduled auto runs too; settings, hooks, plugins, skills, commands, bin, credentials and every .json, .toml, .sh, .py and .js file under the homes stay denied in scheduled runs.
+- Editing Markdown instruction files under the Claude and Codex homes (CLAUDE.md, agents/*.md, rules/**/*.md, memory MEMORY.md files, Codex AGENTS.md), interactively; unattended auto runs report `.claude` instruction-file proposals for the owner; settings, hooks, plugins, skills, commands, bin, credentials and every .json, .toml, .sh, .py and .js file under the homes stay denied in scheduled runs.
 - Setting `disable-model-invocation: true` on your own user-triggered skills.
 - Switching a single routing row to a model already in your roster, as a one-row trial.
 - Writing new scripts under `tools/` or `~/.claude/bin/` (new files only; nothing existing is replaced).
@@ -77,7 +77,7 @@ Use the bundled script for the bookkeeping. Call `~/.claude/bin/kaizen-backup` i
    - hooks pass their sample-input tests;
    - `claude plugin validate` or the project's checks pass where relevant;
    - agents and skills still have valid frontmatter.
-4. **Finish or roll back:** if verification passes, run `kaizen-backup finish <change folder>`, which records the after-hashes undo uses to detect later edits. If it fails, run `kaizen-backup undo <change folder> --force`, report the failure, and skip the change.
+4. **Finish or roll back:** if verification passes, run `kaizen-backup finish <change folder>`, which records the after-hashes undo uses to detect later edits. If it fails interactively, run `kaizen-backup undo <change folder> --force`, report the failure, and skip the change. In scheduled auto runs, leave the backup unfinished (or record `finish <change folder> --verification failed`) and report the failed check. The runner performs forced rollback after the cycle exits; the model never gets `undo` or `action`.
 5. **Ledger row** in `docs/kaizen/LEDGER.md`, with the backup folder, so `/agent-kaizen:undo` can reverse it.
 6. **Summary at the end:** what was applied, what was skipped and why (hard stop, cap reached, missing permission), and what was rolled back.
 
@@ -85,14 +85,16 @@ Use the bundled script for the bookkeeping. Call `~/.claude/bin/kaizen-backup` i
 
 The autonomy mode decides what the *skills* will do. Claude Code's own permission prompts still apply. To run without tool prompts:
 - **Interactive:** use a permission mode that auto-accepts edits (`acceptEdits`, or auto mode if your plan has it) for the session. Some files, such as your settings, may still prompt; skills skip what they're not allowed to do and list it.
-- **Scheduled:** `install-schedule --auto all|none|DIR...` sets `scheduledAutonomy` globally or for selected projects. The `kaizen-scheduled` runner uses `dontAsk` in propose mode and `acceptEdits` in auto mode. Both restrict available and allowed tools; propose mode includes restricted read-only Bash, and auto mode adds edit tools and selected commands. Auto mode also denies hard-stop commands. It passes `--disallowedTools` deny rules using `Edit(//<abs>/...)` for both config homes: settings*.json, hooks, plugins, skills, commands, bin, `.credentials*`, `auth.json`, and every `.json`, `.toml`, `.sh`, `.py` and `.js` under them. It also denies edits to the Claude user config file and the project's `.claude/settings*.json`. Markdown instruction files stay editable. Both modes use `--strict-mcp-config`. See [scheduled permissions](scheduling.md#unattended-permissions) for the exact lists.
+- **Scheduled:** `install-schedule --auto all|none|DIR...` sets `scheduledAutonomy` globally or for selected projects. The `kaizen-scheduled` runner uses `dontAsk` in propose mode and `default` in auto mode, with explicit Edit/Write grants under the project and config homes. Both restrict available and allowed tools; propose mode includes restricted read-only Bash, and auto mode adds edit tools and selected commands. Both modes also deny hard-stop commands and bulk Bash readers such as `grep`, `rg`, `find` and `cat`; use Read, Grep and Glob. It passes `--disallowedTools` deny rules using `Edit(//<abs>/...)` and `Write(//<abs>/...)` for both config homes: settings*.json, hooks, plugins, skills, commands, bin, `.credentials*`, `auth.json`, and every `.json`, `.toml`, `.sh`, `.py` and `.js` under them. It also denies edits to the Claude user config file and the project's `.claude/settings*.json`. Claude Code protects `.claude` instruction files (CLAUDE.md and `.claude/rules`) in `-p` mode. Auto changes are limited to other files; instruction-file proposals go in the report for the owner. Both modes deny Read/Edit/Write to the credential paths and backup trees, and use `--strict-mcp-config`. Credential protection rests on no network egress from scheduled tools: WebFetch and WebSearch are unavailable, and curl and wget are denied. The path and command deny lists are a second layer. The project `**/.env.*` rule also hides `.env.example`. `kaizen-backup begin` refuses credential paths; use `kaizen-backup list` for backup metadata. See [scheduled permissions](scheduling.md#unattended-permissions) for the exact lists.
 
-  Deny rules cover Edit/Write and the file commands Claude Code recognises (cat, sed, tee, redirects). They do not cover `cp` or scripts, so every script the runner allows re-checks its own paths. It never uses `bypassPermissions`. Changes to settings, hooks and permissions are still made interactively, where you see each edit.
+  Edit/Write denies do not cover every Bash file command. Scheduled auto runs therefore use default permission mode and explicitly deny filesystem commands such as `cp`, rather than relying on `acceptEdits`. Every allowed helper re-checks its own paths. It never uses `bypassPermissions`. Changes to settings, hooks and permissions are still made interactively, where you see each edit.
 
 ## Undo
 
 - `/agent-kaizen:undo last` reverses the most recent applied change.
 - `/agent-kaizen:undo <ledger row date or backup folder>` reverses a specific one.
 - `/agent-kaizen:undo run` reverses everything from the last run.
+
+After `kaizen-link --replace`, first run `kaizen-link --unlink --restore-replaced`, then `kaizen-backup undo <dir>`. Undo through a symlink writes into plugin sources; the backup command refuses such restores even with `--force`.
 
 `/agent-kaizen:undo` runs `kaizen-backup undo`. That command skips changes already reverted, and treats a file whose hash differs from the recorded after-hash as a conflict (nothing is restored without `--force`). It restores backups, deletes created files that are unchanged, and prints recorded actions' reverse commands without running them. The skill then marks the ledger row.
