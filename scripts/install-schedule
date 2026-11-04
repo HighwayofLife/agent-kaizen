@@ -354,7 +354,7 @@ def main(argv=None):
                 "--bin", str(BIN), "--hooks-dir", str(BIN.parent / "hooks"),
                 "--mode", "auto", "--replace-prefixed", "--only", ",".join(names)]
         try:
-            for flags in ([], ["--apply"]):
+            for flags in ([], ["--apply"], ["--check"]):
                 result = subprocess.run(link + flags)
                 if result.returncode:
                     return result.returncode

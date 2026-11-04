@@ -171,7 +171,7 @@ class ScheduleTests(StubCase):
         write(target / 'rules-lint', 'foreign tool')
         (target / 'kaizen-backup').symlink_to(SCRIPTS / 'kaizen-backup')
         write(self.home / '.claude/agent-kaizen.json', '{"localScripts":["notes-ledger"]}')
-        result = self.install()
+        result = self.install(code=1)
         self.assertEqual(next(target.glob('kaizen-scheduled.replaced-*')).read_text(), 'old runner')
         self.assertTrue((target / 'kaizen-scheduled').is_symlink())
         self.assertEqual((SCRIPTS / 'kaizen-scheduled').read_bytes(), original)
@@ -180,6 +180,19 @@ class ScheduleTests(StubCase):
         self.assertIn('DRIFT rules-lint', result.stdout)
         self.assertIn('skip LOCAL notes-ledger', result.stdout)
         self.assertFalse((target / 'notes-ledger').exists())
+
+    def test_cache_install_reports_unresolved_dependency_drift(self):
+        plugin = self.root / 'plugins/cache/agent-kaizen/version'
+        shutil.copytree(SCRIPTS, plugin / 'scripts')
+        command = [sys.executable, str(plugin / 'scripts/install-schedule'), '--scheduler', 'cron', '--apply']
+        first = subprocess.run(command, env=self.env, capture_output=True, text=True)
+        self.assertEqual(first.returncode, 0, first.stderr)
+        for name in ('packet-report', 'notes-ledger', 'token-audit'):
+            (plugin / 'scripts' / name).write_text('changed')
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 1)
+        for name in ('packet-report', 'notes-ledger', 'token-audit'):
+            self.assertIn('DRIFT ' + name, result.stdout)
 
     def test_cache_install_copies_dependencies_and_survives_plugin_move(self):
         plugin = self.root / 'plugins/cache/agent-kaizen/version'
@@ -193,8 +206,7 @@ class ScheduleTests(StubCase):
         target = custom / 'bin'
         self.assertIn('would copy kaizen-scheduled', result.stdout)
         self.assertFalse((target / 'kaizen-scheduled').is_symlink())
-        check = subprocess.run([sys.executable, str(target / 'kaizen-link'), '--check',
-                                '--plugin-root', str(plugin)],
+        check = subprocess.run([sys.executable, str(target / 'kaizen-link'), '--check'],
                                env=self.env, capture_output=True, text=True)
         self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
         loader = importlib.machinery.SourceFileLoader('installed_scheduled', str(target / 'kaizen-scheduled'))
@@ -386,7 +398,7 @@ class ScheduleTests(StubCase):
         result = subprocess.CompletedProcess(['crontab', '-l'], 1, stdout='discard this\n')
         ok = subprocess.CompletedProcess([], 0)
         with patch.object(schedule.shutil, 'which', return_value=str(self.bin / 'crontab')), \
-                patch.object(schedule.subprocess, 'run', side_effect=[ok, ok, result, ok]) as run:
+                patch.object(schedule.subprocess, 'run', side_effect=[ok, ok, ok, result, ok]) as run:
             self.assertEqual(schedule.main(['--scheduler', 'cron', '--apply']), 0)
         self.assertNotIn('discard this', run.call_args.kwargs['input'])
 

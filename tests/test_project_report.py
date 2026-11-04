@@ -111,6 +111,13 @@ class ProjectReportTests(unittest.TestCase):
             self.assertIn('projectCommands', result.stderr)
             self.assertNotIn('Traceback', result.stderr)
 
+    def test_rejects_relative_keys_even_after_matching_project(self):
+        (self.root / 'agent-kaizen.json').write_text(json.dumps({'projectCommands': {
+            str(self.project): {}, '.': {}}}))
+        result = self.invoke()
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("projectCommands key must be absolute: '.'", result.stderr)
+
     def test_unenrolled(self):
         shutil.rmtree(self.project / 'docs/kaizen')
         result = self.invoke()
