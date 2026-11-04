@@ -1,0 +1,12 @@
+Model/effort: gpt-6-astra / high; mode: diff
+Raw output: /private/var/folders/gz/jgnh4_992978ddyyywss85700000gn/T/codex-review/20261104T215403.465201Z
+Target: --base 815db91 (review the merge-base-to-HEAD diff)
+Model: Codex/GPT-6; effort: not exposed. Target: `815db91...a13358d`, `scripts/` only. Read `AGENTS.md`, `CLAUDE.md`, and the port plan.
+- **[P2] scripts/kaizen-scheduled:699** — Post-run verification accepts replacement symlinks — a symlink to identical bytes passes and snapshots are deleted, leaving subsequent ledger writes redirected; recheck the regular-file invariant.
+- **[P2] scripts/install-schedule:355** — Copy-mode upgrades leave generic dependencies stale — `--replace-prefixed` skips changed `packet-report`, `notes-ledger`, and canonical dependencies while installation succeeds; refresh previously managed copies or fail on unresolved drift.
+- **[P2] scripts/kaizen-scheduled:1052** — Worktrees overwrite their canonical project’s report — index entries share a project key, so reports collide within a second or make a worktree’s incomplete report newest; iterate discovered canonical projects instead.
+- **[P2] scripts/kaizen-link:90** — Copied linker cannot locate its plugin by default — installed `kaizen-link --check` searches `<config>/scripts` and exits 2; load the recorded plugin root for copy installations.
+- **[P2] scripts/kaizen-project-report:114** — Relative configuration keys silently depend on CWD — `"."` matches interactively but drops configured sections under another launch directory; reject nonabsolute `projectCommands` keys here, consistently with the scheduler’s schema.
+CWD confirmation is conditional: probes reproduced it with relative configuration keys. Absolute project/config paths produced identical output across working directories; missing launchd `WorkingDirectory` alone was insufficient.
+Validation: targeted in-memory probes and diff checks; no files edited. Full tests were not run because they write fixtures.
+VERDICT: ISSUES FOUND (5)

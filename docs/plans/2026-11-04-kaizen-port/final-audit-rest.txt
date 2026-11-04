@@ -1,0 +1,10 @@
+Model/effort: gpt-6-astra / high; mode: diff
+Raw output: /private/var/folders/gz/jgnh4_992978ddyyywss85700000gn/T/codex-review/20261104T215403.465385Z
+Target: --base 815db91 (review the merge-base-to-HEAD diff)
+Model: GPT-6/Codex; effort: not exposed. Target: `815db91...HEAD`, restricted to the requested paths. Read AGENTS.md, CLAUDE.md and the port plan.
+- **P1** `docs/scheduling.md:132` — Auto mode removes the required failure-rollback command — `docs/autonomy.md:80` requires `kaizen-backup undo … --force` after failed verification, but unattended permissions exclude it; failed changes can remain applied. Provide a constrained rollback mechanism or prevent such changes.
+- **P1** `docs/scheduling.md:50` — Link replacement instructions omit the required unlink-before-undo step — after replacing an existing file with a symlink, ordinary `kaizen-backup undo` copies through it into plugin sources. Document and integrate the plan’s `kaizen-link --unlink --restore-replaced` prerequisite into rollback.
+- **P2** `skills/cycle/SKILL.md:22` — Suggested drift repair cannot repair differing regular-file copies — `kaizen-link --apply` leaves those files as DRIFT without replacement flags. Recommend scoped, backed-up replacement so cache-copy updates actually take effect.
+CWD: **not reproduced at HEAD**. Launchd plists omit `WorkingDirectory` (`scripts/install-schedule:131`), but `kaizen-project-report:100` resolves the project and lines 23/44 run children with `cwd=project`. Packet output matched from the repository and `/`. Any remaining report CWD bug should be fixed in `kaizen-project-report` path handling or configured commands; one launchd working directory cannot represent multiple projects.
+Shellcheck and scoped `git diff --check` passed. No files edited; no new owner-specific values found in scope.
+VERDICT: ISSUES FOUND (3)
