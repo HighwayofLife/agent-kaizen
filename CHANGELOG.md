@@ -2,6 +2,19 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.7.1 (2026-11-04)
+
+Security hardening for scheduled (unattended) runs, from the port's final audit and a live permission probe:
+
+- Scheduled runs have no network tools (WebFetch and WebSearch are removed) and no plain Bash commands. The only Bash rules left are the exact `notes-ledger add` and `kaizen-backup begin|finish|list` helpers, in auto mode only. Read, Grep and Glob cover reading. Model and release web checks run only in interactive cycles.
+- Auto mode uses the default permission mode with scoped Edit/Write allow rules instead of `acceptEdits`, and denies file-writing and read-through Bash commands, credential files, `.env` files and `.git` trees, including in the config homes.
+- Failed auto changes are rolled back by the runner, never the model. The runner only rolls back backups created during the run. The backup root cannot be edited or read by the model, entries are validated, and restores never write through symlinks. `kaizen-backup begin` refuses credential paths.
+- The ledger guard detects symlink swaps of the ledger file and its parents. Projects are iterated once per canonical repo, not per worktree.
+- Unattended runs cannot edit `.claude` instruction files, because Claude Code protects them in `-p` mode. Proposals for those files go into the report.
+- `kaizen-link --check` reports `STALE-CACHE` when the installed plugin cache differs from the plugin root. `claude plugin update` does nothing while the version is unchanged, so bump the version or reinstall. Installed `kaizen-link` copies find their plugin root, the installer refreshes managed copies, and `kaizen-project-report` rejects relative `projectCommands` keys.
+- `notes-ledger due` tolerates non-object config and malformed dates. The session-notes hook has a timeout fallback for systems without `timeout`.
+- `tests/test_schedule_live_probe.py` (opt-in, `KAIZEN_LIVE_PROBE=1`) checks these permissions against the real Claude CLI.
+
 ## 0.7.0 (2026-11-04)
 
 - `kaizen-link` links or copies managed scripts and hooks; `--check` reports drift, `localScripts` marks intended differences, and `--apply --replace` saves differing files with a `.replaced-<date>` suffix. Plugin cache installs use copies.
