@@ -135,3 +135,7 @@ Plugin work lands on a branch in group order, each Codex packet from its own wor
 
 - Whether to port the Codex owner-only features next (Decision 2 follow-up).
 - Whether New World should later shrink `tools/packet_report.py` to call `packet-report` (not needed for this plan).
+
+## Status (2026-11-04)
+
+Done. Packets 01-13 landed, plus fixes a-g; fix-f took 6 rounds of permission hardening. Final audit: 8 findings, all fixed. Released 0.7.1 and installed it for the owner (scheduled jobs: com.agent-kaizen.audit and com.agent-kaizen.review). Live permission probe: `KAIZEN_LIVE_PROBE=1 python3 -m unittest tests.test_schedule_live_probe` passes. Open follow-ups are in followups.md: codex-dispatch NEEDS-DECISION/NO-CHANGE, notes-ledger `--timeline-match`, and scheduled release checks by runner precompute.

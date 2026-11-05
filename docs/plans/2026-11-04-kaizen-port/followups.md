@@ -5,3 +5,7 @@
 ## notes-ledger set cannot update hand-written legacy rows (2026-11-04)
 
 `set --match` requires the timeline row text to be equivalent to the CSV change text. Rows written by hand before notes-ledger existed use different wording, so set fails with "match must select exactly one timeline row" and nothing can be updated. Proposal: add `--timeline-match TEXT` to select the timeline row separately, still exactly one row.
+
+## Scheduled release checks by runner precompute (2026-11-04)
+
+Scheduled cycles lost WebFetch/WebSearch in 0.7.1. Model and release checks could instead be fetched by the runner, with curl and the generic User-Agent, into the checks report, the same way it precomputes other checks.
