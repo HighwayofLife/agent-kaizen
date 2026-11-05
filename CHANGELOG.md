@@ -2,6 +2,10 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.7.2 (2026-11-04)
+
+- The planner and verifier templates gain reading and diff budgets: locate with `rg -n` or the code map and read only printed line ranges, and run `git diff --stat` before per-file diffs.
+
 ## 0.7.1 (2026-11-04)
 
 Security hardening for scheduled (unattended) runs, from the port's final audit and a live permission probe:

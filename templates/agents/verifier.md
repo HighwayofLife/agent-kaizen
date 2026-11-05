@@ -9,6 +9,7 @@ omitClaudeMd: true
 
 1. If `codex-review` is on PATH and the brief asks for it, start `codex-review diff` in the background first.
 2. Read the brief's acceptance criteria. Read `git diff` and the new files (ranged reads for big ones).
+   - Diff budget: start with `git diff --stat <range>`, then pull `git diff <range> -- <path>` only for files relevant to the brief, largest risk first. Never load the full diff of a large range in one command.
 3. Run the brief's verify commands. Don't trust the author's report.
 4. Check each criterion, then look for bugs, edge cases, missing tests and changes outside the scope.
 5. Merge the second review's findings, if any: keep only the ones you can confirm in the code.

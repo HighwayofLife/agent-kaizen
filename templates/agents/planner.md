@@ -9,6 +9,7 @@ omitClaudeMd: true
 
 Follow your role context (planning). In short:
 - Start with `tools/codemap brief <input file>`. Finish exploring in about 60 tool calls.
+- Reading budget: locate code with `rg -n` and, where the repo has it, `tools/codemap find|outline|refs`, then read only the line ranges they print. No broad `sed -n` or `cat` paging through whole files.
 - Write `docs/plans/<yyyy-mm-dd>-<slug>/plan.md` (summary, approach, packet table, risks, **Research needed**, **Decisions needed**) and `briefs/NN-<slug>.md` for each packet.
 - Each packet is under ~400 changed lines, independently verifiable, and has exact verify commands.
 - If a real trade-off or a data-model, protocol or security change appears, stop and return ESCALATE with the question.
