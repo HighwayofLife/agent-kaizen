@@ -4,7 +4,10 @@ import json
 from pathlib import Path
 import runpy
 
-from test_scripts import SCRIPTS, StubCase, jsonl
+try:
+    from tests.test_scripts import SCRIPTS, StubCase, jsonl
+except ModuleNotFoundError:
+    from test_scripts import SCRIPTS, StubCase, jsonl
 
 AUDIT = runpy.run_path(str(SCRIPTS / 'token-audit'))
 

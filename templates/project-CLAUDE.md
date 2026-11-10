@@ -9,17 +9,17 @@ Read `<design doc path>` before design work. Plans and briefs live in `docs/plan
 
 ## Architecture (invariants only)
 
-- <e.g. Game logic lives in `<core library>` with no engine references; the engine is a viewer that reads snapshots and sends commands.>
-- <e.g. Determinism: one seeded PRNG with named streams; no wall clock in game logic.>
+- <e.g. Core logic lives in `<core library>` with no framework or UI references; the UI layer only reads state and sends commands.>
+- <e.g. Determinism, if it matters: one seeded random source; no wall clock in core logic.>
 - <e.g. Every tunable lives in `<settings file>`; never hard-code one.>
-- <e.g. Player-facing text lives in language files keyed by id.>
+- <e.g. User-facing text lives in resource files keyed by id.>
 
 ## Commands
 
 ```
 <build command>
-<fast unit tests: seconds, no editor>
-<engine tests: targeted filter>
+<fast unit tests: seconds, no heavy runtime>
+<slow tests: targeted filter>
 <one check command per change, e.g. tools/check.sh>
 <asset validator, if any>
 ```
@@ -28,7 +28,7 @@ Inside the Codex sandbox (no network): <the offline build and test variants, if 
 
 ## Code map
 
-`tools/codemap` indexes symbols, settings keys, localisation ids and scenes. Use it before grepping or reading files, then read only the line ranges it prints: `find`, `outline <file>`, `refs`, `setting <key>`, `tests <fragment>`, `brief <file>`, `tree`.
+If the repo has `tools/codemap` (a symbol index; `/agent-kaizen:code-map` builds one), it indexes <symbols, settings keys, resource ids>. Use it before grepping or reading files, then read only the line ranges it prints: `find`, `outline <file>`, `refs`, `setting <key>`, `tests <fragment>`, `brief <file>`, `tree`.
 
 ## Working rules
 
@@ -41,8 +41,8 @@ Inside the Codex sandbox (no network): <the offline build and test variants, if 
 ## Topic docs
 
 Read the one that matches your task and skip the rest:
-- `docs/agents/engine.md`: engine toolchain, test runner, batch-mode traps.
-- `docs/agents/assets.md`: asset tools, budgets, licensing ledger.
-- `docs/agents/ui-text.md`: language files and naming.
+- `docs/agents/<toolchain>.md`: <build toolchain, test runner, known traps>.
+- `docs/agents/<topic>.md`: <e.g. asset tools, budgets, licensing ledger>.
+- `docs/agents/<topic>.md`: <e.g. resource files and naming>.
 
 Main session only (Codex and subagents skip it): @docs/agents/orchestrator.md

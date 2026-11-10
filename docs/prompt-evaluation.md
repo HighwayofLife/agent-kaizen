@@ -11,7 +11,7 @@ This is what changed and why.
 | Skill | First-draft problem | Fix |
 |---|---|---|
 | `start` | Didn't exist. Changes were one-offs with no record of their effect | New: ledger, loop README, baseline of what loads every turn |
-| `audit` | Didn't say where transcripts live, missed subagent transcripts, would double-count tokens | Names `~/.claude/projects/<proj>/*.jsonl` plus `<session>/subagents/*.jsonl` and Codex `function_call`/`custom_tool_call`. De-duplicates by message id. Reports context × turns. Ships a working script instead of asking Claude to write one |
+| `audit` | Didn't say where transcripts live, missed subagent transcripts, would double-count tokens | Names `<Claude config dir>/projects/<proj>/*.jsonl` plus `<session>/subagents/*.jsonl` and the Codex sessions folder. De-duplicates by message id. Reports context × turns. Ships a working script instead of asking Claude to write one |
 | `slim-instructions` | "Remove unneeded rules" risked losing rules silently | Must list every dropped or merged rule and why, plus a before/after token estimate per file |
 | `lean-agents` | Assumed frontmatter and hook features exist | Tells Claude to check the docs (`omitClaudeMd`, `SubagentStart` `additionalContext`), warns that built-in agents still load CLAUDE.md, ships the hook and templates |
 | `codex-dispatch` | Asked Claude to write a dispatcher from scratch | Ships a tested, portable dispatcher (resume rounds, checks outside the sandbox, overload retry, `--disable-mcp`, code-map prefetch) |
@@ -28,6 +28,8 @@ This is what changed and why.
 | `trim-context` | Didn't exist | New: MCP servers, connectors, plugins, skill and agent descriptions, Codex MCP, with cache-invalidation warnings |
 | `roster` | Didn't exist. Routing assumed a fixed set of vendors | New: detects the CLIs and subscriptions you have (key names only, never values), researches strengths with sources, optionally runs a bake-off on your repo, then builds routing with fallbacks, escalation ladders and pool rules |
 | `cycle` | Didn't exist | New: one entry point that runs the loop and decides which checks are due |
+| `autonomy` | Didn't exist. The mode lived in each skill's own wording | New: one place to show or set `propose`, `safe` or `auto`, with the hard stops stated in plain words |
+| `undo` | Didn't exist. A bad change meant restoring files by hand | New: reverses the last change, a specific change folder or a whole run from its backup, and stops on a conflict |
 
 ## Known limits
 

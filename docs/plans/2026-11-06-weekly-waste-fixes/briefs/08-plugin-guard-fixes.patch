@@ -1,0 +1,135 @@
+--- /var/folders/gz/jgnh4_992978ddyyywss85700000gn/T/tmp.GWxwTwBEIH/b	2026-11-06 14:42:25
++++ /Users/highwayoflife/github/highwayoflife/agent-kaizen/scripts/codex-dispatch	2026-11-06 14:40:42
+@@ -6,6 +6,7 @@
+ from pathlib import Path
+ import re
+ import shutil
++import stat
+ import subprocess
+ import sys
+ 
+@@ -73,8 +74,16 @@
+     return rewritten if result.returncode == 0 and rewritten else command
+ 
+ 
+-def tree_snapshot(cwd):
++def tree_snapshot(cwd, out):
+     """Return the worktree fingerprint and number of changed paths, if in Git."""
++    try:
++        return _tree_snapshot(cwd, out)
++    except OSError as exc:
++        print(f"WARNING: tree snapshot failed: {one_line(str(exc))}; require-change skipped")
++        return None
++
++
++def _tree_snapshot(cwd, out):
+     root = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd,
+                           capture_output=True, check=False)
+     if root.returncode:
+@@ -86,31 +95,58 @@
+ 
+     status = git("status", "--porcelain=v1", "-uall", "-z")
+     try:
+-        diff = git("diff", "HEAD", "--binary")
++        out.relative_to(cwd)
++        excluded_path = str(out.relative_to(root))
++        excluded = os.fsencode(excluded_path)
++        pathspec = ("--", ".", f":(exclude,literal){excluded_path}")
++    except ValueError:
++        excluded = None
++        pathspec = ()
++    try:
++        diff = git("diff", "HEAD", "--binary", *pathspec)
+     except subprocess.CalledProcessError:
+         # A newly initialized repository has no HEAD yet.
+-        diff = git("diff", "--binary") + git("diff", "--cached", "--binary")
++        diff = git("diff", "--binary", *pathspec) + git("diff", "--cached", "--binary", *pathspec)
+     entries = status.split(b"\0")
++    included = []
+     untracked = []
+     count = 0
+     index = 0
+     while index < len(entries) and entries[index]:
+         entry = entries[index]
++        renamed = entry[:2].find(b"R") >= 0 or entry[:2].find(b"C") >= 0
++        extra = entries[index + 1] if renamed else None
++        name = entry[3:].rstrip(b"/")
++        if excluded is not None and (name == excluded or name.startswith(excluded + b"/")):
++            index += 2 if renamed else 1
++            continue
++        included.append(entry)
++        if extra is not None:
++            included.append(extra)
+         count += 1
+         if entry.startswith(b"?? "):
+             path = root / os.fsdecode(entry[3:])
+-            stat = path.lstat()
+-            if path.is_symlink():
++            info = path.lstat()
++            if stat.S_ISLNK(info.st_mode):
+                 content = os.fsencode(os.readlink(path))
+-            elif stat.st_size > 5 * 1024 * 1024:
+-                content = f"{stat.st_size}:{stat.st_mtime_ns}".encode()
++            elif not stat.S_ISREG(info.st_mode) or info.st_size > 5 * 1024 * 1024:
++                content = f"{info.st_size}:{info.st_mtime_ns}".encode()
++                if stat.S_ISDIR(info.st_mode):
++                    nested_root = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"],
++                                                 capture_output=True, check=False)
++                    if nested_root.returncode == 0 and Path(os.fsdecode(nested_root.stdout.rstrip(b"\n"))) == path:
++                        head = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"],
++                                              capture_output=True, check=False)
++                        nested = subprocess.run(["git", "-C", str(path), "status", "--porcelain=v1"],
++                                                capture_output=True, check=False)
++                        content += head.stdout + nested.stdout
+             else:
+                 content = path.read_bytes()
+             untracked.append((entry[3:], hashlib.sha256(content).digest()))
+-        if entry[:2].find(b"R") >= 0 or entry[:2].find(b"C") >= 0:
++        if renamed:
+             index += 1
+         index += 1
+-    return (status, hashlib.sha256(diff).digest(), tuple(untracked)), count
++    return (tuple(included), hashlib.sha256(diff).digest(), tuple(untracked)), count
+ 
+ 
+ def main():
+@@ -175,7 +211,7 @@
+         if not cwd.is_dir():
+             raise OSError(f"working directory missing: {cwd}")
+         task = args.brief.expanduser().read_text()
+-        if not args.resume and "sol" in (args.m or "").lower():
++        if not args.resume and re.search(r"(^|[^a-z0-9])sol([^a-z0-9]|$)", (args.m or "").lower()):
+             match = re.search(r"^\s*Sol reason:[ \t]*(\S[^\r\n]*)", task, re.IGNORECASE | re.MULTILINE)
+             if not match:
+                 print("ERROR: Sol model requires a Sol reason in the brief.", file=sys.stderr)
+@@ -197,7 +233,7 @@
+         brief = out / "brief.md"
+         brief.write_text(preamble + "\n" + (locations.rstrip() + "\n\n" if locations else "") + task)
+         runner = str(here / "codex-run")
+-        initial = tree_snapshot(cwd)
++        initial = tree_snapshot(cwd, out)
+         dirty_count = initial[1] if initial else 0
+         require_change = initial is not None and args.p == "engineer" and not args.allow_no_change
+         failures = []
+@@ -234,11 +270,16 @@
+                             os.environ[name] = value
+ 
+             if require_change:
+-                changed = tree_snapshot(cwd)[0] != initial[0]
+-                change_log = out / "check-require-change.log"
+-                change_log.write_text("Files changed.\n" if changed else "No files changed since dispatch started.\n")
+-                shutil.copyfile(change_log, out / f"check-require-change-round-{attempt}.log")
+-                results[0] = (0, "require-change", 0 if changed else 1, change_log, attempt)
++                current = tree_snapshot(cwd, out)
++                if current is None:
++                    require_change = False
++                    results.pop(0, None)
++                else:
++                    changed = current[0] != initial[0]
++                    change_log = out / "check-require-change.log"
++                    change_log.write_text("Files changed.\n" if changed else "No files changed since dispatch started.\n")
++                    shutil.copyfile(change_log, out / f"check-require-change-round-{attempt}.log")
++                    results[0] = (0, "require-change", 0 if changed else 1, change_log, attempt)
+             run_checks(selected, "initial" if attempt == 0 else "retry")
+             if attempt and all(not check[2] for check in results.values()):
+                 retried = {number for number, _ in selected}

@@ -4,6 +4,7 @@ import argparse
 from collections import Counter, defaultdict
 import csv
 from datetime import datetime, timedelta, timezone
+import importlib.util
 from importlib.machinery import SourceFileLoader
 import json
 import os
@@ -15,7 +16,16 @@ import subprocess
 import sys
 import tempfile
 
-AUDIT = SourceFileLoader('kaizen_token_audit', str(Path(__file__).resolve().with_name('token-audit'))).load_module()
+
+
+def load_sibling(name, file):
+    loader = SourceFileLoader(name, str(Path(__file__).resolve().with_name(file)))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(module)
+    return module
+
+
+AUDIT = load_sibling('kaizen_token_audit', 'token-audit')
 CLAUDE = ('opus', 'sonnet', 'haiku', 'fable', 'claude_other')
 CODEX = ('sol', 'terra', 'astra', 'luna', 'codex_other')
 BASE = ('date main_calls main_avg_ctx main_peak_ctx wakeups wakeup_avg_ctx main_images '
@@ -51,13 +61,17 @@ def matches(raw, args, folder=None):
     return True
 
 
-def claude_files(args):
+def claude_files(args, since=None):
+    """Transcripts that can hold rows at or after `since` (default args.since): older mtimes cannot."""
+    since = since or args.since
     root = AUDIT.claude_home() / 'projects'
     if not root.is_dir():
         return
     for project in sorted(p for p in root.iterdir() if p.is_dir()):
         for pattern, main in (('*.jsonl', True), ('*/subagents/*.jsonl', False)):
             for path in sorted(project.glob(pattern)):
+                if AUDIT.too_old(path, since):
+                    continue
                 parent = path if main else project / (path.parent.parent.name + '.jsonl')
                 if matches(AUDIT.cwd_of_file(parent), args, project.name):
                     yield path, main
@@ -83,7 +97,11 @@ def scan_claude(path, main, args, days, agents, warnings, priced, seen):
     for row in AUDIT.rows(path, args.since, warnings):
         if not isinstance(row.get('timestamp'), str):
             continue
-        ts = AUDIT.date_time(row['timestamp'])
+        try:
+            ts = AUDIT.date_time(row['timestamp'])
+        except (ValueError, OverflowError):
+            warnings['malformed rows'] += 1
+            continue
         if ts >= args.stop:
             continue
         day = ts.date().isoformat()
@@ -148,6 +166,8 @@ def scan_claude(path, main, args, days, agents, warnings, priced, seen):
 
 def scan_codex(args, days, warnings, priced):
     for path in sorted((AUDIT.codex_home() / 'sessions').glob('*/*/*/*.jsonl')):
+        if AUDIT.too_old(path, args.since):
+            continue
         if not matches(AUDIT.cwd_of_file(path), args):
             # Codex stores cwd in payload, unlike Claude.
             try:
@@ -158,7 +178,7 @@ def scan_codex(args, days, warnings, priced):
             except (OSError, ValueError, AttributeError):
                 warnings['unreadable Codex header'] += 1
                 continue
-        previous, model, active = Counter(), 'unknown', set()
+        previous, model, active = {}, 'unknown', set()
         for row in AUDIT.rows(path, datetime.min.replace(tzinfo=timezone.utc), warnings, keep_model=True):
             if not isinstance(row.get('timestamp'), str):
                 continue
@@ -170,17 +190,19 @@ def scan_codex(args, days, warnings, priced):
             usage = info.get('total_token_usage') if isinstance(info, dict) else None
             if payload.get('type') != 'token_count' or not isinstance(usage, dict):
                 continue
-            current = Counter({k: v for k, v in usage.items() if isinstance(v, (int, float))})
-            reset = any(current[k] < previous[k] for k in ('input_tokens', 'output_tokens'))
-            delta = current if reset else current - previous
-            previous = current
-            ts = AUDIT.date_time(row['timestamp'])
+            try:
+                ts = AUDIT.date_time(row['timestamp'])
+            except (ValueError, OverflowError):
+                warnings['malformed rows'] += 1
+                continue
+            # Rows before the window only seed the baseline.
+            delta, previous = AUDIT.codex_delta(previous, usage)
             if not args.since <= ts < args.stop:
                 continue
             day = ts.date().isoformat()
             cost = AUDIT.price(priced, model, 'codex', delta, codex=True)
             key = AUDIT.pricing_key(priced['_pricing'], model)
-            days[day]['unpriced_calls'] += int(key is None)
+            days[day]['unpriced_calls'] += int(key is None and any(delta.values()))
             days[day]['cost_codex_model_' + key if key else 'cost_codex_other_model'] += cost
             days[day]['cost_' + family(model, True)] += cost
             active.add(day)
@@ -235,12 +257,18 @@ def scan_git(args, days, warnings):
         try:
             result = subprocess.run(['git', '--no-pager', '-c', 'core.quotepath=off', '-C', str(repo),
                                      'log', '--all', '--no-merges', '--format=COMMIT %H %at', '--numstat'],
-                                    capture_output=True, text=True, check=True)
+                                    capture_output=True, check=True)
         except (OSError, subprocess.CalledProcessError):
             warnings['git repository unavailable'] += 1
             continue
+        try:
+            output = result.stdout.decode('utf-8')
+        except UnicodeDecodeError:
+            # core.quotepath=off prints raw path bytes; keep the numbers, replace the bad bytes.
+            warnings['git output was not valid UTF-8 (decoded with replacement)'] += 1
+            output = result.stdout.decode('utf-8', errors='replace')
         day = None
-        for line in result.stdout.splitlines():
+        for line in output.splitlines():
             if line.startswith('COMMIT '):
                 _, ident, timestamp = line.split()
                 ts = datetime.fromtimestamp(int(timestamp), timezone.utc)

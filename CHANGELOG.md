@@ -2,6 +2,75 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.9.0 (2026-11-10)
+
+From a full review of the plugin. Each fix has a regression test.
+
+Upgrade notes:
+
+- A project file can no longer switch on scheduled auto mode by itself. `scheduledAutonomy: auto` in `docs/kaizen/config.json` counts only when the project is listed in the new global-only `autoProjects` setting. Run `kaizen-scheduled config set --for DIR scheduledAutonomy=auto` (or `install-schedule --auto DIR`) once per project; until then the project runs as propose.
+- `install-schedule --apply` without `--review` now removes an installed review job. The audit job is never removed this way.
+- `token-audit` prices a model only on an exact key or alias match (a `-YYYYMMDD` or bracket suffix is allowed). A newer sibling model shows as Unpriced until `pricing.json` lists it.
+- The three project-specific patterns added to the bundled `rules-lint.patterns` in 0.8.0 are removed. Keep personal patterns in `kaizen-rules-lint.txt` under the Claude config dir.
+
+New:
+
+- `usage-db`: a SQLite store of per-call token usage (`ingest`, `status`, `report`, `sql`). Ingest is incremental, so history survives after Claude Code deletes old transcripts. It stores ids, times, models, working directories and token counts, never message text. Cost is computed at report time. The scheduled audit job runs the ingest.
+- `codex-dispatch --check-timeout` (default 1800 s) and `--codex-timeout` (default off).
+- `CODEX_DISPATCH_REASON_MODELS` sets which model names need a reason line in the brief. The default is `sol`; an empty value turns the guard off. `Model reason:` is accepted as well as `Sol reason:`.
+- `KAIZEN_BASH_BURST=0` or `"enabled": false` turns the bash-burst hook off.
+
+Scheduled runs:
+
+- More credential files are denied in both modes (kube, npm, pypi, gcloud, azure and others, plus `*.pem`, `*.key`, `id_rsa*`, `.envrc` in projects). Auto mode can no longer edit project hooks, agents, commands, skills, `.mcp.json`, CI workflows, the `agents/` folder in the Claude config dir or the Codex `AGENTS.md`.
+- `config set --for DIR scheduledAutonomy=auto` is refused when `DIR` is a subdirectory or linked worktree of the project that runs use. The message names that project.
+- A path that the permission rules cannot express gives the status `unsupported-path` instead of a line only in `run.log`.
+- SIGTERM and SIGHUP run the rollback and the ledger check before exit. The model run has a time limit (`KAIZEN_REVIEW_TIMEOUT`, default 3600 s) and every other step has 600 s.
+- Audit, review and housekeeping take a run lock. A second run waits up to `KAIZEN_LOCK_WAIT` seconds (default 1800), then skips.
+- The ledger guard saves the rejected content before it restores its snapshot. A ledger that cannot be read is `ledger-config-error`, not a violation, and housekeeping still runs.
+- A second proposal on the same day is written as `cycle-<date>-2.md`. `run.log` rotates at 1 MiB.
+- A `docs/kaizen/` folder in a subdirectory of a larger repository is its own project.
+- `install-schedule` never rewrites a crontab after `crontab -l` fails for a reason other than "no crontab", and prints one-line errors instead of tracebacks.
+
+Dispatch and review:
+
+- A run or review is no longer reported as failed because its tool output contains an overload message.
+- The `require-change` check compares the tree right before and after each Codex run. Files written by checks do not count, a commit by Codex does, and the output directory is excluded wherever it lies in the repository.
+- Codex runs and checks run in their own process group. SIGINT, SIGTERM or SIGHUP to `codex-dispatch` stops them before it exits.
+- A refused dispatch prints `Reason:` and `STATUS: CODEX FAILED` on stdout. A Codex failure shows the last stderr lines as its reason.
+- `packet-report` labels an escalation by its full model path (`terra->sol->terra`).
+
+Backups, ledger and linker:
+
+- `kaizen-backup undo run` no longer reports a conflict when two changes in one run edit the same file. Undo of an unfinished change that created a file is a conflict unless `--force` is given. The newest change is chosen by creation time. A corrupt manifest is skipped with a warning. Backup folders are mode 700 and the root follows `CLAUDE_CONFIG_DIR`.
+- `notes-ledger set` can no longer update the wrong row when a change text contains an unusual line separator. `add` no longer skips the timeline row for a change whose text starts with an existing one. Errors name the row. A BOM, blank lines, CRLF files and symlinked ledgers are handled.
+- `kaizen-link --apply` leaves a live symlink that points outside the plugin alone unless `--replace` is given, and then backs it up. `--unlink` removes copies that are identical to the plugin's files.
+
+Usage audit:
+
+- Codex numbers in `token-audit` are in-window deltas. A session that started before the window is no longer charged its whole total. `token-audit` and `usage-series` share the delta code.
+- `token-audit` skips the tool-universe rescan when every main session has tool definitions. `usage-series` skips files older than the window.
+- Zero-usage synthetic rows are not counted as calls. A malformed timestamp no longer stops `usage-series`. The Cost section warns when `pricing.json` was last checked more than 60 days ago.
+
+Hooks, templates and CI:
+
+- bash-burst also counts failed Bash calls, detects the main session by the absence of `agent_id`, counts safely under parallel calls and keeps its state in a private per-user folder. Its message no longer names agents the plugin does not ship.
+- `after-compact` is silent without jq. The image guard follows symlinks. The big-read hint quotes the path, and an offset-only read near the end of a file is allowed.
+- The settings template uses the Claude config dir for hook paths and sets hook timeouts. Verdict-style agents get their own context file.
+- The project and orchestrator templates no longer carry game-specific content. The global template gains a rule to split a mixed fix batch by tier before by file.
+- CI runs `--help` on every script and requires the version to increase.
+
+Docs: an Uninstall section in the README, sections for `install-schedule`, `kaizen-backup` and `usage-db` in `scripts/README.md`, and skills that no longer hard-code `~/.claude`.
+
+## 0.8.0 (2026-11-06)
+
+From the 2026-11-06 weekly review:
+
+- `codex-dispatch` snapshots the Git tree before Codex runs and adds a built-in `require-change` check for engineer runs. A run that changes nothing fails and resumes. `--allow-no-change` turns the check off. A tree that is already dirty gets a WARNING line, because a status-based check could not fail there.
+- `codex-dispatch` refuses a Sol model unless the brief has a `Sol reason:` line. Resumed threads are exempt. The report shows the reason.
+- New `bash-burst` hook (UserPromptSubmit + PostToolUse on Bash, main session only). It warns after `KAIZEN_BASH_BURST` Bash calls in one turn (default 8) and at each multiple. It fails open.
+- `packet-report` reads an optional `dispatch_models` list (model, effort, rounds per dispatch) from the outcome log. It reports `escalations` and `dispatch_models_coverage`.
+
 ## 0.7.2 (2026-11-04)
 
 - The planner and verifier templates gain reading and diff budgets: locate with `rg -n` or the code map and read only printed line ranges, and run `git diff --stat` before per-file diffs.
@@ -46,7 +115,7 @@ Security hardening for scheduled (unattended) runs, from the port's final audit 
 
 - token-audit: the by-agent table shows each subagent type's cost share, models and effort mix. A new extract file per report holds the same numbers per agent type, plus a hint for types that might run on a cheaper model. New `--extract-out` defaults to the audits folder's `extracts/`, never `--out`.
 - New `kaizen-scheduled housekeep` runs after every scheduled audit and review and at the end of an interactive cycle. It deletes the plugin's own old generated files: extracts and probe output after 30 days (200 MB cap), failed proposals and notice markers after 30 days, and reports and proposals after 365 days (newest 5 per folder and family kept). Settings `retention` (`auto`/`off`) and `retentionOverrides` are global only.
-- Scheduled auto runs can edit Markdown instruction files under the Claude and Codex config homes. Deny rules block settings, hooks, plugins, skills, commands, bin, credentials and every `.json`, `.toml`, `.sh`, `.py` and `.js` file under both homes, the Claude user config file, and the project's `.claude/settings*.json`. The rules cover Edit, Write and recognised file commands, not `cp` or scripts.
+- Scheduled auto runs can edit Markdown instruction files under the Claude and Codex config homes. Deny rules block settings, hooks, plugins, skills, commands, bin, credentials and every `.json`, `.toml`, `.sh`, `.py` and `.js` file under both homes, the Claude user config file, and the project's `.claude/settings*.json`. The rules cover Edit, Write and recognised file commands, not `cp` or scripts. (replaced in 0.7.1)
 - `docs/autonomy.md` adds exceptions to "Deleting things" for own generated data and files kaizen created earlier through `kaizen-backup undo`, and adds Markdown instruction files to the safe list.
 - Scheduled auto runs no longer allow `cp` or `touch`, which the deny rules don't cover. Deny rules are not built for paths that contain `,`, `(`, `)`, `*`, `?`, `[`, `]` or `\`; the review fails closed instead.
 - Config values are validated by type (integers, enums, objects, relative-path lists); invalid values fall back to the default with a warning.
@@ -95,7 +164,7 @@ Also:
 Fixes from five end-to-end `yolo` test runs on a real project:
 - **`kaizen-backup` script** (begin / finish / action / list / undo): backups, manifests, after-hashes and undo are now done by a tested script instead of model-followed steps. Undo refuses conflicts unless `--force`, and prints reverse commands without running them.
 - **Scheduled runs:**
-  - they can read `~/.claude` and `~/.codex` (`--add-dir`) and run read-only commands (ls, wc, head, tail, rg, git status/diff/log, jq);
+  - they can read `~/.claude` and `~/.codex` (`--add-dir`) and run read-only commands (ls, wc, head, tail, rg, git status/diff/log, jq); (replaced in 0.7.1)
   - every change in a run shares a `KAIZEN_RUN_ID`;
   - the audit copy is installed as `kaizen-token-audit`, so it never replaces another `token-audit`.
 - **`auto` mode applies changes.** The cycle carries out its top proposals instead of stopping at a list, and docs/autonomy.md lists the reasons that don't justify skipping a change. Headless runs leave protected `~/.claude` files as "do interactively".
@@ -105,7 +174,7 @@ Fixes from five end-to-end `yolo` test runs on a real project:
 
 - **Autonomy modes**: `propose` (default), `safe` and `auto` (alias `yolo`), set per run (`/agent-kaizen:cycle yolo`), per project or globally (`/agent-kaizen:autonomy`). Every applied change is backed up, verified, rolled back if verification fails, capped at 3 per run, and logged. The hard stops (secrets, spending, permissions, deletions, pushes, installs) always ask. See docs/autonomy.md.
 - New skills: `autonomy` and `undo`.
-- `install-schedule --auto`: the weekly cycle applies changes with `acceptEdits` and a narrow tool list (never `bypassPermissions`).
+- `install-schedule --auto`: the weekly cycle applies changes with `acceptEdits` and a narrow tool list (never `bypassPermissions`). (replaced in 0.7.1)
 - CI: tests on Linux and macOS (Python 3.9 and 3.13), hook smoke tests, repo-consistency and privacy checks, shellcheck, JSON lint, `claude plugin validate`, and a version and changelog check on PRs.
 
 ## 0.1.0 (2026-10-29)

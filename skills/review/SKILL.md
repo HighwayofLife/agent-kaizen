@@ -47,8 +47,7 @@ before it and docs/kaizen/LEDGER.md.
    show the failure persists or the fact is stale. For `Stuck turns` with a large share of
    cost, propose fixing the cause: a brief, agent instructions, a missing check script or
    a guardrail, not a live judge.
-Wait for my OK, implement the approved ones (each with a ledger row), and mark the audit
-reviewed.
+Wait for my OK, implement the approved ones (each with a ledger row), and mark the audit reviewed: when the audit is in the audits folder, create an empty `<report name without .md>.reviewed` file beside it (`touch`).
 
 ## Done when
 

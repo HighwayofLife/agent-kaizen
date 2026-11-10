@@ -1,0 +1,534 @@
+#!/usr/bin/env python3
+"""Keep a small SQLite store of per-call token usage from Claude and Codex logs."""
+import argparse
+from collections import Counter
+import csv
+from datetime import datetime, timezone
+import hashlib
+import importlib.util
+from importlib.machinery import SourceFileLoader
+import io
+import json
+import os
+from pathlib import Path
+import re
+import sqlite3
+import sys
+import time
+
+
+def load_sibling(name, file):
+    loader = SourceFileLoader(name, str(Path(__file__).resolve().with_name(file)))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(module)
+    return module
+
+
+AUDIT = load_sibling('kaizen_token_audit', 'token-audit')
+SCHEMA_VERSION = 1
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+BATCH = 2000
+BUSY_SECONDS = 30
+GROUPS = {'day': 'day', 'model': "COALESCE(model, 'unknown')", 'project': "COALESCE(project, '(unknown)')",
+          'agent': "COALESCE(agent, 'unknown')", 'session': "COALESCE(session, 'unknown')", 'source': 'source'}
+SCHEMA = """
+CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID;
+CREATE TABLE files (path TEXT PRIMARY KEY, source TEXT, size INTEGER, mtime_ns INTEGER, ingested_at TEXT);
+CREATE TABLE calls (
+    source TEXT NOT NULL, call_id TEXT NOT NULL, ts TEXT NOT NULL, day TEXT NOT NULL,
+    project TEXT, session TEXT, agent TEXT, model TEXT,
+    input INTEGER NOT NULL DEFAULT 0, cache_read INTEGER NOT NULL DEFAULT 0,
+    cache_write_5m INTEGER NOT NULL DEFAULT 0, cache_write_1h INTEGER NOT NULL DEFAULT 0,
+    output INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (source, call_id)) WITHOUT ROWID;
+CREATE INDEX calls_day ON calls (day);
+CREATE INDEX calls_project_day ON calls (project, day);
+"""
+
+
+class Fatal(Exception):
+    def __init__(self, message, code=2):
+        super().__init__(message)
+        self.code = code
+
+
+def db_path(args):
+    if args.db:
+        return args.db.expanduser()
+    if os.environ.get('KAIZEN_USAGE_DB'):
+        return Path(os.environ['KAIZEN_USAGE_DB']).expanduser()
+    return AUDIT.claude_home() / 'kaizen-usage.db'
+
+
+def check_version(conn, path):
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()
+    except sqlite3.Error:
+        row = None
+    if row is None:
+        raise Fatal(f'{path} is not a usage-db database (no schema_version)')
+    try:
+        version = int(row[0])
+    except (TypeError, ValueError):
+        raise Fatal(f'{path} has an unreadable schema_version')
+    if version > SCHEMA_VERSION:
+        raise Fatal(f'{path} has schema version {version}; this script knows {SCHEMA_VERSION}. Update agent-kaizen.')
+    return version
+
+
+def open_write(path):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        os.close(os.open(path, os.O_CREAT | os.O_RDWR, 0o600))
+    conn = sqlite3.connect(path, timeout=BUSY_SECONDS, isolation_level=None)
+    try:
+        conn.execute(f'PRAGMA busy_timeout = {BUSY_SECONDS * 1000}')
+        conn.execute('BEGIN IMMEDIATE')
+        if conn.execute('SELECT count(*) FROM sqlite_master').fetchone()[0] == 0:
+            for statement in SCHEMA.strip().split(';\n'):
+                if statement.strip():
+                    conn.execute(statement)
+            conn.execute("INSERT INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
+        else:
+            check_version(conn, path)
+        conn.execute('COMMIT')
+        # Only a file that passed the checks above may be switched to WAL.
+        conn.execute('PRAGMA journal_mode = WAL')
+    except (sqlite3.OperationalError, Fatal):
+        conn.close()
+        raise
+    except sqlite3.DatabaseError as exc:
+        conn.close()
+        raise Fatal(f'{path} is not a usable SQLite database: {exc}')
+    return conn
+
+
+def open_read(path):
+    if not path.is_file():
+        raise Fatal(f'no database at {path}; run: usage-db ingest', 1)
+    conn = sqlite3.connect(path.resolve().as_uri() + '?mode=ro', uri=True, timeout=BUSY_SECONDS)
+    conn.execute(f'PRAGMA busy_timeout = {BUSY_SECONDS * 1000}')
+    check_version(conn, path)
+    return conn
+
+
+def number(value):
+    return int(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else 0
+
+
+def stamp(value):
+    """(UTC ISO timestamp, UTC day) for a transcript timestamp string."""
+    ts = AUDIT.date_time(value)
+    return ts.isoformat().replace('+00:00', 'Z'), ts.date().isoformat()
+
+
+# --- discovery (same rules as usage-series) ---
+
+def claude_files():
+    """Yield (path, is_main, project folder name) for every Claude transcript."""
+    root = AUDIT.claude_home() / 'projects'
+    if not root.is_dir():
+        return
+    for project in sorted(p for p in root.iterdir() if p.is_dir()):
+        for pattern, main in (('*.jsonl', True), ('*/subagents/*.jsonl', False)):
+            for path in sorted(project.glob(pattern)):
+                yield path, main, project.name
+
+
+def codex_files():
+    yield from sorted((AUDIT.codex_home() / 'sessions').glob('*/*/*/*.jsonl'))
+
+
+# --- parsing: each generator yields call tuples ---
+# (call_id, ts, day, model, input, cache_read, cache_write_5m, cache_write_1h, output)
+
+def agent_label(path, warnings):
+    agent = 'unknown'
+    meta = path.with_suffix('.meta.json')
+    if meta.is_file():
+        try:
+            agent = json.loads(meta.read_text()).get('agentType') or 'unknown'
+            if not isinstance(agent, str) or not re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_-]{0,63}', agent):
+                agent = 'unknown'
+        except (OSError, ValueError, AttributeError):
+            warnings['malformed agent metadata'] += 1
+    return agent
+
+
+def claude_calls(path, session, warnings):
+    for row in AUDIT.rows(path, EPOCH, warnings):
+        if row.get('type') != 'assistant' or not isinstance(row.get('timestamp'), str):
+            continue
+        message = row.get('message')
+        usage = message.get('usage') if isinstance(message, dict) else None
+        if not isinstance(usage, dict) or not usage or AUDIT.empty_synthetic(message, usage):
+            continue
+        try:
+            ts, day = stamp(row['timestamp'])
+        except (ValueError, OverflowError):
+            warnings['malformed rows'] += 1
+            continue
+        model = message.get('model') or 'unknown'
+        model = model if isinstance(model, str) else 'unknown'
+        write = number(usage.get('cache_creation_input_tokens'))
+        breakdown = usage.get('cache_creation')
+        hour = min(write, number(breakdown.get('ephemeral_1h_input_tokens')) if isinstance(breakdown, dict) else 0)
+        values = (number(usage.get('input_tokens')), number(usage.get('cache_read_input_tokens')),
+                  write - hour, hour, number(usage.get('output_tokens')))
+        ident = message.get('id')
+        if not isinstance(ident, str) or not ident:
+            # No message id: derive a stable one so re-reading the file gives the same id.
+            ident = 'anon:' + hashlib.sha1(f'{session}|{ts}|{model}|{values}'.encode()).hexdigest()[:24]
+        yield (ident, ts, day, model) + values
+
+
+def codex_cwd(path):
+    try:
+        with path.open('rb') as stream:
+            payload = json.loads(stream.readline(AUDIT.LINE_LIMIT)).get('payload')
+        cwd = payload.get('cwd') if isinstance(payload, dict) else None
+        return cwd if isinstance(cwd, str) else None
+    except (OSError, ValueError, AttributeError, RecursionError):
+        return None
+
+
+def codex_calls(path, warnings):
+    previous, model = {}, 'unknown'
+    for row in AUDIT.rows(path, EPOCH, warnings, keep_model=True):
+        if not isinstance(row.get('timestamp'), str):
+            continue
+        payload = row.get('payload') or {}
+        if not isinstance(payload, dict):
+            continue
+        model = payload.get('model') or row.get('model') or model
+        info = payload.get('info') or {}
+        usage = info.get('total_token_usage') if isinstance(info, dict) else None
+        if payload.get('type') != 'token_count' or not isinstance(usage, dict):
+            continue
+        try:
+            ts, day = stamp(row['timestamp'])
+        except (ValueError, OverflowError):
+            warnings['malformed rows'] += 1
+            continue
+        delta, previous = AUDIT.codex_delta(previous, usage)
+        cached = number(delta.get('cached_input_tokens'))
+        output = number(delta.get('output_tokens'))
+        # Reasoning counts as output only when the billed total places it outside output_tokens,
+        # exactly as token-audit's price(..., codex=True) decides.
+        extra = max(0, number(delta.get('total_tokens')) - number(delta.get('input_tokens')) - output)
+        output += min(extra, number(delta.get('reasoning_output_tokens')))
+        values = (max(0, number(delta.get('input_tokens')) - cached), cached, 0, 0, output)
+        if not any(values):
+            continue
+        total = previous.get('total_tokens', previous.get('input_tokens', 0) + previous.get('output_tokens', 0))
+        yield (f'{path.stem}:{ts}:{number(total)}', ts, day, model if isinstance(model, str) else 'unknown') + values
+
+
+# --- ingest ---
+
+def store_file(conn, path, source, size, mtime_ns, calls, project, session, agent, warnings):
+    """Insert one file's calls and its files row in one transaction; return calls added."""
+    before = conn.total_changes
+    unreadable = warnings['unreadable files']
+    conn.execute('BEGIN IMMEDIATE')
+    try:
+        batch = []
+        insert = ('INSERT OR IGNORE INTO calls (source, call_id, ts, day, project, session, agent, model, input, '
+                  'cache_read, cache_write_5m, cache_write_1h, output) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+        for call in calls:
+            batch.append((source, call[0], call[1], call[2], project, session, agent) + call[3:])
+            if len(batch) >= BATCH:
+                conn.executemany(insert, batch)
+                batch.clear()
+        if batch:
+            conn.executemany(insert, batch)
+        if warnings['unreadable files'] != unreadable:
+            raise OSError('unreadable')  # do not mark a partly read file as done
+        added = conn.total_changes - before
+        conn.execute('INSERT OR REPLACE INTO files VALUES (?,?,?,?,?)', (
+            str(path), source, size, mtime_ns, datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')))
+        conn.execute('COMMIT')
+        return added
+    except BaseException:
+        conn.execute('ROLLBACK')
+        raise
+
+
+def ingest(args):
+    started = time.monotonic()
+    path = db_path(args)
+    conn = open_write(path)
+    warnings = Counter()
+    known = {row[0]: (row[1], row[2]) for row in conn.execute('SELECT path, size, mtime_ns FROM files')}
+    seen = set()
+    stats = Counter()
+    parents = {}
+    jobs = []
+    for file, main, folder in claude_files():
+        jobs.append(('claude', file, main, folder))
+    for file in codex_files():
+        jobs.append(('codex', file, None, None))
+    for source, file, main, folder in jobs:
+        try:
+            real = file.resolve()
+            if real in seen:
+                continue
+            seen.add(real)
+            info = file.stat()
+        except OSError:
+            warnings['unreadable files'] += 1
+            continue
+        stats['seen'] += 1
+        if known.get(str(file)) == (info.st_size, info.st_mtime_ns):
+            continue
+        stats['read'] += 1
+        if source == 'claude':
+            if main:
+                session, agent, parent = file.stem, 'main', file
+            else:
+                session, agent = file.parent.parent.name, agent_label(file, warnings)
+                parent = file.parent.parent.parent / (session + '.jsonl')
+            if parent not in parents:
+                parents[parent] = AUDIT.cwd_of_file(parent) or folder
+            project = parents[parent]
+            calls = claude_calls(file, session, warnings)
+        else:
+            session, agent, project = file.stem, 'main', codex_cwd(file)
+            calls = codex_calls(file, warnings)
+        try:
+            stats['added'] += store_file(conn, file, source, info.st_size, info.st_mtime_ns, calls,
+                                         project, session, agent, warnings)
+        except OSError:
+            continue
+    conn.close()
+    if not args.quiet:
+        print(f"{stats['seen']} files seen, {stats['read']} read, {stats['added']} calls added, "
+              f"{sum(warnings.values())} warnings, {time.monotonic() - started:.1f}s")
+        for warning, count in warnings.items():
+            print(f'Warning: {warning} ({count})')
+    elif warnings:
+        print('Warning: ' + ', '.join(f'{name} ({count})' for name, count in warnings.items()), file=sys.stderr)
+    return 0
+
+
+# --- status ---
+
+def status(args):
+    path = db_path(args)
+    conn = open_read(path)
+    print(f'database: {path}')
+    print(f'size: {path.stat().st_size} bytes')
+    print(f'schema version: {check_version(conn, path)}')
+    counts = dict(conn.execute('SELECT source, count(*) FROM calls GROUP BY source'))
+    for source in ('claude', 'codex'):
+        print(f'{source} calls: {counts.pop(source, 0)}')
+    for source, count in sorted(counts.items()):
+        print(f'{source} calls: {count}')
+    first, last = conn.execute('SELECT min(day), max(day) FROM calls').fetchone()
+    print(f'first day: {first or "none"}')
+    print(f'last day: {last or "none"}')
+    print(f'last ingest: {conn.execute("SELECT max(ingested_at) FROM files").fetchone()[0] or "never"}')
+    return 0
+
+
+# --- report ---
+
+def pricing_state(args):
+    pricing, error = AUDIT.load_pricing(args.pricing.expanduser())
+    if error:
+        print(f'Warning: {error}; every call is reported as unpriced', file=sys.stderr)
+    return dict(_pricing=pricing, cost=dict(unpriced={}, components=Counter(), by_model=Counter(),
+                                          by_agent=Counter(), total=0))
+
+
+def usage_dict(source, input_, cache_read, write_5m, write_1h, output):
+    """Rebuild the usage mapping token-audit's price() reads, from stored columns."""
+    if source == 'codex':
+        return dict(input_tokens=input_ + cache_read, cached_input_tokens=cache_read, output_tokens=output)
+    return dict(input_tokens=input_, cache_read_input_tokens=cache_read, output_tokens=output,
+                cache_creation_input_tokens=write_5m + write_1h,
+                cache_creation=dict(ephemeral_1h_input_tokens=write_1h))
+
+
+def sql_where(conditions):
+    return (' WHERE ' + ' AND '.join(conditions)) if conditions else ''
+
+
+def report_rows(conn, args, state):
+    where, params = [], []
+    if args.since:
+        where.append('day >= ?')
+        params.append(args.since)
+    if args.until:
+        where.append('day <= ?')
+        params.append(args.until)
+    if args.source:
+        where.append('source = ?')
+        params.append(args.source)
+    if args.project:
+        where.append('instr(lower(COALESCE(project, \'\')), lower(?)) > 0')
+        params.append(args.project)
+    key = GROUPS[args.by]
+    pricing = state['_pricing']
+    # A Claude model with a context threshold is priced call by call; every other
+    # combination is priced once per group, because price() is linear in tokens.
+    per_call = [model for source, model in conn.execute(
+        'SELECT DISTINCT source, COALESCE(model, \'unknown\') FROM calls' + sql_where(where), params)
+        if source == 'claude' and (pricing.get('models', {}).get(AUDIT.pricing_key(pricing, model)) or {}).get('over_threshold')]
+    marks = ','.join('?' * len(per_call))
+    expr = "COALESCE(model, 'unknown')"
+    threshold = f"source = 'claude' AND {expr} IN ({marks})"
+    sums = 'COUNT(*), SUM(input), SUM(cache_read), SUM(cache_write_5m), SUM(cache_write_1h), SUM(output)'
+    each = '1, input, cache_read, cache_write_5m, cache_write_1h, output'
+    conditions = where + ([f'NOT ({threshold})'] if per_call else [])
+    grouped = f'SELECT {key}, source, {expr}, {sums} FROM calls{sql_where(conditions)} GROUP BY 1, 2, 3'
+    queries = [(grouped, params + per_call)]
+    if per_call:
+        queries.append((f'SELECT {key}, source, {expr}, {each} FROM calls{sql_where(where + [threshold])}',
+                        params + per_call))
+    groups = {}
+    for sql, values in queries:
+        for group, source, model, calls, *tokens in conn.execute(sql, values):
+            tokens = [t or 0 for t in tokens]
+            cost = AUDIT.price(state, model, 'main', usage_dict(source, *tokens), codex=source == 'codex')
+            entry = groups.setdefault(group, Counter())
+            entry.update(calls=calls, input=tokens[0], cache_read=tokens[1], cache_write=tokens[2] + tokens[3],
+                         output=tokens[4], cost=cost,
+                         unpriced=calls if AUDIT.pricing_key(pricing, model) is None else 0)
+    return groups
+
+
+REPORT_COLUMNS = ['key', 'calls', 'input', 'cache_read', 'cache_write', 'output', 'cost_usd', 'unpriced_calls']
+
+
+def report(args):
+    conn = open_read(db_path(args))
+    state = pricing_state(args)
+    groups = report_rows(conn, args, state)
+    conn.close()
+    order = sorted(groups) if args.by == 'day' else sorted(groups, key=lambda k: (-groups[k]['cost'], k))
+    total = Counter()
+    for entry in groups.values():
+        total.update(entry)
+    def line(name, entry):
+        return [name, entry['calls'], entry['input'], entry['cache_read'], entry['cache_write'],
+                entry['output'], entry['cost'], entry['unpriced']]
+    table = [line(name, groups[name]) for name in order]
+    footer = line('total', total)
+    if args.format == 'json':
+        keys = [args.by] + REPORT_COLUMNS[1:]
+        out = dict(rows=[dict(zip(keys, round_cost(r))) for r in table],
+                   total=dict(zip(['key'] + REPORT_COLUMNS[1:], round_cost(footer))))
+        out['total'].pop('key')
+        print(json.dumps(out, indent=2))
+    else:
+        print(render([args.by] + REPORT_COLUMNS[1:], [round_cost(r) for r in table + [footer]], args.format), end='')
+    return 0
+
+
+def round_cost(row):
+    return row[:6] + [round(row[6], 8)] + row[7:]
+
+
+# --- output ---
+
+def cell(value):
+    if value is None:
+        return ''
+    return f'{value:.4f}' if isinstance(value, float) else str(value)
+
+
+def render(columns, rows, fmt):
+    if fmt == 'json':
+        return json.dumps([dict(zip(columns, row)) for row in rows], indent=2, default=str) + '\n'
+    if fmt == 'csv':
+        stream = io.StringIO()
+        writer = csv.writer(stream, lineterminator='\n')
+        writer.writerow(columns)
+        writer.writerows(rows)
+        return stream.getvalue()
+    cells = [[cell(v) for v in row] for row in rows]
+    widths = [max(len(str(name)), *(len(c[i]) for c in cells)) if cells else len(str(name))
+              for i, name in enumerate(columns)]
+    def format_row(values, raw):
+        return '  '.join(v.rjust(w) if isinstance(r, (int, float)) else v.ljust(w)
+                         for v, w, r in zip(values, widths, raw)).rstrip()
+    lines = [format_row([str(c) for c in columns], [''] * len(columns))]
+    lines += [format_row(c, r) for c, r in zip(cells, rows)]
+    return '\n'.join(lines) + '\n'
+
+
+# --- sql ---
+
+def deny_attach(action, *_):
+    return sqlite3.SQLITE_DENY if action in (sqlite3.SQLITE_ATTACH, sqlite3.SQLITE_DETACH) else sqlite3.SQLITE_OK
+
+
+def run_sql(args):
+    conn = open_read(db_path(args))
+    conn.set_authorizer(deny_attach)
+    conn.execute('PRAGMA query_only = ON')
+    try:
+        cursor = conn.execute(args.query)
+        columns = [d[0] for d in cursor.description or []]
+        rows = cursor.fetchall()
+    except (sqlite3.Error, ValueError) as exc:
+        raise Fatal(f'SQL error: {exc}'.splitlines()[0])
+    print(render(columns, rows, args.format), end='')
+    return 0
+
+
+# --- command line ---
+
+def day(value):
+    try:
+        return datetime.strptime(value, '%Y-%m-%d').date().isoformat()
+    except ValueError:
+        raise argparse.ArgumentTypeError(f'{value!r} is not a YYYY-MM-DD date')
+
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument('--db', type=Path, default=None, metavar='PATH',
+                        help='database file (default: $KAIZEN_USAGE_DB, else <CLAUDE_CONFIG_DIR or ~/.claude>/kaizen-usage.db)')
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='command', required=True, metavar='{ingest,status,report,sql}')
+    ingest_parser = commands.add_parser('ingest', parents=[common], help='read new or changed transcripts into the database',
+                                        description='Read Claude transcripts and Codex session files that are new or changed since the last run.')
+    ingest_parser.add_argument('--quiet', action='store_true', default=False, help='print nothing on success (default: print one summary line)')
+    commands.add_parser('status', parents=[common], help='show database size, counts and last ingest',
+                        description='Show the database path, size, schema version, call counts, day range and last ingest time.')
+    report_parser = commands.add_parser('report', parents=[common], help='aggregate usage and cost',
+                                        description='Aggregate calls, tokens and list-price cost, priced now from pricing.json.')
+    report_parser.add_argument('--since', type=day, metavar='YYYY-MM-DD', help='first UTC day (default: all)')
+    report_parser.add_argument('--until', type=day, metavar='YYYY-MM-DD', help='last UTC day, inclusive (default: all)')
+    report_parser.add_argument('--by', choices=sorted(GROUPS), default='day',
+                               help='group key (default: day; other keys sort by cost, highest first)')
+    report_parser.add_argument('--project', metavar='SUBSTR', help='keep projects whose path contains SUBSTR, ignoring case (default: all)')
+    report_parser.add_argument('--source', choices=('claude', 'codex'), help='keep one source (default: both)')
+    report_parser.add_argument('--format', choices=('table', 'csv', 'json'), default='table', help='output format (default: table)')
+    report_parser.add_argument('--pricing', type=Path, default=Path(__file__).resolve().with_name('pricing.json'),
+                               help='price file (default: pricing.json next to this script)')
+    sql_parser = commands.add_parser('sql', parents=[common], help='run one read-only SQL statement',
+                                     description='Run one read-only statement. Tables: calls, files, meta.')
+    sql_parser.add_argument('query', help='one SQL statement; the database is opened read-only')
+    sql_parser.add_argument('--format', choices=('table', 'csv', 'json'), default='table', help='output format (default: table)')
+    return parser
+
+
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
+    if args.command == 'report' and args.since and args.until and args.until < args.since:
+        parser.error('--until must be on or after --since')
+    try:
+        return dict(ingest=ingest, status=status, report=report, sql=run_sql)[args.command](args)
+    except Fatal as exc:
+        print(f'usage-db: {exc}', file=sys.stderr)
+        return exc.code
+    except sqlite3.Error as exc:
+        print(f'usage-db: database error: {exc}', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

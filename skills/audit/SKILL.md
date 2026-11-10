@@ -9,7 +9,7 @@ argument-hint: "[propose|safe|auto|yolo]"
 
 Measure where tokens, turns and time actually go, so the changes you make target real costs and not guesses.
 
-**Changes:** writes a report and an audit script. Changes no configuration.
+**Changes:** writes a report under docs/kaizen/. Changes no configuration.
 
 **Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `agent-kaizen.json` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`), else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
@@ -18,14 +18,13 @@ Measure where tokens, turns and time actually go, so the changes you make target
 Audit my Claude Code and Codex usage for this project. Don't change any configuration.
 
 Data sources (check which exist):
-- Claude Code transcripts: ~/.claude/projects/<this project's folder>/*.jsonl, plus
-  subagent transcripts in ~/.claude/projects/<folder>/<session-id>/subagents/*.jsonl.
-- Codex sessions: ~/.codex/sessions/**/*.jsonl (tool calls may be logged as
-  function_call or custom_tool_call).
+- Claude Code transcripts: <Claude config dir>/projects/<this project's folder>/*.jsonl, plus
+  subagent transcripts in <Claude config dir>/projects/<folder>/<session-id>/subagents/*.jsonl.
+- Codex sessions: <Codex home>/sessions/**/*.jsonl.
 
 Rules:
-- Parse with the bundled token-audit script (see Bundled resources), extended if needed,
-  never by reading transcripts yourself; they are huge.
+- Parse with the bundled token-audit script (see Bundled resources), never by reading
+  transcripts yourself; they are huge.
 - Token usage lives in assistant messages (message.usage: input_tokens,
   cache_creation_input_tokens, cache_read_input_tokens, output_tokens). One message can
   appear on several lines; de-duplicate by message id before summing.
@@ -33,19 +32,15 @@ Rules:
 
 Use the token-audit report for usage and cost sections. When present, use this project's `project-report-*.md` for outcomes, calibration proposals, shadow reviews, slow tests, speed and pending project-ledger rows. Use the global audits folder's `checks-*.md` for drift, stale rules and notes-ledger measurements due.
 
-Report, for the last 14 days:
-1. Main sessions: turns, peak and median context, total tokens by kind.
-2. Per subagent type: spawns, median and p90 tool calls, median context, total tokens.
-   Report Claude and Codex brief sizes; flag median growth between audits.
-3. Per tool: call counts; top 20 Bash commands by first word; the largest files read
-   whole; images read (count and who read them); URLs fetched more than once.
-4. Patterns that waste tokens, each with numbers:
-   - long sessions that never compact;
-   - wrapper agents that only relay another tool's output;
-   - grep → read → grep exploration loops;
-   - whole-file reads of big files;
-   - planners or reviewers that run far longer than the median;
-   - many small agent spawns, each of which wakes the main session.
+Report, for the last 14 days, the sections token-audit prints:
+1. Totals by model (calls, context, cache-read share, output) and main sessions (calls,
+   average and peak context; flagged sessions).
+2. By agent type: spawns, median and max tool calls, context, minutes, brief sizes (Claude
+   and Codex), cost share, models and effort. Orchestrator turns by trigger.
+3. Main-session tool results (count and characters per tool) and image blocks read in the
+   main session; top Bash command heads per heavy agent.
+4. Codex by model, and by kind, model and effort (sessions, minutes, tokens).
+   Changes since the last audit with the same scope, and flagged regressions.
 5. `Cost (API-equivalent)`: cache-aware cost by agent type and model, using published
    prices in `scripts/pricing.json`, with shares for cache reads, writes, uncached input
    and output. This is a comparison weight, not a bill; most users have subscriptions.
@@ -57,6 +52,11 @@ Report, for the last 14 days:
 8. `Unused tools and MCP servers`: per project, unused over at least 10 prompts across
    2 sessions, or at least 5 sessions; mark deferred or loaded in full when known.
 
+Not measured by the script: Bash commands of the main session, files read whole, URLs
+fetched more than once, who read each image, and the waste patterns (sessions that never
+compact, relay wrappers, grep-read loops, many small spawns). Say so in the report where
+it matters; rank only what the numbers show.
+
 Write docs/kaizen/audit-<yyyy-mm-dd>.md: a headline (3 lines), the tables above,
 and a ranked list of the 10 biggest savings, each with estimated tokens saved per week,
 effort (S/M/L), risk, and which prompt or change addresses it. If
@@ -67,7 +67,7 @@ Finish by recommending the first 3 changes.
 
 ## Bundled resources
 
-Start from the bundled audit script instead of writing one: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-audit --cwd . --days 14 --out docs/kaizen/`. `--cwd` matches this project's exact path, so it never mixes in similarly named projects; `--project` is a loose substring filter. Extend it only if a section below is missing.
+Start from the bundled audit script instead of writing one: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-audit --cwd . --days 14 --out docs/kaizen/`. `--cwd` matches this project's exact path, so it never mixes in similarly named projects; `--project` is a loose substring filter.
 
 ## Done when
 

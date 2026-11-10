@@ -149,6 +149,141 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(self.run_cli(*args).returncode, 0)
 
 
+    def test_set_with_unicode_line_separators_in_a_change_changes_only_the_matched_row(self):
+        for index, separator in enumerate(('\u2028', '\x0c', '\u0085', '\x1c')):
+            with self.subTest(separator=repr(separator)):
+                day = '2026-10-0' + str(index + 2)
+                second, third = 'Second ' + day, 'Third ' + day
+                for change in ('First' + separator + 'line', second, third):
+                    self.assertEqual(self.run_cli(*self.add_args(change, date=day)).returncode, 0)
+                result = self.run_cli('set', '--match', second, '--status', 'reverted')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                rows = [row for row in self.rows() if row['date'] == day]
+                self.assertEqual([(r['change'].split(' Why:')[0], r['status']) for r in rows],
+                                 [('First' + separator + 'line', 'active'), (second, 'reverted'),
+                                  (third, 'active')])
+                self.assertIn('| %s | %s | reverted | no |' % (day, second), self.timeline.read_text())
+                self.assertIn('| %s | %s | active | no |' % (day, third), self.timeline.read_text())
+                self.assertEqual(self.run_cli(*self.add_args('Fourth', date=day)).returncode, 0)
+
+    def test_same_date_change_that_extends_an_existing_one_still_gets_a_timeline_row(self):
+        for change in ('Trim hooks', 'Trim hooks config'):
+            self.assertEqual(self.run_cli(*self.add_args(change)).returncode, 0)
+        text = self.timeline.read_text()
+        self.assertIn('| 2026-10-03 | Trim hooks | active | no |', text)
+        self.assertIn('| 2026-10-03 | Trim hooks config | active | no |', text)
+        result = self.run_cli('set', '--match', 'Trim hooks config', '--status', 'reverted')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('| 2026-10-03 | Trim hooks | active | no |', self.timeline.read_text())
+        self.assertIn('| 2026-10-03 | Trim hooks config | reverted | no |', self.timeline.read_text())
+        self.assertEqual(self.run_cli(*self.add_args('Trim hooks')).stdout.strip(), 'already recorded')
+
+    def ledger(self, csv_rows, timeline_cells, date='2026-10-03'):
+        self.csv.write_text(HEADER + ''.join('%s,test,%s,manual,active,no\n' % (date, row) for row in csv_rows))
+        table = ''.join('| %s | %s | active | no |\n' % (date, cell) for cell in timeline_cells)
+        self.timeline.write_text(TIMELINE.replace('| 2026-10-01 | Existing | active | no |\n', table))
+
+    def test_set_fallback_never_takes_the_row_of_a_sibling_csv_row(self):
+        self.ledger(['Trim hooks Why: a', 'Trim hooks config Why: b'], ['Trim hooks'])
+        before = self.csv.read_bytes(), self.timeline.read_bytes()
+        result = self.run_cli('set', '--match', 'Trim hooks config', '--status', 'reverted')
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('match must select exactly one timeline row', result.stderr)
+        self.assertEqual(before, (self.csv.read_bytes(), self.timeline.read_bytes()))
+
+    def test_set_fallback_still_accepts_a_hand_shortened_cell_of_no_other_row(self):
+        self.ledger(['Trim hooks Why: a', 'Trim hooks config Why: b'], ['Trim hooks', 'hooks config'])
+        result = self.run_cli('set', '--match', 'Trim hooks config', '--status', 'reverted')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = self.timeline.read_text()
+        self.assertIn('| 2026-10-03 | Trim hooks | active | no |', text)
+        self.assertIn('| 2026-10-03 | hooks config | reverted | no |', text)
+
+    def test_set_prefers_the_exact_timeline_row_over_substring_candidates(self):
+        self.ledger(['Trim hooks config Why: b'], ['Trim hooks config', 'hooks'])
+        result = self.run_cli('set', '--match', 'Trim hooks config', '--status', 'reverted')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        text = self.timeline.read_text()
+        self.assertIn('| 2026-10-03 | Trim hooks config | reverted | no |', text)
+        self.assertIn('| 2026-10-03 | hooks | active | no |', text)
+
+    def test_bom_and_blank_lines_do_not_break_add_set_or_due(self):
+        self.csv.write_bytes(b'\xef\xbb\xbf' + (HEADER + '\n2026-10-01,test,Existing,manual,active,no\n\n').encode())
+        self.assertEqual(self.run_cli(*self.add_args('Added')).returncode, 0)
+        result = self.run_cli('set', '--match', 'Added', '--status', 'planned')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        raw = self.csv.read_bytes()
+        self.assertTrue(raw.startswith(b'\xef\xbb\xbf' + HEADER.encode() + b'\n2026-10-01,test,Existing,manual,active,no\n\n'))
+        self.assertTrue(raw.endswith(b',manual,planned,no\n'))
+        self.assertEqual(self.run_cli('due').returncode, 0)
+
+    def test_invalid_csv_row_names_the_row_and_reason(self):
+        self.csv.write_text(HEADER + '2026-10-01,test,Existing,manual,active,no\n2026-10-02,short\n')
+        for args in (self.add_args(), ['set', '--match', 'Existing', '--status', 'planned'], ['due']):
+            result = self.run_cli(*args)
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertIn('row 3', result.stderr)
+            self.assertIn('6 columns', result.stderr)
+        self.csv.write_text('date,category\n')
+        result = self.run_cli(*self.add_args())
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('header', result.stderr)
+
+    def test_missing_ledger_names_path_and_header_and_is_not_created(self):
+        self.csv.unlink()
+        result = self.run_cli(*self.add_args())
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(str(self.csv), result.stderr)
+        self.assertIn('date,category,change,source,status,measured', result.stderr)
+        self.assertIn('does not create', result.stderr)
+        self.assertFalse(self.csv.exists())
+
+    def test_add_keeps_the_crlf_line_ending_of_the_file(self):
+        self.csv.write_bytes((HEADER + '2026-10-01,test,Existing,manual,active,no\n').replace('\n', '\r\n').encode())
+        self.assertEqual(self.run_cli(*self.add_args()).returncode, 0)
+        raw = self.csv.read_bytes()
+        self.assertEqual(raw.count(b'\n'), raw.count(b'\r\n'))
+        self.assertEqual(raw.count(b'\r\n'), 3)
+
+    def test_non_string_csv_or_timeline_is_a_clear_error(self):
+        for settings in ({'csv': 5}, {'csv': ['a']}, {'csv': str(self.csv), 'timeline': 7},
+                         {'csv': str(self.csv), 'timeline': ['x']}):
+            with self.subTest(settings=settings):
+                (self.root / 'agent-kaizen.json').write_text(json.dumps({'notesLedger': settings}))
+                for args in (self.add_args(), ['set', '--match', 'x', '--status', 'planned']):
+                    result = self.run_cli(*args)
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertNotIn('Traceback', result.stderr)
+                    self.assertIn('must be a string', result.stderr)
+        (self.root / 'agent-kaizen.json').write_text(json.dumps({'notesLedger': {'csv': 5}}))
+        result = self.run_cli('due')
+        self.assertEqual(result.returncode, 2)
+        self.assertNotIn('Traceback', result.stderr)
+
+    def test_symlinked_ledger_and_timeline_stay_links_and_targets_update(self):
+        real = self.root / 'real'
+        real.mkdir()
+        for path in (self.csv, self.timeline):
+            path.rename(real / path.name)
+            path.symlink_to(real / path.name)
+        self.assertEqual(self.run_cli(*self.add_args('Linked')).returncode, 0)
+        result = self.run_cli('set', '--match', 'Linked', '--status', 'planned')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for path in (self.csv, self.timeline):
+            self.assertTrue(path.is_symlink(), path)
+        self.assertIn(',manual,planned,no', (real / 'changes.csv').read_text())
+        self.assertIn('| 2026-10-03 | Linked | planned | no |', (real / 'timeline.md').read_text())
+
+    def test_help_and_add_work_without_fcntl(self):
+        code = ("import runpy, sys; sys.modules['fcntl'] = None; sys.argv = ['notes-ledger'] + sys.argv[1:]; "
+                "runpy.run_path(%r, run_name='__main__')" % str(SCRIPT))
+        result = subprocess.run(['python3', '-c', code, '--help'], text=True, capture_output=True, env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = subprocess.run(['python3', '-c', code, *self.add_args()], text=True, capture_output=True, env=self.env)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.rows()), 2)
+
+
 class DueTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

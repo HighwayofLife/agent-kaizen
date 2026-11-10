@@ -74,6 +74,19 @@ class RulesLintTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1)
         self.assertEqual(json.loads(result.stdout)["count"], 2)
 
+    def test_agents_only_repo_is_detected(self):
+        write(self.claude / "kaizen-rules-lint.txt", "old wording\n")
+        write(self.repo / "AGENTS.md", "old wording\n")
+        result = self.run_lint("--json", cwd=self.repo)
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(json.loads(result.stdout)["count"], 1)
+
+    def test_bundled_patterns_name_no_project(self):
+        text = (ROOT / "scripts/rules-lint.patterns").read_text(encoding="utf-8")
+        for line in text.splitlines():
+            self.assertNotIn("New World", line)
+            self.assertNotIn("playtest", line)
+
     def test_no_patterns_and_bad_pattern(self):
         script = self.root / "rules-lint"
         shutil.copy(LINT, script)

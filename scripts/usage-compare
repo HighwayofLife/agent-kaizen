@@ -4,6 +4,7 @@ import argparse
 from collections import Counter
 import csv
 from datetime import datetime, timedelta, timezone
+import importlib.util
 from importlib.machinery import SourceFileLoader
 import json
 import os
@@ -13,7 +14,16 @@ import subprocess
 import sys
 import tempfile
 
-SERIES = SourceFileLoader('kaizen_usage_series', str(Path(__file__).resolve().with_name('usage-series'))).load_module()
+
+
+def load_sibling(name, file):
+    loader = SourceFileLoader(name, str(Path(__file__).resolve().with_name(file)))
+    module = importlib.util.module_from_spec(importlib.util.spec_from_loader(name, loader))
+    loader.exec_module(module)
+    return module
+
+
+SERIES = load_sibling('kaizen_usage_series', 'usage-series')
 
 
 def divide(value, denominator):
@@ -82,8 +92,12 @@ def window(rows, args, before, commands, git):
                 logs_missing=missing, unavailable=unavailable), warnings
 
 
-def clean_split(args):
-    """Run isolated Claude audits; exclude every before file modified at/after cutoff."""
+def clean_split(args, warnings=None):
+    """Run isolated Claude audits; exclude every before file modified at/after cutoff.
+
+    A file whose mtime is before the first window starts cannot hold rows in either window, so
+    claude_files skips it. The before side keeps its own rule (mtime before the cutoff); the after
+    side reads every remaining file. Skipped and malformed rows are added to `warnings` (a list)."""
     audit = Path(__file__).resolve().with_name('token-audit')
     start = args.before_from or args.cutoff - timedelta(days=30)
     stop = args.after_to + timedelta(days=1) if args.after_to else datetime.now(timezone.utc)
@@ -92,12 +106,13 @@ def clean_split(args):
     results = []
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
-        files = list(SERIES.claude_files(args))
+        files = list(SERIES.claude_files(args, start))
         projects = sorted({str(p.parent if m else p.parent.parent.parent) for p, m in files})
         for side, since, until in (('before', start, args.cutoff), ('after', args.cutoff, stop)):
             config = root / side / 'claude'
             config.mkdir(parents=True)
             # Stage filtered rows too: token-audit has no --until option.
+            skipped = Counter()
             for path, main in files:
                 if side == 'before' and path.stat().st_mtime >= args.cutoff.timestamp():
                     continue
@@ -108,12 +123,21 @@ def clean_split(args):
                 target = project / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 with target.open('w') as stream:
-                    for row in SERIES.AUDIT.rows(path, since, Counter()):
-                        if isinstance(row.get('timestamp'), str) and SERIES.AUDIT.date_time(row['timestamp']) < until:
+                    for row in SERIES.AUDIT.rows(path, since, skipped):
+                        if not isinstance(row.get('timestamp'), str):
+                            continue
+                        try:
+                            keep = SERIES.AUDIT.date_time(row['timestamp']) < until
+                        except (ValueError, OverflowError):
+                            skipped['malformed rows'] += 1
+                            continue
+                        if keep:
                             stream.write(json.dumps(row) + '\n')
                 meta = path.with_suffix('.meta.json')
                 if not main and meta.is_file():
                     shutil.copyfile(meta, target.with_suffix('.meta.json'))
+            if warnings is not None:
+                warnings.extend(f'{side}: {count} {key} skipped in clean split' for key, count in skipped.items())
             env = dict(os.environ, CLAUDE_CONFIG_DIR=str(config), CODEX_HOME=str(root / 'empty-codex'))
             command = [sys.executable, str(audit), '--json', '--since', since.strftime('%Y-%m-%d'),
                        '--pricing', str(args.pricing), '--out', str(root / side / 'reports'),
@@ -176,8 +200,9 @@ def main():
         parser.error('--after-to must be on or after --cutoff')
     try:
         if args.clean_split:
-            before, after = clean_split(args)
-            warnings = ['clean split uses Claude transcripts only and elapsed UTC days; series active-day threshold does not apply']
+            warnings = []
+            before, after = clean_split(args, warnings)
+            warnings.insert(0, 'clean split uses Claude transcripts only and elapsed UTC days; series active-day threshold does not apply')
             for side, data in (('before', before), ('after', after)):
                 if not data['calls']:
                     warnings.append(f'{side}: 0 calls in clean split window')

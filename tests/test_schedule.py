@@ -21,6 +21,7 @@ import os, pathlib, sys
 path = pathlib.Path(os.environ['CRON_FILE'])
 if sys.argv[1] == '-l':
     if not path.exists():
+        sys.stderr.write('no crontab for user\\n')
         sys.exit(1)
     sys.stdout.write(path.read_text())
 else:
@@ -334,13 +335,14 @@ class ScheduleTests(StubCase):
         one, two = self.project('one'), self.project('two')
         self.install('--auto', str(one), str(two))
         global_file = self.home / '.claude/agent-kaizen.json'
-        self.assertFalse(global_file.exists())
+        # A project's auto only takes effect once the global file lists the project.
+        self.assertEqual(json.loads(global_file.read_text()), {'autoProjects': [str(one), str(two)]})
         for path in (one, two):
             self.assertEqual(json.loads((path / 'docs/kaizen/config.json').read_text())['scheduledAutonomy'], 'auto')
         write(global_file, '{ "scheduledAutonomy": "propose", "autonomy": "propose" }\n')
-        global_before = global_file.read_bytes()
         self.install('--auto', str(one), str(two))
-        self.assertEqual(global_file.read_bytes(), global_before)
+        self.assertEqual(json.loads(global_file.read_text()), {
+            'scheduledAutonomy': 'propose', 'autonomy': 'propose', 'autoProjects': [str(one), str(two)]})
         before = (one / 'docs/kaizen/config.json').read_bytes()
         result = self.install('--auto', 'none', '--project-dir', str(one))
         self.assertEqual(json.loads(global_file.read_text())['scheduledAutonomy'], 'propose')
@@ -408,7 +410,8 @@ class ScheduleTests(StubCase):
 
     def test_nonzero_crontab_ignores_stdout(self):
         schedule = self.load_schedule()
-        result = subprocess.CompletedProcess(['crontab', '-l'], 1, stdout='discard this\n')
+        result = subprocess.CompletedProcess(['crontab', '-l'], 1, stdout='discard this\n',
+                                            stderr='no crontab for user\n')
         ok = subprocess.CompletedProcess([], 0)
         with patch.object(schedule.shutil, 'which', return_value=str(self.bin / 'crontab')), \
                 patch.object(schedule.subprocess, 'run', side_effect=[ok, ok, ok, result, ok]) as run:

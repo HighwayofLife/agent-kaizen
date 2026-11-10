@@ -7,7 +7,7 @@ argument-hint: "[propose|safe|auto|yolo|re-evaluate]"
 
 # Build your agent roster: who does what, with fallbacks and escalation
 
-The best routing depends on what *you* have. One example: if you have a Grok subscription, it can be an excellent research agent with okay coding ability. Gemini can handle very long documents or act as a visual tie-breaker. Codex can take most coding off your Claude usage, and a local model can do bulk text transforms for free. None of that matters if you don't have the subscription. This skill:
+The best routing depends on what *you* have. For example, a vendor with strong web search can be your research agent, and a long-context model can take very long documents. Codex can take most coding off your Claude usage, and a local model can do bulk text transforms for free. None of that matters if you don't have the subscription. This skill:
 - finds out what you have;
 - researches each model's strengths from current sources;
 - optionally tests the models on your own repo;
@@ -16,6 +16,8 @@ The best routing depends on what *you* have. One example: if you have a Grok sub
 **Changes:** creates agents, scripts and instruction sections, after you approve each part. With `re-evaluate`, it re-checks an existing roster and proposes changes only.
 
 **Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `agent-kaizen.json` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`), else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
+
+In this skill, `<Claude config dir>` means `$CLAUDE_CONFIG_DIR` or `~/.claude`, and `<Codex home>` means `$CODEX_HOME` or `~/.codex`.
 
 ## Task
 
@@ -34,7 +36,7 @@ Phase 1: discover what I have. Never print, copy or store secret values.
   Never run env, printenv or grep on the environment in a way that prints values, and never
   read .env files.
 - List local models (ollama list), configured MCP servers, and my existing agents
-  (~/.claude/agents, .claude/agents).
+  (<Claude config dir>/agents, .claude/agents).
 - Then ask me to confirm and complete the list in one question, covering each provider's
   plan or tier, its known limits (5-hour windows, weekly caps, quotas), whether I want it
   used, and anything you couldn't detect. Ask which pool I most want to protect (for
@@ -84,11 +86,11 @@ Phase 5: build it.
 - Create a thin agent only where an isolated context really helps. Give it
   `omitClaudeMd: true`, a tools allowlist, the right model and effort, and a one-line
   description that says when to use it and when not to.
-- Write each vendor's own instruction file (for example ~/.codex/AGENTS.md, or the
+- Write each vendor's own instruction file (for example <Codex home>/AGENTS.md, or the
   equivalent for other CLIs) from templates/codex-AGENTS.md: short, with the same
   red lines.
-- Add the routing table, ladders and pool rules to ~/.claude/CLAUDE.md (keep it compact;
-  long detail goes in ~/.claude/orchestrator/routing-details.md).
+- Add the routing table, ladders and pool rules to <Claude config dir>/CLAUDE.md (keep it compact;
+  long detail goes in <Claude config dir>/orchestrator/routing-details.md).
 - Map every new agent to a role in .claude/agent-context/roles.conf, if I use the
   subagent-context hook.
 - Back up everything you touch first. Keys stay in the environment or the CLI's own login,

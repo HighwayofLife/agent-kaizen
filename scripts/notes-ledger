@@ -3,7 +3,6 @@
 import argparse
 import csv
 import datetime as dt
-import fcntl
 import html
 import io
 import json
@@ -13,6 +12,11 @@ import re
 import sys
 import subprocess
 import tempfile
+
+try:
+    import fcntl
+except ImportError:  # no file locking on this platform
+    fcntl = None
 
 HEADER = ['date', 'category', 'change', 'source', 'status', 'measured']
 HEADING = re.compile(r'^## (\d{4}-\d{2}-\d{2}) to (\d{4}-\d{2}-\d{2})\s*$')
@@ -32,22 +36,46 @@ def config():
     if not isinstance(ledger, dict) or not ledger.get('csv'):
         print('notes-ledger: no notesLedger.csv in agent-kaizen.json', file=sys.stderr)
         raise SystemExit(3)
-    return Path(ledger['csv']).expanduser(), (Path(ledger['timeline']).expanduser()
-            if ledger.get('timeline') else None)
+    return path_setting(ledger, 'csv'), (path_setting(ledger, 'timeline') if ledger.get('timeline') else None)
+
+
+def path_setting(ledger, key):
+    if not isinstance(ledger[key], str):
+        raise ValueError('notesLedger.{} in agent-kaizen.json must be a string path'.format(key))
+    return Path(ledger[key]).expanduser()
+
+
+def physical_lines(data):
+    """Split on \\n, \\r\\n and \\r only, the way the csv module counts lines."""
+    return io.StringIO(data, newline='').readlines()
 
 
 def read_csv(path):
-    with path.open(encoding='utf-8', newline='') as f:
-        data = f.read()
-    lines = data.splitlines(keepends=True)
-    reader = csv.reader(io.StringIO(data, newline=''))
+    try:
+        with path.open(encoding='utf-8', newline='') as f:
+            data = f.read()
+    except FileNotFoundError:
+        raise FileNotFoundError('ledger {} does not exist. It must exist with the header {}; '
+                                'add does not create it'.format(path, ','.join(HEADER))) from None
+    lines = physical_lines(data)
+    # A leading BOM stays in the file; only the parser skips it.
+    reader = csv.reader(io.StringIO(data[1:] if data.startswith('\ufeff') else data, newline=''))
     records = []
     start = 0
-    for row in reader:
-        records.append((row, start, reader.line_num))
-        start = reader.line_num
-    if not records or records[0][0] != HEADER or any(len(r[0]) != len(HEADER) for r in records[1:]):
-        raise ValueError('invalid CSV header or row')
+    try:
+        for row in reader:
+            if row:  # blank lines are kept in the file but are not rows
+                records.append((row, start, reader.line_num))
+            start = reader.line_num
+    except csv.Error as exc:
+        raise ValueError('invalid CSV row {}: {}'.format(start + 1, exc)) from None
+    if not records or records[0][0] != HEADER:
+        raise ValueError('invalid CSV header in row {}: expected {}'.format(
+            records[0][1] + 1 if records else 1, ','.join(HEADER)))
+    for row, first, _ in records[1:]:
+        if len(row) != len(HEADER):
+            raise ValueError('invalid CSV row {}: expected {} columns, found {}'.format(
+                first + 1, len(HEADER), len(row)))
     return data, lines, records
 
 
@@ -58,12 +86,14 @@ def csv_line(row, ending='\n'):
 
 
 def atomic_write(path, data):
+    path = Path(os.path.realpath(path))  # a symlinked file stays a link; its target is replaced
     mode = path.stat().st_mode
     name = None
     try:
         with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', newline='', dir=str(path.parent), delete=False) as f:
             name = f.name
-            os.fchmod(f.fileno(), mode & 0o7777)
+            if hasattr(os, 'fchmod'):
+                os.fchmod(f.fileno(), mode & 0o7777)
             f.write(data)
             f.flush()
             os.fsync(f.fileno())
@@ -76,7 +106,7 @@ def atomic_write(path, data):
 def timeline_info(path):
     with path.open(encoding='utf-8', newline='') as f:
         data = f.read()
-    lines = data.splitlines(keepends=True)
+    lines = physical_lines(data)
     headings = []
     rows = []
     for i, line in enumerate(lines):
@@ -97,15 +127,16 @@ def timeline_cell(text):
 def equivalent(short, full):
     short = timeline_cell(html.unescape(short))
     full = timeline_cell(full)
-    return bool(short) and short in full
+    # The short text is the change itself; the CSV text continues with " Why: ...".
+    return bool(short) and (full == short or full.startswith(short + ' Why: '))
 
 
 def timeline_add(path, date, change):
     data, lines, headings, rows = timeline_info(path)
-    if any(row[0] == date and bool(row[1]) and timeline_cell(change).startswith(timeline_cell(html.unescape(row[1]))) for _, row in rows):
+    cell = timeline_cell(change).strip()
+    if any(row[0] == date and bool(row[1]) and timeline_cell(html.unescape(row[1])).strip() == cell for _, row in rows):
         return None
     day = dt.date.fromisoformat(date)
-    cell = timeline_cell(change)
     row = '| {} | {} | {} | {} |\n'
     # Status is filled by the caller.
     return data, lines, headings, day, cell, row
@@ -115,11 +146,11 @@ def add(args, csv_path, timeline_path):
     if not re.fullmatch(r'\d{4}-\d{2}-\d{2}', args.date):
         raise ValueError('date must be YYYY-MM-DD')
     dt.date.fromisoformat(args.date)
-    data, _, records = read_csv(csv_path)
+    data, csv_lines, records = read_csv(csv_path)
     change = '{} Why: {} Measure: {}'.format(args.change, args.why, args.measure)
     row = [args.date, args.category, change, args.source, args.status, 'no']
     csv_exists = any(r[0] == args.date and bool(r[2]) and (change.startswith(r[2]) or r[2].startswith(change)) for r, _, _ in records[1:])
-    timeline = timeline_add(timeline_path, args.date, change) if timeline_path else None
+    timeline = timeline_add(timeline_path, args.date, args.change) if timeline_path else None
     if csv_exists and timeline is None:
         print('already recorded')
         return
@@ -155,8 +186,10 @@ def add(args, csv_path, timeline_path):
     if not csv_exists:
         if data and not data.endswith(('\n', '\r')):
             raise ValueError('CSV lacks a final newline')
+        last = csv_lines[-1]
+        ending = '\r\n' if last.endswith('\r\n') else ('\r' if last.endswith('\r') else '\n')
         with csv_path.open('a', encoding='utf-8', newline='') as f:
-            f.write(csv_line(row))
+            f.write(csv_line(row, ending))
             f.flush()
             os.fsync(f.fileno())
         if os.environ.get('NOTES_LEDGER_FAIL_AFTER_CSV') == '1':
@@ -184,7 +217,15 @@ def set_row(args, csv_path, timeline_path):
     timeline_data = None
     if timeline_path:
         _, timeline_lines, _, rows = timeline_info(timeline_path)
-        matching = [(i, cells) for i, cells in rows if cells[0] == old[0] and equivalent(cells[1], old[2])]
+        same_date = [(i, cells) for i, cells in rows if cells[0] == old[0]]
+        matching = [(i, cells) for i, cells in same_date if equivalent(cells[1], old[2])]
+        if not matching:
+            # A timeline cell shortened by hand: accept it when it is the only same-date fragment
+            # and no other CSV row of that date already owns it.
+            others = [r[2] for r, _, _ in records[1:] if r is not old and r[0] == old[0]]
+            matching = [(i, cells) for i, cells in same_date
+                        if cells[1] and timeline_cell(html.unescape(cells[1])) in timeline_cell(old[2])
+                        and not any(equivalent(cells[1], other) for other in others)]
         if len(matching) != 1:
             raise ValueError('match must select exactly one timeline row')
         i, cells = matching[0]
@@ -286,7 +327,7 @@ def due(args):
     days = ledger.get('measureAfterDays', 7)
     if type(days) is not int or days < 1:
         days = 7
-    _, _, rows = read_csv(Path(ledger['csv']).expanduser())
+    _, _, rows = read_csv(path_setting(ledger, 'csv'))
     reports = audit_reports()
     for row, start, _ in rows[1:]:
         if row[4] != 'active' or row[5] != 'no':
@@ -381,9 +422,12 @@ def main():
         if args.dry_run:
             action(args, csv_path, timeline_path)
         else:
-            with open(str(csv_path) + '.lock', 'a') as lock:
-                fcntl.flock(lock, fcntl.LOCK_EX)
+            if fcntl is None:
                 action(args, csv_path, timeline_path)
+            else:
+                with open(str(csv_path) + '.lock', 'a') as lock:
+                    fcntl.flock(lock, fcntl.LOCK_EX)
+                    action(args, csv_path, timeline_path)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError, json.JSONDecodeError) as exc:
         print('notes-ledger: {}'.format(exc), file=sys.stderr)
         return 1 if isinstance(exc, (OSError, RuntimeError)) else 2

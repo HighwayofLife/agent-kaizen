@@ -17,10 +17,15 @@ def git(directory, *arguments):
 
 def worktrees(directory):
     result = git(directory, 'worktree', 'list', '--porcelain', '-z')
+    separator = b'\0'
+    if result is not None and result.returncode:
+        # Git older than 2.36 has no -z for this command.
+        result = git(directory, 'worktree', 'list', '--porcelain')
+        separator = b'\n'
     if result is None or result.returncode:
         return [directory]
-    return [Path(field[9:].decode(errors='surrogateescape'))
-            for field in result.stdout.split(b'\0') if field.startswith(b'worktree ')]
+    return [Path(os.fsdecode(field[9:]))
+            for field in result.stdout.split(separator) if field.startswith(b'worktree ')]
 
 
 def dirty_row(directory):
@@ -60,7 +65,8 @@ def main():
     try:
         result = subprocess.run(['ps', '-eo', 'pid=,etime=,args='], capture_output=True, text=True, check=False)
         for line in result.stdout.splitlines():
-            if 'codex-dispatch' in line and 'dispatch-status' not in line:
+            command = line.split()[2:]
+            if any(os.path.basename(word) == 'codex-dispatch' for word in command) and 'dispatch-status' not in line:
                 print(line.strip())
     except OSError as exc:
         print(f'Process listing unavailable: {exc}')

@@ -52,19 +52,23 @@ def main():
         print(f"Error: working directory missing: {cwd}\nSTATUS: REVIEW FAILED")
         return 2
     out = cwd / "out/dispatch" / (stamp() + "-review")
-    ensure_ignored(cwd)
-    out.mkdir(parents=True)
     limit = 15 if args.mode == "look" else 25
     header = [f"Model/effort: {one_line(args.m or 'configured default')} / {one_line(args.e)}; mode: {args.mode}", f"Raw output: {out}"]
 
     def failed(reason):
-        emit(out / "report.md", header[:limit - 2] +
-             ["Error: " + one_line(reason), "STATUS: REVIEW FAILED"])
+        lines = header[:limit - 2] + ["Error: " + one_line(reason), "STATUS: REVIEW FAILED"]
+        try:
+            emit(out / "report.md", lines)
+        except OSError:
+            # The output directory could not be created, so print the report instead.
+            print("\n".join(one_line(line) for line in lines))
         return 2
 
     try:
         if not cwd.is_dir():
             raise ValueError(f"working directory missing: {cwd}")
+        ensure_ignored(cwd)
+        out.mkdir(parents=True)
         here = Path(__file__).resolve().parent
         prompt = (here / f"prompts/review-{args.mode}.md").read_text()
         command = ["codex", "exec", "-s", "read-only", "-c",
@@ -82,6 +86,10 @@ def main():
                 if ahead and ahead.returncode == 0 and int(ahead.stdout.strip()) > 0:
                     args.base = candidate
                     header.append("Base: " + one_line(candidate) + " (default)")
+                    dirty = git(cwd, "status", "--porcelain")
+                    if dirty.returncode == 0 and dirty.stdout.strip():
+                        header.append("Note: uncommitted changes are NOT part of this review; "
+                                      "pass --uncommitted to review them.")
             if args.base:
                 if git(cwd, "rev-parse", "--verify", args.base + "^{commit}").returncode:
                     raise ValueError(f"base branch does not exist: {args.base}")
@@ -147,10 +155,14 @@ def main():
             last.unlink(missing_ok=True)
             rc = run_logged(command, cwd, out / f"raw-{attempt}.log", stdin=brief)
             has_final = last.is_file() and bool(last.read_text().strip())
-            overloaded = "server_overloaded" in (out / f"raw-{attempt}.log").read_text() or "model is at capacity" in (out / f"raw-{attempt}.log").read_text()
-            if has_final and not overloaded:
+            if has_final and rc == 0:
                 break
-        if rc or overloaded or not last.is_file() or not last.read_text().strip():
+            # The raw log is a transcript that can quote tool output, so overload
+            # strings only decide whether a failed attempt is worth retrying.
+            raw = (out / f"raw-{attempt}.log").read_text(errors="replace")
+            if has_final and not ("server_overloaded" in raw or "model is at capacity" in raw):
+                break
+        if rc or not has_final:
             return failed("; ".join(key_errors(out / f"raw-{attempt}.log")) or "no final message")
         # Models sometimes bold the verdict line ("**VERDICT: REVISE** — ..."); strip markdown emphasis first.
         lines = [re.sub(r"^[*_\s]+|\*\*|__", "", line) if re.match(r"^[*_\s]*(VERDICT|ANSWER):", line) else line

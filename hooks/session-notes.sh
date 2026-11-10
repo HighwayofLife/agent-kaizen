@@ -79,7 +79,13 @@ fi
 
 lint=$(find_tool rules-lint)
 if [ -n "$lint" ]; then
-  rl=$("$lint" --repo "$PWD" 2>/dev/null | tail -1)
+  if command -v timeout >/dev/null 2>&1; then
+    rl=$(timeout "${SESSION_NOTES_TIMEOUT:-20}" "$lint" --repo "$PWD" 2>/dev/null | tail -1)
+  elif command -v gtimeout >/dev/null 2>&1; then
+    rl=$(gtimeout "${SESSION_NOTES_TIMEOUT:-20}" "$lint" --repo "$PWD" 2>/dev/null | tail -1)
+  else
+    rl=$("$lint" --repo "$PWD" 2>/dev/null | tail -1)
+  fi
   case "$rl" in
     ""|"rules-lint: 0 "*|*"no patterns configured"*) ;;
     *) add "$rl (run rules-lint --repo . for details)" ;;

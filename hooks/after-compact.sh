@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # SessionStart (matcher "compact"): after a compaction, point the session back at on-disk
 # state (git, plans) instead of re-deriving it from a lossy summary. Never fails the session.
+command -v jq >/dev/null 2>&1 || exit 0
 cwd=$(jq -r '.cwd // empty' 2>/dev/null); cd "${cwd:-$PWD}" 2>/dev/null || exit 0
 git rev-parse --is-inside-work-tree >/dev/null 2>&1 || exit 0
 plans_glob=${PLANS_GLOB:-docs/plans/*/plan.md}

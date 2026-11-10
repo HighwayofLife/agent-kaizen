@@ -68,7 +68,7 @@ def main(argv=None):
     parser.add_argument("--json", action="store_true")
     args = parser.parse_args(argv)
     repos = [Path(repo) for repo in args.repo]
-    if not repos and Path("CLAUDE.md").is_file():
+    if not repos and (Path("CLAUDE.md").is_file() or Path("AGENTS.md").is_file()):
         repos = [Path.cwd()]
     home = claude_home()
     sources = [Path(__file__).resolve().with_name("rules-lint.patterns"),

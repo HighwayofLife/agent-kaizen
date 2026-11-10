@@ -128,7 +128,7 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                               and b'<task-notification>' not in line):
                             before_user = True
                         continue
-                    if old and not (keep_model and (b'"model"' in line or b'"user_message"' in prefix or b'"role":"user"' in prefix or b'"role": "user"' in prefix or (bounds is not None and b'"turn_context"' in prefix))):
+                    if old and not (keep_model and (b'"model"' in line or b'"token_count"' in prefix or b'"user_message"' in prefix or b'"role":"user"' in prefix or b'"role": "user"' in prefix or (bounds is not None and b'"turn_context"' in prefix))):
                         continue
                     if keep_tools and (saved_shape or saved_deltas or before_user):
                         for saved, ts in ([saved_shape] if saved_shape else []) + saved_deltas:
@@ -156,12 +156,29 @@ def context(usage):
         "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
 
 
+def empty_synthetic(message, usage):
+    """Claude Code writes zero-usage <synthetic> assistant rows; they are not model calls."""
+    return message.get("model") == "<synthetic>" and not (context(usage) or usage.get("output_tokens"))
+
+
 def add(counter, usage):
     ctx = context(usage)
     counter.update(calls=1, context=ctx, cache_read=usage.get("cache_read_input_tokens", 0) or 0,
                    cache_write=usage.get("cache_creation_input_tokens", 0) or 0,
                    output=usage.get("output_tokens", 0) or 0)
     counter["peak"] = max(counter["peak"], ctx)
+
+
+def codex_delta(previous, usage):
+    """Turn cumulative Codex totals into (delta since `previous`, current numeric totals).
+
+    A decrease in the input, output or total tokens means the counter was reset, so the
+    delta is the current value. Used by token-audit and usage-series.
+    """
+    current = {key: value for key, value in usage.items() if isinstance(value, (int, float))}
+    if any(current.get(key, 0) < previous.get(key, 0) for key in ("input_tokens", "output_tokens", "total_tokens")):
+        return dict(current), current
+    return {key: max(0, value - previous.get(key, 0)) for key, value in current.items()}, current
 
 
 def image_count(content):
@@ -205,11 +222,38 @@ def load_pricing(path):
         return {}, f"Pricing file unavailable: {path} ({exc})"
 
 
+PRICING_MAX_AGE_DAYS = 60
+
+
+def pricing_age_warning(pricing, today):
+    """One line when pricing.json source.checked is over 60 days old; None if missing or unparsable."""
+    source = pricing.get("source")
+    checked = source.get("checked") if isinstance(source, dict) else None
+    try:
+        age = (today.date() - datetime.strptime(checked, "%Y-%m-%d").date()).days
+    except (TypeError, ValueError):
+        return None
+    if age > PRICING_MAX_AGE_DAYS:
+        return f"Pricing last checked {checked} ({age} days before this audit); rates may be out of date."
+    return None
+
+
+# A key or alias matches a model id only if the rest is empty, a dated snapshot
+# (-YYYYMMDD) and/or a bracketed suffix such as [1m]. Newer minor versions stay unpriced.
+MODEL_SUFFIX = re.compile(r"(?:-\d{8})?(?:\[[^\]]*\])?")
+
+
 def pricing_key(pricing, model):
-    key = model if model in pricing.get("models", {}) else next((
-        pricing["aliases"][prefix] for prefix in sorted(pricing.get("aliases", {}), key=len, reverse=True)
-        if model.startswith(prefix)), None)
-    return key if key in pricing.get("models", {}) else None
+    models, aliases = pricing.get("models", {}), pricing.get("aliases", {})
+    if model in models:
+        return model
+    matching = [name for name in (*models, *aliases) if model.startswith(name)
+                and MODEL_SUFFIX.fullmatch(model, len(name))]
+    if not matching:
+        return None
+    name = max(matching, key=len)
+    key = name if name in models else aliases[name]
+    return key if key in models else None
 
 
 def price(data, model, agent, usage, codex=False):
@@ -455,7 +499,8 @@ def scan_claude(path, agent, since, data, seen_messages, project):
                 turn = dict(calls=0, cost=0, failures=[], bash_calls={}, active=True)
                 observed["prompts"] += int(main)
         usage = message.get("usage")
-        if row.get("type") == "assistant" and isinstance(usage, dict) and usage and not usage_seen:
+        if (row.get("type") == "assistant" and isinstance(usage, dict) and usage and not usage_seen
+                and not empty_synthetic(message, usage)):
             model = message.get("model", "unknown")
             if not isinstance(model, str):
                 model = "unknown"
@@ -615,10 +660,10 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
             except (OSError, ValueError, RecursionError):
                 continue
         data["codex_files_scanned"] += 1
-        model, final, brief, effort = "unknown", None, None, None
+        model, seen_usage, brief, effort = "unknown", False, None, None
         first = last = None
         users = []
-        prior_usage = Counter()
+        prior_usage, window = {}, Counter()
 
         bounds = [None, None]
         # Older session files can contain recent resumes. Keep earlier model
@@ -644,17 +689,19 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                 length = sum(len(text) for text in texts if text and not text.startswith(INJECTED_PREFIXES))
                 if length:
                     brief = length
-            if payload.get("type") == "token_count" and not row.get("_before_window"):
-                info = payload.get("info") or {}
-                usage = info.get("total_token_usage")
+            if payload.get("type") == "token_count":
+                info = payload.get("info")
+                usage = info.get("total_token_usage") if isinstance(info, dict) else None
                 if isinstance(usage, dict):
-                    final = dict(usage)
-                    delta = {key: max(0, value - prior_usage[key]) for key, value in usage.items()
-                             if isinstance(value, (int, float))}
+                    delta, prior_usage = codex_delta(prior_usage, usage)
+                    # Rows before the window only seed the baseline: not priced, not counted.
+                    if row.get("_before_window"):
+                        continue
+                    seen_usage = True
+                    window.update(delta)
                     price(data, model, "codex", delta, codex=True)
-                    prior_usage = Counter(usage)
         first, last = bounds
-        if final is not None:
+        if seen_usage:
             if brief is not None:
                 data["codex_briefs"][model].append(brief)
             text = " ".join(users)
@@ -662,14 +709,13 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                     "review-diff" if "VERDICT: NO ISSUES" in text else
                     "planner" if "as the engineering planner" in text else
                     "engineer" if "You are working in a git repository. Read AGENTS" in text else "other")
-            tokens = final.get("total_tokens", final.get("input_tokens", 0) + final.get("output_tokens", 0))
+            # In-window deltas, not the session's cumulative totals.
+            tokens = window["total_tokens"] if "total_tokens" in window else window["input_tokens"] + window["output_tokens"]
             data["codex_sessions"].append(dict(kind=kind, model=model, effort=effort or "n/a", tokens=tokens,
                                                duration_s=(last - first).total_seconds() if first and last and first != last else None))
             total = data["codex"][model]
-            total.update(sessions=1, input=final.get("input_tokens", 0),
-                         cached_input=final.get("cached_input_tokens", 0),
-                         output=final.get("output_tokens", 0),
-                         tokens=final.get("total_tokens", final.get("input_tokens", 0) + final.get("output_tokens", 0)))
+            total.update(sessions=1, input=window["input_tokens"], cached_input=window["cached_input_tokens"],
+                         output=window["output_tokens"], tokens=tokens)
 
 
 def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=None):
@@ -813,6 +859,61 @@ def agent_usage(data):
     return sorted(result, key=lambda row: (-row["cost"], row["agent"]))
 
 
+TOOL_USE_TYPE = re.compile(rb'"type"\s*:\s*"tool_use"')
+TOOL_USE_NAME = re.compile(rb'"type"\s*:\s*"tool_use"\s*,\s*"id"\s*:\s*"[^"\\]*"\s*,\s*"name"\s*:\s*"((?:[^"\\]|\\.)*)"')
+
+
+def needs_tool_universe(data):
+    """True when a main session (all its files merged) has no recorded tool definitions."""
+    for observed in data["_observed"].values():
+        known = {}
+        for session_id, entry in observed:
+            if entry["main"]:
+                known[session_id] = known.get(session_id, False) or entry["known"]
+        if not all(known.values()):
+            return True
+    return False
+
+
+def tool_use_names(line):
+    """Tool names in one transcript line; a pattern reads the usual key order, json.loads the rest."""
+    names = TOOL_USE_NAME.findall(line)
+    if len(names) == len(TOOL_USE_TYPE.findall(line)):
+        try:
+            return [json.loads(b'"' + name + b'"') if b"\\" in name else name.decode("utf-8")
+                    for name in names if name]
+        except (ValueError, UnicodeError):
+            pass
+    row = json.loads(line)
+    return [b["name"] for b in blocks(row.get("message") or {}) if b.get("type") == "tool_use" and b.get("name")]
+
+
+def add_unscanned_tools(data, scanned, since):
+    root = claude_home() / "projects"
+    for directory in root.iterdir() if root.is_dir() else []:
+        if not directory.is_dir():
+            continue
+        paths = list(directory.glob("*.jsonl")) + list(directory.glob("*/subagents/*.jsonl"))
+        for path in paths:
+            if path in scanned or too_old(path, since) or path.resolve() in scanned:
+                continue
+            # Only parse potential tool-use records from unscanned files.
+            try:
+                with path.open("rb") as stream:
+                    for line in stream:
+                        if b'"tool_use"' not in line:
+                            continue
+                        match = TIMESTAMP.search(line)
+                        if not match or date_time(match[1].decode()) < since:
+                            continue
+                        try:
+                            data["_tool_universe"].update(tool_use_names(line))
+                        except (ValueError, TypeError, UnicodeError):
+                            pass
+            except (OSError, ValueError):
+                pass
+
+
 def finalize_measurements(data, scanned, since):
     cost, stuck = data["cost"], data["stuck_turns"]
     cost["shares"] = {key: value / cost["total"] if cost["total"] else 0
@@ -841,31 +942,9 @@ def finalize_measurements(data, scanned, since):
                 sessions=len(fact["sessions"]), occurrences=fact["occurrences"],
                 worked_instead=next(iter(fact["worked_instead"]), "")))
     # Filters should not shrink the fallback universe to tools used in that project.
-    root = claude_home() / "projects"
-    for directory in root.iterdir() if root.is_dir() else []:
-        if not directory.is_dir():
-            continue
-        paths = list(directory.glob("*.jsonl")) + list(directory.glob("*/subagents/*.jsonl"))
-        for path in paths:
-            if path in scanned or too_old(path, since) or path.resolve() in scanned:
-                continue
-            # Only parse potential tool-use records from unscanned files.
-            try:
-                with path.open("rb") as stream:
-                    for line in stream:
-                        if b'"tool_use"' not in line:
-                            continue
-                        match = TIMESTAMP.search(line)
-                        if not match or date_time(match[1].decode()) < since:
-                            continue
-                        try:
-                            row = json.loads(line)
-                            data["_tool_universe"].update(b["name"] for b in blocks(row.get("message") or {})
-                                if b.get("type") == "tool_use" and b.get("name"))
-                        except (ValueError, TypeError):
-                            pass
-            except (OSError, ValueError):
-                pass
+    # It is only read when some observed main session has no recorded tool definitions.
+    if needs_tool_universe(data):
+        add_unscanned_tools(data, scanned, since)
     try:
         config = json.loads(claude_json().read_text())
     except (OSError, ValueError):
@@ -971,9 +1050,10 @@ def measurement_sections(data):
     cost, stuck = data["cost"], data["stuck_turns"]
     lines = ["", "## Cost (API-equivalent)",
              "API-equivalent $ is a comparison weighting, not a subscription bill."]
-    lines.append("Codex resumed sessions may be over-counted: pre-window cumulative usage is not seeded.")
     if cost["pricing_error"]:
         lines.append(cost["pricing_error"])
+    if cost.get("pricing_warning"):
+        lines.append(cost["pricing_warning"])
     lines.append(f"Total API-equivalent cost: {money(cost['total'])}")
     for label, mapping in (("Agent", cost["by_agent"]), ("Model", cost["by_model"])):
         lines += [f"{label} | API-equivalent $ | Share", "--- | --- | ---"]
@@ -1187,7 +1267,7 @@ def report(data, out, scope):
     for _, headers, _ in sections:
         if headers and " | " in headers[-1]:
             headers.append(" | ".join("---" for _ in headers[-1].split(" | ")))
-    lines = [*data["parser_warnings"], "# Token audit", f"Since: {data['since']} (UTC; Claude calls in window, Codex final session totals).",
+    lines = [*data["parser_warnings"], "# Token audit", f"Since: {data['since']} (UTC; Claude calls in window, Codex in-window token deltas).",
              *headline, "<!-- token-audit-headline " + json.dumps(h) + " -->",
              "<!-- token-audit-scope " + json.dumps(scope, sort_keys=True) + " -->",
              "<!-- token-audit-extract " + json.dumps(dict(v=1, file=out.stem + ".extract.json")) + " -->"]
@@ -1243,31 +1323,55 @@ def write_extract(data, out, directory, scope):
                 pass
 
 
+MAX_DAYS = 36500
+
+
+def utc_date(value):
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise argparse.ArgumentTypeError(f"{value!r} is not a date in YYYY-MM-DD form")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     period = parser.add_mutually_exclusive_group()
-    period.add_argument("--days", type=int, default=3)
-    period.add_argument("--since", type=lambda s: datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc))
+    period.add_argument("--days", type=int, default=3,
+                        help=f"audit the last N days, 0 to {MAX_DAYS} (default: 3)")
+    period.add_argument("--since", type=utc_date, metavar="YYYY-MM-DD",
+                        help="audit from this UTC date instead of --days (default: use --days)")
     selection = parser.add_mutually_exclusive_group()
-    selection.add_argument("--project", help="filter project folder names by substring")
-    selection.add_argument("--cwd", action="append", metavar="PATH", help="select transcripts by working directory (repeatable)")
-    parser.add_argument("--project-dir", action="append", default=[], type=Path)
-    parser.add_argument("--codex", action="store_true", help="include Codex sessions (also included by default)")
-    parser.add_argument("--out", type=Path)
+    selection.add_argument("--project", help="filter Claude project folder names by substring; "
+                           "does not filter Codex sessions (--cwd does)")
+    selection.add_argument("--cwd", action="append", metavar="PATH",
+                           help="select Claude transcripts and Codex sessions by working directory "
+                           "and its descendants (repeatable; default: all)")
+    parser.add_argument("--project-dir", action="append", default=[], type=Path,
+                        help="audit this Claude project directory instead of every one under the "
+                        "Claude config dir (repeatable; default: all projects)")
+    parser.add_argument("--codex", action="store_true",
+                        help="kept for compatibility; Codex sessions are always included")
+    parser.add_argument("--out", type=Path,
+                        help="report directory (default: Claude config dir/audits)")
     parser.add_argument("--extract-out", type=Path, default=claude_home() / "audits" / "extracts",
                         help="extract directory (default: Claude config dir/audits/extracts)")
     parser.add_argument("--json", action="store_true", help="print full structured data instead of headline stdout")
-    parser.add_argument("--pricing", type=Path, default=Path(__file__).resolve().with_name("pricing.json"))
-    for flag, default in (("stuck-repeats", 3), ("fact-sessions", 3), ("prune-prompts", 10),
-                          ("prune-min-sessions", 2), ("prune-sessions", 5)):
-        parser.add_argument("--" + flag, type=int, default=default)
+    parser.add_argument("--pricing", type=Path, default=Path(__file__).resolve().with_name("pricing.json"),
+                        help="pricing file (default: pricing.json next to this script)")
+    for flag, default, text in (
+            ("stuck-repeats", 3, "same failed tool call this many times in one turn marks it stuck"),
+            ("fact-sessions", 3, "sessions that hit the same failure before it is a repo-fact candidate"),
+            ("prune-prompts", 10, "prompts without use before an unused tool or server is a pruning candidate"),
+            ("prune-min-sessions", 2, "sessions without use that go with --prune-prompts"),
+            ("prune-sessions", 5, "sessions without use that make a pruning candidate on their own")):
+        parser.add_argument("--" + flag, type=int, default=default, help=f"{text} (default: {default})")
     args = parser.parse_args()
     options = {key: getattr(args, key) for key in ("stuck_repeats", "fact_sessions", "prune_prompts",
                                                   "prune_min_sessions", "prune_sessions")}
     if any(value < 1 for value in options.values()):
         parser.error("measurement thresholds must be positive")
-    if args.days < 0:
-        parser.error("--days must be nonnegative")
+    if not 0 <= args.days <= MAX_DAYS:
+        parser.error(f"--days must be between 0 and {MAX_DAYS}")
     now = datetime.now(timezone.utc)
     since = args.since or (now - timedelta(days=args.days)).replace(microsecond=0)
     root = claude_home() / "projects"
@@ -1292,6 +1396,7 @@ def main():
                 raise ValueError(f"project directory missing: {path}")
         pricing, pricing_error = load_pricing(args.pricing.expanduser())
         data = collect(projects, codex_root, since, pricing, pricing_error, options, cwd)
+        data["cost"]["pricing_warning"] = pricing_age_warning(pricing, now)
         data["scope"] = scope
         for warning in data["parser_warnings"]:
             print(warning, file=sys.stderr)

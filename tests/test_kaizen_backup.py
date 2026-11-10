@@ -18,6 +18,7 @@ class KaizenBackupTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp()).resolve()
         self.addCleanup(shutil.rmtree, self.tmp)
         self.env = {**os.environ, 'KAIZEN_BACKUP_DIR': str(self.tmp / 'backups')}
+        self.env.pop('CLAUDE_CONFIG_DIR', None)
 
     def run_script(self, *args, ok=True):
         result = subprocess.run([sys.executable, str(SCRIPT), *map(str, args)], env=self.env,
@@ -431,6 +432,210 @@ class KaizenBackupTests(unittest.TestCase):
                             self.assertIsNone(json.loads((change / 'manifest.json').read_text())['reverted'])
                     # Keep the next subtest's run independent of the rejected one.
                     shutil.rmtree(self.tmp / 'backups')
+
+
+    def test_undo_run_with_same_file_in_two_changes_restores_the_original(self):
+        target = self.tmp / 'shared'
+        target.write_text('v1')
+        first = self.change(target, run='r1')
+        target.write_text('v2')
+        self.run_script('finish', first)
+        second = self.change(target, run='r1')
+        target.write_text('v3')
+        self.run_script('finish', second)
+        result = self.run_script('undo', 'run')
+        self.assertNotIn('CONFLICT', result.stdout)
+        self.assertEqual(target.read_text(), 'v1')
+
+    def test_undo_run_with_same_file_still_conflicts_on_outside_edit(self):
+        target = self.tmp / 'shared'
+        target.write_text('v1')
+        first = self.change(target, run='r1')
+        target.write_text('v2')
+        self.run_script('finish', first)
+        second = self.change(target, run='r1')
+        target.write_text('v3')
+        self.run_script('finish', second)
+        target.write_text('outside edit')
+        result = self.run_script('undo', 'run', ok=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('CONFLICT', result.stdout)
+        self.assertEqual(target.read_text(), 'outside edit')
+
+    def test_undo_run_conflicts_on_a_manual_edit_between_two_changes(self):
+        target = self.tmp / 'shared'
+        target.write_text('v1')
+        first = self.change(target, run='r1')
+        target.write_text('v2')
+        self.run_script('finish', first)
+        target.write_text('MANUAL-EDIT')
+        second = self.change(target, run='r1')
+        target.write_text('v3')
+        self.run_script('finish', second)
+        result = self.run_script('undo', 'run', ok=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn('CONFLICT', result.stdout)
+        self.assertIn(str(target), result.stdout)
+        self.assertIn(Path(first).name, result.stdout)
+        self.assertIn(Path(second).name, result.stdout)
+        self.assertEqual(target.read_text(), 'v3')
+        self.assertEqual(self.run_script('list').stdout.count('open'), 2)
+        self.run_script('undo', 'run', '--force')
+        self.assertEqual(target.read_text(), 'v1')
+
+    def test_undo_run_removes_file_created_by_one_change_and_edited_by_the_next(self):
+        target = self.tmp / 'made'
+        first = self.change(target, run='r1')
+        target.write_text('v1')
+        self.run_script('finish', first)
+        second = self.change(target, run='r1')
+        target.write_text('v2')
+        self.run_script('finish', second)
+        self.run_script('undo', 'run')
+        self.assertFalse(target.exists())
+
+    def test_undo_unfinished_change_with_created_file_is_a_conflict(self):
+        edited, created = self.tmp / 'edited', self.tmp / 'created'
+        edited.write_text('original')
+        change = Path(self.change(edited, created))
+        edited.write_text('half done')
+        created.write_text('orphan')
+        result = self.run_script('undo', change, ok=False)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn(str(created), result.stdout)
+        self.assertIn('never finished', result.stdout)
+        self.assertEqual((edited.read_text(), created.read_text()), ('half done', 'orphan'))
+        self.assertIsNone(json.loads((change / 'manifest.json').read_text())['reverted'])
+        self.run_script('undo', change, '--force')
+        self.assertEqual(edited.read_text(), 'original')
+        self.assertFalse(created.exists())
+        self.assertTrue(json.loads((change / 'manifest.json').read_text())['reverted'])
+
+    def test_undo_unfinished_change_without_created_file_still_reverts(self):
+        edited, created = self.tmp / 'edited', self.tmp / 'created'
+        edited.write_text('original')
+        change = Path(self.change(edited, created))
+        edited.write_text('half done')
+        self.run_script('undo', change)
+        self.assertEqual(edited.read_text(), 'original')
+        self.assertTrue(json.loads((change / 'manifest.json').read_text())['reverted'])
+
+    def test_newest_change_is_decided_by_created_at_not_run_id_text(self):
+        target = self.tmp / 'target'
+        target.write_text('x')
+        older = self.change(target, run='weekly-1')
+        newer = self.change(target, run='20991231-000000')
+        lines = self.run_script('list').stdout.splitlines()
+        self.assertEqual([line.split('\t')[0] for line in lines], [newer, older])
+        self.run_script('undo', 'last')
+        self.assertTrue(json.loads((Path(newer) / 'manifest.json').read_text())['reverted'])
+        self.assertIsNone(json.loads((Path(older) / 'manifest.json').read_text())['reverted'])
+
+    def test_manifest_without_created_at_sorts_by_run_id(self):
+        target = self.tmp / 'target'
+        target.write_text('x')
+        old = Path(self.change(target, run='a-old'))
+        manifest = json.loads((old / 'manifest.json').read_text())
+        del manifest['created_at']
+        (old / 'manifest.json').write_text(json.dumps(manifest))
+        new = self.change(target, run='0-new')
+        lines = self.run_script('list').stdout.splitlines()
+        self.assertEqual([line.split('\t')[0] for line in lines], [new, str(old)])
+
+    def test_failed_begin_leaves_no_folder_and_a_retry_works(self):
+        good, folder = self.tmp / 'good', self.tmp / 'folder'
+        good.write_text('x')
+        folder.mkdir()
+        result = self.run_script('begin', '--run', 'r3', '--skill', 'e', '--ledger', 't', good, folder, ok=False)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('not a regular file', result.stderr)
+        self.assertEqual(list((self.tmp / 'backups').iterdir()), [])
+        change = Path(self.change(good, run='r3', skill='e'))
+        self.assertEqual(change.name, 'r3-01-e')
+
+    def test_begin_numbers_changes_from_folder_names_when_a_manifest_is_missing(self):
+        good = self.tmp / 'good'
+        good.write_text('x')
+        (self.tmp / 'backups/r4-01-e').mkdir(parents=True)
+        self.assertEqual(Path(self.change(good, run='r4', skill='e')).name, 'r4-02-e')
+
+    def test_corrupt_manifests_are_skipped_with_a_warning_naming_the_file(self):
+        target = self.tmp / 'target'
+        target.write_text('original')
+        change = self.change(target)
+        target.write_text('changed')
+        self.run_script('finish', change)
+        root = self.tmp / 'backups'
+        (root / 'bad-json').mkdir()
+        (root / 'bad-json/manifest.json').write_text('{broken')
+        (root / 'bad-keys').mkdir()
+        (root / 'bad-keys/manifest.json').write_text('{}')
+        (root / 'bad-read/manifest.json').mkdir(parents=True)
+        for args in (('list',), ('undo', 'last')):
+            result = self.run_script(*args)
+            for name in ('bad-json', 'bad-keys', 'bad-read'):
+                self.assertIn(str(root / name / 'manifest.json'), result.stderr)
+            self.assertNotIn('Traceback', result.stderr)
+        self.assertEqual(target.read_text(), 'original')
+        self.run_script('begin', '--run', 'r2', '--skill', 's', '--ledger', 't', target)  # not blocked
+
+    def test_undo_of_a_named_corrupt_manifest_names_the_file_without_traceback(self):
+        root = self.tmp / 'backups'
+        for name, text in (('bad-json', '{broken'), ('bad-keys', '{}')):
+            (root / name).mkdir(parents=True)
+            (root / name / 'manifest.json').write_text(text)
+            result = self.run_script('undo', root / name, ok=False)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn(str(root / name / 'manifest.json'), result.stderr)
+            self.assertNotIn('Traceback', result.stderr)
+
+    def test_backup_folders_are_private_and_restore_keeps_the_file_mode(self):
+        self.env.pop('KAIZEN_BACKUP_DIR')
+        self.env['CLAUDE_CONFIG_DIR'] = str(self.tmp / 'config')
+        root = self.tmp / 'config' / 'kaizen-backups'
+        root.mkdir(parents=True)
+        root.chmod(0o755)
+        target = self.tmp / 'target'
+        target.write_text('original')
+        target.chmod(0o640)
+        change = Path(self.change(target))
+        target.write_text('changed')
+        self.run_script('finish', change)
+        self.assertEqual(root.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(change.stat().st_mode & 0o777, 0o700)
+        self.assertEqual((change / 'files').stat().st_mode & 0o777, 0o700)
+        target.chmod(0o600)
+        self.run_script('undo', 'last')
+        self.assertEqual(target.read_text(), 'original')
+        self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+
+    def test_user_chosen_existing_backup_root_keeps_its_mode(self):
+        root = self.tmp / 'backups'
+        root.mkdir()
+        root.chmod(0o755)
+        target = self.tmp / 'target'
+        target.write_text('x')
+        change = Path(self.change(target))
+        self.assertEqual(root.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(change.stat().st_mode & 0o777, 0o700)
+
+    def test_new_backup_root_is_private(self):
+        target = self.tmp / 'target'
+        target.write_text('x')
+        self.change(target)
+        self.assertEqual((self.tmp / 'backups').stat().st_mode & 0o777, 0o700)
+
+    def test_default_root_follows_claude_config_dir_and_explicit_dir_wins(self):
+        home, config = self.tmp / 'home', self.tmp / 'config'
+        home.mkdir()
+        self.env.update(HOME=str(home), CLAUDE_CONFIG_DIR=str(config))
+        self.env.pop('KAIZEN_BACKUP_DIR')
+        target = self.tmp / 'target'
+        target.write_text('x')
+        self.assertEqual(Path(self.change(target)).parent, config / 'kaizen-backups')
+        self.assertFalse((home / '.claude').exists())
+        self.env['KAIZEN_BACKUP_DIR'] = str(self.tmp / 'explicit')
+        self.assertEqual(Path(self.change(target)).parent, self.tmp / 'explicit')
 
 
 if __name__ == '__main__':

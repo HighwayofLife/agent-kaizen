@@ -9,7 +9,7 @@ argument-hint: "[propose|safe|auto|yolo]"
 
 Set up the files that turn one-off tune-ups into a loop that keeps improving: an improvements ledger and a baseline.
 
-**Changes:** creates `docs/kaizen/` and writes `schedule` and `scheduledAutonomy` to `docs/kaizen/config.json` when you answer.
+**Changes:** creates `docs/kaizen/` and writes `schedule` and `scheduledAutonomy` to `docs/kaizen/config.json` when you answer; `auto` also adds the project to the global `autoProjects`.
 
 **Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `agent-kaizen.json` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`), else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
@@ -33,9 +33,9 @@ lists the files you create, including `docs/kaizen/config.json`, as docs/autonom
    <Claude config dir>/settings.json hooks, <Claude config dir>/agents/*.md, .claude/agents/*.md,
    <Codex home>/AGENTS.md, <Codex home>/config.toml. The Claude config dir is `$CLAUDE_CONFIG_DIR` or `~/.claude`; the Codex home is `$CODEX_HOME` or `~/.codex`. Write that list to
    docs/kaizen/baseline-config.md.
-4. Add `docs/kaizen/audit-*.md` and `docs/kaizen/token-audit-*.md` to .gitignore (audit
+4. Add `docs/kaizen/audit-*.md`, `docs/kaizen/token-audit-*.md`, `docs/kaizen/cycle-*.md`, `docs/kaizen/review-*.md` and `docs/kaizen/project-report-*.md` to .gitignore (audit
    reports contain paths and prompt fragments; the ledger and README stay tracked).
-5. Ask whether to include this project in the weekly review (`schedule=active` or `schedule=off`; default `active`), then whether the weekly run may apply changes here (`scheduledAutonomy=auto` or `scheduledAutonomy=propose`; default `propose`). Wait for each answer. `docs/kaizen/config.json` may be committed, so `auto` applies to teammates' schedules too. A personal choice belongs in the global setting via `/agent-kaizen:schedule`. Write both answers explicitly, even when they match the defaults, because global settings may override unwritten keys: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled config set --for . schedule=<v> scheduledAutonomy=<v>`. If the Claude config dir's `bin/` has no scheduled runner, suggest `/agent-kaizen:schedule`.
+5. Ask whether to include this project in the weekly review (`schedule=active` or `schedule=off`; default `active`), then whether the weekly run may apply changes here (`scheduledAutonomy=auto` or `scheduledAutonomy=propose`; default `propose`). Wait for each answer. `docs/kaizen/config.json` may be committed, so `auto` applies to teammates' schedules too, but only on machines where the project is in the global `autoProjects` list; the `config set --for` command below writes that opt-in for this machine. A personal choice belongs in the global setting via `/agent-kaizen:schedule`. Write both answers explicitly, even when they match the defaults, because global settings may override unwritten keys: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled config set --for . schedule=<v> scheduledAutonomy=<v>`. A project path with spaces or shell metacharacters cannot use scheduled auto mode. If the Claude config dir's `bin/` has no scheduled runner, suggest `/agent-kaizen:schedule`.
 6. Explain that `docs/kaizen/` enrolls the project in the audit. An optional outcome log follows `${CLAUDE_PLUGIN_ROOT}/docs/outcome-log.md`. Offer `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-link --check`, then after OK and with a `kaizen-backup`, offer `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-link --apply` to link the plugin scripts in `<Claude config dir>/bin` (copy mode when the plugin is in a plugin cache).
 7. Suggest which of the skills I should run next, based on what you found.
 Don't commit; I'll review first.

@@ -9,7 +9,13 @@ command -v jq >/dev/null 2>&1 || { echo "jq missing: block-image-read disabled" 
 in=$(cat)
 path=$(jq -r '.tool_input.file_path // empty' <<<"$in" 2>/dev/null)
 shopt -s nocasematch
-[[ "$path" =~ \.(png|jpe?g|gif|webp|bmp|tiff?|exr|heic)$ ]] || exit 0
+image_ext='\.(png|jpe?g|gif|webp|bmp|tiff?|exr|heic)$'
+if ! [[ "$path" =~ $image_ext ]]; then
+    # A symlink can hide an image behind another name: check the resolved target too.
+    [[ -L "$path" ]] || exit 0
+    target=$(python3 -c 'import os, sys; print(os.path.realpath(sys.argv[1]))' "$path" 2>/dev/null)
+    [[ "$target" =~ $image_ext ]] || exit 0
+fi
 cwd=$(jq -r '.cwd // empty' <<<"$in" 2>/dev/null)
 names=${IMAGE_AGENTS:-image-reader}
 top=$(git -C "${cwd:-$PWD}" rev-parse --show-toplevel 2>/dev/null)

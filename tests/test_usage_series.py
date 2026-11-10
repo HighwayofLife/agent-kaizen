@@ -108,6 +108,16 @@ class SeriesTests(StubCase):
         self.series()
         self.assertEqual(float(self.read_daily()[1]['codex_tokens_db']), 5000)
 
+    def test_transcript_older_than_the_window_is_skipped_by_modification_time(self):
+        # A transcript cannot hold rows newer than its last write, so an old mtime means no rows in the window.
+        path = jsonl(self.config / 'projects/example/stale.jsonl', [self.row(2, ident='stale')])
+        os.utime(path, (1733011200, 1733011200))  # 2024-12-01
+        self.series()
+        self.assertEqual(float(self.read_daily()[1]['main_calls']), 0)
+        os.utime(path, (1736000000, 1736000000))  # 2025-01-04
+        self.series()
+        self.assertEqual(float(self.read_daily()[1]['main_calls']), 1)
+
     def test_database_missing_columns_and_lock_copy(self):
         self.fixtures()
         path = self.codex / 'state_5.sqlite'

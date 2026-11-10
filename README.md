@@ -37,7 +37,7 @@ So I turned it into a loop and packaged it as a Claude Code plugin. I called it 
 
 The audit runs every few days on its own (it's just a script, so it costs nothing). When there's a new one, Claude reviews it against a ledger of what I've already changed, proposes the next couple of fixes, and after the next audit we check whether they actually helped. If a change didn't move the numbers, it gets reverted. That ledger has been the most useful part. A few things I was sure would help barely did anything.
 
-There's also a roster step. It figures out which AI tools you pay for, looks up what each one is good at right now, and sets up agents and fallbacks around that. For me, Grok is great for research, Codex for most of the coding, Claude for most of the planning, Codex's Terra model for image analysis, and Gemini gets the giant-document jobs. Yours will be different, so the plugin tailors the agents to what suits your project, and it only sets up what you have.
+There's also a roster step. It figures out which AI tools you pay for, looks up what each one is good at right now, and sets up agents and fallbacks around that. For me, Grok is great for research, Codex for most of the coding, Claude for most of the planning, a Codex model for image analysis, and Gemini gets the giant-document jobs. Yours will be different, so the plugin tailors the agents to what suits your project, and it only sets up what you have.
 
 If you're ready for it, there's a yolo (auto) mode where it applies the changes itself instead of asking you every time. I run it this way. Everything gets backed up and checked first; it rolls back anything that fails, and there's an undo. It still stops and asks before it touches keys, spends money, loosens permissions, deletes anything, or pushes code.
 
@@ -119,11 +119,11 @@ If you'd rather not approve every change:
 | `safe` | Applies low-risk, reversible changes (docs, instruction cleanups that drop no rule, new scripts, one-row model trials) and proposes the rest |
 | `auto` / `yolo` | Applies everything except the hard stops: secrets, spending money or new vendors, loosening permissions, deleting things, commits and pushes, package installs (unless `allowInstalls`) |
 
-In every mode, each applied change is backed up to `~/.claude/kaizen-backups/`, verified (`jq`, hook tests, `claude plugin validate`), rolled back automatically if verification fails, and logged in the ledger. At most 3 changes are made per run (`maxChangesPerRun`), so the next audit can tell which change did what. `/agent-kaizen:undo last` (or `run`) reverses changes. Claude Code's own permission prompts still apply: run the session with edits auto-accepted to avoid them. Details: [docs/autonomy.md](docs/autonomy.md).
+In every mode, each applied change is backed up (to `KAIZEN_BACKUP_DIR`, or `kaizen-backups/` under the Claude config dir), verified (`jq`, hook tests, `claude plugin validate`), rolled back automatically if verification fails, and logged in the ledger. At most 3 changes are made per run (`maxChangesPerRun`), so the next audit can tell which change did what. `/agent-kaizen:undo last` (or `run`) reverses changes. Claude Code's own permission prompts still apply: run the session with edits auto-accepted to avoid them. Details: [docs/autonomy.md](docs/autonomy.md).
 
 ### 3. Make it periodic
 
-Run `scripts/install-schedule` from the plugin or your clone; the plugin path varies by install.
+Run `/agent-kaizen:schedule`. It finds the plugin path and asks before it installs anything. Or run `scripts/install-schedule` from the plugin or your clone; the plugin path varies by install.
 
 ```bash
 scripts/install-schedule --apply                  # audit about every 3 days, no tokens
@@ -134,6 +134,16 @@ scripts/install-schedule --apply --review --auto ~/code/my-project # allow chang
 ```
 
 The plugin's session-start hook tells Claude when a new audit hasn't been reviewed. Then run `/agent-kaizen:cycle`, or ask Claude to use the `kaizen-auditor` agent. See [docs/scheduling.md](docs/scheduling.md).
+
+Running `install-schedule --apply` again without `--review` removes an installed review job. The audit job is not touched.
+
+### Uninstall
+
+1. `scripts/install-schedule --remove` removes the audit and review jobs.
+2. `scripts/kaizen-link --unlink` removes the linked scripts and hooks from `<Claude config dir>/bin` (add `--restore-replaced` if you used `--replace`).
+3. Remove the plugin: `claude plugin uninstall agent-kaizen@agent-kaizen-tools`.
+
+Project files (`docs/kaizen/`), reports in `<Claude config dir>/audits/` and backups (`KAIZEN_BACKUP_DIR`, or `kaizen-backups/` under the Claude config dir) stay until you delete them.
 
 ## Support and environment
 
@@ -154,9 +164,27 @@ The plugin's session-start hook tells Claude when a new audit hasn't been review
 | `READ_GUARD_MAX_LINES` | Read guard | Line limit; default 400 |
 | `READ_GUARD_EXTENSIONS` | Read guard | Overrides the exempt extension regex; default is listed in the hook |
 | `PLANS_GLOB` | After-compact hook | Plan search glob; default `docs/plans/*/plan.md` |
-| `KAIZEN_BACKUP_DIR` | Backup script | Backup directory; default `~/.claude/kaizen-backups` |
+| `KAIZEN_BACKUP_DIR` | Backup script, scheduler | Backup directory; default `kaizen-backups/` under the Claude config dir |
+| `KAIZEN_BASH_BURST` | Bash burst hook | Bash calls per turn between hints; default 8; `0` turns the hook off; a non-numeric value means 8 |
+| `CODEX_DISPATCH_MODEL` | `codex-dispatch` | Default for `-m` |
+| `CODEX_REVIEW_MODEL` | `codex-review` | Default model for `plan` and `code` reviews |
+| `CODEX_LOOK_MODEL` | `codex-review` | Default model for `visual` and `look` reviews |
+| `CODEX_DISPATCH_REASON_MODELS` | `codex-dispatch` | Comma-separated model-name tokens that need a reason line in the brief; default `sol`; empty turns the guard off |
+| `CODEX_DISPATCH_CHECK_TIMEOUT` | `codex-dispatch` | Seconds before a `-k` check is killed and counted as failed; default 1800; `0` = no limit |
+| `CODEX_DISPATCH_CODEX_TIMEOUT` | `codex-dispatch` | Seconds before a Codex run is killed; default 0 = no limit |
+| `SESSION_NOTES_TIMEOUT` | Session-notes hook | Seconds allowed for each helper call; default 20 |
+| `KAIZEN_SKIP_CHECKS` | Scheduler | `1` skips the drift, rules-lint, notes and project-report steps of a scheduled run |
+| `KAIZEN_USAGE_DB` | `usage-db` | SQLite file; default `kaizen-usage.db` in the Claude config dir |
 | `KAIZEN_REVIEW_MODEL` | Scheduler | Review model; default `sonnet`. Read when you run `install-schedule` (or `kaizen-scheduled` by hand), not by installed jobs |
 | `KAIZEN_REVIEW_MAX_TURNS` | Scheduler | Review turn limit; default 40. Read like `KAIZEN_REVIEW_MODEL` |
+
+## Codex dispatch guards
+
+- **Dirty tree:** `codex-dispatch` snapshots the Git tree before it runs and warns if it is dirty.
+- **No-change guard:** an engineer run must change files, judged per Codex run. A run that changes nothing counts as a failure and is resumed. `--allow-no-change` turns this off. Planner, `none` and non-Git runs skip it. Ignored files do not count.
+- **Reason guard:** if the model name (from `-m` or `CODEX_DISPATCH_MODEL`) contains a token from `CODEX_DISPATCH_REASON_MODELS`, the brief needs a line `<Token> reason: <why>` or `Model reason: <why>` outside code fences. The default token is `sol`, the owner's name for a high-cost Codex tier. Set your own tokens, or an empty value to turn the guard off. Without the line, the script prints a refusal on stdout before it creates `out/`, then `STATUS: CODEX FAILED`, and exits 2. A model chosen only by the Codex config and resumed threads are not checked. The reason is copied into the report.
+
+Flags, timeouts and the report format are in [scripts/README.md](scripts/README.md).
 
 ## Skills
 
@@ -187,7 +215,7 @@ All skills are user-triggered (`disable-model-invocation: true`), so their descr
 
 Resume rounds re-run only the checks that failed, then all checks once; check commands see `DISPATCH_ROUND` and `DISPATCH_PASS`. Give `-k` the narrowest check (affected/filtered tests); full suites run at the project's batch cadence. A repo may route check commands through an executable `tools/rewrite_check` (argv[1] = the command, stdout = its replacement, empty = unchanged; worktrees fall back to the main checkout's copy).
 
-The plugin also ships an **`kaizen-auditor` agent**, which runs one propose-only cycle and returns a 20-line summary, and a **SessionStart hook** for the unreviewed-audit notice.
+The plugin also ships a **`kaizen-auditor` agent**, which runs one propose-only cycle and returns a 20-line summary, a **SessionStart hook** for the unreviewed-audit notice, and a Bash burst hook.
 
 ## Feeding the audit from your project
 
@@ -199,20 +227,23 @@ Enrol a project with `docs/kaizen/` and record packet outcomes using the [outcom
 .claude-plugin/     plugin.json + marketplace.json (this repo is its own marketplace)
 skills/             the loop, one SKILL.md per step (plain Markdown; readable without the plugin)
 agents/             kaizen-auditor (propose-only)
-hooks/              audit-notice (enabled by the plugin), plus opt-in guardrails:
+hooks/              audit-notice and bash-burst (enabled by the plugin), plus opt-in guardrails:
                     limit-big-read, block-image-read, subagent-context, after-compact, session-notes
-scripts/            token-audit (+ pricing.json), usage-series, usage-compare, kaizen-backup (backups + undo), codex-dispatch, codex-review,
+                    (lists running dispatches and dirty worktrees, pending ledger rows and stale rules at session start)
+scripts/            token-audit (+ pricing.json), usage-series, usage-compare, usage-db, kaizen-backup (backups + undo), codex-dispatch, codex-run, codex-review,
                     dispatch-status, install-schedule, kaizen-scheduled, kaizen-link, packet-report,
                     kaizen-project-report, rules-lint (+ rules-lint.patterns), notes-ledger
 templates/          starting points: global and project CLAUDE.md, orchestrator.md,
                     Codex AGENTS.md and config.toml, settings.example.json,
                     agent templates (scout, judge, swarm-lead, verifier, planner,
                     debugger, image-reader), agent-context role files, plan + brief
-docs/               what-we-learned.md, scheduling.md, prompt-evaluation.md
+docs/               what-we-learned.md, scheduling.md, autonomy.md, outcome-log.md, prompt-evaluation.md
 assets/             banner, teaser animation and loop diagram; assets/src/ has the scripts that draw them
 ```
 
-The guardrail hooks and templates are **opt-in**: `/agent-kaizen:guardrails` and `/agent-kaizen:lean-agents` install and adapt them with your approval. Installing the plugin enables only the audit notice.
+The guardrail hooks and templates are **opt-in**: `/agent-kaizen:guardrails` and `/agent-kaizen:lean-agents` install and adapt them with your approval. Installing the plugin enables the audit notice and Bash burst hook.
+
+The Bash burst hook counts main-session Bash calls per user turn, failed calls included. Every eight calls by default it adds: "N Bash calls this turn. Chain the remaining steps into one command or script that prints a summary, or hand the investigation to a cheaper read-only subagent." Set `KAIZEN_BASH_BURST` to change the threshold. To turn it off, set `KAIZEN_BASH_BURST=0` or put `"enabled": false` in `agent-kaizen.json` in the Claude config dir.
 
 ## Without the plugin
 
@@ -222,13 +253,13 @@ Every skill is a plain Markdown file. You can also point Claude Code at a clone 
 Read ~/.claude/agent-kaizen/skills/audit/SKILL.md and do it for this project.
 ```
 
-Or paste the `## Task` section of any skill into a session.
+Or paste the `## Task` section of any skill into a session. Where a skill says `${CLAUDE_PLUGIN_ROOT}`, read it as the clone path (for example `~/.claude/agent-kaizen`). Also read the **Autonomy** paragraph above `## Task`.
 
 ## Safety
 
 - By default skills propose before they change anything. In `safe`/`auto` mode they apply changes themselves, but always back up first, verify, roll back on failure, log to the ledger, and stop at the hard stops. `/agent-kaizen:undo` reverses any change.
 - Scheduled runs default to propose mode: the audit is a plain script, and the weekly review runs with read-only tools and prints its proposal.
-- Audits read your local transcripts (`~/.claude/projects`, `~/.codex/sessions`). Reports stay on your machine under `docs/kaizen/` or `~/.claude/audits/`. Don't commit audit reports to a public repo; they can contain file paths and prompt fragments.
+- Audits read your local transcripts (`projects/` under the Claude config dir, `sessions/` under the Codex home). Reports stay on your machine under `docs/kaizen/` or `audits/` in the Claude config dir. Don't commit audit reports to a public repo; they can contain file paths and prompt fragments.
 - Setting names and CLI flags change between versions. The skills tell Claude to check the current docs before writing config.
 
 ## Compared with TokenEconomizer

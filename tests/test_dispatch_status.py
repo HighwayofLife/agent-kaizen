@@ -1,5 +1,8 @@
 """Offline checks for dirty worktree reporting."""
+import os
+import shutil
 import subprocess
+import time
 from pathlib import Path
 from tests.test_scripts import StubCase
 
@@ -39,3 +42,32 @@ class DispatchStatusTests(StubCase):
         section = output.split('DIRTY WORKTREES (uncommitted paths outside out/, newest change age)')[1]
         self.assertIn(str(other), section)
         self.assertNotIn(str(self.work) + ':', section)
+
+    def test_old_git_without_z_still_discovers_worktrees(self):
+        other = self.root / 'other worktree'
+        self.git('worktree', 'add', '-qb', 'other', str(other))
+        (other / 'task.md').write_text('changed')
+        real = shutil.which('git', path=os.environ['PATH'])
+        wrapper = self.bin / 'git'
+        wrapper.write_text('#!/bin/sh\ncase "$*" in *"worktree list"*" -z"*) exit 129;; esac\n'
+                           'exec "%s" "$@"\n' % real)
+        wrapper.chmod(0o755)
+        output = self.run_script('dispatch-status').stdout
+        section = output.split('DIRTY WORKTREES (uncommitted paths outside out/, newest change age)')[1]
+        self.assertIn(str(other), section)
+
+    def test_running_match_needs_codex_dispatch_script(self):
+        fake = self.bin / 'codex-dispatch'
+        fake.write_text('#!/bin/sh\nsleep 5\n')
+        fake.chmod(0o755)
+        procs = [subprocess.Popen([str(fake)]),
+                 subprocess.Popen(['python3', '-c', 'import time; time.sleep(5)', 'codex-dispatch.log'])]
+        try:
+            time.sleep(0.5)
+            running = self.run_script('dispatch-status').stdout.split('LATEST REPORT')[0]
+        finally:
+            for proc in procs:
+                proc.kill()
+                proc.wait()
+        self.assertIn(str(fake), running)
+        self.assertNotIn('codex-dispatch.log', running)

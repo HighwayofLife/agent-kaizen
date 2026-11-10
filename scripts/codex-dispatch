@@ -1,18 +1,41 @@
 #!/usr/bin/env python3
 """Run codex-run and checks synchronously; callers may background this process."""
 import argparse
+import hashlib
 import os
 from pathlib import Path
 import re
 import shutil
+import stat
 import subprocess
 import sys
 
-from codex_common import code_locations, emit, ensure_ignored, key_errors, one_line, relevant, run_logged, stamp, mcp_overrides
+from codex_common import code_locations, emit, ensure_ignored, exit_on_signals, key_errors, one_line, relevant, run_logged, stamp, mcp_overrides
+
+
+EPILOG = """environment:
+  CODEX_DISPATCH_MODEL          default for -m
+  CODEX_DISPATCH_REASON_MODELS  comma-separated model-name tokens (default: sol) that
+                                need a "<Token> reason: why" or "Model reason: why" line
+                                in the brief; empty turns the guard off
+  CODEX_DISPATCH_CHECK_TIMEOUT  default for --check-timeout (seconds, default 1800)
+  CODEX_DISPATCH_CODEX_TIMEOUT  default for --codex-timeout (seconds, default 0)
+"""
+
+
+def seconds(parser, flag, name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        parser.error(f"{name} must be a number of seconds (used as the default for {flag})")
 
 
 def arguments():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser(description=__doc__, epilog=EPILOG,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("-m", default=os.environ.get("CODEX_DISPATCH_MODEL"))
     p.add_argument("-e", default="medium")
     p.add_argument("-C", default=os.getcwd())
@@ -21,18 +44,29 @@ def arguments():
     p.add_argument("-p", choices=["engineer", "planner", "none"], default="engineer")
     p.add_argument("--disable-mcp", action="append", default=[], metavar="NAME")
     p.add_argument("-i", action="append", default=[])
+    p.add_argument("--allow-no-change", action="store_true",
+                   help="allow engineer runs that leave the Git tree unchanged")
+    p.add_argument("--check-timeout", type=float, metavar="SECONDS",
+                   default=seconds(p, "--check-timeout", "CODEX_DISPATCH_CHECK_TIMEOUT", 1800.0),
+                   help="kill a -k check after this long and count it as failed (default 1800; 0 = no limit)")
+    p.add_argument("--codex-timeout", type=float, metavar="SECONDS",
+                   default=seconds(p, "--codex-timeout", "CODEX_DISPATCH_CODEX_TIMEOUT", 0.0),
+                   help="kill a Codex run after this long (default 0 = no limit)")
     p.add_argument("--resume")
     p.add_argument("-o")
     p.add_argument("brief", type=Path)
     args = p.parse_args()
     if not 0 <= args.r <= 2:
         p.error("-r must be between 0 and 2")
+    if args.check_timeout < 0 or args.codex_timeout < 0:
+        p.error("--check-timeout and --codex-timeout must not be negative")
     return args
 
 
 def parse_run(path):
-    thread, usage, summary = None, None, []
+    thread, usage, summary, errors = None, None, [], []
     final = False
+    failing = False
     with path.open(errors="replace") as stream:
         for line in stream:
             line = line.rstrip()
@@ -42,11 +76,15 @@ def parse_run(path):
                 final = True
             elif line == "---- GIT DIFF STAT ----":
                 final = False
+            elif line == "---- CODEX ERRORS ----":
+                final, failing = False, True
+            elif failing:
+                errors.append(line)
             elif final:
                 summary.append(line)
             elif '"usage"' in line:
                 usage = line
-    return thread, usage, [line for line in summary if line.strip()]
+    return thread, usage, [line for line in summary if line.strip()], [line for line in errors if line.strip()]
 
 
 def rewrite_check(command, cwd):
@@ -70,12 +108,167 @@ def rewrite_check(command, cwd):
     return rewritten if result.returncode == 0 and rewritten else command
 
 
+def tree_snapshot(cwd, out, warnings):
+    """Return the worktree fingerprint and number of changed paths, if in Git.
+
+    The fingerprint covers HEAD, tracked changes and untracked files, but not
+    ignored files. The scope is the whole repository, minus the output directory.
+    """
+    try:
+        return _tree_snapshot(cwd, out)
+    except subprocess.CalledProcessError as exc:
+        detail = one_line(os.fsdecode(exc.stderr or b"").strip()) or f"exit status {exc.returncode}"
+        reason = f"git {exc.cmd[1]} failed: {detail}"
+    except OSError as exc:
+        reason = one_line(str(exc))
+    warning = f"WARNING: tree snapshot failed: {reason}; require-change skipped"
+    if warning not in warnings:
+        warnings.append(warning)
+        print(warning)
+    return None
+
+
+def _tree_snapshot(cwd, out):
+    root = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd,
+                          capture_output=True, check=False)
+    if root.returncode:
+        return None
+    root = Path(os.fsdecode(root.stdout.rstrip(b"\n")))
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=root, capture_output=True, check=True).stdout
+
+    status = git("status", "--porcelain=v1", "-uall", "-z")
+    try:
+        head = git("rev-parse", "HEAD").strip()
+    except subprocess.CalledProcessError:
+        head = b"unborn"
+    try:
+        excluded_path = str(out.relative_to(Path(os.path.realpath(root))))
+        excluded = os.fsencode(excluded_path)
+        pathspec = ("--", ".", f":(exclude,literal){excluded_path}")
+    except ValueError:
+        excluded = None
+        pathspec = ()
+    try:
+        diff = git("diff", "HEAD", "--binary", *pathspec)
+    except subprocess.CalledProcessError:
+        # A newly initialized repository has no HEAD yet.
+        diff = git("diff", "--binary", *pathspec) + git("diff", "--cached", "--binary", *pathspec)
+    entries = status.split(b"\0")
+    included = []
+    untracked = []
+    count = 0
+    index = 0
+    while index < len(entries) and entries[index]:
+        entry = entries[index]
+        renamed = entry[:2].find(b"R") >= 0 or entry[:2].find(b"C") >= 0
+        extra = entries[index + 1] if renamed else None
+        name = entry[3:].rstrip(b"/")
+        if excluded is not None and (name == excluded or name.startswith(excluded + b"/")):
+            index += 2 if renamed else 1
+            continue
+        included.append(entry)
+        if extra is not None:
+            included.append(extra)
+        count += 1
+        if entry.startswith(b"?? "):
+            path = root / os.fsdecode(entry[3:])
+            info = path.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                content = os.fsencode(os.readlink(path))
+            elif not stat.S_ISREG(info.st_mode) or info.st_size > 5 * 1024 * 1024:
+                content = f"{info.st_size}:{info.st_mtime_ns}".encode()
+                if stat.S_ISDIR(info.st_mode):
+                    nested_root = subprocess.run(["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                                                 capture_output=True, check=False)
+                    if nested_root.returncode == 0 and Path(os.fsdecode(nested_root.stdout.rstrip(b"\n"))) == path:
+                        nested_head = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"],
+                                                     capture_output=True, check=False)
+                        nested = subprocess.run(["git", "-C", str(path), "status", "--porcelain=v1"],
+                                                capture_output=True, check=False)
+                        content += nested_head.stdout + nested.stdout
+            else:
+                content = path.read_bytes()
+            untracked.append((entry[3:], hashlib.sha256(content).digest()))
+        if renamed:
+            index += 1
+        index += 1
+    return (head, tuple(included), hashlib.sha256(diff).digest(), tuple(untracked)), count
+
+
+def untracked_count(cwd, out):
+    """Untracked, non-ignored files in the repository, not counting the output directory."""
+    try:
+        root = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd, capture_output=True, check=True).stdout
+        root = Path(os.path.realpath(os.fsdecode(root.rstrip(b"\n"))))
+        pathspec = ["--", "."]
+        try:
+            pathspec.append(f":(exclude,literal){out.relative_to(root)}")
+        except ValueError:
+            pass
+        listing = subprocess.run(["git", "ls-files", "--others", "--exclude-standard", "-z", *pathspec],
+                                 cwd=root, capture_output=True, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return 0
+    return len([name for name in listing.split(b"\0") if name])
+
+
+def reason_tokens():
+    raw = os.environ.get("CODEX_DISPATCH_REASON_MODELS")
+    return [token.strip().lower() for token in ("sol" if raw is None else raw).split(",") if token.strip()]
+
+
+def outside_fences(text):
+    """Drop fenced code blocks so quoted examples are not mistaken for the brief."""
+    lines, fenced = [], False
+    for line in text.splitlines():
+        if line.lstrip().startswith(("```", "~~~")):
+            fenced = not fenced
+        elif not fenced:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def reason_guard(model, text):
+    """Return (label, reason, error) for models that need a stated reason in the brief."""
+    name = (model or "").lower()
+    tokens = [token for token in reason_tokens()
+              if re.search(r"(^|[^a-z0-9])" + re.escape(token) + r"\d*([^a-z0-9]|$)", name)]
+    if not tokens:
+        return None, None, None
+    labels = "|".join([re.escape(token) for token in tokens] + ["model"])
+    # Up to three spaces of indent: four or a tab is an indented code block. A reason that is only
+    # a placeholder such as "<why>" does not count either.
+    reasons = [match.group(1).strip() for match in re.finditer(
+        rf"^ {{0,3}}[*_]*(?:{labels})[ \t]+reason[*_]*:[*_]*[ \t]*(?![*_]*[ \t]*$)(\S[^\r\n]*)",
+        outside_fences(text), re.IGNORECASE | re.MULTILINE)]
+    reasons = [reason for reason in reasons if not re.fullmatch(r"<[^>]*>", reason)]
+    label = tokens[0].capitalize()
+    if not reasons:
+        return label, None, (f'model "{model}" needs a line "{label} reason: <why>" (or "Model reason: <why>") '
+                             "in the brief, outside code fences")
+    return label, reasons[0], None
+
+
 def main():
     args = arguments()
+    exit_on_signals("SIGTERM", "SIGHUP")
     cwd = Path(args.C).expanduser().resolve()
     if not cwd.is_dir():
         print(f"Reason: working directory missing: {cwd}\nSTATUS: CODEX FAILED")
         return 2
+    reason_label = reason_text = None
+    if not args.resume:
+        try:
+            text = args.brief.expanduser().read_text()
+        except (OSError, ValueError):
+            text = None  # the run below reports an unreadable brief
+        if text is not None:
+            reason_label, reason_text, error = reason_guard(args.m, text)
+            if error:
+                print(f"Reason: {error}\nSTATUS: CODEX FAILED")
+                return 2
     base = cwd / "out/dispatch"
     slug = re.sub(r"[^\w.-]", "-", args.brief.stem)
     out = Path(args.o).expanduser().resolve() if args.o else base / f"{stamp()}-{slug}"
@@ -85,6 +278,8 @@ def main():
     thread, usage, summary, checks, rounds = args.resume, None, [], [], 0
     reason = None
     locations = ""
+    warnings = []
+    dirty_count = 0
 
     def report(status, code):
         fixed = [f"Model/effort: {one_line(args.m or 'configured default')} / {one_line(args.e)}",
@@ -93,6 +288,11 @@ def main():
         fixed.append(f"Code map: {count} location lines" if locations else "Code map: none")
         if args.resume:
             fixed[0] += " (resume inherits thread model)"
+        if dirty_count:
+            fixed.append(f"WARNING: tree was dirty before dispatch ({dirty_count} paths)")
+        fixed += [one_line(warning) for warning in warnings]
+        if reason_text:
+            fixed.append(f"{reason_label} reason: {one_line(reason_text)}")
         if reason:
             fixed.append(f"Reason: {one_line(reason)}")
         check_lines = []
@@ -110,15 +310,21 @@ def main():
         end = [f"Rounds used: {rounds}/{args.r} resumes", f"OUTDIR: {out}", f"STATUS: {status}"]
         statlog = out / "git-diff-stat.log"
         run_logged(["git", "diff", "--stat"], cwd, statlog)
+        untracked = untracked_count(cwd, out)
         stat = statlog.read_text(errors="replace").splitlines()
         if stat and stat[0].startswith(("warning:", "fatal:", "error:")):
             stat = ["not a git repository"]
-        budget = 25 - len(fixed) - len(check_lines) - len(end)
+        budget = 25 - len(fixed) - len(check_lines) - len(end) - (1 if untracked else 0)
         stat_budget = min(11, max(1, budget // 2))
         if len(stat) > stat_budget:
             stat = stat[:max(0, stat_budget - 1)] + [stat[-1]]
         stat = stat or ["(no tracked diff)"]
         final = ["Codex: " + one_line(line) for line in summary[:min(10, max(0, budget - len(stat)))]]
+        if untracked:
+            if stat == ["(no tracked diff)"]:
+                stat = [f"(no tracked diff); {untracked} untracked file(s)"]
+            else:
+                stat.append(f"{untracked} untracked file(s)")
         emit(out / "report.md", fixed + final + ["Diff: " + line for line in stat] + check_lines + end)
         return code
 
@@ -142,20 +348,30 @@ def main():
         brief = out / "brief.md"
         brief.write_text(preamble + "\n" + (locations.rstrip() + "\n\n" if locations else "") + task)
         runner = str(here / "codex-run")
+        initial = tree_snapshot(cwd, out, warnings)
+        dirty_count = initial[1] if initial else 0
+        require_change = initial is not None and args.p == "engineer" and not args.allow_no_change
+        before, changed = initial, False
         failures = []
         for attempt in range(args.r + 1):
             log = out / f"codex-{attempt}.log"
             command = ([runner, "--resume", thread, args.e, str(brief)] if thread else
                        [runner, args.m or "", args.e, str(brief)]) + [str(argfile)]
-            rc = run_logged(command, cwd, log)
-            next_thread, next_usage, summary = parse_run(log)
+            if require_change and attempt:
+                before = tree_snapshot(cwd, out, warnings)
+            rc = run_logged(command, cwd, log, timeout=args.codex_timeout or None, own_session=True)
+            # Compare right after Codex, before any check can write files.
+            after = tree_snapshot(cwd, out, warnings) if require_change and before else None
+            next_thread, next_usage, summary, problems = parse_run(log)
             thread = next_thread if next_thread and next_thread != "unknown" else thread
             usage = next_usage or usage
             if rc or not summary or any(line == "(no final message)" for line in summary):
-                reason = "; ".join(key_errors(log)) or "Codex returned no final message"
+                timeout = [line for line in log.read_text(errors="replace").splitlines() if line.startswith("TIMEOUT after ")]
+                reason = ("Codex timed out: " + timeout[-1] if rc == 124 and timeout else
+                          "; ".join(problems) or "Codex returned no final message")
                 return report("CODEX FAILED", 2)
             selected = list(enumerate(args.k, 1)) if attempt == 0 else [
-                (number, args.k[number - 1]) for number, _, _, _, _ in failures]
+                (number, args.k[number - 1]) for number, _, _, _, _ in failures if number]
             results = {check[0]: check for check in checks}
 
             def run_checks(selected, pass_name):
@@ -165,7 +381,7 @@ def main():
                     for number, command in selected:
                         command = rewrite_check(command, cwd)
                         log = out / f"check-{number}.log"
-                        rc = run_logged(command, cwd, log, shell=True)
+                        rc = run_logged(command, cwd, log, shell=True, timeout=args.check_timeout or None, own_session=True)
                         shutil.copyfile(log, out / f"check-{number}-round-{attempt}.log")
                         results[number] = (number, command, rc, log, attempt)
                 finally:
@@ -175,8 +391,20 @@ def main():
                         else:
                             os.environ[name] = value
 
+            if require_change:
+                if before is None or after is None:
+                    require_change = False
+                    results.pop(0, None)
+                else:
+                    changed = changed or after[0] != before[0]
+                    change_log = out / "check-require-change.log"
+                    change_log.write_text("Files changed.\n" if changed else
+                                          "No files changed since dispatch started.\n"
+                                          "Ignored files do not count. Pass --allow-no-change when no change is expected.\n")
+                    shutil.copyfile(change_log, out / f"check-require-change-round-{attempt}.log")
+                    results[0] = (0, "require-change", 0 if changed else 1, change_log, attempt)
             run_checks(selected, "initial" if attempt == 0 else "retry")
-            if attempt and all(not results[number][2] for number, _ in selected):
+            if attempt and all(not check[2] for check in results.values()):
                 retried = {number for number, _ in selected}
                 run_checks([(number, command) for number, command in enumerate(args.k, 1)
                             if number not in retried], "final")
@@ -188,13 +416,15 @@ def main():
                 return report("CHECKS FAILING", 1)
             if not thread:
                 reason = "Cannot resume failing checks without a thread id"
+                if any(check[1] == "require-change" for check in failures):
+                    return report("CHECKS FAILING", 1)
                 return report("CODEX FAILED", 2)
             brief = out / f"resume-{attempt + 1}.md"
             brief.write_text("Fix the failing checks below. Do not commit or push.\n\n" + "\n\n".join(
                 f"Check {number}: {command}\n" + "\n".join(relevant(log))
                 for number, command, _, log, _ in failures))
             rounds += 1
-    except (OSError, ValueError) as exc:
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
         reason = str(exc)
         return report("CODEX FAILED", 2)
 

@@ -1,0 +1,153 @@
+diff --git a/scripts/codex-dispatch b/scripts/codex-dispatch
+index 54db191..8d4c6e3 100755
+--- a/scripts/codex-dispatch
++++ b/scripts/codex-dispatch
+@@ -1,6 +1,7 @@
+ #!/usr/bin/env python3
+ """Run codex-run and checks synchronously; callers may background this process."""
+ import argparse
++import hashlib
+ import os
+ from pathlib import Path
+ import re
+@@ -21,6 +22,8 @@ def arguments():
+     p.add_argument("-p", choices=["engineer", "planner", "none"], default="engineer")
+     p.add_argument("--disable-mcp", action="append", default=[], metavar="NAME")
+     p.add_argument("-i", action="append", default=[])
++    p.add_argument("--allow-no-change", action="store_true",
++                   help="allow engineer runs that leave the Git tree unchanged")
+     p.add_argument("--resume")
+     p.add_argument("-o")
+     p.add_argument("brief", type=Path)
+@@ -70,6 +73,46 @@ def rewrite_check(command, cwd):
+     return rewritten if result.returncode == 0 and rewritten else command
+ 
+ 
++def tree_snapshot(cwd):
++    """Return the worktree fingerprint and number of changed paths, if in Git."""
++    root = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd,
++                          capture_output=True, check=False)
++    if root.returncode:
++        return None
++    root = Path(os.fsdecode(root.stdout.rstrip(b"\n")))
++
++    def git(*args):
++        return subprocess.run(["git", *args], cwd=root, capture_output=True, check=True).stdout
++
++    status = git("status", "--porcelain=v1", "-uall", "-z")
++    try:
++        diff = git("diff", "HEAD", "--binary")
++    except subprocess.CalledProcessError:
++        # A newly initialized repository has no HEAD yet.
++        diff = git("diff", "--binary") + git("diff", "--cached", "--binary")
++    entries = status.split(b"\0")
++    untracked = []
++    count = 0
++    index = 0
++    while index < len(entries) and entries[index]:
++        entry = entries[index]
++        count += 1
++        if entry.startswith(b"?? "):
++            path = root / os.fsdecode(entry[3:])
++            stat = path.lstat()
++            if path.is_symlink():
++                content = os.fsencode(os.readlink(path))
++            elif stat.st_size > 5 * 1024 * 1024:
++                content = f"{stat.st_size}:{stat.st_mtime_ns}".encode()
++            else:
++                content = path.read_bytes()
++            untracked.append((entry[3:], hashlib.sha256(content).digest()))
++        if entry[:2].find(b"R") >= 0 or entry[:2].find(b"C") >= 0:
++            index += 1
++        index += 1
++    return (status, hashlib.sha256(diff).digest(), tuple(untracked)), count
++
++
+ def main():
+     args = arguments()
+     cwd = Path(args.C).expanduser().resolve()
+@@ -85,6 +128,8 @@ def main():
+     thread, usage, summary, checks, rounds = args.resume, None, [], [], 0
+     reason = None
+     locations = ""
++    sol_reason = None
++    dirty_count = 0
+ 
+     def report(status, code):
+         fixed = [f"Model/effort: {one_line(args.m or 'configured default')} / {one_line(args.e)}",
+@@ -93,6 +138,10 @@ def main():
+         fixed.append(f"Code map: {count} location lines" if locations else "Code map: none")
+         if args.resume:
+             fixed[0] += " (resume inherits thread model)"
++        if dirty_count:
++            fixed.append(f"WARNING: tree was dirty before dispatch ({dirty_count} paths)")
++        if sol_reason:
++            fixed.append(f"Sol reason: {one_line(sol_reason)}")
+         if reason:
+             fixed.append(f"Reason: {one_line(reason)}")
+         check_lines = []
+@@ -126,6 +175,12 @@ def main():
+         if not cwd.is_dir():
+             raise OSError(f"working directory missing: {cwd}")
+         task = args.brief.expanduser().read_text()
++        if not args.resume and "sol" in (args.m or "").lower():
++            match = re.search(r"^\s*Sol reason:[ \t]*(\S[^\r\n]*)", task, re.IGNORECASE | re.MULTILINE)
++            if not match:
++                print("ERROR: Sol model requires a Sol reason in the brief.", file=sys.stderr)
++                return 2
++            sol_reason = match.group(1).strip()
+         locations = code_locations(cwd, args.brief.expanduser().resolve(), out / "codemap.log")
+         here = Path(__file__).resolve().parent
+         preamble = "" if args.p == "none" else (here / f"preambles/{args.p}.md").read_text()
+@@ -142,6 +197,9 @@ def main():
+         brief = out / "brief.md"
+         brief.write_text(preamble + "\n" + (locations.rstrip() + "\n\n" if locations else "") + task)
+         runner = str(here / "codex-run")
++        initial = tree_snapshot(cwd)
++        dirty_count = initial[1] if initial else 0
++        require_change = initial is not None and args.p == "engineer" and not args.allow_no_change
+         failures = []
+         for attempt in range(args.r + 1):
+             log = out / f"codex-{attempt}.log"
+@@ -155,7 +213,7 @@ def main():
+                 reason = "; ".join(key_errors(log)) or "Codex returned no final message"
+                 return report("CODEX FAILED", 2)
+             selected = list(enumerate(args.k, 1)) if attempt == 0 else [
+-                (number, args.k[number - 1]) for number, _, _, _, _ in failures]
++                (number, args.k[number - 1]) for number, _, _, _, _ in failures if number]
+             results = {check[0]: check for check in checks}
+ 
+             def run_checks(selected, pass_name):
+@@ -175,8 +233,14 @@ def main():
+                         else:
+                             os.environ[name] = value
+ 
++            if require_change:
++                changed = tree_snapshot(cwd)[0] != initial[0]
++                change_log = out / "check-require-change.log"
++                change_log.write_text("Files changed.\n" if changed else "No files changed since dispatch started.\n")
++                shutil.copyfile(change_log, out / f"check-require-change-round-{attempt}.log")
++                results[0] = (0, "require-change", 0 if changed else 1, change_log, attempt)
+             run_checks(selected, "initial" if attempt == 0 else "retry")
+-            if attempt and all(not results[number][2] for number, _ in selected):
++            if attempt and all(not check[2] for check in results.values()):
+                 retried = {number for number, _ in selected}
+                 run_checks([(number, command) for number, command in enumerate(args.k, 1)
+                             if number not in retried], "final")
+@@ -188,13 +252,15 @@ def main():
+                 return report("CHECKS FAILING", 1)
+             if not thread:
+                 reason = "Cannot resume failing checks without a thread id"
++                if any(check[1] == "require-change" for check in failures):
++                    return report("CHECKS FAILING", 1)
+                 return report("CODEX FAILED", 2)
+             brief = out / f"resume-{attempt + 1}.md"
+             brief.write_text("Fix the failing checks below. Do not commit or push.\n\n" + "\n\n".join(
+                 f"Check {number}: {command}\n" + "\n".join(relevant(log))
+                 for number, command, _, log, _ in failures))
+             rounds += 1
+-    except (OSError, ValueError) as exc:
++    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+         reason = str(exc)
+         return report("CODEX FAILED", 2)
+ 

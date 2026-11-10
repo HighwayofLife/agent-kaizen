@@ -5,6 +5,7 @@ from pathlib import Path
 import os
 import json
 import re
+import signal
 import subprocess
 
 
@@ -46,17 +47,52 @@ def one_line(text):
     return " ".join(str(text).splitlines())
 
 
-def run_logged(args, cwd, output, stdin=None, shell=False, timeout=None):
-    """Never collect an unbounded transcript in memory."""
+def kill_group(process):
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except (OSError, AttributeError):
+        process.kill()
+
+
+def run_logged(args, cwd, output, stdin=None, shell=False, timeout=None, own_session=False):
+    """Never collect an unbounded transcript in memory.
+
+    With a timeout (or own_session) the command runs in its own process group.
+    On expiry the whole group is killed, "TIMEOUT after Ns" is logged and 124
+    is returned. Any other exception that leaves the wait (Ctrl-C, SystemExit
+    from a signal handler) kills the group too, then propagates.
+    """
+    detached = bool(timeout) or own_session
     with Path(output).open("w") as log:
         try:
             with Path(stdin).open() if stdin else open(os.devnull) as source:
-                return subprocess.run(args, cwd=cwd, stdin=source, stdout=log,
-                                      stderr=subprocess.STDOUT, shell=shell,
-                                      timeout=timeout, check=False).returncode
-        except (OSError, subprocess.TimeoutExpired) as exc:
+                process = subprocess.Popen(args, cwd=cwd, stdin=source, stdout=log,
+                                           stderr=subprocess.STDOUT, shell=shell,
+                                           start_new_session=detached)
+                try:
+                    return process.wait(timeout=timeout)
+                except subprocess.TimeoutExpired:
+                    kill_group(process)
+                    process.wait()
+                    log.write(f"TIMEOUT after {timeout:g}s\n")
+                    return 124
+                except BaseException:
+                    if detached:
+                        kill_group(process)
+                        process.wait()
+                    raise
+        except OSError as exc:
             log.write(f"ERROR: {exc}\n")
             return 127
+
+
+def exit_on_signals(*names):
+    """Turn termination signals into SystemExit(128 + signal) so cleanup runs."""
+    def stop(number, frame):
+        raise SystemExit(128 + number)
+    for name in names:
+        if hasattr(signal, name):
+            signal.signal(getattr(signal, name), stop)
 
 
 def code_locations(cwd, brief, log):

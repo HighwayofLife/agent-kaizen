@@ -34,8 +34,8 @@ Then propose a tiered system, with an estimate of the time saved per item:
    slots held by dead processes) that limits engine instances machine-wide, for example
    to 2, so parallel agents queue instead of thrashing.
 5. Fast worktrees: one git worktree per parallel task, created by a script that copies
-   the engine's import cache with copy-on-write (APFS clonefile on macOS, reflink on
-   Linux), so a new worktree doesn't reimport everything.
+   large generated caches (imports, build output, dependency folders) with copy-on-write
+   (APFS clonefile on macOS, reflink on Linux), so a new worktree doesn't rebuild them.
 6. If the engine's test runner offers "run only affected tests", plan a short spike to
    prove it works on this repo before relying on it. Ours never selected anything, and
    we fell back to the tiers above.

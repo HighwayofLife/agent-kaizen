@@ -13,10 +13,12 @@ argument-hint: "[propose|safe|auto|yolo]"
 
 **Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `agent-kaizen.json` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`), else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
+In this skill, `<Claude config dir>` means `$CLAUDE_CONFIG_DIR` or `~/.claude`, and `<Codex home>` means `$CODEX_HOME` or `~/.codex`.
+
 ## Task
 
-Review the instructions that load automatically: CLAUDE.md (project and ~/.claude/),
-any @-imported files, AGENTS.md and ~/.codex/AGENTS.md. First measure each one
+Review the instructions that load automatically: CLAUDE.md (project and <Claude config dir>/),
+any @-imported files, AGENTS.md and <Codex home>/AGENTS.md. First measure each one
 (lines, characters / 4 ≈ tokens).
 
 Then propose a restructure:
@@ -40,4 +42,4 @@ Starting templates: `${CLAUDE_PLUGIN_ROOT}/templates/global-CLAUDE.md`, `${CLAUD
 
 ## Done when
 
-the core files usually shrink by 40–70%, with no rule lost.
+the core files shrink and no rule is lost; the audit's instruction-size section shows the change.

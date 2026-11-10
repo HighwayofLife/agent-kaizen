@@ -77,6 +77,12 @@ class SessionNotesTests(unittest.TestCase):
         self.env['SESSION_NOTES_TIMEOUT'] = '0.1'
         self.assertEqual(self.context(), '')
 
+    @unittest.skipUnless(shutil.which('timeout'), 'timeout is required')
+    def test_rules_lint_timeout(self):
+        self.stub('rules-lint', 'sleep 3; echo "rules-lint: 5 stale hits"')
+        self.env['SESSION_NOTES_TIMEOUT'] = '0.1'
+        self.assertEqual(self.context(), '')
+
     def test_rules_lint(self):
         for output in ('rules-lint: 0 stale-rule hit(s)', 'rules-lint: no patterns configured', ''):
             with self.subTest(output=output):

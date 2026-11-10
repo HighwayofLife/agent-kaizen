@@ -13,15 +13,17 @@ New models often change the best choice for a routing row: a newer small model c
 
 **Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `agent-kaizen.json` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`), else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
+In this skill, `<Claude config dir>` means `$CLAUDE_CONFIG_DIR` or `~/.claude`, and `<Codex home>` means `$CODEX_HOME` or `~/.codex`.
+
 ## Task
 
 ```text
 0. If docs/kaizen/model-roster.md exists, start from it: it lists my subscriptions,
    pools and the strengths found last time. Update it with what you find here.
 1. List the models I currently route to. Find every model name or alias in
-   ~/.claude/settings.json (model, modelSettings, env CLAUDE_CODE_SUBAGENT_MODEL),
-   ~/.claude/agents/*.md and .claude/agents/*.md (model:), the routing table in CLAUDE.md,
-   ~/.codex/config.toml, and any dispatch scripts or env vars that pass -m.
+   <Claude config dir>/settings.json (model, modelSettings, env CLAUDE_CODE_SUBAGENT_MODEL),
+   <Claude config dir>/agents/*.md and .claude/agents/*.md (model:), the routing table in
+   CLAUDE.md, <Codex home>/config.toml, and any dispatch scripts or env vars that pass -m.
 2. Find what is available today, from primary sources:
    - Claude: the Claude Code model configuration docs and Anthropic's models overview and
      pricing pages (current model ids, aliases, context windows, prices).
@@ -34,7 +36,11 @@ New models often change the best choice for a routing row: a newer small model c
    same price? Note deprecations and retirement dates for models I still use.
 4. Check what my usage audit (`docs/kaizen/` or this project's report folder, printed as `reports` by `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled config show --for .`) says each tier costs,
    so the saving estimate uses my real volumes.
-5. Propose at most 5 changes, each with the expected effect, the risk, how to try it
+5. Compare the models in the latest audit's Unpriced table (Cost section) with
+   `${CLAUDE_PLUGIN_ROOT}/scripts/pricing.json`. Propose the price and alias additions,
+   with the vendor page URL for each, and update `source.checked`. Never fill in a price
+   from memory.
+6. Propose at most 5 changes, each with the expected effect, the risk, how to try it
    safely (one routing row first, for a week), and how the next audit will show whether
    it worked.
 Wait for my OK. Add a ledger row (docs/kaizen/LEDGER.md) for each change we make.

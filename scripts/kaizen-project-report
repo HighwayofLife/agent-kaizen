@@ -132,14 +132,16 @@ def main():
               '\n\n'.join('## ' + s['title'] + '\n' + '\n'.join(s['lines']) for s in sections)) + '\n'
     if args.out:
         name = None
+        args.out.parent.mkdir(parents=True, exist_ok=True)
         try:
             with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=args.out.parent,
                                              delete=False) as stream:
                 name = stream.name
                 stream.write(output)
-                mask = os.umask(0)
-                os.umask(mask)
-                os.fchmod(stream.fileno(), 0o644 & ~mask)
+                if hasattr(os, 'fchmod'):
+                    mask = os.umask(0)
+                    os.umask(mask)
+                    os.fchmod(stream.fileno(), 0o644 & ~mask)
             os.replace(name, args.out)
         finally:
             if name and os.path.exists(name):

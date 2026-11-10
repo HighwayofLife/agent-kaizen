@@ -57,7 +57,7 @@ class UsageTests(StubCase):
             write(path.with_suffix('.meta.json'), json.dumps(dict(agentType=kind)))
         return write(self.root / 'prices.json', json.dumps(dict(models={
             'claude-cheap': dict(output=1), 'claude-mid': dict(output=2), 'claude-pro': dict(output=4)},
-            aliases={'claude-': 'claude-cheap', 'claude-pro-': 'claude-pro'})))
+            aliases={'claude-': 'claude-cheap', 'claude-pro-version': 'claude-pro'})))
 
     def audit(self, *args):
         return json.loads(self.run_script('token-audit', '--pricing', self.fixture(), '--json', *args).stdout)
@@ -150,7 +150,7 @@ class CandidateTests(unittest.TestCase):
         self.data = dict(agents={'worker': [dict(calls=15)]},
             cost=dict(total=20, by_agent={'worker': 1}),
             _pricing=dict(models={'claude-cheap': dict(output=1), 'claude-pro': dict(output=4)},
-                          aliases={'claude-': 'claude-cheap', 'claude-pro-': 'claude-pro'}),
+                          aliases={'claude-': 'claude-cheap', 'claude-pro-version': 'claude-pro'}),
             _agent_models=defaultdict(Counter, worker=Counter({'claude-pro-version': 1})),
             _agent_effort=defaultdict(Counter), _agent_result_chars=defaultdict(list, worker=[4000]),
             _agent_turns=Counter(), _agent_flagged=Counter(), _agent_results=Counter(), _agent_failed=Counter())
@@ -197,7 +197,7 @@ class CandidateTests(unittest.TestCase):
         self.assertEqual(AUDIT['pricing_key'](pricing, 'claude-cheap'), 'claude-cheap')
         self.assertIsNone(AUDIT['pricing_key'](pricing, 'unknown'))
         pricing['aliases']['missing'] = 'absent'
-        self.assertIsNone(AUDIT['pricing_key'](pricing, 'missing-version'))
+        self.assertIsNone(AUDIT['pricing_key'](pricing, 'missing'))
         self.data['_agent_models']['worker']['unknown'] = 100
         self.assertTrue(self.usage()['cheaper_model_candidate'])
 

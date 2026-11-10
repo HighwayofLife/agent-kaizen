@@ -1,7 +1,10 @@
 """Exercise wrappers against isolated Git layouts."""
 import subprocess
 
-from test_scripts import StubCase, write
+try:
+    from .test_scripts import StubCase, write
+except ImportError:  # unittest discovery imports this as a top-level module.
+    from test_scripts import StubCase, write
 
 
 class PortabilityTests(StubCase):
@@ -67,8 +70,8 @@ class PortabilityTests(StubCase):
     def test_dispatch_excludes_output_once(self):
         exclude = self.repo / '.git/info/exclude'
         exclude.write_bytes(b'custom')
-        self.run_script('codex-dispatch', '-C', self.repo, self.brief)
-        self.run_script('codex-dispatch', '-C', self.repo, self.brief)
+        self.run_script('codex-dispatch', '--allow-no-change', '-C', self.repo, self.brief)
+        self.run_script('codex-dispatch', '--allow-no-change', '-C', self.repo, self.brief)
         self.assertEqual(exclude.read_bytes(), b'custom\nout/\n')
         self.assertNotIn('out/', self.git('status', '--porcelain'))
 
@@ -78,13 +81,13 @@ class PortabilityTests(StubCase):
         before = exclude.read_bytes()
         self.review('--uncommitted')
         self.assertEqual(exclude.read_bytes(), before)
-        self.run_script('codex-dispatch', '-C', self.repo, '-o', self.root / 'external', self.brief)
+        self.run_script('codex-dispatch', '--allow-no-change', '-C', self.repo, '-o', self.root / 'external', self.brief)
         self.assertEqual(exclude.read_bytes(), before)
 
     def test_external_output_does_not_change_exclude(self):
         exclude = self.repo / '.git/info/exclude'
         before = exclude.read_bytes()
-        self.run_script('codex-dispatch', '-C', self.repo, '-o', self.root / 'external', self.brief)
+        self.run_script('codex-dispatch', '--allow-no-change', '-C', self.repo, '-o', self.root / 'external', self.brief)
         self.assertEqual(exclude.read_bytes(), before)
 
     def test_non_git_and_linked_worktree(self):
@@ -97,3 +100,16 @@ class PortabilityTests(StubCase):
         self.review(repo=linked)
         self.assertIn('out/', (self.repo / '.git/info/exclude').read_text().splitlines())
         self.assertNotIn('out/', self.git('status', '--porcelain', repo=linked))
+
+    def test_default_base_with_dirty_tree_says_uncommitted_is_not_reviewed(self):
+        self.remote('main', symbolic=True)
+        self.commit('second')
+        note = 'uncommitted changes are NOT part of this review; pass --uncommitted to review them'
+        self.assertNotIn(note, self.review().stdout)
+        write(self.repo / 'dirty', 'change')
+        result = self.review()
+        self.assertIn(note, result.stdout)
+        self.assertIn('Base: origin/main (default)', result.stdout)
+        self.assertIn('--base origin/main', self.calls()[-1]['prompt'])
+        self.assertLessEqual(len(result.stdout.splitlines()), 25)
+        self.assertNotIn(note, self.review('--base', 'origin/main').stdout)

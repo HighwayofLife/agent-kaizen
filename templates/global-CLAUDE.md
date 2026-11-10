@@ -50,4 +50,5 @@ The main session evaluates, plans, delegates, verifies and integrates. **Delegat
 - **Effort.** `high` for verdicts and judgment, `medium` for routine implementation, `low` for relaying and command-running.
 - **Verification is proportional.** Read diffs under ~50 lines yourself; send larger ones to one verifier plus one second-model review.
 - **Fewer, bigger briefs.** Batch related small fixes. Each brief stands alone: goal, files, acceptance criteria, verify commands, what not to touch, and "don't commit".
+- **Split a mixed batch by tier before by file.** Items with the exact change stated go to `<cheap coder>` as one batch; only items that need design or new logic go up a tier. One hard item does not promote its file-mates.
 - **Self-improvement.** When the session-start notice reports an unreviewed usage audit, run `/agent-kaizen:review` (or `/agent-kaizen:cycle`) at the next pause.

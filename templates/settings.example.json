@@ -21,7 +21,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash ~/.claude/hooks/session-notes.sh"
+            "command": "bash \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/session-notes.sh\"",
+            "timeout": 30
           }
         ]
       },
@@ -30,7 +31,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash ~/.claude/hooks/after-compact.sh"
+            "command": "bash \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/after-compact.sh\"",
+            "timeout": 10
           }
         ]
       }
@@ -40,7 +42,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash ~/.claude/hooks/subagent-context.sh"
+            "command": "bash \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/subagent-context.sh\"",
+            "timeout": 10
           }
         ]
       }
@@ -51,11 +54,13 @@
         "hooks": [
           {
             "type": "command",
-            "command": "bash ~/.claude/hooks/block-image-read.sh"
+            "command": "bash \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/block-image-read.sh\"",
+            "timeout": 5
           },
           {
             "type": "command",
-            "command": "bash ~/.claude/hooks/limit-big-read.sh"
+            "command": "bash \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/limit-big-read.sh\"",
+            "timeout": 5
           }
         ]
       }

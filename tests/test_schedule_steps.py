@@ -32,8 +32,11 @@ AUTO_BASH = PROPOSE_BASH + (
 
 CREDENTIAL_PATHS = {
     'config': ('.credentials.json', 'auth.json', '*token*.json', '*secret*.json'),
-    'home': ('.ssh/**', '.aws/**', '.gnupg/**', '.netrc', '.config/gh/**', '.docker/config.json'),
-    'project': ('**/.env', '**/.env.*'),
+    'home': ('.ssh/**', '.aws/**', '.gnupg/**', '.netrc', '.config/gh/**', '.docker/config.json',
+             '.kube/config', '.npmrc', '.pypirc', '.git-credentials', '.config/gcloud/**',
+             '.azure/**', '.config/op/**', '.terraform.d/credentials.tfrc.json'),
+    'project': ('**/.env', '**/.env.*', '**/.npmrc', '**/.envrc', '**/*.pem', '**/*.key',
+                '**/id_rsa*', '**/id_ed25519*'),
 }
 FILE_COMMAND_DENIES = (
     'cp', 'touch', 'mkdir', 'sed', 'dd', 'install', 'ln', 'truncate', 'perl', 'python3 -c', 'python',
@@ -310,6 +313,17 @@ print(' '.join(sys.argv[1:]))
         self.assertFalse(list(folder.glob('cycle-????-??-??.md')))
         return state
 
+    def assert_ledger_config_error(self):
+        folder = self.audits / 'projects' / self.module.key(self.project)
+        state = json.loads((folder / 'state.json').read_text())
+        self.assertEqual(state['status'], 'ledger-config-error')
+        self.assertNotIn('reviewed_at', state)
+        self.assertNotIn('ledger_errors', state)
+        self.assertIn('fix notesLedger in the global config or create the file', state['last_error'])
+        self.assertIn('ledger-config-error', next(folder.glob('cycle-*.failed.md')).read_text())
+        self.assertFalse(list(folder.glob('cycle-????-??-??.md')))
+        return state
+
     def test_guard_restores_git_log_truncation_in_both_modes(self):
         for mode in ('auto', 'propose'):
             with self.subTest(mode=mode):
@@ -392,10 +406,10 @@ subprocess.run([sys.executable, os.environ['LEDGER_SCRIPT'], 'add', '--date', '2
             code = self.module.main(['review', '--force', '--project-dir', str(self.project),
                                      '--claude', str(self.claude)])
         self.assertEqual(code, 1)
-        housekeep.assert_not_called()
+        housekeep.assert_called_once()  # a config error is not a violation
         self.assertFalse(self.record.exists())
-        state = self.assert_ledger_violation()
-        self.assertIn('unreadable fixture', '\n'.join(state['ledger_errors']))
+        state = self.assert_ledger_config_error()
+        self.assertIn('unreadable fixture', state['last_error'])
 
     def test_guard_restores_when_run_truncates_ledgers_and_snapshots(self):
         self.configure_ledgers()
@@ -423,8 +437,8 @@ for entry in json.loads((snapshot / 'manifest.json').read_text()):
                 self.assertFalse(self.record.exists())
                 self.assertTrue(path.is_symlink())
                 self.assertEqual(target.read_bytes(), self.original_ledgers[kind == 'timeline'])
-                state = self.assert_ledger_violation()
-                self.assertIn('regular file, not a symlink', '\n'.join(state['ledger_errors']))
+                state = self.assert_ledger_config_error()
+                self.assertIn('regular file, not a symlink', state['last_error'])
                 path.unlink()
 
     def test_guard_reports_ledger_parent_symlink_without_writing_through_it(self):

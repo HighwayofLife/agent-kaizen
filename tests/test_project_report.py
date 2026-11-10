@@ -96,6 +96,26 @@ class ProjectReportTests(unittest.TestCase):
             replace.assert_called_once()
             self.assertNotEqual(Path(replace.call_args.args[0]), destination)
 
+    def test_out_creates_missing_parent_directories(self):
+        destination = self.root / 'new/nested/report.md'
+        result = self.invoke('--out', str(destination))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('## Packet outcomes', destination.read_text())
+        self.assertEqual(list(destination.parent.iterdir()), [destination])
+
+    def test_out_without_fchmod_still_writes(self):
+        destination = self.root / 'plain/report.md'
+        destination.parent.mkdir()
+        fchmod = os.fchmod
+        del os.fchmod  # simulate a platform without os.fchmod
+        try:
+            with mock.patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(self.root)}), \
+                    mock.patch.object(sys, 'argv', ['report', '--project', str(self.project), '--out', str(destination)]):
+                self.assertEqual(report.main(), 0)
+        finally:
+            os.fchmod = fchmod
+        self.assertIn('## Packet outcomes', destination.read_text())
+
     def test_output_mode_and_invalid_commands(self):
         destination = self.root / 'report.md'
         for mask in (0o022, 0o077):

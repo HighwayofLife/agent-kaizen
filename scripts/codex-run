@@ -7,6 +7,12 @@ import subprocess
 import sys
 
 
+OVERLOAD = ('server_overloaded', 'model is at capacity')
+
+
+def mentions_overload(text):
+    return any(word in text for word in OVERLOAD)
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -47,19 +53,29 @@ def main():
         except OSError as exc:
             errors.write_text(str(exc))
             rc = 127
+        # Overload is judged from stderr, non-JSON lines and non-item events only.
+        # Command output and messages (item.*) can quote the overload strings.
         overloaded = False
+        problems = []
         with events.open(errors='replace') as log:
             for line in log:
-                overloaded |= 'server_overloaded' in line or 'model is at capacity' in line
                 try:
                     event = json.loads(line)
                 except ValueError:
-                    continue
+                    event = None
                 if not isinstance(event, dict):
+                    overloaded |= mentions_overload(line)
                     continue
+                if not str(event.get('type', '')).startswith('item.'):
+                    overloaded |= mentions_overload(line)
+                    if event.get('type') in ('error', 'turn.failed'):
+                        error = event.get('error')
+                        problems.append(event.get('message') or (error.get('message') if isinstance(error, dict) else error))
                 thread = event.get('thread_id') or thread
                 usage = event.get('usage') or usage
-        overloaded |= any(word in errors.read_text(errors='replace') for word in ('server_overloaded', 'model is at capacity'))
+        stderr_text = errors.read_text(errors='replace')
+        overloaded |= mentions_overload(stderr_text)
+        problems += stderr_text.splitlines()
         summary = last.read_text() if last.is_file() else ''
         if summary.strip() and not overloaded:
             break
@@ -69,7 +85,13 @@ def main():
     print('---- CODEX FINAL MESSAGE ----')
     print(summary.strip() or '(no final message)')
     print('---- GIT DIFF STAT ----')
-    return rc if rc else (0 if summary.strip() and not overloaded else 2)
+    code = rc if rc else (0 if summary.strip() and not overloaded else 2)
+    if code:
+        # The dispatcher shows these as the failure reason.
+        lines = [' '.join(str(item).split())[:300] for item in problems if item and str(item).strip()]
+        print('---- CODEX ERRORS ----')
+        print('\n'.join(lines[-5:]) or (f'codex exited with code {rc}' if rc else 'codex returned no final message'))
+    return code
 
 
 if __name__ == '__main__':

@@ -125,10 +125,10 @@ class ScriptTests(StubCase):
     def test_check_rewrite_hook_and_missing_hook(self):
         subprocess.run(['git', 'init', '-q', str(self.work)], check=True, env=self.env)
         command = 'echo original >> check-result'
-        self.dispatch('-k', command)
+        self.dispatch('--allow-no-change', '-k', command)
         self.assertEqual((self.work / 'check-result').read_text().splitlines(), ['original'])
         executable(self.work / 'tools/rewrite_check', "#!/usr/bin/env python3\nimport sys\nassert sys.argv[1] == 'echo original >> check-result'\nprint('echo rewritten >> check-result')\n")
-        self.dispatch('-k', command)
+        self.dispatch('--allow-no-change', '-k', command)
         self.assertEqual((self.work / 'check-result').read_text().splitlines(), ['original', 'rewritten'])
 
     def test_checks_resume_and_confirm_skipped(self):
@@ -941,7 +941,7 @@ class AuditTests(StubCase):
             unit='USD per million tokens', models={
                 'fixture': dict(input=2, cache_write_5m=3, cache_write_1h=4, cache_read=1, output=5),
                 'code': dict(input=2, cached_input=1, output=5)},
-            aliases={'fix': 'code', 'fixture': 'fixture'})))
+            aliases={'fix': 'code', 'fixture': 'fixture', 'fixture-v1': 'fixture'})))
 
     def test_cost_cache_split_unknown_and_missing(self):
         now = datetime.now(timezone.utc).isoformat()
@@ -1209,7 +1209,7 @@ class AuditTests(StubCase):
         data = json.loads(self.run_script('token-audit', '--pricing', pricing, '--json').stdout)
         self.assertAlmostEqual(data['cost']['total'], .000209 + .00098)
         self.assertEqual(data['cost']['unpriced'], {})
-        self.assertIn('pre-window cumulative usage is not seeded', Path(data['report_path']).read_text())
+        self.assertNotIn('pre-window cumulative usage is not seeded', Path(data['report_path']).read_text())
 
     def test_failure_redaction_in_errors_targets_and_hints(self):
         secrets = ['sk-' + 'secret' * 6, 'ghp_' + 'value' * 8, 'xoxb-' + 'token' * 8,

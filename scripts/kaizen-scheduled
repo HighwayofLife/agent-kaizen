@@ -4,6 +4,8 @@
 Commands:
   config show [--for DIR]           show effective scheduled settings and reports path
   config set [--for DIR] KEY=VALUE  merge global or project scheduled settings
+                                    (--for DIR scheduledAutonomy=auto|propose also adds or removes
+                                    DIR in the global autoProjects list, which project auto needs)
   audit                            run the global token audit
   review [--dry-run]                audit and review every due project
   housekeep [--dry-run]             delete expired generated audit files
@@ -12,22 +14,30 @@ Global settings live in <Claude config dir>/agent-kaizen.json; project settings
 live in docs/kaizen/config.json. Interactive autonomy settings are left unchanged.
 """
 import argparse
+import contextlib
 import fnmatch
 from datetime import datetime, timedelta, timezone
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
 import runpy
 import shlex
 import shutil
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
 import time
 import uuid
+
+try:
+    import fcntl
+except ImportError:  # no file locking on this platform
+    fcntl = None
 
 
 # --- paths helper ---
@@ -93,10 +103,20 @@ def valid_notes_ledger(value):
         return False
 
 
+def valid_auto_projects(value):
+    """Absolute project directories (after `~` expansion); a project file cannot opt itself in."""
+    try:
+        return all("\0" not in item and Path(item).expanduser().is_absolute() for item in value)
+    except (ValueError, RuntimeError):
+        return False
+
+
 SCHEMA = {
     "enabled": {"kind": "bool", "default": True, "global_only": True},
     "schedule": {"kind": "enum", "default": "active", "choices": ("active", "always", "off")},
     "scheduledAutonomy": {"kind": "enum", "default": "propose", "choices": ("propose", "auto")},
+    "autoProjects": {"kind": "strings", "default": [], "global_only": True,
+                     "check": valid_auto_projects},
     "retention": {"kind": "enum", "default": "auto", "choices": ("auto", "off"), "global_only": True},
     "retentionOverrides": {"kind": "object", "default": {}, "global_only": True,
                            "check": valid_retention_overrides},
@@ -186,6 +206,24 @@ def valid_value(name, value):
     return False
 
 
+def same_directory(path, other):
+    try:
+        return Path(path).expanduser().resolve() == Path(other).expanduser().resolve()
+    except (OSError, RuntimeError, ValueError):
+        return False
+
+
+def auto_not_opted_in(project_dir, auto_projects):
+    """Explain why a project file's `auto` is ignored, or return None when the project opted in."""
+    if any(same_directory(project_dir, listed) for listed in auto_projects):
+        return None
+    directory = Path(project_dir).resolve()
+    command = shlex.join(["python3", str(HERE / "kaizen-scheduled"), "config", "set", "--for",
+                          str(directory), "scheduledAutonomy=auto"])
+    return (f"scheduledAutonomy=auto in the project file is ignored: {directory} is not in autoProjects "
+            f"(global); using the global or default value. To opt in, run: {command}")
+
+
 def effective(project_dir=None):
     """Resolve scheduled settings with their project, global or default source."""
     global_path = global_config_path()
@@ -210,6 +248,12 @@ def effective(project_dir=None):
                     fallback = json.dumps(fallback)
                 print(f"config: {path}: {name}={shown} invalid, using {fallback}", file=sys.stderr)
                 continue
+            if name == "scheduledAutonomy" and source == "project" and value == "auto":
+                note = auto_not_opted_in(project_dir, result["autoProjects"]["value"])
+                if note:
+                    print(f"config: {path}: {note}", file=sys.stderr)
+                    result["scheduledAutonomy"] = dict(result["scheduledAutonomy"], note=note)
+                    continue
             result[name] = {"value": value, "source": source}
     if result["enabled"]["value"] is False:
         result["schedule"] = {"value": "off", "source": "global"}
@@ -228,6 +272,141 @@ LOG_TO_STDERR = False
 
 def log(message):
     print(f"{datetime.now(timezone.utc).isoformat()} {message}", file=sys.stderr if LOG_TO_STDERR else sys.stdout)
+
+
+# Wall-clock limits. Every helper step gets STEP_TIMEOUT; the model run gets KAIZEN_REVIEW_TIMEOUT.
+STEP_TIMEOUT = 600
+REVIEW_TIMEOUT = 3600
+LOCK_WAIT = 1800
+LOG_LIMIT = 1 << 20
+
+
+def env_seconds(name, default):
+    """A non-negative number of seconds from the environment; anything else is the default."""
+    try:
+        value = float(os.environ[name])
+    except (KeyError, ValueError):
+        return default
+    return value if math.isfinite(value) and value >= 0 else default
+
+
+def review_timeout():
+    """Seconds allowed for one model run; None means no limit (KAIZEN_REVIEW_TIMEOUT=0)."""
+    return env_seconds("KAIZEN_REVIEW_TIMEOUT", REVIEW_TIMEOUT) or None
+
+
+def failure_text(error):
+    if isinstance(error, subprocess.TimeoutExpired):
+        return f"timed out after {error.timeout:g} s"
+    return str(error)
+
+
+@contextlib.contextmanager
+def run_lock(audits):
+    """Hold <audits>/.lock for a whole run; yield False if another run keeps it past KAIZEN_LOCK_WAIT."""
+    if fcntl is None:
+        yield True
+        return
+    audits.mkdir(parents=True, exist_ok=True)
+    path = audits / ".lock"
+    wait = env_seconds("KAIZEN_LOCK_WAIT", LOCK_WAIT)
+    deadline = time.monotonic() + wait
+    announced = False
+    with path.open("a") as handle:
+        while True:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except (BlockingIOError, PermissionError):
+                if wait > 0 and not announced:
+                    announced = True
+                    print(f"waiting up to {wait:g} s for the run lock {path}", file=sys.stderr)
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    log(f"another run holds the lock {path}; this run was skipped")
+                    yield False
+                    return
+                time.sleep(min(1, remaining))
+        yield True
+
+
+class Terminated(BaseException):
+    """A SIGTERM or SIGHUP; unwinds through the finally blocks that roll back and verify the ledger."""
+
+    def __init__(self, number):
+        super().__init__(number)
+        self.number = number
+        self.name = signal.Signals(number).name
+
+
+# fired: first signal seen; raised: Terminated already thrown; deferred: depth of protected() sections.
+SIGNALS = {"fired": None, "raised": False, "deferred": 0}
+
+
+def _on_signal(number, frame):
+    if SIGNALS["fired"] is None:
+        SIGNALS["fired"] = number
+    if SIGNALS["raised"] or SIGNALS["deferred"]:
+        return  # one exception only; cleanup keeps running
+    SIGNALS["raised"] = True
+    raise Terminated(number)
+
+
+@contextlib.contextmanager
+def terminating_on_signals():
+    """Turn SIGTERM and SIGHUP into Terminated. The child process is killed as the exception unwinds
+    through subprocess.run."""
+    SIGNALS.update(fired=None, raised=False, deferred=0)
+    previous = {}
+    for name in ("SIGTERM", "SIGHUP"):
+        number = getattr(signal, name, None)
+        try:
+            if number is not None and signal.getsignal(number) != signal.SIG_IGN:  # nohup stays honoured
+                previous[number] = signal.signal(number, _on_signal)
+        except ValueError:  # not the main thread
+            break
+    try:
+        yield
+    finally:
+        for number, handler in previous.items():
+            signal.signal(number, handler)
+
+
+@contextlib.contextmanager
+def protected():
+    """Hold back a signal until cleanup is done, then raise it."""
+    SIGNALS["deferred"] += 1
+    try:
+        yield
+    finally:
+        SIGNALS["deferred"] -= 1
+        # Also when the body raised: the held signal wins over the body's error.
+        if SIGNALS["fired"] is not None and not SIGNALS["raised"] and not SIGNALS["deferred"]:
+            SIGNALS["raised"] = True
+            raise Terminated(SIGNALS["fired"])
+
+
+def rotate_log(audits):
+    """Keep run.log under 1 MB. The scheduler redirects with `>>`, so copy then truncate in place:
+    a renamed file would keep receiving this run's own output."""
+    path = audits / "run.log"
+    copied = None
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size <= LOG_LIMIT:
+            return
+        with path.open("rb") as source, tempfile.NamedTemporaryFile(
+                dir=audits, prefix=".run.log.", delete=False) as copy:
+            copied = Path(copy.name)
+            shutil.copyfileobj(source, copy)
+        os.chmod(copied, stat.S_IMODE(path.stat().st_mode))
+        os.replace(copied, audits / "run.log.1")
+        os.truncate(path, 0)
+        log("run.log: rotated to run.log.1")
+    except OSError as error:
+        log(f"run.log: cannot rotate ({error})")
+    finally:
+        if copied is not None:
+            copied.unlink(missing_ok=True)
 
 
 # Bound each JSONL line read; a huge first line is not a session header.
@@ -266,8 +445,8 @@ class Project:
 def _git(directory, *arguments):
     try:
         result = subprocess.run(["git", "-C", str(directory), *arguments],
-                                capture_output=True, text=True)
-    except (OSError, UnicodeError):
+                                capture_output=True, text=True, timeout=STEP_TIMEOUT)
+    except (OSError, UnicodeError, subprocess.TimeoutExpired):
         return None
     return result.stdout.strip() if result.returncode == 0 else None
 
@@ -336,12 +515,28 @@ def discover(claude_root, codex_root, index, project_dirs=None):
                 if path.is_dir():
                     listed.append(path)
                     paths.add(path)
-        canonical = (common.parent if kind == "git" and common.name == ".git"
-                     else listed[0] if kind == "git" and listed else directories[0])
-        if not (canonical / "docs/kaizen").is_dir():
-            not_enrolled.add(str(canonical))
-            continue
-        projects.append(Project(canonical, paths))
+        root = (common.parent if kind == "git" and common.name == ".git"
+                else listed[0] if kind == "git" and listed else None)
+        if root is None:
+            projects.append(Project(directories[0], paths))
+        elif (root / "docs/kaizen").is_dir():
+            # The repository root is itself enrolled: it is the project, with every worktree.
+            projects.append(Project(root, paths))
+        else:
+            # Enrolled subdirectories of a larger repository: one project per subdirectory,
+            # grouped with the same subdirectory of the other worktrees.
+            prefixes = {}
+            for directory in directories:
+                prefix = _git(directory, "rev-parse", "--show-prefix")
+                prefixes.setdefault(prefix.rstrip("/") if prefix is not None else None, []).append(directory)
+            for prefix, members in prefixes.items():
+                if prefix is None:
+                    projects.extend(Project(member, {member}) for member in members)
+                    continue
+                same = {path / prefix for path in listed if (path / prefix).is_dir()}
+                main = listed[0] / prefix if listed else None
+                canonical = main if main in same and (main / "docs/kaizen").is_dir() else sorted(members)[0]
+                projects.append(Project(canonical, {*members, *same}))
     return sorted(projects, key=lambda project: project.canonical), sorted(not_enrolled)
 
 
@@ -547,8 +742,11 @@ def review_dry_run(audits, project_dirs=None, now=None, options=None, json_outpu
         rows = []
         for project in projects:
             setting = effective(project.canonical)["scheduledAutonomy"]
-            rows.append(dict(path=str(project.canonical), scheduledAutonomy=setting["value"],
-                             source=setting["source"]))
+            row = dict(path=str(project.canonical), scheduledAutonomy=setting["value"],
+                       source=setting["source"])
+            if "note" in setting:
+                row["note"] = setting["note"]
+            rows.append(row)
         print(json.dumps(rows))
         return
     for project in projects:
@@ -564,6 +762,8 @@ def review_dry_run(audits, project_dirs=None, now=None, options=None, json_outpu
                 value = json.dumps(value)
             settings.append(f"{name}={value} ({setting['source']})")
         print("  config: " + "; ".join(settings))
+        if "note" in cfg["scheduledAutonomy"]:
+            print("  note: " + cfg["scheduledAutonomy"]["note"])
         state = read_state(project)
         due, reason = review_gate(project, projects, cfg, state, now, cache, options, project_dirs)
         print("  gate: " + (f"due ({reason.removeprefix('due: ')})" if due else reason))
@@ -637,30 +837,52 @@ def audit_command(options, out, project=None):
                       "--extract-out", str(extracts)]
 
 
+class UnsupportedPath(ValueError):
+    """A path holds characters that permission rules cannot express."""
+
+
 def deny_path(path, resolve=True):
     path = Path(path).expanduser()
     path = (path.resolve() if resolve else path).as_posix()
     # Rule syntax gives these characters meaning; fail closed rather than build a wrong rule.
     bad = sorted(set(path) & set(",()*?[]\\"))
     if bad:
-        raise ValueError(f"cannot build deny rules: path contains {''.join(bad)!r}: {path}")
+        raise UnsupportedPath(f"cannot build deny rules: path contains {''.join(bad)!r}: {path}; "
+                              "permission rules cannot express these characters, so this project "
+                              "cannot be reviewed until the path is renamed or moved")
     return "//" + path.lstrip("/")
+
+
+def allow_path(path):
+    """Check a path embedded in a Bash allow rule; commas also split --allowedTools."""
+    path = str(path)
+    bad = sorted({char for char in path if char in ",()*?[]\\\"'`$;&|<>" or char.isspace()})
+    if bad:
+        raise UnsupportedPath(f"cannot build allow rules: path contains {''.join(bad)!r}: {path}; "
+                              "permission rules cannot express these characters, so auto mode "
+                              "cannot run until the path is renamed or moved")
+    return path
 
 
 def config_home_deny(project_dir=None):
     """Protect config state; Claude Code separately protects instruction paths."""
     rules = []
-    for home in (claude_home(), codex_home()):
+    # Agent definitions (tool and permission frontmatter) and Codex's AGENTS.md steer later sessions.
+    for home, extra in ((claude_home(), ("agents/**",)), (codex_home(), ("AGENTS.md",))):
         for root in dict.fromkeys(deny_path(home, resolve=value) for value in (False, True)):
             for pattern in ("settings*.json", "hooks/**", "plugins/**", "skills/**", "commands/**",
                             "bin/**", "**/*.json", "**/*.toml", "**/*.sh", "**/*.py", "**/*.js",
-                            ".credentials*", "auth.json", "**/.git/**"):
+                            ".credentials*", "auth.json", "**/.git/**", *extra):
                 rules.extend(f"{tool}({root}/{pattern})" for tool in ("Edit", "Write"))
     for path in dict.fromkeys(deny_path(claude_json(), resolve=value) for value in (False, True)):
         rules.extend(f"{tool}({path})" for tool in ("Edit", "Write"))
     if project_dir is not None:
         for root in dict.fromkeys(deny_path(project_dir, resolve=value) for value in (False, True)):
-            rules.extend(f"{tool}({root}/.claude/settings*.json)" for tool in ("Edit", "Write"))
+            # Files that run, or widen permissions, in the next interactive session or CI run.
+            for pattern in (".claude/settings*.json", ".claude/hooks/**", ".claude/agents/**",
+                            ".claude/commands/**", ".claude/skills/**", ".mcp.json",
+                            ".github/workflows/**", ".husky/**"):
+                rules.extend(f"{tool}({root}/{pattern})" for tool in ("Edit", "Write"))
     return rules
 
 
@@ -693,12 +915,17 @@ def ledger_deny():
 
 
 def backup_root():
-    return Path(os.environ.get("KAIZEN_BACKUP_DIR", Path.home() / ".claude" / "kaizen-backups")).expanduser()
+    # The same rule as scripts/kaizen-backup.
+    return Path(os.environ.get("KAIZEN_BACKUP_DIR") or claude_home() / "kaizen-backups").expanduser()
 
 
 def backup_deny():
     paths = dict.fromkeys(deny_path(backup_root(), resolve=resolve) for resolve in (False, True))
     return [f"{tool}({path}/**)" for path in paths for tool in ("Read", "Edit", "Write")]
+
+
+class LedgerConfigError(ValueError):
+    """The configured ledger cannot be read at the start: a config problem, not a violation."""
 
 
 class LedgerGuard:
@@ -709,7 +936,11 @@ class LedgerGuard:
         self.entries = []
 
     def snapshot(self):
-        for kind, path in ledger_paths().items():
+        try:
+            paths = ledger_paths()
+        except ValueError as error:
+            raise LedgerConfigError(str(error)) from error
+        for kind, path in paths.items():
             try:
                 if path.is_symlink() or not path.is_file():
                     raise ValueError("ledger must be a regular file, not a symlink")
@@ -720,12 +951,66 @@ class LedgerGuard:
                                      "data": data, "size": len(data), "sha256": hashlib.sha256(data).hexdigest(),
                                      "mode": stat.S_IMODE(path.stat().st_mode)})
             except (OSError, ValueError) as error:
-                raise ValueError(f"{path}: cannot snapshot ledger ({error})") from error
+                raise LedgerConfigError(f"{path}: cannot snapshot ledger ({error})") from error
         (self.folder / "manifest.json").write_text(json.dumps([
             {key: str(value) if isinstance(value, Path) else value
              for key, value in entry.items() if key != "data"} for entry in self.entries], indent=2) + "\n")
 
+    @contextlib.contextmanager
+    def locked(self):
+        """The lock notes-ledger takes (<csv>.lock), so a concurrent `notes-ledger set` finishes first.
+        A lock path that is not a plain file we can open (a symlink, a FIFO) raises OSError."""
+        entry = next((item for item in self.entries if item["kind"] == "csv"), None)
+        descriptor = None
+        if fcntl is not None and entry is not None:
+            # Never create the lock file through a replaced parent directory.
+            if entry["path"].parent.resolve() == entry["resolved"].parent:
+                lock = str(entry["path"]) + ".lock"
+                flags = (os.O_WRONLY | os.O_CREAT | os.O_APPEND
+                         | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+                try:
+                    descriptor = os.open(lock, flags, 0o666)
+                    if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+                        raise OSError(f"{lock} is not a regular file")
+                except OSError as error:
+                    if descriptor is not None:
+                        os.close(descriptor)
+                    raise OSError(f"cannot lock the ledger: {error}") from error
+        if descriptor is None:
+            yield
+            return
+        try:
+            deadline = time.monotonic() + 60
+            while True:
+                try:
+                    fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except (BlockingIOError, PermissionError):
+                    if time.monotonic() > deadline:
+                        raise OSError("timed out waiting for the ledger lock") from None
+                    time.sleep(0.1)
+            yield
+        finally:
+            os.close(descriptor)
+
     def verify(self):
+        with self.locked():
+            return self._verify()
+
+    def save_rejected(self, entry):
+        """Keep the bytes the guard is about to overwrite; return a message naming them."""
+        path = entry["path"]
+        try:
+            if (path.parent.resolve() != entry["resolved"].parent or path.is_symlink()
+                    or not path.is_file()):
+                return ""
+            saved = self.folder / (entry["kind"] + ".rejected")
+            saved.write_bytes(path.read_bytes())
+            return f"; rejected content saved to {saved}"
+        except OSError as error:
+            return f"; rejected content not saved ({error})"
+
+    def _verify(self):
         problems = []
         for entry in self.entries:
             path = entry["path"]
@@ -747,7 +1032,7 @@ class LedgerGuard:
                 if not valid:
                     raise ValueError("ledger history changed or growth is not whole lines")
             except (OSError, ValueError) as error:
-                message = f"{path}: {error}"
+                message = f"{path}: {error}" + self.save_rejected(entry)
                 temporary = None
                 try:
                     if path.parent.resolve() != entry["resolved"].parent:
@@ -778,13 +1063,17 @@ def review_command(options, mode, report, session_id, project_dir=None):
                          *auto_edit_allow(project_dir), *READ_ONLY_BASH]
         # File-writing Bash tools bypass Edit/Write denies; grant only the scoped helpers.
         backup = HERE / "kaizen-backup"
+        if backup.is_file() or ledger.is_file():
+            python = allow_path(options.python)
         if backup.is_file():
+            allow_path(backup)
             for subcommand in ("begin", "finish", "list"):
                 allowed_tools.extend(f"Bash({prefix}{backup} {subcommand}:*)"
-                                     for prefix in ("", "python3 ", options.python + " "))
+                                     for prefix in ("", "python3 ", python + " "))
         if ledger.is_file():
+            allow_path(ledger)
             allowed_tools.extend([f"Bash(python3 {ledger} add:*)",
-                                  f"Bash({options.python} {ledger} add:*)"])
+                                  f"Bash({python} {ledger} add:*)"])
         allowed = ",".join(allowed_tools)
     command = [options.claude, "-p", f"/agent-kaizen:cycle {mode} {report} notes-ledger-path={ledger}",
                "--session-id", session_id, "--model", options.model, "--max-turns", str(options.max_turns),
@@ -813,6 +1102,9 @@ RETENTION_KINDS = {
         "checks": ("checks-*.md",),
         "project-report": ("projects/*/project-report-*.md",),
         "cycle": ("projects/*/cycle-*.md",)}, "days": 365},
+    # Per-run ledger snapshots kept after a violation; temp files of a run that was killed.
+    "ledger-runs": {"patterns": ("projects/*/.ledger-*/*",), "days": 7},
+    "temp": {"patterns": ("projects/*/cycle-*.md.*",), "days": 1},
 }
 
 
@@ -959,7 +1251,8 @@ def housekeep(audits, cfg, dry_run=False, now=None):
         log(f"housekeep: {action} {entry['path']} kind={entry['kind']} "
             f"size={entry['size']} reason={entry['reason']}")
     for folder in sorted(touched):
-        if folder == audits / "extracts" or folder.parent == audits / "projects":
+        if (folder == audits / "extracts" or folder.parent == audits / "projects"
+                or (folder.name.startswith(".ledger-") and folder.parent.parent == audits / "projects")):
             try:
                 if stat.S_ISDIR(os.lstat(folder).st_mode):
                     os.rmdir(folder)
@@ -976,20 +1269,28 @@ def scheduled_housekeep(audits):
 
 
 def run_audit(audits, options):
+    stopped = False
     try:
         return _run_audit(audits, options)
+    except Terminated:
+        stopped = True
+        raise
     finally:
-        scheduled_housekeep(audits)
+        if not stopped:
+            scheduled_housekeep(audits)
 
 
 def run_review(audits, project_dirs, options, clock):
-    safety = {"ledger_violation": False}
+    safety = {"ledger_violation": False, "stopped": False}
     try:
         result = _run_review(audits, project_dirs, options, clock, safety)
         return result
+    except Terminated:
+        safety["stopped"] = True  # a stopped run does no housekeeping
+        raise
     finally:
         # Reporting can raise after a violation; still stop all later steps.
-        if not safety["ledger_violation"]:
+        if not (safety["ledger_violation"] or safety["stopped"]):
             scheduled_housekeep(audits)
 
 
@@ -1001,15 +1302,15 @@ def run_step(name, options, arguments, success=(0,)):
         return None
     try:
         result = subprocess.run([options.python, str(script), *map(str, arguments)],
-                                capture_output=True, text=True)
+                                capture_output=True, text=True, timeout=STEP_TIMEOUT)
         if result.returncode in success:
             return "\n".join(result.stdout.strip().splitlines()[:30])
         reason = f"exit {result.returncode}"
         detail = (result.stderr or result.stdout).strip().splitlines()
         if detail:
             reason += ": " + detail[0]
-    except (OSError, ValueError) as error:
-        reason = str(error)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        reason = failure_text(error)
     log(f"step {name}: failed ({reason})")
     return "unavailable: " + reason
 
@@ -1094,17 +1395,48 @@ def audit_steps(audits, options):
         log(f"step projects: failed ({error})")
 
 
+def run_usage_db(options):
+    """Keep per-call usage history; never changes the audit result."""
+    try:
+        script = sibling(None, "usage-db")
+    except FileNotFoundError:
+        return
+    lines = []
+    try:
+        result = subprocess.run([options.python, str(script), "ingest", "--quiet"],
+                                capture_output=True, text=True, timeout=STEP_TIMEOUT)
+        lines = result.stderr.strip().splitlines()
+        if not result.returncode:
+            for line in lines[:10]:
+                log(f"step usage-db: {line}")
+            return
+        reason = f"exit {result.returncode}"
+        if lines:
+            reason += ": " + lines.pop(0)
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        reason = failure_text(error)
+    log(f"step usage-db: failed ({reason})")
+    for line in lines[:9]:
+        log(f"step usage-db: {line}")
+
+
 def _run_audit(audits, options):
+    code = _run_token_audit(audits, options)
+    run_usage_db(options)
+    return code
+
+
+def _run_token_audit(audits, options):
     audits.mkdir(parents=True, exist_ok=True)
     audit_steps(audits, options)
     try:
         with (audits / "run.log").open("a", encoding="utf-8") as errors:
             result = subprocess.run(audit_command(options, audits), stdout=subprocess.PIPE,
-                                    stderr=errors, text=True)
+                                    stderr=errors, text=True, timeout=STEP_TIMEOUT)
         if not result.returncode:
             report = report_path(result.stdout)
-    except (OSError, ValueError) as error:
-        log(f"audit: failed ({error})")
+    except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+        log(f"audit: failed ({failure_text(error)})")
         return 1
     if result.returncode:
         log(f"audit: failed (exit {result.returncode})")
@@ -1153,14 +1485,14 @@ def rollback_auto_changes(options, run_id, session_id, started, root, before):
     for _, change in sorted(pending, reverse=True):
         try:
             result = subprocess.run([options.python, str(HERE / "kaizen-backup"), "undo", str(change), "--force"],
-                                    capture_output=True, text=True,
+                                    capture_output=True, text=True, timeout=STEP_TIMEOUT,
                                     env=dict(os.environ, KAIZEN_BACKUP_DIR=str(root)))
             if result.returncode:
                 detail = (result.stderr or result.stdout).strip()
                 raise ValueError(f"exit {result.returncode}: {detail}")
             messages.append(f"rolled-back: {change}")
-        except (OSError, ValueError) as error:
-            problems.append(f"rollback failed: {change}: {error}")
+        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+            problems.append(f"rollback failed: {change}: {failure_text(error)}")
     return messages, problems
 
 
@@ -1175,7 +1507,7 @@ def _run_review(audits, project_dirs, options, clock, safety):
                            read_index(audits), project_dirs)
     write_index(audits, projects)
     run_checks(audits, options, projects)
-    rollback_failed = False
+    rollback_failed = config_failed = False
     cache = {}
     for project in sorted(projects, key=lambda project: project.canonical):
         project.folder = audits / "projects" / project.key
@@ -1189,15 +1521,17 @@ def _run_review(audits, project_dirs, options, clock, safety):
             project.folder.mkdir(parents=True, exist_ok=True)
             with (audits / "run.log").open("a", encoding="utf-8") as errors:
                 result = subprocess.run(audit_command(options, project.folder, project),
-                                        stdout=subprocess.PIPE, stderr=errors, text=True)
+                                        stdout=subprocess.PIPE, stderr=errors, text=True,
+                                        timeout=STEP_TIMEOUT)
             if result.returncode:
                 audit_error = f"audit failed (exit {result.returncode})"
             else:
                 report = report_path(result.stdout)
-        except (OSError, ValueError) as error:
-            audit_error = f"failed ({error})"
+        except (OSError, ValueError, subprocess.TimeoutExpired) as error:
+            audit_error = f"failed ({failure_text(error)})"
         if audit_error is not None:
-            state.update(status="audit-failed", last_error_at=timestamp(clock()))
+            state.update(status="audit-failed", last_error=audit_error, last_error_at=timestamp(clock()))
+            state.pop("ledger_errors", None)
             write_state(project, state)
             log(f"{project.canonical}: {audit_error}")
             continue
@@ -1209,11 +1543,17 @@ def _run_review(audits, project_dirs, options, clock, safety):
         state["ignore_sessions"] = (ignored + [session_id])[-20:]
         write_state(project, state)
         started = clock()
-        proposal = project.folder / ("cycle-" + started.astimezone().strftime("%Y-%m-%d") + ".md")
+        base = "cycle-" + started.astimezone().strftime("%Y-%m-%d")
+        proposal = project.folder / (base + ".md")
+        number = 2
+        while proposal.exists():  # never replace a proposal the owner may not have read
+            proposal = project.folder / f"{base}-{number}.md"
+            number += 1
         failed = proposal.with_suffix(".failed.md")
         temporary = None
         succeeded = False
         ledger_problems = []
+        path_error = config_error = timed_out = terminated = None
         rollbacks, rollback_problems = [], []
         guard = None
         try:
@@ -1232,45 +1572,70 @@ def _run_review(audits, project_dirs, options, clock, safety):
                 try:
                     guard = LedgerGuard(Path(tempfile.mkdtemp(dir=project.folder, prefix=".ledger-")))
                     guard.snapshot()
+                except LedgerConfigError as error:
+                    config_error = (f"{error}; fix notesLedger in the global config "
+                                    "or create the file")
+                    shutil.rmtree(guard.folder, ignore_errors=True)
                 except Exception as error:
                     ledger_problems.append(str(error))
-                if not ledger_problems:
+                if not ledger_problems and config_error is None:
+                    limit = review_timeout()
                     try:
                         result = subprocess.run(review_command(options, mode, report, session_id, project.canonical),
-                                                cwd=project.canonical, env=env, stdout=output, stderr=errors)
+                                                cwd=project.canonical, env=env, stdout=output, stderr=errors,
+                                                timeout=limit)
+                    except subprocess.TimeoutExpired:
+                        timed_out = limit
                     finally:
-                        if mode == "auto":
+                        with protected():  # a signal now waits until rollback and the ledger check are done
+                            if mode == "auto":
+                                try:
+                                    rollbacks, rollback_problems = rollback_auto_changes(
+                                        options, run_id, session_id, started, root, before)
+                                except Exception as error:
+                                    rollback_problems.append(f"rollback failed: {error}")
                             try:
-                                rollbacks, rollback_problems = rollback_auto_changes(
-                                    options, run_id, session_id, started, root, before)
+                                ledger_problems.extend(guard.verify())
+                                if not ledger_problems:
+                                    shutil.rmtree(guard.folder)
                             except Exception as error:
-                                rollback_problems.append(f"rollback failed: {error}")
-                        try:
-                            ledger_problems.extend(guard.verify())
-                            if not ledger_problems:
-                                shutil.rmtree(guard.folder)
-                        except Exception as error:
-                            paths = ", ".join(str(entry["path"]) for entry in guard.entries)
-                            ledger_problems.append(f"{paths}: ledger guard failed ({error}); snapshots: {guard.folder}")
-                        for message in [*rollbacks, *rollback_problems]:
-                            output.write("\n" + message + "\n")
+                                paths = ", ".join(str(entry["path"]) for entry in guard.entries)
+                                ledger_problems.append(f"{paths}: ledger guard failed ({error}); snapshots: {guard.folder}")
+                            for message in [*rollbacks, *rollback_problems]:
+                                output.write("\n" + message + "\n")
             if ledger_problems:
                 outcome = "ledger-violation: " + "; ".join(ledger_problems)
+            elif config_error:
+                outcome = "ledger-config-error: " + config_error
             elif rollback_problems:
                 outcome = "; ".join(rollback_problems)
             elif rollbacks:
                 outcome = "rolled-back"
+            elif timed_out:
+                outcome = f"failed (timed out after {timed_out:g} s)"
             elif result.returncode == 0:
                 os.replace(temporary, proposal)
                 succeeded = True
                 outcome = f"reviewed ({mode})"
             else:
                 outcome = f"failed (exit {result.returncode})"
+        except Terminated as error:
+            terminated = error
+            outcome = f"failed (terminated by {error.name})"
+        except UnsupportedPath as error:
+            path_error = str(error)
+            outcome = "unsupported-path: " + path_error
         except (OSError, ValueError) as error:
             outcome = f"failed ({error})"
         rollback_failed = rollback_failed or bool(rollback_problems)
         if rollbacks and not rollback_problems:
             outcome = "rolled-back"
+        if config_error and not ledger_problems:
+            config_failed = True
+            outcome = "ledger-config-error: " + config_error
+            if temporary is not None:
+                with temporary.open("a", encoding="utf-8") as output:
+                    output.write("\n" + outcome + "\n")
         if ledger_problems:
             safety["ledger_violation"] = True
             outcome = "ledger-violation: " + "; ".join(ledger_problems)
@@ -1280,13 +1645,27 @@ def _run_review(audits, project_dirs, options, clock, safety):
         exited = clock()
         if succeeded:
             state.pop("ledger_errors", None)
+            state.pop("last_error", None)
             state.update(reviewed_at=timestamp(exited), status="ok", report=str(report), proposal=str(proposal))
         else:
             state.update(status="ledger-violation" if ledger_problems else
-                         "failed" if rollback_problems or not rollbacks else "rolled-back",
+                         "ledger-config-error" if config_error else
+                         "unsupported-path" if path_error else
+                         "failed" if rollback_problems else
+                         "rolled-back" if rollbacks else
+                         "timed-out" if timed_out else "failed",
                          last_error_at=timestamp(exited))
+            detail = (path_error or config_error
+                      or (f"timed out after {timed_out:g} s" if timed_out else None)
+                      or (f"terminated by {terminated.name}" if terminated else None))
+            if detail:
+                state["last_error"] = detail
+            else:
+                state.pop("last_error", None)
             if ledger_problems:
                 state["ledger_errors"] = ledger_problems
+            else:
+                state.pop("ledger_errors", None)
             if temporary is not None:
                 try:
                     os.replace(temporary, failed)
@@ -1295,14 +1674,19 @@ def _run_review(audits, project_dirs, options, clock, safety):
                     outcome += f"; output: {temporary} (could not save as {failed}: {error})"
         write_state(project, state)
         log(f"{project.canonical}: {outcome}")
+        if terminated is not None:
+            raise terminated
         if ledger_problems:
             return 1
-    return 1 if rollback_failed else 0
+    return 1 if rollback_failed or config_failed else 0
 
 
 def write_config(path, updates):
     """Merge an object and atomically replace it without discarding other keys."""
     path = Path(path)
+    if path.is_symlink():
+        # Replace the real file so a symlinked config (dotfiles, stow) stays a symlink.
+        path = Path(os.path.realpath(path))
     try:
         cfg = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -1335,7 +1719,34 @@ def write_config(path, updates):
             temporary.unlink(missing_ok=True)
 
 
+def canonical_project(directory):
+    """Return the enrolled project a real run would use for this directory or one above it."""
+    directory = Path(directory).resolve()
+    for candidate in (directory, *directory.parents):
+        if (candidate / "docs/kaizen").is_dir():
+            projects, _ = discover(claude_home() / "projects", codex_home() / "sessions", {}, [candidate])
+            if projects:
+                return projects[0].canonical
+            break
+    return directory
+
+
+def update_auto_projects(project, enable):
+    """Add or remove a project's canonical path in the global autoProjects list."""
+    raw = load_config(global_config_path(), strict=True).get("autoProjects", [])
+    if not valid_value("autoProjects", raw):
+        raise ValueError("autoProjects in the global config is invalid; fix it first")
+    listed = any(same_directory(item, project) for item in raw)
+    if enable and not listed:
+        write_config(global_config_path(), {"autoProjects": [*raw, str(project)]})
+    elif listed and not enable:
+        write_config(global_config_path(), {"autoProjects": [
+            item for item in raw if not same_directory(item, project)]})
+
+
 def show_config(project_dir=None):
+    if project_dir is not None:
+        project_dir = canonical_project(project_dir)
     result = effective(project_dir)
     result["reports"] = (str(audits_dir() / "projects" / key(project_dir)) + "/"
                          if project_dir is not None else None)
@@ -1378,7 +1789,12 @@ def main(argv=None):
     LOG_TO_STDERR = getattr(args, "json", False)
     if args.command == "housekeep":
         audits = (args.audits if args.audits is not None else audits_dir()).expanduser().resolve()
-        housekeep(audits, effective(), args.dry_run)
+        if args.dry_run or not audits.is_dir():
+            housekeep(audits, effective(), args.dry_run)
+            return 0
+        with run_lock(audits) as held:
+            if held:
+                housekeep(audits, effective())
         return 0
     if args.command in ("audit", "review"):
         if args.command == "review":
@@ -1400,12 +1816,18 @@ def main(argv=None):
         try:
             options = command_options(args)
             audits = (args.audits if args.audits is not None else audits_dir()).expanduser().resolve()
-            if args.command == "audit":
-                return run_audit(audits, options)
-            if args.dry_run:
+            if args.command == "review" and args.dry_run:
                 review_dry_run(audits, args.project_dir, now(fixed), options, args.json)
                 return 0
-            return run_review(audits, args.project_dir, options, lambda: now(fixed))
+            with terminating_on_signals(), run_lock(audits) as held:
+                if not held:
+                    return 0
+                rotate_log(audits)
+                if args.command == "audit":
+                    return run_audit(audits, options)
+                return run_review(audits, args.project_dir, options, lambda: now(fixed))
+        except Terminated as error:
+            return 128 + error.number
         except (OSError, ValueError) as error:
             print(f"kaizen-scheduled: {error}", file=sys.stderr)
             return 2
@@ -1432,11 +1854,31 @@ def main(argv=None):
                 parser.error(f"invalid value for {name}: {value}")
             updates[name] = value
         path = global_config_path()
+        note = None
         if args.project_dir is not None:
-            path = project_config_path(args.project_dir)
+            # Runs use the canonical project, not the directory named here: a monorepo root, a main
+            # worktree, or a nested project. Opt-in and the config file must be that project's.
+            canonical = canonical_project(args.project_dir)
+            path = project_config_path(canonical)
             if not path.parent.is_dir():
                 parser.error(f"{args.project_dir} must contain docs/kaizen/")
+            if canonical != Path(args.project_dir).expanduser().resolve():
+                if updates.get("scheduledAutonomy") == "auto":
+                    print(f"kaizen-scheduled: {args.project_dir} is not the project runs use ({canonical}); "
+                          f"to opt that project in run: kaizen-scheduled config set --for "
+                          f"{shlex.quote(str(canonical))} scheduledAutonomy=auto", file=sys.stderr)
+                    return 2
+                note = f"kaizen-scheduled: {args.project_dir} is not the project runs use; wrote to {path}"
+            if "scheduledAutonomy" in updates:
+                # Project auto only takes effect for projects listed in the global autoProjects.
+                try:
+                    update_auto_projects(canonical, updates["scheduledAutonomy"] == "auto")
+                except ValueError as error:
+                    print(f"kaizen-scheduled: {error}", file=sys.stderr)
+                    return 2
         write_config(path, updates)
+        if note:
+            print(note, file=sys.stderr)
     show_config(args.project_dir)
     return 0
 

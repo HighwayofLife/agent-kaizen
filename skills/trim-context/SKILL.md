@@ -13,6 +13,8 @@ Every MCP tool schema, connector, enabled plugin, skill description and custom-a
 
 **Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `agent-kaizen.json` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`), else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
+In this skill, `<Claude config dir>` means `$CLAUDE_CONFIG_DIR` or `~/.claude`, and `<Codex home>` means `$CODEX_HOME` or `~/.codex`.
+
 ## Task
 
 ```text
@@ -20,12 +22,12 @@ Every MCP tool schema, connector, enabled plugin, skill description and custom-a
    run, estimate instead: file sizes / 4 for instruction files, plus counts of servers, tools,
    skills and agents. Then list:
    - MCP servers (`claude mcp list`), and which of their tools any transcript in the last
-     30 days actually called (count tool names starting with mcp__ in ~/.claude/projects);
+     30 days actually called (count tool names starting with mcp__ in <Claude config dir>/projects);
    - claude.ai connectors that show up in this project;
    - enabled plugins and their skills, agents and hooks;
    - custom agents and skills whose descriptions are listed every turn, and how often each
      was used (subagent types in transcripts, Skill tool calls);
-   - Codex MCP servers in ~/.codex/config.toml, and how often Codex sessions used them.
+   - Codex MCP servers in <Codex home>/config.toml, and how often Codex sessions used them.
 2. Propose, each with the token or turn saving where you can estimate it. Check every
    setting name against the current Claude Code settings docs first:
    - use `Unused tools and MCP servers` in the audit to propose `permissions.deny`
@@ -49,7 +51,7 @@ Every MCP tool schema, connector, enabled plugin, skill description and custom-a
      use them, and merge or delete agents unused in 30 days;
    - in Codex, set enabled = false on MCP servers that most runs don't need, and enable
      them per run (codex exec -c mcp_servers.NAME.enabled=true);
-   - prune stale [projects."..."] trust entries in ~/.codex/config.toml.
+   - prune stale [projects."..."] trust entries in <Codex home>/config.toml.
 3. Note the trade-offs. Connecting or disconnecting MCP servers, switching models and
    compacting all invalidate the prompt cache, so make these changes between sessions,
    not in the middle of one.

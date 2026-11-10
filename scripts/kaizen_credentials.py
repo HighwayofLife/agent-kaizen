@@ -4,12 +4,15 @@ import os
 from pathlib import Path
 
 
-# Config patterns are top-level; project dotenv patterns cover every directory.
+# Config patterns are top-level; project name patterns cover every directory.
 # Keep in sync with docs/scheduling.md and the independent permission test pin.
 CREDENTIAL_PATHS = {
     "config": (".credentials.json", "auth.json", "*token*.json", "*secret*.json"),
-    "home": (".ssh/**", ".aws/**", ".gnupg/**", ".netrc", ".config/gh/**", ".docker/config.json"),
-    "project": ("**/.env", "**/.env.*"),
+    "home": (".ssh/**", ".aws/**", ".gnupg/**", ".netrc", ".config/gh/**", ".docker/config.json",
+             ".kube/config", ".npmrc", ".pypirc", ".git-credentials", ".config/gcloud/**",
+             ".azure/**", ".config/op/**", ".terraform.d/credentials.tfrc.json"),
+    "project": ("**/.env", "**/.env.*", "**/.npmrc", "**/.envrc", "**/*.pem", "**/*.key",
+                "**/id_rsa*", "**/id_ed25519*"),
 }
 
 

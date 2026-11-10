@@ -31,7 +31,7 @@ SCRIPTS = {
     "kaizen_credentials.py": "kaizen_credentials.py",
     "pricing.json": "pricing.json", "kaizen-pricing.json": "pricing.json",
     "rules-lint.patterns": "rules-lint.patterns", "install-schedule": "install-schedule",
-    "usage-series": "usage-series", "usage-compare": "usage-compare",
+    "usage-series": "usage-series", "usage-compare": "usage-compare", "usage-db": "usage-db",
     "rules-lint": "rules-lint", "packet-report": "packet-report",
     "kaizen-project-report": "kaizen-project-report", "notes-ledger": "notes-ledger",
     "kaizen-link": "kaizen-link", "codex-review": "codex-review",
@@ -61,6 +61,42 @@ def status(source, target, local):
     if not target.exists():
         return "ABSENT"
     return "OK" if source.exists() and same_copy(source, target) else "DRIFT"
+
+
+def identical(source, target):
+    """True when target is an exact copy of source (no missing or extra files)."""
+    if source.is_dir():
+        return (target.is_dir() and not target.is_symlink()
+                and sorted(p.name for p in source.iterdir()) == sorted(p.name for p in target.iterdir())
+                and all(identical(item, target / item.name) for item in source.iterdir()))
+    return target.is_file() and not target.is_symlink() and source.read_bytes() == target.read_bytes()
+
+
+def plugin_name(root):
+    try:
+        return json.loads((root / ".claude-plugin/plugin.json").read_text())["name"]
+    except (OSError, ValueError, KeyError, TypeError):
+        return root.name
+
+
+def ours(source, target, root):
+    """A symlink this script may replace on its own: into this plugin, or an older copy of it
+    (plugins/cache or plugins/marketplaces) in a folder named after this plugin."""
+    resolved = target.resolve()
+    if resolved == root or root in resolved.parents:
+        return True
+    relative = source.relative_to(root).parts
+    if resolved.parts[-len(relative):] != relative:
+        return False
+    head = resolved.parts[:-len(relative)]
+    return plugin_name(root) in head and any(
+        head[i:i + 2] in (("plugins", "cache"), ("plugins", "marketplaces")) for i in range(len(head)))
+
+
+def replaced_key(path, name):
+    """Sort key for NAME.replaced-YYYYMMDD[-N]: date, then the number (none sorts first)."""
+    parts = path.name[len(name) + len(".replaced-"):].split("-")
+    return int(parts[0]), int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
 
 
 def backup(target):
@@ -151,6 +187,7 @@ def main():
     mode = args.mode
     if mode == "auto":
         mode = "copy" if "/plugins/cache/" in root.as_posix() + "/" else "link"
+    settings_known = True
     try:
         settings_path = claude_home() / "agent-kaizen.json"
         settings = json.loads(settings_path.read_text()) if settings_path.exists() else {}
@@ -158,8 +195,11 @@ def main():
         if not isinstance(local, list) or any(not isinstance(x, str) for x in local):
             raise ValueError("localScripts must be a list of names")
     except (OSError, ValueError, AttributeError) as exc:
-        parser.exit(2, "kaizen-link: cannot read settings: %s\n" % exc)
-    selected = set(args.only.split(",")) if args.only else None
+        if not args.unlink:
+            parser.exit(2, "kaizen-link: cannot read settings: %s\n" % exc)
+        print("kaizen-link: warning: cannot read settings (%s); unlinking symlinks only" % exc, file=sys.stderr)
+        local, settings_known = [], False
+    selected = {n.strip() for n in args.only.split(",") if n.strip()} if args.only else None
     entries = []
     pairs = [(name, root / "scripts" / filename, args.bin / name, "bin")
              for name, filename in SCRIPTS.items()]
@@ -175,18 +215,29 @@ def main():
             if target.is_symlink() and target.resolve().is_relative_to(root):
                 target.unlink()
                 detail = "unlinked"
+            elif target.exists() and not target.is_symlink():
+                if not settings_known:
+                    detail = "skip: settings unreadable, copy left in place"
+                elif not source.exists() or not identical(source, target):
+                    detail = "skip: differs from the plugin source, left in place"
+                elif target.is_dir():
+                    shutil.rmtree(target)
+                    detail = "removed copy"
+                else:
+                    target.unlink()
+                    detail = "removed copy"
             else:
                 detail = "skip"
             if args.restore_replaced and not target.exists() and not target.is_symlink():
                 candidates = [p for p in target.parent.glob(name + ".replaced-*")
                               if p.name[len(name) + len('.replaced-'):].split('-')[0].isdigit()]
                 if candidates:
-                    newest = max(candidates, key=lambda p: (p.stat().st_mtime_ns, p.name))
+                    newest = max(candidates, key=lambda p: (replaced_key(p, name), p.name))
                     newest.rename(target)
                     detail = "restored " + newest.name
         elif args.apply:
             replace = args.replace or (args.replace_prefixed and name.startswith(("kaizen-", "kaizen_")))
-            if current in ("DRIFT", "BROKEN") and target.is_symlink():
+            if target.is_symlink() and (current == "BROKEN" or (current == "DRIFT" and ours(source, target, root))):
                 target.unlink()
                 current = "ABSENT"
             elif current == "DRIFT" and replace:
@@ -201,15 +252,15 @@ def main():
                 else:
                     shutil.copy2(source, target)
                 current = "OK"
-                detail = (detail + " " if detail else "") + mode + "ed"
+                detail = (detail + " " if detail else "") + {"link": "linked", "copy": "copied"}[mode]
             elif current == "DRIFT":
                 detail = "re-run kaizen-link --apply --replace"
         elif args.check:
-            if current == "DRIFT" and not target.is_symlink():
+            if current == "DRIFT" and not (target.is_symlink() and ours(source, target, root)):
                 detail = "re-run kaizen-link --apply --replace"
         else:
             detail = "would " + ("skip" if current in ("OK", "LOCAL") or
-                                    (current == "DRIFT" and not target.is_symlink() and
+                                    (current == "DRIFT" and not (target.is_symlink() and ours(source, target, root)) and
                                      not (args.replace or (args.replace_prefixed and name.startswith(("kaizen-", "kaizen_")))))
                                     else mode) + " " + name
         entries.append({"name": name, "kind": kind, "status": current, "detail": detail})

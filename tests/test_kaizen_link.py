@@ -262,5 +262,155 @@ class LinkTests(unittest.TestCase):
                 self.assertEqual(hashlib.sha256(source.read_bytes()).hexdigest(), before)
 
 
+    def test_live_foreign_symlink_is_kept_without_replace_and_saved_with_replace(self):
+        self.bin.mkdir()
+        mine = self.home / "mine"
+        mine.write_text("mine")
+        link = self.bin / "token-audit"
+        link.symlink_to(mine)
+        self.assertIn("DRIFT token-audit", self.run_link("--check", "--only", "token-audit").stdout)
+        self.assertIn("would skip token-audit", self.run_link("--only", "token-audit").stdout)
+        result = self.run_link("--apply", "--only", "token-audit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("DRIFT token-audit", result.stdout)
+        self.assertIn("--replace", result.stdout)
+        self.assertEqual(link.resolve(), mine.resolve())
+        self.assertEqual(list(self.bin.glob("token-audit.replaced-*")), [])
+        result = self.run_link("--apply", "--replace", "--only", "token-audit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(link.resolve(), (ROOT / "scripts/token-audit").resolve())
+        saved = list(self.bin.glob("token-audit.replaced-*"))
+        self.assertEqual(len(saved), 1)
+        self.assertTrue(saved[0].is_symlink())
+        self.assertEqual(saved[0].resolve(), mine.resolve())
+
+    def test_symlinks_into_the_plugin_root_or_older_caches_and_broken_ones_are_fixed_without_replace(self):
+        fake = self.home / "plugin"
+        (fake / "scripts").mkdir(parents=True)
+        (fake / "scripts/token-audit").write_text("source")
+        (fake / "scripts/kaizen-backup").write_text("source")
+        (fake / "scripts/codex-review").write_text("source")
+        (fake / "scripts/other").write_text("other")
+        (fake / ".claude-plugin").mkdir()
+        (fake / ".claude-plugin/plugin.json").write_text(json.dumps({"name": "agent-kaizen"}))
+        old = self.home / "plugins/cache/market/agent-kaizen/0.1.0/scripts"
+        old.mkdir(parents=True)
+        (old / "kaizen-backup").write_text("old")
+        self.bin.mkdir()
+        (self.bin / "token-audit").symlink_to(fake / "scripts/other")
+        (self.bin / "kaizen-backup").symlink_to(old / "kaizen-backup")
+        (self.bin / "codex-review").symlink_to(self.home / "missing")
+        result = self.run_link("--apply", root=fake)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("token-audit", "kaizen-backup", "codex-review"):
+            self.assertEqual((self.bin / name).resolve(), (fake / "scripts" / name).resolve())
+        self.assertEqual(list(self.bin.glob("*.replaced-*")), [])
+
+    def test_symlinks_that_only_look_like_the_plugin_are_foreign(self):
+        fake = self.home / "plugin"
+        (fake / "scripts").mkdir(parents=True)
+        for name in ("token-audit", "kaizen-backup", "codex-review"):
+            (fake / "scripts" / name).write_text("source")
+        elsewhere = self.home / "elsewhere/scripts"
+        cache_other = self.home / "plugins/cache/market/agent-kaizen/0.1.0/scripts"
+        for folder in (elsewhere, cache_other):
+            folder.mkdir(parents=True)
+            (folder / "token-audit").write_text("mine")
+        (cache_other / "kaizen-backup").write_text("mine")
+        self.bin.mkdir()
+        (self.bin / "token-audit").symlink_to(elsewhere / "token-audit")  # right name, not a plugin cache
+        (self.bin / "kaizen-backup").symlink_to(cache_other / "token-audit")  # cache, wrong file
+        (self.bin / "codex-review").symlink_to(cache_other / "kaizen-backup")  # cache, wrong file
+        self.assertEqual(self.run_link("--apply", root=fake).returncode, 0)
+        self.assertEqual((self.bin / "token-audit").resolve(), (elsewhere / "token-audit").resolve())
+        self.assertEqual((self.bin / "kaizen-backup").resolve(), (cache_other / "token-audit").resolve())
+        self.assertEqual((self.bin / "codex-review").resolve(), (cache_other / "kaizen-backup").resolve())
+
+    def test_another_plugins_cache_copy_is_foreign_and_own_cache_and_marketplace_copies_are_replaced(self):
+        fake = self.home / "plugin"
+        (fake / "scripts").mkdir(parents=True)
+        (fake / ".claude-plugin").mkdir()
+        (fake / ".claude-plugin/plugin.json").write_text(json.dumps({"name": "agent-kaizen"}))
+        names = ("token-audit", "kaizen-backup", "codex-review")
+        for name in names:
+            (fake / "scripts" / name).write_text("source")
+        copies = {"token-audit": "plugins/cache/market/other-plugin/1.0.0/scripts",
+                  "kaizen-backup": "plugins/cache/market/agent-kaizen/0.1.0/scripts",
+                  "codex-review": "plugins/marketplaces/market/agent-kaizen/scripts"}
+        self.bin.mkdir()
+        for name, folder in copies.items():
+            (self.home / folder).mkdir(parents=True)
+            (self.home / folder / name).write_text("old")
+            (self.bin / name).symlink_to(self.home / folder / name)
+        result = self.run_link("--apply", root=fake)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.bin / "token-audit").resolve(), (self.home / copies["token-audit"] / "token-audit").resolve())
+        self.assertIn("DRIFT token-audit", result.stdout)
+        for name in ("kaizen-backup", "codex-review"):
+            self.assertEqual((self.bin / name).resolve(), (fake / "scripts" / name).resolve())
+        self.assertEqual(list(self.bin.glob("*.replaced-*")), [])
+
+    def test_cache_copy_name_falls_back_to_the_plugin_root_folder_name_without_a_manifest(self):
+        fake = self.home / "agent-kaizen"
+        (fake / "scripts").mkdir(parents=True)
+        (fake / "scripts/kaizen-backup").write_text("source")
+        old = self.home / "plugins/cache/market/agent-kaizen/0.1.0/scripts"
+        old.mkdir(parents=True)
+        (old / "kaizen-backup").write_text("old")
+        self.bin.mkdir()
+        (self.bin / "kaizen-backup").symlink_to(old / "kaizen-backup")
+        self.assertEqual(self.run_link("--apply", "--only", "kaizen-backup", root=fake).returncode, 0)
+        self.assertEqual((self.bin / "kaizen-backup").resolve(), (fake / "scripts/kaizen-backup").resolve())
+
+    def test_unlink_removes_identical_copies_and_keeps_changed_ones_with_a_reason(self):
+        result = self.run_link("--apply", "--mode", "copy", "--only", "token-audit,preambles,kaizen-backup")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("copied", result.stdout)
+        self.assertNotIn("copyed", result.stdout)
+        self.assertFalse((self.bin / "token-audit").is_symlink())
+        (self.bin / "kaizen-backup").write_text("edited")
+        extra = self.bin / "preambles/extra.md"
+        extra.write_text("mine")
+        result = self.run_link("--unlink", "--only", "token-audit,preambles,kaizen-backup")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.bin / "token-audit").exists())
+        self.assertEqual((self.bin / "kaizen-backup").read_text(), "edited")
+        self.assertTrue(extra.is_file())
+        for line in result.stdout.splitlines():
+            if "kaizen-backup" in line or "preambles" in line:
+                self.assertIn("differs", line)
+        extra.unlink()
+        self.assertEqual(self.run_link("--unlink", "--only", "preambles").returncode, 0)
+        self.assertFalse((self.bin / "preambles").exists())
+
+    def test_unlink_still_works_when_settings_are_malformed(self):
+        self.assertEqual(self.run_link("--apply", "--only", "token-audit").returncode, 0)
+        (self.home / "agent-kaizen.json").write_text("{not json")
+        result = self.run_link("--unlink", "--only", "token-audit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("warning", result.stderr)
+        self.assertFalse((self.bin / "token-audit").exists())
+        self.assertEqual(self.run_link("--apply", "--only", "token-audit").returncode, 2)
+
+    def test_restore_replaced_picks_the_newest_suffix_not_the_newest_mtime(self):
+        self.bin.mkdir()
+        names = {"token-audit.replaced-20261104": "oldest day", "token-audit.replaced-20261105": "first of day",
+                 "token-audit.replaced-20261105-2": "newest", "token-audit.replaced-20261105-1": "second of day"}
+        for index, (name, text) in enumerate(names.items()):
+            (self.bin / name).write_text(text)
+            os.utime(self.bin / name, (1_000_000 - index * 1000, 1_000_000 - index * 1000))
+        os.utime(self.bin / "token-audit.replaced-20261104", (2_000_000, 2_000_000))  # newest mtime
+        result = self.run_link("--unlink", "--restore-replaced", "--only", "token-audit")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((self.bin / "token-audit").read_text(), "newest")
+
+    def test_only_strips_whitespace_around_names(self):
+        result = self.run_link("--apply", "--only", "token-audit, preambles ,")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((self.bin / "token-audit").is_symlink())
+        self.assertTrue((self.bin / "preambles").is_symlink())
+        self.assertFalse((self.bin / "usage-series").exists())
+
+
 if __name__ == "__main__":
     unittest.main()

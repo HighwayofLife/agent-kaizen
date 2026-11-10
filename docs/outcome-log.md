@@ -2,6 +2,8 @@
 
 Projects append packet outcomes to `out/packets.jsonl` for the audit and calibration report. Each line is one JSON object. The report requires the first four keys; other keys are optional.
 
+A packet is one brief in a plan (see `/agent-kaizen:planning`). Your own landing script or agent writes these rows; the plugin ships no writer.
+
 | Key | Required | Type and default |
 | --- | --- | --- |
 | ts | yes | ISO UTC timestamp string |
@@ -14,12 +16,13 @@ Projects append packet outcomes to `out/packets.jsonl` for the audit and calibra
 | fix_origin | no | string or null; default null |
 | fixes | no | list of packet ID strings; default [] |
 | dispatches | no | number; default 1 |
+| dispatch_models | no | list in dispatch order of objects with model and effort strings and rounds integer, one per dispatch |
 | rounds | no | number; default 0 |
 | status | no | string: DONE, CHECKS FAILING, CODEX FAILED, ENV NOT READY, or none; default unknown |
-| slot_wait_s | no | number or null |
-| playmode_s | no | number or null |
-| editmode_s | no | number or null |
-| dotnet_s | no | number or null |
+| slot_wait_s | no | number or null; project-specific timing fields; `packet-report` ignores them |
+| playmode_s | no | number or null; project-specific timing fields; `packet-report` ignores them |
+| editmode_s | no | number or null; project-specific timing fields; `packet-report` ignores them |
+| dotnet_s | no | number or null; project-specific timing fields; `packet-report` ignores them |
 | wall_s | no | number or null; default null |
 | lines | no | number; default 0 |
 | files | no | number |

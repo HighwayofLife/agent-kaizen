@@ -39,12 +39,16 @@ jobs:
         run: for f in .claude-plugin/*.json hooks/hooks.json templates/*.json scripts/pricing.json; do jq empty "$f" || exit 1; done
       - name: Python scripts compile
         run: |
-          for f in scripts/token-audit scripts/usage-series scripts/usage-compare scripts/codex-dispatch scripts/codex-review scripts/codex-run \
-                   scripts/dispatch-status scripts/install-schedule scripts/kaizen-scheduled scripts/codex_common.py; do
+          for f in $(git ls-files 'scripts/*' ':!:scripts/preambles' ':!:scripts/prompts' | grep -Ev '\.(json|md|patterns)$'); do
+            [ -f "$f" ] && [ ! -L "$f" ] || continue
             python3 -c "import sys; compile(open(sys.argv[1]).read(), sys.argv[1], 'exec')" "$f" || exit 1
           done
       - name: Scripts answer --help
-        run: for s in token-audit usage-series usage-compare codex-dispatch codex-review dispatch-status install-schedule kaizen-scheduled; do scripts/$s --help > /dev/null || exit 1; done
+        run: |
+          for f in $(git ls-files 'scripts/*' ':!:scripts/preambles' ':!:scripts/prompts' | grep -Ev '\.(json|md|patterns|py)$'); do
+            [ -f "$f" ] && [ ! -L "$f" ] || continue
+            "$f" --help > /dev/null || { echo "::error::$f --help failed"; exit 1; }
+          done
 
   plugin:
     name: claude plugin validate
@@ -68,11 +72,14 @@ jobs:
         with:
           fetch-depth: 0
       - name: Plugin changes bump the version and add a CHANGELOG entry
+        env:
+          BASE_REF: ${{ github.base_ref }}
         run: |
-          base=origin/${{ github.base_ref }}
+          base=origin/$BASE_REF
           changed=$(git diff --name-only "$base"...HEAD -- skills agents hooks scripts templates .claude-plugin)
           [ -z "$changed" ] && { echo "No plugin files changed."; exit 0; }
           old=$(git show "$base":.claude-plugin/plugin.json | jq -r .version)
           new=$(jq -r .version .claude-plugin/plugin.json)
-          [ "$old" != "$new" ] || { echo "::error::Plugin files changed but version is still $new. Bump .claude-plugin/plugin.json (users on a GitHub install only get new versions)."; exit 1; }
-          grep -q "^## $new" CHANGELOG.md || { echo "::error::CHANGELOG.md has no '## $new' entry."; exit 1; }
+          [ "$old" != "$new" ] && [ "$(printf '%s\n%s\n' "$old" "$new" | sort -V | tail -n 1)" = "$new" ] || { echo "::error::Plugin files changed but version $new is not greater than $old. Bump .claude-plugin/plugin.json (users on a GitHub install only get new versions)."; exit 1; }
+          pattern="^## ${new//./\\.}( |\$)"
+          grep -Eq "$pattern" CHANGELOG.md || { echo "::error::CHANGELOG.md has no '## $new' entry."; exit 1; }

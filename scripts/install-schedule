@@ -12,7 +12,8 @@ systemd user timers when the user manager is running. Windows is unsupported.
 --apply installs managed scripts through kaizen-link into <claude home>/bin.
 Plugin cache installs use copies so jobs survive plugin moves; re-run to refresh.
 Claude home is CLAUDE_CONFIG_DIR or ~/.claude; Codex home is CODEX_HOME or ~/.codex.
-Jobs record PATH and those config variables when set, and use absolute Python.
+Jobs record PATH and those config variables (and KAIZEN_BACKUP_DIR, KAIZEN_USAGE_DB) when set, and use absolute Python.
+--apply without --review (or --auto) removes an installed review job; the audit job stays.
 Without --apply or --remove, prints jobs and config commands without writing config.
 """
 import argparse
@@ -50,7 +51,7 @@ MANAGED_NAMES = (
     "kaizen_credentials.py",
     "kaizen-pricing.json", "pricing.json", "kaizen-link", "rules-lint",
     "rules-lint.patterns", "packet-report", "kaizen-project-report", "notes-ledger",
-    "usage-series", "usage-compare",
+    "usage-series", "usage-compare", "usage-db",
 )
 LABEL = "com.agent-kaizen"
 MARK = "# agent-kaizen"
@@ -123,7 +124,7 @@ def remaining_opt_ins(args):
 def job_env():
     env = {"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin")}
     # Jobs run with another cwd and no shell expansion, so record absolute paths.
-    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "KAIZEN_BACKUP_DIR", "KAIZEN_USAGE_DB"):
         if os.environ.get(name):
             env[name] = str(Path(os.environ[name]).expanduser().resolve())
     return env
@@ -151,9 +152,29 @@ def jobs(args):
     return out
 
 
+DROP_NOTE = "review job (not requested; pass --review to keep it)"
+
+
+def drops_review(args):
+    """--apply is declarative: without --review, an installed review job goes."""
+    return bool(args.apply and not args.remove and not args.review)
+
+
+def preview_drop(args, found):
+    """Say what happens to a review job that is installed but not requested."""
+    if found and not args.remove and not args.review:
+        print(("removed " if args.apply else "would remove ") + DROP_NOTE)
+
+
 def mac(args, selected):
     agents = Path.home() / "Library" / "LaunchAgents"
     domain = f"gui/{os.getuid()}"
+    stale = agents / f"{LABEL}.review.plist"
+    if "review" not in selected and stale.exists():
+        if drops_review(args):
+            subprocess.run(["launchctl", "bootout", domain, str(stale)], stderr=subprocess.DEVNULL)
+            stale.unlink()
+        preview_drop(args, True)
     for name, job in selected.items():
         path = agents / f"{LABEL}.{name}.plist"
         if args.remove:
@@ -186,15 +207,27 @@ def cron(args, selected):
     if not shutil.which("crontab"):
         return missing()
     try:
-        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True)
+        # The "no crontab" text is translated; ask for the C locale so the test below matches.
+        result = subprocess.run(["crontab", "-l"], capture_output=True, text=True,
+                                env={**os.environ, "LC_ALL": "C", "LANG": "C"})
     except FileNotFoundError:
         return missing()
+    if result.returncode and "no crontab" not in result.stderr.lower():
+        if args.apply or args.remove:
+            print(f"install-schedule: crontab -l failed, crontab left unchanged: "
+                  f"{result.stderr.strip() or result.returncode}", file=sys.stderr)
+            return 2
     current = result.stdout if result.returncode == 0 else ""
+    dropped = "review" not in selected and not args.remove
+    owned = [*selected, *(["review"] if dropped else [])]
+    ends = lambda line, name: line.rstrip('\r\n').endswith(f"{MARK}-{name}")
     kept = [line for line in current.splitlines(keepends=True)
-            if not any(line.rstrip('\r\n').endswith(f"{MARK}-{n}") for n in selected)]
+            if not any(ends(line, n) for n in owned)]
+    found = dropped and any(ends(line, "review") for line in current.splitlines())
     added = [] if args.remove else lines
     if not args.apply and not args.remove:
         print("\n".join(added))
+        preview_drop(args, found)
         return 0
     text = "".join(kept)
     if added:
@@ -204,6 +237,7 @@ def cron(args, selected):
     except FileNotFoundError:
         return missing()
     print(("removed" if args.remove else "installed") + ": " + ", ".join(selected))
+    preview_drop(args, found)
     return 0
 
 
@@ -255,6 +289,17 @@ def systemctl(*arguments):
 
 def systemd(args, selected):
     directory = unit_dir()
+    stale = [directory / f"agent-kaizen-review.{kind}" for kind in ("timer", "service")]
+    if "review" not in selected and any(path.exists() for path in stale):
+        if drops_review(args):
+            try:
+                subprocess.run(["systemctl", "--user", "disable", "--now", stale[0].name],
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError:
+                pass
+            for path in stale:
+                path.unlink(missing_ok=True)
+        preview_drop(args, True)
     for name, job in selected.items():
         service = directory / f"agent-kaizen-{name}.service"
         timer = directory / f"agent-kaizen-{name}.timer"
@@ -381,7 +426,11 @@ def main(argv=None):
         if has_units or scheduler == "systemd":
             status = systemd(args, selected) or status
     else:
-        status = {"launchd": mac, "cron": cron, "systemd": systemd}[scheduler](args, selected) or 0
+        try:
+            status = {"launchd": mac, "cron": cron, "systemd": systemd}[scheduler](args, selected) or 0
+        except (OSError, subprocess.CalledProcessError) as error:
+            print(f"install-schedule: {error}", file=sys.stderr)
+            return 2
         if args.apply and scheduler == "cron" and any(unit_dir().glob("agent-kaizen-*.timer")):
             print(f"note: agent-kaizen systemd timers are also installed in {unit_dir()}; "
                   "remove them with --scheduler systemd --remove", file=sys.stderr)

@@ -49,6 +49,7 @@ class RunnerTests(StubCase):
             "enabled": {"value": True, "source": "default"},
             "schedule": {"value": "active", "source": "default"},
             "scheduledAutonomy": {"value": "propose", "source": "default"},
+            "autoProjects": {"value": [], "source": "default"},
             "retention": {"value": "auto", "source": "default"},
             "retentionOverrides": {"value": {}, "source": "default"},
             "projectCommands": {"value": {}, "source": "default"},
@@ -69,8 +70,8 @@ class RunnerTests(StubCase):
             ({"enabled": False}, {"schedule": "always"}, "schedule", "off", "global"),
             ({"schedule": "active"}, {"schedule": "off"}, "schedule", "off", "project"),
             ({"schedule": "off"}, {"schedule": "active"}, "schedule", "active", "project"),
-            ({"scheduledAutonomy": "propose"}, {"scheduledAutonomy": "auto"},
-             "scheduledAutonomy", "auto", "project"),
+            ({"scheduledAutonomy": "propose", "autoProjects": [str(self.project)]},
+             {"scheduledAutonomy": "auto"}, "scheduledAutonomy", "auto", "project"),
             ({"schedule": "always"}, {}, "schedule", "always", "global"),
         ]
         for global_cfg, project_cfg, name, value, source in cases:
@@ -439,7 +440,8 @@ class DiscoveryTests(DiscoveryCase):
     def test_json_preview_autonomy_sources_without_writes(self):
         one, two = self.project('one'), self.project('two')
         write(one / 'docs/kaizen/config.json', '{"scheduledAutonomy":"auto"}')
-        write(self.cfg / 'agent-kaizen.json', '{"enabled":false,"scheduledAutonomy":"propose"}')
+        write(self.cfg / 'agent-kaizen.json', json.dumps({
+            'enabled': False, 'scheduledAutonomy': 'propose', 'autoProjects': [str(one)]}))
         rows = json.loads(self.preview('--json', '--project-dir', str(one), '--project-dir', str(two)))
         self.assertEqual(rows, [dict(path=str(one), scheduledAutonomy='auto', source='project'),
                                 dict(path=str(two), scheduledAutonomy='propose', source='global')])
@@ -649,7 +651,7 @@ class DiscoveryTests(DiscoveryCase):
         self.assertTrue(run.called)
         for call in run.call_args_list:
             self.assertEqual(call.args[0][0], "git")
-            self.assertEqual(call.kwargs, {"capture_output": True, "text": True})
+            self.assertEqual(call.kwargs, {"capture_output": True, "text": True, "timeout": 600})
 
 
 class GateTests(DiscoveryCase):
@@ -977,12 +979,12 @@ class ExecutionTests(DiscoveryCase):
 
     def expected_config_deny(self, project=None):
         rules = []
-        for home in (self.cfg, self.cx):
+        for home, extra in ((self.cfg, ('agents/**',)), (self.cx, ('AGENTS.md',))):
             for path in dict.fromkeys((home, home.resolve())):
                 root = '//' + path.as_posix().lstrip('/')
                 for pattern in ('settings*.json', 'hooks/**', 'plugins/**', 'skills/**',
                                 'commands/**', 'bin/**', '**/*.json', '**/*.toml', '**/*.sh',
-                                '**/*.py', '**/*.js', '.credentials*', 'auth.json', '**/.git/**'):
+                                '**/*.py', '**/*.js', '.credentials*', 'auth.json', '**/.git/**', *extra):
                     rules.extend(f'{tool}({root}/{pattern})' for tool in ('Edit', 'Write'))
         for path in dict.fromkeys((self.cfg / '.claude.json', (self.cfg / '.claude.json').resolve())):
             config = path.as_posix().lstrip('/')
@@ -990,7 +992,10 @@ class ExecutionTests(DiscoveryCase):
         if project is not None:
             for path in dict.fromkeys((project, project.resolve())):
                 root = path.as_posix().lstrip('/')
-                rules.extend(f'{tool}(//{root}/.claude/settings*.json)' for tool in ('Edit', 'Write'))
+                for pattern in ('.claude/settings*.json', '.claude/hooks/**', '.claude/agents/**',
+                                '.claude/commands/**', '.claude/skills/**', '.mcp.json',
+                                '.github/workflows/**', '.husky/**'):
+                    rules.extend(f'{tool}(//{root}/{pattern})' for tool in ('Edit', 'Write'))
         return rules
 
     def test_two_due_projects_have_independent_commands_outputs_and_state(self):
@@ -1089,7 +1094,7 @@ class ExecutionTests(DiscoveryCase):
                 ({'scheduledAutonomy': 'auto'}, {'scheduledAutonomy': 'propose'}, 'propose-only'))):
             with self.subTest(mode=mode, number=number):
                 path = self.due('mode' + str(number))
-                write(self.cfg / 'agent-kaizen.json', json.dumps(global_cfg))
+                write(self.cfg / 'agent-kaizen.json', json.dumps({**global_cfg, 'autoProjects': [str(path)]}))
                 write(path / 'docs/kaizen/config.json', json.dumps(local_cfg))
                 self.review('--project-dir', path)
                 argv = self.calls()[-1]['argv']
@@ -1110,7 +1115,7 @@ class ExecutionTests(DiscoveryCase):
                                                 self.runner.HARD_STOP_DENY, 'Edit(**/.git/**)',
                                                 'Write(**/.git/**)', *rules, *self.runner.backup_deny()])])
                     for rule in rules:
-                        for text in ('.md', 'CLAUDE', 'agents', 'rules'):
+                        for text in ('CLAUDE', 'rules'):
                             self.assertNotIn(text, rule)
                     root = '//' + self.cfg.as_posix().lstrip('/')
                     for pattern in ('settings*.json', 'hooks/**', '**/*.json'):
@@ -1176,8 +1181,8 @@ class ExecutionTests(DiscoveryCase):
                         self.runner.review_command(options, 'propose-only', 'report', 'session', project)
         self.env['CODEX_HOME'] = str(self.root / 'bad,codex')
         result = self.review('--project-dir', path)
-        self.assertIn(f"{path}: failed (cannot build deny rules: path contains ',':", result.stdout)
-        self.assertEqual(self.state(path)['status'], 'failed')
+        self.assertIn(f"{path}: unsupported-path: cannot build deny rules: path contains ',':", result.stdout)
+        self.assertEqual(self.state(path)['status'], 'unsupported-path')
         self.assertFalse(self.record.exists())
 
     def test_permission_rule_metacharacters_fail_closed(self):
@@ -1204,6 +1209,7 @@ class ExecutionTests(DiscoveryCase):
     def test_permission_auto_dry_run_has_same_deny_rules(self):
         path = self.due('auto dry project')
         write(path / 'docs/kaizen/config.json', '{"scheduledAutonomy":"auto"}')
+        write(self.cfg / 'agent-kaizen.json', json.dumps({'autoProjects': [str(path)]}))
         before = {p: p.read_bytes() if p.is_file() else None for p in self.root.rglob('*')}
         output = self.review('--dry-run').stdout
         command = shlex.split(next(line.split('review command: ', 1)[1]
@@ -1317,7 +1323,9 @@ class ExecutionTests(DiscoveryCase):
         write(path / 'docs/kaizen/config.json', '{"schedule":"always"}')
         executable(self.claude, STUB_CLAUDE.replace('stub cycle output', 'failed retry output'))
         self.env['STUB_EXIT'] = '1'
-        failed = proposal.with_suffix('.failed.md')
+        # The retry gets the next free name, so its report is cycle-<date>-2.failed.md.
+        retry = proposal.with_name(proposal.stem + '-2.md')
+        failed = retry.with_suffix('.failed.md')
         write(failed, 'older failure')
         result = self.review('--now', fixed)
         state = self.state(path)
@@ -1327,7 +1335,7 @@ class ExecutionTests(DiscoveryCase):
         self.assertEqual(proposal.read_text(), 'stub cycle output\n')
         self.assertEqual(failed.read_text(), 'failed retry output\n')
         self.assertIn(f'output: {failed}', result.stdout)
-        self.assertEqual(list(self.folder(path).glob(proposal.name + '.*')), [])
+        self.assertEqual(list(self.folder(path).glob(retry.name + '.*')), [])
 
     def test_global_audit_empty_stdout_is_normal_failure(self):
         executable(self.audit, '#!/usr/bin/env python3\n')

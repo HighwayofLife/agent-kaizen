@@ -61,6 +61,40 @@ If executable `tools/codemap` exists in the target, the dispatcher runs
 task. `CODEMAP_TIMEOUT` sets its timeout in seconds (default 20); absent,
 failed, or timed-out codemaps are skipped. Failures are logged.
 Exit codes: 0 DONE, 1 CHECKS FAILING, 2 CODEX FAILED or invalid arguments.
+The report's `STATUS:` word is `DONE`, `CHECKS FAILING` or `CODEX FAILED`. On a
+Codex failure, `Reason:` shows the cause; when Codex gave no final message it is
+the last five stderr or error-event lines.
+
+Built-in check `require-change` (shown as `Check 0`) fails an engineer run that
+changed nothing. It is decided per Codex run, from a snapshot taken right before
+and after the run, and is cumulative across rounds. Files written by `-k` checks
+never count, a commit by Codex counts, and ignored files do not. The snapshot is
+repo-wide even when `-C` is a subdirectory; the output directory is excluded
+when it is inside the repo. Pass `--allow-no-change` when no change is expected.
+If the tree was dirty before dispatch, the report has `WARNING: tree was dirty
+before dispatch (N paths)`; if the snapshot fails, `WARNING: tree snapshot
+failed: <reason>; require-change skipped`.
+
+Reason guard: a model whose name matches a token in `CODEX_DISPATCH_REASON_MODELS`
+(comma-separated, case-insensitive, default `sol`, empty = off) needs a line
+`<Token> reason: <why>` or `Model reason: <why>` in the brief, outside code
+fences. A token matches a whole name segment, optionally followed by digits
+(`sol`, `gpt-6.1-sol`, `sol2` match; `solhigh` does not). Without it the
+dispatch prints `Reason: model "<m>" needs a line ...` and `STATUS: CODEX
+FAILED` (exit 2) before it creates `out/`. Only the name given by `-m` or
+`CODEX_DISPATCH_MODEL` is checked; `--resume` is exempt. A line indented by
+four or more spaces or a tab does not count, and a reason that is only a
+placeholder in angle brackets, such as `<why>`, does not count.
+
+`--check-timeout SECONDS` kills a `-k` check (default env
+`CODEX_DISPATCH_CHECK_TIMEOUT`, else 1800; 0 = no limit); it shows as `Check N
+FAIL: <cmd> — TIMEOUT after Ns` and is resumed like any failed check.
+`--codex-timeout SECONDS` limits a Codex run (default env
+`CODEX_DISPATCH_CODEX_TIMEOUT`, else 0 = no limit); a timeout gives `Reason:
+Codex timed out: TIMEOUT after Ns` and `STATUS: CODEX FAILED`. Every Codex run
+and every `-k` check runs in its own process group. SIGINT, SIGTERM or SIGHUP
+to `codex-dispatch` kills that group before it exits. SIGTERM exits 143 and
+SIGHUP exits 129.
 
 ## codex-run
 
@@ -114,7 +148,10 @@ Without a target, the default base is `origin/HEAD`, or the first existing ref
 of `origin/main`, `origin/master`, and `origin/develop`. It is used only when
 HEAD is ahead, and printed as `Base: <ref> (default)`. Otherwise uncommitted changes are
 reviewed. An empty working tree with no ahead base prints `Error: nothing to
-review: ...` and `STATUS: REVIEW FAILED`. When no ignore rule covers `out/`,
+review: ...` and `STATUS: REVIEW FAILED`. With uncommitted changes and an
+auto-chosen base, the header adds `Note: uncommitted changes are NOT part of this
+review; pass --uncommitted to review them.` The STATUS words are `DONE` and
+`REVIEW FAILED`. When no ignore rule covers `out/`,
 it is added to the repository's `info/exclude` (shared by its worktrees).
 
 ## token-audit
@@ -132,12 +169,15 @@ token-audit --since 2026-01-01 --json > audit.json 2> audit-errors.log &
 ```
 
 Claude Code should invoke a background Bash command and read the printed report
-path. `--project SUBSTRING` filters folder names case-insensitively;
+path. `--project SUBSTRING` filters Claude folder names case-insensitively and does not
+filter Codex sessions (`--cwd` selects both);
 `--project-dir DIR` can explicitly select one or more folders; repeat `--cwd PATH` to select transcripts by working directory. `--out DIR` is a
 directory (default `<Claude config dir>/audits/`), containing timestamped Markdown reports.
 Normal stdout prints that path and totals; `--json` includes `report_path` and
 all structured results. `--days N` and `--since YYYY-MM-DD` are mutually exclusive;
-dates use UTC. There are no model environment variables. `--codex` is accepted for compatibility; sessions are already
+dates use UTC. The five threshold flags are `--stuck-repeats` (3), `--fact-sessions` (3),
+`--prune-prompts` (10), `--prune-min-sessions` (2) and `--prune-sessions` (5).
+`--days` must be 0 to 36500. There are no model environment variables. `--codex` is accepted for compatibility; sessions are already
 included by default.
 
 `--extract-out DIR` selects the machine-readable extract folder. Its default is
@@ -170,8 +210,9 @@ counts. These are hints for review, not automatic model changes.
 
 Duplicate assistant message IDs across selected transcripts count once. Entries
 without message IDs count individually. Duplicate file paths are scanned once.
-Codex counts final cumulative session totals for sessions with usage events in
-the window, including resumes of older files, attributed to the latest model.
+Codex numbers are in-window deltas: rows before the window set the baseline,
+and a counter decrease is treated as a reset. The header reads `Since: <date>
+(UTC; Claude calls in window, Codex in-window token deltas).`
 Cached input is a subset of Codex input and is never added twice. Claude context
 includes input, cache reads and cache creation. These are usage counts, not
 currency estimates. Reports cap at 80 lines; JSON retains all rows. Malformed
@@ -181,6 +222,14 @@ audits is flagged.
 Reports include scope metadata and compare only with an earlier report of the same scope. Pre-0.4.0 reports have no scope and are not compared. Flags use per-call intensity, not volume.
 Exit 0 means the report was written; errors use nonzero exit codes.
 
+Cost uses `pricing.json`. A price key or alias matches a model id only when the
+rest of the id is empty, a `-YYYYMMDD` suffix, a bracket suffix such as `[1m]`,
+or both; the longest match wins. Anything else, including a newer sibling model,
+is Unpriced and appears in the Unpriced table. When `source.checked` is more than
+60 days old the Cost section adds `Pricing last checked <date> (<N> days before
+this audit); rates may be out of date.` (`cost.pricing_warning` in `--json`).
+Zero-usage `<synthetic>` rows are not counted as calls.
+
 ## kaizen-scheduled
 
 `kaizen-scheduled config show [--for DIR]` shows effective settings and the report path; `config set [--for DIR] KEY=VALUE...` merges settings, including global `retention` and `retentionOverrides`. `audit` writes a global audit; `review` audits and reviews due projects. `review --dry-run` previews without writes or tokens; add `--json` for structured output. Repeat `--project-dir DIR` to replace discovery, or use `--now` to set the review time.
@@ -189,7 +238,7 @@ Exit 0 means the report was written; errors use nonzero exit codes.
 
 Both audit and review accept `--audits`, `--python`, `--token-audit` and `--pricing` overrides. Review also accepts `--claude`, `--model` and `--max-turns`. Run each subcommand with `--help` for details.
 
-Under `<Claude config dir>/audits`, global reports are `token-audit-*.md`, extracts live in `extracts/`, and `projects/index.json` is the registry. Each `projects/<key>/` holds `state.json`, project `token-audit-*.md` and `cycle-<date>.md`. Scheduler output goes to `run.log`.
+Under `<Claude config dir>/audits`, global reports are `token-audit-*.md`, extracts live in `extracts/`, and `projects/index.json` is the registry. Each `projects/<key>/` holds `state.json`, project `token-audit-*.md` and `cycle-<date>.md` (a second proposal on the same day gets a `-2` suffix). Scheduler output goes to `run.log`. Statuses, run lock, timeouts, auto-mode opt-in (`autoProjects`) and environment variables are in [docs/scheduling.md](../docs/scheduling.md).
 
 ## dispatch-status
 
@@ -201,7 +250,7 @@ instructions. No model or project-specific environment variables are used.
 dispatch-status "$PWD" ../another-worktree > status.log 2>&1 &
 ```
 
-Claude Code can background this Bash command and read `status.log`. With no
+Claude Code can background this Bash command and read `status.log`. A process counts as running only when its argv has a word whose basename is `codex-dispatch`. It falls back to `git worktree list --porcelain` on git older than 2.36. Runs started with `-o DIR` are not shown. With no
 paths it inspects the current directory. It reads `out/dispatch/*/report.md`;
 review reports appear there too. It makes no changes and does not poll.
 
@@ -214,6 +263,57 @@ python3 -m unittest discover -s tests -v
 Tests create a fake `codex` executable on PATH and synthetic transcripts in
 isolated temporary directories. No network, Docker, or real Codex session is
 used. All executable scripts are Python, so shellcheck does not apply.
+
+## install-schedule
+
+Install, preview or remove the scheduled jobs (launchd, cron or systemd user
+timers). Without `--apply` or `--remove` it only prints them.
+
+```text
+install-schedule [--scheduler auto|launchd|cron|systemd] [--apply] [--remove]
+                 [--review] [--auto [all|none|DIR ...]]
+                 [--project-dir DIR] [--model MODEL] [--max-turns N]
+```
+
+`--apply` installs the audit job and the managed scripts (through `kaizen-link`)
+and adds the weekly review with `--review`. `--auto` implies `--review`.
+`--apply` without `--review` or `--auto` removes an installed review job; the
+audit job stays. `--remove` removes both. Errors print `install-schedule:
+<error>` and exit 2. See [docs/scheduling.md](../docs/scheduling.md).
+
+## kaizen-backup
+
+Backups, manifests and undo for Agent Kaizen changes.
+
+```text
+kaizen-backup begin --skill NAME --ledger TEXT [--run RUN_ID] FILE...
+kaizen-backup finish CHANGE_DIR [--verification passed|failed]
+kaizen-backup action CHANGE_DIR --did CMD --undo CMD
+kaizen-backup list [--all]
+kaizen-backup undo [last|run|CHANGE_DIR] [--force]
+```
+
+`begin` copies existing files, records missing ones as created, refuses
+credential paths and prints the change folder; run it before editing. `finish`
+records each file's sha256 after the edit. `action` records a non-file action
+and its reverse command; `undo` prints that command and never runs it. `list`
+shows changes newest first.
+
+`undo` takes `last` (default), `run` (the changes of the newest run) or a change
+directory. It restores files and deletes created files whose hash still matches.
+A file changed since `finish` is a conflict and nothing is restored unless
+`--force` is given. Undo of an unfinished change whose created file exists is
+also a conflict (`<path> was created by <change>, which was never finished`,
+exit 2); `--force` removes it. For several changes only the newest one touching
+a path has its hash checked, and restore runs newest first. A corrupt manifest
+is skipped with a message on stderr. `undo run` also reports a conflict when a
+file was edited by hand between two changes of the run: `<path> was edited
+between <older change> and <newer change>`. `--force` skips this check.
+
+The backup root is `KAIZEN_BACKUP_DIR` if set (empty counts as unset), else
+`<Claude config dir>/kaizen-backups`. The backup root is created with mode 700; an existing root is set to mode 700
+only when it is the default location; a directory chosen with
+`KAIZEN_BACKUP_DIR` keeps its mode; change folders are always mode 700.
 
 ## usage-series
 
@@ -305,6 +405,51 @@ Rates use elapsed UTC days, not active days. The before window defaults to the
 is set. Pass the original selection and pricing options again; CSVs do not
 store private scope information.
 
+## usage-db
+
+Keep per-call token usage in a small SQLite file, so history survives after
+Claude Code deletes old transcripts and repeat reports do not re-read them.
+The file is `$KAIZEN_USAGE_DB` if set, else `kaizen-usage.db` in
+`CLAUDE_CONFIG_DIR` (default `~/.claude`). `--db PATH` overrides both. It is
+created with mode 0600. It holds only ids, timestamps, model names, working
+directory paths and token counts, never message text. The scheduled `audit` job runs `usage-db ingest --quiet`.
+
+```bash
+usage-db ingest [--db PATH] [--quiet]
+usage-db status [--db PATH]
+usage-db report [--db PATH] [--since YYYY-MM-DD] [--until YYYY-MM-DD]
+                [--by day|model|project|agent|session|source]
+                [--project SUBSTR] [--source claude|codex]
+                [--format table|csv|json] [--pricing PATH]
+usage-db sql QUERY [--db PATH] [--format table|csv|json]
+```
+
+`ingest` finds Claude transcripts and Codex sessions the way `usage-series`
+does (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`). It skips a file whose size and
+modification time match the last run, and reads a new or changed file from the
+start, adding only calls it has not stored. One message id counts once across
+files. Zero-token `<synthetic>` rows are not stored. Codex rows store the
+change since the previous cumulative counter. A file that is later deleted
+keeps its rows. Bad lines and unreadable files are counted and printed as
+warnings, not errors. `--quiet` prints nothing.
+
+`status` shows the path, size, schema version, calls per source, first and last
+day and last ingest time. A missing database exits 1.
+
+`report` groups calls, tokens, cost and unpriced calls by `--by` (default
+`day`) and adds a total row. Dates are UTC days and `--until` is inclusive.
+
+Cost is not stored. `report` prices each call when it runs, with `pricing.json`
+(or `--pricing`), so a corrected price also corrects old rows. Models without a
+price show as `unpriced_calls` and add no cost.
+
+`sql` runs one statement against a read-only connection; an error exits 2.
+Tables are `calls`, `files` and `meta`. A database written by a newer schema
+version is refused with exit 2.
+
+A file that is not a usable SQLite database is refused with `usage-db: <path> is
+not a usable SQLite database: <sqlite message>` and exit 2. It is not modified.
+
 ## kaizen-link
 
 Install or check managed scripts and hooks. Cache installs use copies; `localScripts` marks intentional differences.
@@ -317,6 +462,10 @@ usage: kaizen-link [-h] [--bin BIN] [--hooks-dir HOOKS_DIR]
                    [--json] [--plugin-root DIR]
 ```
 
+Output says `linked` or `copied`. A live symlink that points outside the plugin is `DRIFT <name> re-run kaizen-link --apply --replace` and is left alone. `--replace` saves it as `NAME.replaced-<date>` and installs the plugin's version. Broken links, links into the plugin root and links into an older plugin cache copy are fixed without `--replace`. A link into
+another copy under `plugins/cache` or `plugins/marketplaces` counts as this
+plugin's own only when a path component equals the plugin name. `--unlink` removes links into the plugin and copies that are byte-identical to the source (`removed copy`); a differing copy is left (`skip: differs from the plugin source, left in place`). A malformed `agent-kaizen.json` gives a warning and only symlinks are removed. `--restore-replaced` (with `--unlink`) restores the newest `.replaced-*` file. `--only` takes comma-separated names; spaces are ignored.
+
 Example: `kaizen-link --check`.
 
 ## packet-report
@@ -328,6 +477,8 @@ usage: packet-report [-h] [--packets PACKETS | --project PROJECT]
                      [--since SINCE] [--until UNTIL] [--ladder LADDER]
                      [--markdown | --json]
 ```
+
+An escalation is labelled by its full path of model names, with consecutive duplicates removed (`terra->sol->terra`). Names are normalised against the calibration ladder. `rounds: 1.0` is accepted; `1.5` and NaN make that history invalid. Effort-only changes are not escalations.
 
 Example: `packet-report --project . --markdown`.
 
@@ -350,14 +501,24 @@ Find stale wording using `rules-lint.patterns`, the user file `kaizen-rules-lint
 usage: rules-lint [-h] [--repo DIR] [--json]
 ```
 
+A repository with only `AGENTS.md` is detected. The bundled `rules-lint.patterns` hold no personal patterns; put them in `<Claude config dir>/kaizen-rules-lint.txt` or `docs/kaizen/rules-lint.txt`.
+
 Example: `rules-lint --repo .`.
 
 ## notes-ledger
 
-Record changes, update them, or propose due measurements. Configure paths in global `notesLedger`; unattended runs may only use `add`.
+Record changes, update them, or propose due measurements. Configure paths in global `notesLedger` in `agent-kaizen.json`: `csv` (required), `timeline` (optional) and `measureAfterDays` (default 7). Paths must be strings. Unattended runs may only use `add`.
 
 ```text
-usage: notes-ledger [-h] {add,set,due} ...
+notes-ledger add --date D --category C --change X --why W --measure M --source S
+                 [--status planned|active] [--dry-run]
+notes-ledger set --match TEXT [--status planned|active|superseded|reverted]
+                 [--measured yes|no] [--effect TEXT] [--dry-run]
+notes-ledger due [--project DIR] [--json]
 ```
+
+The CSV header is `date,category,change,source,status,measured`. `add` does not create the file: it must exist with that header, and the error names the path. `add` treats a same-date row as already present only when the text before ` Why: ` is equal. `set --match` selects the CSV row whose change cell contains TEXT; it must select exactly one row. In the timeline it matches the row exactly first, and falls back to a substring only when no exact row exists. Errors name the row (`invalid CSV row N: expected 6 columns, found K`). A BOM and blank lines are tolerated, `add` keeps the file's line ending, and a symlinked ledger stays a link.
+
+Exit codes: 0 success, 1 file or runtime error, 2 invalid data or arguments, 3 no `notesLedger.csv` configured.
 
 Example: `notes-ledger due`.

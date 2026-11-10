@@ -21,7 +21,7 @@ class PacketReportTests(unittest.TestCase):
         result = self.run_report('--packets', FIXTURE, '--json')
         self.assertEqual(result.returncode, 0, result.stderr)
         data = json.loads(result.stdout)
-        self.assertEqual(set(data), {'groups', 'area_groups', 'totals', 'fix_origins', 'proposals', 'rule', 'disclaimer'})
+        self.assertEqual(set(data), {'groups', 'area_groups', 'totals', 'fix_origins', 'proposals', 'escalations', 'dispatch_models_coverage', 'rule', 'disclaimer'})
         self.assertIn({'model': 'sonnet', 'effort': 'high', 'direction': 'UP'}, data['proposals'])
         self.assertIn({'model': 'opus', 'effort': 'high', 'direction': 'DOWN'}, data['proposals'])
         self.assertIn('too few', self.run_report('--packets', FIXTURE, '--since', '2026-02-01').stdout)
@@ -64,6 +64,61 @@ class PacketReportTests(unittest.TestCase):
             self.assertEqual(rendered.returncode, 0, rendered.stderr)
             self.assertIn('| model effort / area | n |', rendered.stdout)
             self.assertIn('| --- | ---:', rendered.stdout)
+
+    def test_escalations_and_coverage(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'packets.jsonl'
+            base = dict(ts='2026-01-01T00:00:00Z', model='sol', effort='high')
+            terra = dict(model='terra', effort='high', rounds=1)
+            sol = dict(model='sol', effort='high', rounds=0)
+            histories = [[terra, sol], [terra, terra], None, 'invalid',
+                         [dict(model='terra', effort='high', rounds=True)], []]
+            rows = [dict(base, id=str(i), dispatch_models=history)
+                    for i, history in enumerate(histories)]
+            rows.append(dict(base, id='missing'))
+            path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            result = self.run_report('--packets', path, '--json')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            data = json.loads(result.stdout)
+            self.assertEqual(data['escalations'], {'count': 1, 'pairs': {'terra->sol': 1}})
+            self.assertEqual(data['dispatch_models_coverage'], {'n_with': 2, 'n_total': 7})
+            self.assertEqual(data['totals']['packets'], 7)
+            for option in ((), ('--markdown',)):
+                output = self.run_report('--packets', path, *option).stdout
+                self.assertIn('Escalations', output)
+                self.assertIn('terra->sol: 1', output)
+                self.assertIn('2/7', output)
+
+    def test_escalation_path_names_and_float_rounds(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'packets.jsonl'
+            base = dict(ts='2026-01-01T00:00:00Z', model='terra', effort='high')
+
+            def step(model, rounds=0):
+                return dict(model=model, effort='high', rounds=rounds)
+
+            histories = [[step('terra'), step('sol'), step('terra')],
+                         [step('gpt-6.1-terra'), step('sol')],
+                         [step('terra', 1.0), step('sol')],
+                         [step('terra', 1.5), step('sol')],
+                         [step('terra', float('nan')), step('sol')]]
+            rows = [dict(base, id=str(i), dispatch_models=h) for i, h in enumerate(histories)]
+            path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            data = json.loads(self.run_report('--packets', path, '--ladder', 'terra high,sol high', '--json').stdout)
+            self.assertEqual(data['escalations'], {'count': 3, 'pairs': {
+                'terra->sol': 2, 'terra->sol->terra': 1}})
+            self.assertEqual(data['dispatch_models_coverage'], {'n_with': 3, 'n_total': 5})
+
+    def test_config_dir_expands_home(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / 'cfg').mkdir()
+            (home / 'cfg/agent-kaizen.json').write_text(json.dumps({'calibrationLadder': 5}))
+            env = dict(os.environ, HOME=str(home), CLAUDE_CONFIG_DIR='~/cfg')
+            result = subprocess.run([sys.executable, str(SCRIPT), '--packets', str(FIXTURE)],
+                                    cwd=ROOT, env=env, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 2, result.stdout)
+            self.assertIn('ladder must be', result.stderr)
 
     def test_unreadable_file(self):
         with tempfile.TemporaryDirectory() as tmp:

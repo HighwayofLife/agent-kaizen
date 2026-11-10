@@ -9,13 +9,15 @@ argument-hint: "[propose|safe|auto|yolo]"
 
 Each subagent loads only the context its job needs and runs on the cheapest model that does that job well. The main session routes work to it on purpose, not by habit.
 
-**Changes:** edits agent definitions, settings and hooks, after you approve. Back up `~/.claude/agents/` and `~/.claude/settings.json` first.
+**Changes:** edits agent definitions, settings and hooks, after you approve. Back up `<Claude config dir>/agents/` and `<Claude config dir>/settings.json` first.
 
 **Autonomy:** follow `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. The mode comes from the skill argument (`propose`, `safe`, `auto` or `yolo`), else `docs/kaizen/config.json`, else `agent-kaizen.json` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`), else `propose`. In `safe` and `auto`, read every "wait for my OK" below as: apply it yourself if the mode allows (backup, verify, roll back on failure, ledger row), otherwise list it as a proposal. Hard stops always ask. At most `maxChangesPerRun` changes (default 3). End with a summary of what was applied, skipped and rolled back.
 
+In this skill, `<Claude config dir>` means `$CLAUDE_CONFIG_DIR` or `~/.claude`, and `<Codex home>` means `$CODEX_HOME` or `~/.codex`.
+
 ## Task
 
-Look at my custom agents (~/.claude/agents/*.md and .claude/agents/*.md) and how the main
+Look at my custom agents (<Claude config dir>/agents/*.md and .claude/agents/*.md) and how the main
 session uses them (the usage audit in docs/kaizen/ shows spawn counts and cost per type).
 
 For each agent report: model, effort, tools allowlist (or none), what instructions it
