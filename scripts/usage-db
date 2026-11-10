@@ -3,7 +3,7 @@
 import argparse
 from collections import Counter
 import csv
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
 from importlib.machinery import SourceFileLoader
@@ -25,7 +25,7 @@ def load_sibling(name, file):
 
 
 AUDIT = load_sibling('kaizen_token_audit', 'token-audit')
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 BATCH = 2000
 BUSY_SECONDS = 30
@@ -88,8 +88,8 @@ def open_write(path):
                 if statement.strip():
                     conn.execute(statement)
             conn.execute("INSERT INTO meta VALUES ('schema_version', ?)", (str(SCHEMA_VERSION),))
-        else:
-            check_version(conn, path)
+        elif check_version(conn, path) < SCHEMA_VERSION:
+            migrate(conn)
         conn.execute('COMMIT')
         # Only a file that passed the checks above may be switched to WAL.
         conn.execute('PRAGMA journal_mode = WAL')
@@ -100,6 +100,26 @@ def open_write(path):
         conn.close()
         raise Fatal(f'{path} is not a usable SQLite database: {exc}')
     return conn
+
+
+def migrate(conn):
+    """Version 1 -> 2: Codex call ids start with the session id inside the file, not the file name.
+
+    Rows whose file still exists are renamed. A row that would collide with an already renamed one is
+    a copy of the same call (the same session read under another file name), so it is dropped."""
+    paths = [Path(row[0]) for row in conn.execute("SELECT path FROM files WHERE source = 'codex'")]
+    stems = Counter(path.stem for path in paths)
+    for path in paths:
+        stem = path.stem
+        session = codex_header(path)[1] if stems[stem] == 1 else None
+        if not session or session == stem:
+            continue
+        low, high = stem + ':', stem + ';'
+        conn.execute("UPDATE OR IGNORE calls SET call_id = ? || substr(call_id, ?) "
+                     "WHERE source = 'codex' AND call_id >= ? AND call_id < ?",
+                     (session + ':', len(low) + 1, low, high))
+        conn.execute("DELETE FROM calls WHERE source = 'codex' AND call_id >= ? AND call_id < ?", (low, high))
+    conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),))
 
 
 def open_read(path):
@@ -181,17 +201,22 @@ def claude_calls(path, session, warnings):
         yield (ident, ts, day, model) + values
 
 
-def codex_cwd(path):
+def codex_header(path):
+    """(cwd, session id) from the first line of a Codex session file; None for what is missing."""
     try:
         with path.open('rb') as stream:
             payload = json.loads(stream.readline(AUDIT.LINE_LIMIT)).get('payload')
-        cwd = payload.get('cwd') if isinstance(payload, dict) else None
-        return cwd if isinstance(cwd, str) else None
+        if not isinstance(payload, dict):
+            return None, None
+        cwd, ident = payload.get('cwd'), payload.get('id')
+        return (cwd if isinstance(cwd, str) else None), (ident if isinstance(ident, str) and ident else None)
     except (OSError, ValueError, AttributeError, RecursionError):
-        return None
+        return None, None
 
 
-def codex_calls(path, warnings):
+def codex_calls(path, session, warnings):
+    """Call ids use the session id inside the file, so a copied or moved file adds nothing.
+    A file with no id falls back to its name."""
     previous, model = {}, 'unknown'
     for row in AUDIT.rows(path, EPOCH, warnings, keep_model=True):
         if not isinstance(row.get('timestamp'), str):
@@ -220,7 +245,7 @@ def codex_calls(path, warnings):
         if not any(values):
             continue
         total = previous.get('total_tokens', previous.get('input_tokens', 0) + previous.get('output_tokens', 0))
-        yield (f'{path.stem}:{ts}:{number(total)}', ts, day, model if isinstance(model, str) else 'unknown') + values
+        yield (f'{session}:{ts}:{number(total)}', ts, day, model if isinstance(model, str) else 'unknown') + values
 
 
 # --- ingest ---
@@ -292,8 +317,9 @@ def ingest(args):
             project = parents[parent]
             calls = claude_calls(file, session, warnings)
         else:
-            session, agent, project = file.stem, 'main', codex_cwd(file)
-            calls = codex_calls(file, warnings)
+            project, identity = codex_header(file)
+            session, agent = file.stem, 'main'
+            calls = codex_calls(file, identity or file.stem, warnings)
         try:
             stats['added'] += store_file(conn, file, source, info.st_size, info.st_mtime_ns, calls,
                                          project, session, agent, warnings)
@@ -330,6 +356,37 @@ def status(args):
     return 0
 
 
+# --- prune ---
+
+def prune(args):
+    """Delete calls whose UTC day is before today minus --older-than days. Dry run unless --apply."""
+    path = db_path(args)
+    cutoff = (datetime.now(timezone.utc).date() - timedelta(days=args.older_than)).isoformat()
+    if not path.is_file():
+        raise Fatal(f'no database at {path}; run: usage-db ingest', 1)
+    conn = open_write(path) if args.apply else open_read(path)
+    try:
+        count, first, last = conn.execute('SELECT count(*), min(day), max(day) FROM calls WHERE day < ?', (cutoff,)).fetchone()
+        if not count:
+            print(f'nothing to prune: no calls older than {args.older_than} days (before {cutoff})')
+            return 0
+        span = f'{count} calls from {first} to {last}'
+        if not args.apply:
+            print(f'dry run: would delete {span} (older than {args.older_than} days, before {cutoff}). '
+                  'Nothing was changed; add --apply to delete.')
+            return 0
+        before = path.stat().st_size
+        conn.execute('BEGIN IMMEDIATE')
+        conn.execute('DELETE FROM calls WHERE day < ?', (cutoff,))
+        conn.execute('COMMIT')
+        conn.execute('VACUUM')
+        conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+        print(f'deleted {span}; vacuumed {before} -> {path.stat().st_size} bytes')
+        return 0
+    finally:
+        conn.close()
+
+
 # --- report ---
 
 def pricing_state(args):
@@ -353,7 +410,7 @@ def sql_where(conditions):
     return (' WHERE ' + ' AND '.join(conditions)) if conditions else ''
 
 
-def report_rows(conn, args, state):
+def report_where(args):
     where, params = [], []
     if args.since:
         where.append('day >= ?')
@@ -367,7 +424,15 @@ def report_rows(conn, args, state):
     if args.project:
         where.append('instr(lower(COALESCE(project, \'\')), lower(?)) > 0')
         params.append(args.project)
-    key = GROUPS[args.by]
+    return where, params
+
+
+def priced_rows(conn, state, where, params, keys):
+    """Yield (group values, source, model, calls, tokens, peak, cost, unpriced) for calls matching `where`.
+
+    `keys` are SQL expressions to group by; tokens is [input, cache_read, cache_write_5m, cache_write_1h,
+    output] and peak the largest single-call context. Shared by `report`, `usage-series --from-db` and
+    `usage-compare --from-db`, so all three price the same way."""
     pricing = state['_pricing']
     # A Claude model with a context threshold is priced call by call; every other
     # combination is priced once per group, because price() is linear in tokens.
@@ -377,23 +442,32 @@ def report_rows(conn, args, state):
     marks = ','.join('?' * len(per_call))
     expr = "COALESCE(model, 'unknown')"
     threshold = f"source = 'claude' AND {expr} IN ({marks})"
-    sums = 'COUNT(*), SUM(input), SUM(cache_read), SUM(cache_write_5m), SUM(cache_write_1h), SUM(output)'
-    each = '1, input, cache_read, cache_write_5m, cache_write_1h, output'
+    context = 'input + cache_read + cache_write_5m + cache_write_1h'
+    sums = f'COUNT(*), SUM(input), SUM(cache_read), SUM(cache_write_5m), SUM(cache_write_1h), SUM(output), MAX({context})'
+    each = f'1, input, cache_read, cache_write_5m, cache_write_1h, output, {context}'
     conditions = where + ([f'NOT ({threshold})'] if per_call else [])
-    grouped = f'SELECT {key}, source, {expr}, {sums} FROM calls{sql_where(conditions)} GROUP BY 1, 2, 3'
+    select = ', '.join(keys + ['source', expr])
+    grouped = f'SELECT {select}, {sums} FROM calls{sql_where(conditions)} GROUP BY {", ".join(map(str, range(1, len(keys) + 3)))}'
     queries = [(grouped, params + per_call)]
     if per_call:
-        queries.append((f'SELECT {key}, source, {expr}, {each} FROM calls{sql_where(where + [threshold])}',
-                        params + per_call))
-    groups = {}
+        queries.append((f'SELECT {select}, {each} FROM calls{sql_where(where + [threshold])}', params + per_call))
     for sql, values in queries:
-        for group, source, model, calls, *tokens in conn.execute(sql, values):
+        for row in conn.execute(sql, values):
+            group, (source, model, calls, *tokens, peak) = row[:len(keys)], row[len(keys):]
             tokens = [t or 0 for t in tokens]
             cost = AUDIT.price(state, model, 'main', usage_dict(source, *tokens), codex=source == 'codex')
-            entry = groups.setdefault(group, Counter())
-            entry.update(calls=calls, input=tokens[0], cache_read=tokens[1], cache_write=tokens[2] + tokens[3],
-                         output=tokens[4], cost=cost,
-                         unpriced=calls if AUDIT.pricing_key(pricing, model) is None else 0)
+            yield (group, source, model, calls, tokens, peak or 0, cost,
+                   calls if AUDIT.pricing_key(pricing, model) is None else 0)
+
+
+def report_rows(conn, args, state):
+    where, params = report_where(args)
+    groups = {}
+    for (group,), source, model, calls, tokens, peak, cost, unpriced in priced_rows(
+            conn, state, where, params, [GROUPS[args.by]]):
+        entry = groups.setdefault(group, Counter())
+        entry.update(calls=calls, input=tokens[0], cache_read=tokens[1], cache_write=tokens[2] + tokens[3],
+                     output=tokens[4], cost=cost, unpriced=unpriced)
     return groups
 
 
@@ -479,6 +553,16 @@ def run_sql(args):
 
 # --- command line ---
 
+def positive_days(value):
+    try:
+        days = int(value)
+    except ValueError:
+        days = 0
+    if days < 1:
+        raise argparse.ArgumentTypeError(f'{value!r} is not a whole number of days, 1 or more')
+    return days
+
+
 def day(value):
     try:
         return datetime.strptime(value, '%Y-%m-%d').date().isoformat()
@@ -491,7 +575,7 @@ def build_parser():
     common.add_argument('--db', type=Path, default=None, metavar='PATH',
                         help='database file (default: $KAIZEN_USAGE_DB, else <CLAUDE_CONFIG_DIR or ~/.claude>/kaizen-usage.db)')
     parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest='command', required=True, metavar='{ingest,status,report,sql}')
+    commands = parser.add_subparsers(dest='command', required=True, metavar='{ingest,status,report,prune,sql}')
     ingest_parser = commands.add_parser('ingest', parents=[common], help='read new or changed transcripts into the database',
                                         description='Read Claude transcripts and Codex session files that are new or changed since the last run.')
     ingest_parser.add_argument('--quiet', action='store_true', default=False, help='print nothing on success (default: print one summary line)')
@@ -508,6 +592,13 @@ def build_parser():
     report_parser.add_argument('--format', choices=('table', 'csv', 'json'), default='table', help='output format (default: table)')
     report_parser.add_argument('--pricing', type=Path, default=Path(__file__).resolve().with_name('pricing.json'),
                                help='price file (default: pricing.json next to this script)')
+    prune_parser = commands.add_parser('prune', parents=[common], help='delete old calls (dry run unless --apply)',
+                                       description='Delete calls older than DAYS UTC days. Without --apply, only print how many rows and '
+                                                   'which dates would go. After --apply the file is vacuumed. Nothing is pruned automatically. '
+                                                   'A transcript that still exists and later changes is re-read, which stores its old calls again.')
+    prune_parser.add_argument('--older-than', type=positive_days, required=True, metavar='DAYS',
+                              help='delete calls whose UTC day is before today minus DAYS (1 or more)')
+    prune_parser.add_argument('--apply', action='store_true', default=False, help='really delete (default: dry run)')
     sql_parser = commands.add_parser('sql', parents=[common], help='run one read-only SQL statement',
                                      description='Run one read-only statement. Tables: calls, files, meta.')
     sql_parser.add_argument('query', help='one SQL statement; the database is opened read-only')
@@ -521,7 +612,7 @@ def main():
     if args.command == 'report' and args.since and args.until and args.until < args.since:
         parser.error('--until must be on or after --since')
     try:
-        return dict(ingest=ingest, status=status, report=report, sql=run_sql)[args.command](args)
+        return dict(ingest=ingest, status=status, report=report, prune=prune, sql=run_sql)[args.command](args)
     except Fatal as exc:
         print(f'usage-db: {exc}', file=sys.stderr)
         return exc.code

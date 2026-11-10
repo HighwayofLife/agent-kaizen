@@ -2,11 +2,12 @@
   "source": {
     "anthropic": "https://platform.claude.com/docs/en/about-claude/pricing",
     "openai": "https://developers.openai.com/api/docs/pricing",
-    "checked": "2026-10-29",
+    "checked": "2026-11-10",
     "note": "Published API list prices (OpenAI: Standard tier, prompts up to 272K tokens). Most users are on subscriptions: token-audit uses these as a cost weighting, not a bill. Update when a vendor changes prices."
   },
   "unit": "USD per million tokens",
   "models": {
+    "claude-fable-5-2": {"input": 8, "cache_write_5m": 10, "cache_write_1h": 16, "cache_read": 0.2, "output": 40},
     "claude-fable-5-1": {"input": 10, "cache_write_5m": 12.5, "cache_write_1h": 20, "cache_read": 0.25, "output": 50},
     "claude-fable-5": {"input": 10, "cache_write_5m": 12.5, "cache_write_1h": 20, "cache_read": 1, "output": 50},
     "claude-opus-5-5": {"input": 4, "cache_write_5m": 5, "cache_write_1h": 8, "cache_read": 0.2, "output": 20},
@@ -26,6 +27,7 @@
     "gpt-6-luna": {"input": 0.1, "cached_input": 0.01, "output": 0.5}
   },
   "aliases": {
+    "claude-fable-5-2": "claude-fable-5-2",
     "claude-fable-5-1": "claude-fable-5-1",
     "claude-fable-5": "claude-fable-5",
     "claude-opus-5-5": "claude-opus-5-5",
@@ -40,7 +42,7 @@
     "claude-sonnet-4-6": "claude-sonnet-4",
     "claude-haiku-5-5": "claude-haiku-5-5",
     "claude-haiku-4-5": "claude-haiku-4-5",
-    "fable": "claude-fable-5-1",
+    "fable": "claude-fable-5-2",
     "opus": "claude-opus-5-5",
     "sonnet": "claude-sonnet-5-5",
     "haiku": "claude-haiku-5-5",

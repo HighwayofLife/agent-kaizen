@@ -98,11 +98,16 @@ def summarize(rows, since=None, until=None, ladder=None):
     for history in histories:
         path = []
         for dispatch in history:
-            name = normalize_model(dispatch['model'], models)
-            if not path or path[-1] != name:
-                path.append(name)
+            step = (normalize_model(dispatch['model'], models), dispatch['effort'])
+            if not path or path[-1] != step:
+                path.append(step)
         if len(set(path)) > 1:
-            paths.append('->'.join(path))
+            if len({effort for _, effort in path}) == 1:
+                # Only the model changed: label by the distinct model path.
+                names = [name for name, _ in path]
+                paths.append('->'.join(names[i] for i in range(len(names)) if not i or names[i] != names[i - 1]))
+            else:
+                paths.append('->'.join(f'{name}:{effort}' for name, effort in path))
     pairs = Counter(paths)
     return dict(groups=overall, area_groups=areas,
                 escalations=dict(count=sum(pairs.values()),

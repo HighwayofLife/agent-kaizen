@@ -109,6 +109,26 @@ class PacketReportTests(unittest.TestCase):
                 'terra->sol': 2, 'terra->sol->terra': 1}})
             self.assertEqual(data['dispatch_models_coverage'], {'n_with': 3, 'n_total': 5})
 
+    def test_effort_only_escalation_is_counted_and_labelled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'packets.jsonl'
+            base = dict(ts='2026-01-01T00:00:00Z', model='terra', effort='medium')
+
+            def step(model, effort):
+                return dict(model=model, effort=effort, rounds=0)
+
+            histories = [[step('terra', 'medium'), step('terra', 'high')],
+                         [step('terra', 'medium'), step('terra', 'high')],
+                         [step('terra', 'high'), step('sol', 'high')],
+                         [step('terra', 'medium'), step('sol', 'high')],
+                         [step('terra', 'high'), step('terra', 'high')]]
+            rows = [dict(base, id=str(i), dispatch_models=h) for i, h in enumerate(histories)]
+            path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            data = json.loads(self.run_report('--packets', path, '--json').stdout)
+            self.assertEqual(data['escalations'], {'count': 4, 'pairs': {
+                'terra:medium->terra:high': 2, 'terra:medium->sol:high': 1, 'terra->sol': 1}})
+            self.assertIn('terra:medium->terra:high: 2', self.run_report('--packets', path).stdout)
+
     def test_config_dir_expands_home(self):
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)

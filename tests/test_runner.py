@@ -1115,13 +1115,31 @@ class ExecutionTests(DiscoveryCase):
                                                 self.runner.HARD_STOP_DENY, 'Edit(**/.git/**)',
                                                 'Write(**/.git/**)', *rules, *self.runner.backup_deny()])])
                     for rule in rules:
-                        for text in ('CLAUDE', 'rules'):
+                        if rule.endswith('/AGENTS.md)'):
+                            continue  # the one literal instruction-file rule (Codex home)
+                        for text in ('.md', 'CLAUDE', 'rules'):
                             self.assertNotIn(text, rule)
                     root = '//' + self.cfg.as_posix().lstrip('/')
-                    for pattern in ('settings*.json', 'hooks/**', '**/*.json'):
+                    for pattern in ('settings*.json', 'hooks/**', '**/*.json', 'agents/**'):
                         self.assertIn(f'Edit({root}/{pattern})', rules)
+                    self.assertIn(f'Write({root}/agents/**)', rules)
+                    codex = '//' + self.cx.as_posix().lstrip('/')
+                    self.assertIn(f'Edit({codex}/AGENTS.md)', rules)
+                    self.assertIn(f'Write({codex}/AGENTS.md)', rules)
+                    project = '//' + path.as_posix().lstrip('/')
+                    for pattern in ('.claude/hooks/**', '.mcp.json', '.github/workflows/**', '.husky/**'):
+                        for tool in ('Edit', 'Write'):
+                            self.assertIn(f'{tool}({project}/{pattern})', rules)
                     self.assertNotIn(f'Bash(python3 {self.audit}:*)', allowed)
                     self.assertNotIn(f'Bash({sys.executable} {self.audit}:*)', allowed)
+                    granted = allowed.split(',')
+                    for bare in ('Read', 'Grep', 'Glob'):
+                        self.assertNotIn(bare, granted)
+                    scope = lambda directory: '//' + Path(directory).resolve().as_posix().lstrip('/')
+                    for directory in (path, self.cfg, self.cx, SCRIPTS.parent, self.cfg / 'audits', self.audits):
+                        self.assertIn(f'Read({scope(directory)}/**)', granted)
+                    self.assertEqual([item for item in granted if item.startswith('Read(')],
+                                     self.runner.auto_read_allow(path, self.audits))
                     backup = SCRIPTS / 'kaizen-backup'
                     for prefix in ('', 'python3 ', sys.executable + ' '):
                         for subcommand in ('begin', 'finish', 'list'):

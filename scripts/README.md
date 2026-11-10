@@ -69,8 +69,13 @@ Built-in check `require-change` (shown as `Check 0`) fails an engineer run that
 changed nothing. It is decided per Codex run, from a snapshot taken right before
 and after the run, and is cumulative across rounds. Files written by `-k` checks
 never count, a commit by Codex counts, and ignored files do not. The snapshot is
-repo-wide even when `-C` is a subdirectory; the output directory is excluded
-when it is inside the repo. Pass `--allow-no-change` when no change is expected.
+limited to the subdirectory when `-C` is a subdirectory of a Git repository
+(changes elsewhere in the repo do not count); with `-C` at the repo root it
+covers the whole repo. HEAD movement still counts, and the output directory is
+excluded when it is inside the repo. Pass `--allow-no-change` when no change is
+expected. The resume prompt after a failed check does not mention that flag; it
+says no files changed and asks for the change or a plain reason none is needed.
+The report and `--help` still name the flag.
 If the tree was dirty before dispatch, the report has `WARNING: tree was dirty
 before dispatch (N paths)`; if the snapshot fails, `WARNING: tree snapshot
 failed: <reason>; require-change skipped`.
@@ -238,7 +243,7 @@ Zero-usage `<synthetic>` rows are not counted as calls.
 
 Both audit and review accept `--audits`, `--python`, `--token-audit` and `--pricing` overrides. Review also accepts `--claude`, `--model` and `--max-turns`. Run each subcommand with `--help` for details.
 
-Under `<Claude config dir>/audits`, global reports are `token-audit-*.md`, extracts live in `extracts/`, and `projects/index.json` is the registry. Each `projects/<key>/` holds `state.json`, project `token-audit-*.md` and `cycle-<date>.md` (a second proposal on the same day gets a `-2` suffix). Scheduler output goes to `run.log`. Statuses, run lock, timeouts, auto-mode opt-in (`autoProjects`) and environment variables are in [docs/scheduling.md](../docs/scheduling.md).
+Under `<Claude config dir>/audits`, global reports are `token-audit-*.md`, extracts live in `extracts/`, and `projects/index.json` is the registry. Each `projects/<key>/` holds `state.json`, project `token-audit-*.md` and `cycle-<date>.md` (a second proposal on the same day gets a `-2` suffix). Scheduler output goes to `run.log`. `config set` takes a lock file, `agent-kaizen.json.lock`, beside the global config (beside the link when the config is a symlink), and leaves it in place. Reviews also lock the backup root, where protected active-run markers support hard-kill recovery across audits folders. The primary marker is `.active-run.json`; additional markers use `.active-run.<32-lowercase-hex-uuid>.json`. Unresolved recovery retains its marker and snapshots and makes each retry propose-only. The status gives a non-forced undo command when available and a command to discard the record after manual resolution. Statuses, run lock, timeouts, hard-kill recovery, auto-mode opt-in (`autoProjects`) and environment variables are in [docs/scheduling.md](../docs/scheduling.md).
 
 ## dispatch-status
 
@@ -278,7 +283,10 @@ install-schedule [--scheduler auto|launchd|cron|systemd] [--apply] [--remove]
 `--apply` installs the audit job and the managed scripts (through `kaizen-link`)
 and adds the weekly review with `--review`. `--auto` implies `--review`.
 `--apply` without `--review` or `--auto` removes an installed review job; the
-audit job stays. `--remove` removes both. Errors print `install-schedule:
+audit job stays. If a review job is also installed in another backend (launchd
+agent, systemd timer or cron line), it is left alone and a warning goes to
+stderr, one per backend, with the command that removes it. `--remove` removes
+both. Errors print `install-schedule:
 <error>` and exit 2. See [docs/scheduling.md](../docs/scheduling.md).
 
 ## kaizen-backup
@@ -291,10 +299,11 @@ kaizen-backup finish CHANGE_DIR [--verification passed|failed]
 kaizen-backup action CHANGE_DIR --did CMD --undo CMD
 kaizen-backup list [--all]
 kaizen-backup undo [last|run|CHANGE_DIR] [--force]
+kaizen-backup prune --older-than DAYS [--apply]
 ```
 
 `begin` copies existing files, records missing ones as created, refuses
-credential paths and prints the change folder; run it before editing. `finish`
+credential paths and prints the change folder; run it before editing. Run and skill names cannot contain `/`, `..` or NUL. `finish`
 records each file's sha256 after the edit. `action` records a non-file action
 and its reverse command; `undo` prints that command and never runs it. `list`
 shows changes newest first.
@@ -309,6 +318,20 @@ a path has its hash checked, and restore runs newest first. A corrupt manifest
 is skipped with a message on stderr. `undo run` also reports a conflict when a
 file was edited by hand between two changes of the run: `<path> was edited
 between <older change> and <newer change>`. `--force` skips this check.
+`undo run` undoes only the newest group of consecutive changes that share one
+run id and session. Older changes that reused the id are left open, and stderr
+says `kaizen-backup: run id <id> also appears on older changes; not undoing: <change>, ...`.
+Undo those with `kaizen-backup undo CHANGE_DIR`.
+
+`prune` lists finished changes created more than DAYS days ago (DAYS must be 1
+or more). It is a dry run unless `--apply` is given, which deletes them. Each
+change gets one line, `would remove <folder>\t<created_at>\t<N> bytes` (or
+`removed ...`), then a total line with the count and bytes freed. It never
+removes unfinished changes, changes with a corrupt manifest, changes without a
+usable `created_at`, or anything newer than the cutoff; each is reported as
+`skipped <folder>: <reason>`. Each change restores from its own backup, so
+pruning an older change does not affect `undo` of a newer change to the same
+file.
 
 The backup root is `KAIZEN_BACKUP_DIR` if set (empty counts as unset), else
 `<Claude config dir>/kaizen-backups`. The backup root is created with mode 700; an existing root is set to mode 700
@@ -324,6 +347,20 @@ projects. Repeat `--cwd` for directories and descendants, or `--project` for
 substrings (Claude project folder names; Codex recorded cwd). The two selection
 options cannot be combined. `CLAUDE_CONFIG_DIR` and `CODEX_HOME` are honored.
 Subagent transcripts whose parent transcript is gone may be missed by `--cwd`.
+There is no `--days` option; use `--since YYYY-MM-DD`. `--out` is required.
+
+`--from-db` reads calls, tokens and cost from the [usage-db](#usage-db) store
+instead of transcripts, for windows whose transcripts have been deleted. Calls without an id that share the same second and usage count once in the database. With no
+database it exits 1 (`usage-series: no database at PATH; run: usage-db ingest`).
+`--git` still reads git. The database does not store some measurements, so
+`daily.csv` has `n/a` (not 0) in `wakeups`, `wakeup_avg_ctx`, `main_images`,
+`main_reads`, `spawns_total`, `codex_threads_db`, `codex_tokens_db`, every
+`codex_tokens_db_*` and every `command_*` column, and `daily-agents.csv` has
+`n/a` in `runs`. Other columns match the transcript output where both have full
+data. `--cwd` matches the stored working directory and its descendants.
+`--project` matches the transcript folder name rebuilt from the stored path
+(every character outside a-z, A-Z, 0-9 becomes `-`) for Claude calls, and the
+stored working directory for Codex calls.
 
 ```bash
 usage-series --since 2026-10-01 --until 2026-10-30 --cwd . --out out/series
@@ -375,6 +412,14 @@ use only the listed active days. Average context is weighted by main calls;
 peak context is the maximum. Ratios are after / before; a zero denominator is
 `n/a`. Override the activity threshold with `--active-min-calls N`.
 
+`--from-db` (needs `--clean-split`; with `--series` it exits 2) computes the
+clean-split metrics from the usage-db store, Claude calls only. Calls without an id that share the same second and usage count once in the database. Windows are split
+by call time, so the rule that drops files modified at or after the cutoff does
+not apply: a transcript that spans the cutoff is split, not dropped.
+`wake-ups/day` and `images/day` print `n/a` because the database stores neither.
+The first warning line says the split uses the usage database. A missing
+database exits 1 with `usage-compare: no database at PATH; run: usage-db ingest`.
+
 ```bash
 usage-compare --series out/series --cutoff 2026-10-20 --before-from 2026-10-01
 usage-compare --series out/series --cutoff 2026-10-20 --json
@@ -421,6 +466,7 @@ usage-db report [--db PATH] [--since YYYY-MM-DD] [--until YYYY-MM-DD]
                 [--by day|model|project|agent|session|source]
                 [--project SUBSTR] [--source claude|codex]
                 [--format table|csv|json] [--pricing PATH]
+usage-db prune --older-than DAYS [--apply] [--db PATH]
 usage-db sql QUERY [--db PATH] [--format table|csv|json]
 ```
 
@@ -433,6 +479,16 @@ change since the previous cumulative counter. A file that is later deleted
 keeps its rows. Bad lines and unreadable files are counted and printed as
 warnings, not errors. `--quiet` prints nothing.
 
+Schema version 2 keys Codex call ids by the session id stored inside the session
+file (the `id` in its first line), not the file name, so a session file that is
+copied or moved to a new name is not counted twice. A file with no session id
+falls back to its file name. A version 1 database is upgraded in place by the
+next `ingest`, with no flag or prompt. Codex rows whose session file still
+exists are re-keyed, and rows already stored twice under two file names collapse
+to one. Rows whose file was deleted before the upgrade keep their old ids, so a
+session that was also copied stays counted twice. `status`, `report` and `sql`
+read a version 1 database without migrating it.
+
 `status` shows the path, size, schema version, calls per source, first and last
 day and last ingest time. A missing database exits 1.
 
@@ -442,6 +498,14 @@ day and last ingest time. A missing database exits 1.
 Cost is not stored. `report` prices each call when it runs, with `pricing.json`
 (or `--pricing`), so a corrected price also corrects old rows. Models without a
 price show as `unpriced_calls` and add no cost.
+
+`prune` deletes calls whose UTC day is before today minus DAYS and runs
+`VACUUM` when `--apply` is given. Without `--apply` it is a dry run that prints how many calls and which
+dates would go, and changes nothing. DAYS must be a whole number of 1 or more,
+otherwise it exits 2. A missing database exits 1 and is not created. Nothing is
+pruned automatically: `ingest` and `report` never delete. A transcript that
+still exists and later changes is read again in full, which stores its pruned
+calls again.
 
 `sql` runs one statement against a read-only connection; an error exits 2.
 Tables are `calls`, `files` and `meta`. A database written by a newer schema
@@ -478,7 +542,7 @@ usage: packet-report [-h] [--packets PACKETS | --project PROJECT]
                      [--markdown | --json]
 ```
 
-An escalation is labelled by its full path of model names, with consecutive duplicates removed (`terra->sol->terra`). Names are normalised against the calibration ladder. `rounds: 1.0` is accepted; `1.5` and NaN make that history invalid. Effort-only changes are not escalations.
+An escalation is labelled by its full path of model names, with consecutive duplicates removed (`terra->sol->terra`). Names are normalised against the calibration ladder. `rounds: 1.0` is accepted; `1.5` and NaN make that history invalid. An escalation is also counted when only the effort rises between rounds (same model); such a pair is labelled with model and effort (`terra:medium->terra:high`). When only the model changes the label stays the model path (`terra->sol`). If both change, every step is labelled `model:effort`.
 
 Example: `packet-report --project . --markdown`.
 

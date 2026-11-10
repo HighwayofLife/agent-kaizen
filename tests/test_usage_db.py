@@ -5,6 +5,7 @@ from importlib.machinery import SourceFileLoader
 import io
 import json
 import os
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 import sqlite3
@@ -53,9 +54,11 @@ class UsageDbCase(StubCase):
     def main_file(self, rows, name='main', project='alpha'):
         return jsonl(self.config / 'projects' / project / f'{name}.jsonl', rows)
 
-    def codex_file(self, rows, name='rollout-one', day='2025/01/01', cwd=None):
+    def codex_file(self, rows, name='rollout-one', day='2025/01/01', cwd=None, session_id=None):
         meta = dict(type='session_meta', timestamp='2024-12-31T00:00:00Z',
                     payload=dict(cwd=cwd or self.cwd, model='gpt-test-sol'))
+        if session_id:
+            meta['payload']['id'] = session_id
         return jsonl(self.codex / 'sessions' / day / f'{name}.jsonl', [meta] + rows)
 
     def ingest(self, *args, **kwargs):
@@ -190,6 +193,60 @@ class IngestTests(UsageDbCase):
         self.assertEqual(self.counts(self.ingest().stdout)[2], 1)
         self.assertEqual(self.query('SELECT input, output FROM calls ORDER BY ts'), [(100, 10), (60, 6)])
 
+    def test_copied_or_moved_codex_session_is_not_counted_twice(self):
+        rows = [token_count('2025-01-01T10:00:00Z', 100, 20, 10), token_count('2025-01-01T10:05:00Z', 250, 70, 30)]
+        original = self.codex_file(rows, session_id='sess-1')
+        self.assertEqual(self.counts(self.ingest().stdout)[2], 2)
+        copy = self.codex_file(rows, name='rollout-copy', day='2025/02/09', session_id='sess-1')
+        self.assertEqual(self.counts(self.ingest().stdout)[:3], (2, 1, 0))
+        original.unlink()  # a move: the old name is gone, the new one was already seen
+        self.assertEqual(self.counts(self.ingest().stdout)[2], 0)
+        self.assertEqual(self.query('SELECT count(*), sum(input) FROM calls'), [(2, 180)])
+        self.assertTrue(copy.exists())
+
+    def test_two_codex_sessions_with_equal_counters_stay_separate(self):
+        rows = [token_count('2025-01-01T10:00:00Z', 100, 20, 10)]
+        self.codex_file(rows, session_id='sess-1')
+        self.codex_file(rows, name='rollout-two', session_id='sess-2')
+        self.ingest()
+        self.assertEqual(self.query('SELECT count(*) FROM calls'), [(2,)])
+
+    def test_codex_file_without_session_id_still_ingests(self):
+        self.codex_file([token_count('2025-01-01T10:00:00Z', 100, 20, 10)])
+        self.assertEqual(self.counts(self.ingest().stdout)[2], 1)
+
+    def test_version_1_database_is_migrated_without_doubling_codex_calls(self):
+        rows = [token_count('2025-01-01T10:00:00Z', 100, 20, 10), token_count('2025-01-01T10:05:00Z', 250, 70, 30)]
+        self.codex_file(rows, session_id='sess-1')
+        self.main_file([assistant('2025-01-01T12:00:00Z', 'a')])
+        self.ingest()
+        # Rewrite the store as a version 1 database: codex ids start with the file name.
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE calls SET call_id = replace(call_id, 'sess-1:', 'rollout-one:') WHERE source = 'codex'")
+            conn.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version'")
+        copy = self.codex_file(rows, name='rollout-copy', day='2025/02/09', session_id='sess-1')
+        self.ingest()
+        self.assertEqual(self.query("SELECT count(*) FROM calls WHERE source = 'codex'"), [(2,)])
+        self.assertEqual(self.query("SELECT value FROM meta WHERE key = 'schema_version'"), [('2',)])
+        self.assertEqual(self.query("SELECT count(*) FROM calls WHERE call_id LIKE 'rollout-%'"), [(0,)])
+        self.assertEqual(self.counts(self.ingest().stdout)[2], 0)
+        self.assertEqual(self.query('SELECT count(*) FROM calls'), [(3,)])
+        copy.unlink()
+
+    def test_version_1_database_with_existing_duplicates_collapses_them(self):
+        rows = [token_count('2025-01-01T10:00:00Z', 100, 20, 10)]
+        self.codex_file(rows, session_id='sess-1')
+        self.codex_file(rows, name='rollout-copy', day='2025/02/09', session_id='sess-1')
+        self.ingest()
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("DELETE FROM calls")
+            for stem in ('rollout-one', 'rollout-copy'):
+                conn.execute("INSERT INTO calls VALUES ('codex', ?, '2025-01-01T10:00:00Z', '2025-01-01', 'p', ?, 'main', "
+                             "'gpt-test-sol', 80, 20, 0, 0, 10)", (f'{stem}:2025-01-01T10:00:00Z:110', stem))
+            conn.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version'")
+        self.ingest()
+        self.assertEqual(self.query('SELECT count(*) FROM calls'), [(1,)])
+
     def test_deleted_transcript_keeps_its_rows(self):
         path = self.main_file([assistant('2025-01-01T12:00:00Z', 'a')])
         self.ingest()
@@ -282,6 +339,72 @@ class IngestTests(UsageDbCase):
         self.assertEqual(self.db.read_bytes(), before)
 
 
+class PruneTests(UsageDbCase):
+    def aged(self):
+        today = datetime.now(timezone.utc).date()
+        stamp = lambda days: (today - timedelta(days=days)).isoformat() + 'T12:00:00Z'
+        self.main_file([assistant(stamp(40), 'old1'), assistant(stamp(35), 'old2'), assistant(stamp(30), 'edge'),
+                        assistant(stamp(5), 'new')])
+        self.ingest()
+        return today
+
+    def prune(self, *args, code=0):
+        return self.run_script('usage-db', 'prune', *args, code=code)
+
+    def test_dry_run_reports_rows_and_dates_and_changes_nothing(self):
+        today = self.aged()
+        before = self.db.read_bytes()
+        out = self.prune('--older-than', '30').stdout
+        self.assertIn('dry run: would delete 2 calls', out)
+        self.assertIn(f'from {today - timedelta(days=40)} to {today - timedelta(days=35)}', out)
+        self.assertIn('--apply', out)
+        self.assertEqual(self.db.read_bytes(), before)
+        self.assertEqual(self.query('SELECT count(*) FROM calls'), [(4,)])
+
+    def test_apply_deletes_older_rows_only_and_vacuums(self):
+        self.aged()
+        out = self.prune('--older-than', '30', '--apply').stdout
+        self.assertIn('deleted 2 calls', out)
+        self.assertIn('vacuumed', out)
+        self.assertEqual(sorted(r[0] for r in self.query('SELECT call_id FROM calls')), ['edge', 'new'])
+        self.assertIn('nothing to prune', self.prune('--older-than', '30', '--apply').stdout)
+        self.assertEqual(self.query('PRAGMA integrity_check'), [('ok',)])
+
+    def test_apply_shrinks_the_file(self):
+        today = datetime.now(timezone.utc).date()
+        self.main_file([assistant((today - timedelta(days=400)).isoformat() + f'T12:{n // 60:02}:{n % 60:02}Z', f'm{n}')
+                        for n in range(3000)] + [assistant(today.isoformat() + 'T00:00:00Z', 'keep')])
+        self.ingest()
+        self.run_script('usage-db', 'sql', 'PRAGMA wal_checkpoint(TRUNCATE)')
+        big = self.db.stat().st_size
+        out = self.prune('--older-than', '1', '--apply').stdout
+        self.assertIn('deleted 3000 calls', out)
+        match = re.search(r'vacuumed (\d+) -> (\d+) bytes', out)
+        self.assertIsNotNone(match)
+        self.assertEqual(int(match.group(1)), big)
+        self.assertLess(int(match.group(2)), int(match.group(1)))
+        self.assertEqual(int(match.group(2)), self.db.stat().st_size)
+
+    def test_days_below_one_or_not_a_number_are_refused(self):
+        self.aged()
+        for value in ('0', '-3', 'abc', '1.5'):
+            self.assertIn('--older-than', self.prune('--older-than', value, code=2).stderr)
+        self.prune(code=2)
+        self.assertEqual(self.query('SELECT count(*) FROM calls'), [(4,)])
+
+    def test_missing_database_is_not_created(self):
+        for extra in ((), ('--apply',)):
+            result = self.prune('--older-than', '30', *extra, code=1)
+            self.assertIn('no database at', result.stderr)
+        self.assertFalse(self.db.exists())
+
+    def test_nothing_is_pruned_by_ingest_or_report(self):
+        self.aged()
+        self.ingest()
+        self.report()
+        self.assertEqual(self.query('SELECT count(*) FROM calls'), [(4,)])
+
+
 class QueryTests(UsageDbCase):
     def test_status(self):
         missing = self.run_script('usage-db', 'status', code=1)
@@ -293,7 +416,7 @@ class QueryTests(UsageDbCase):
         self.codex_file([token_count('2025-01-03T10:00:00Z', 100, 0, 10)], day='2025/01/03')
         self.ingest()
         text = self.run_script('usage-db', 'status').stdout
-        for expected in (str(self.db), 'schema version: 1', 'claude calls: 2', 'codex calls: 1',
+        for expected in (str(self.db), 'schema version: 2', 'claude calls: 2', 'codex calls: 1',
                          'first day: 2025-01-01', 'last day: 2025-01-03'):
             self.assertIn(expected, text)
         self.assertRegex(text, r'last ingest: \d{4}-\d\d-\d\dT')

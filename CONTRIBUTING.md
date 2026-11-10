@@ -18,4 +18,4 @@ python3 -m unittest discover -s tests
 shellcheck -S warning hooks/*.sh
 claude plugin validate .
 ```
-Bump `version` in `.claude-plugin/plugin.json` and add a CHANGELOG entry for any user-visible change.
+Bump `version` in `.claude-plugin/plugin.json` and add a CHANGELOG entry for any user-visible change, and for any change under `skills/`, `agents/`, `hooks/`, `scripts/`, `templates/` or `.claude-plugin/`, or to `docs/autonomy.md` or `docs/outcome-log.md` (skills read them at runtime).

@@ -28,6 +28,50 @@ class DispatchGuardTests(StubCase):
         self.assertIn('No files changed', self.calls()[1]['prompt'])
         self.assertEqual(self.report(result)[-1], 'STATUS: CHECKS FAILING')
 
+    def test_resume_text_for_codex_omits_dispatcher_flag(self):
+        self.dispatch(code=1)
+        prompt = self.calls()[1]['prompt']
+        self.assertNotIn('allow-no-change', prompt)
+        self.assertIn('state plainly why no change is needed', prompt)
+        self.assertIn('Make the change the brief asks for', prompt)
+
+    def subdirectory_case(self, codex_body):
+        write(self.work / 'sub' / 'inside', 'in\n')
+        write(self.work / 'outside', 'out\n')
+        self.commit_all('sub')
+        executable(self.bin / 'codex', FAKE_CODEX + codex_body)
+        return subprocess.run([str(SCRIPTS / 'codex-dispatch'), '-C', str(self.work / 'sub'), '-r', '0', str(self.brief)],
+                              cwd=self.work, env=self.env, capture_output=True, text=True)
+
+    def test_subdirectory_snapshot_ignores_changes_outside_it(self):
+        result = self.subdirectory_case("\npathlib.Path('../outside').write_text('someone else')\n")
+        self.assertEqual(result.returncode, 1, result.stdout)
+        self.assertIn('FAIL: require-change', result.stdout)
+
+    def test_subdirectory_snapshot_counts_changes_inside_it(self):
+        result = self.subdirectory_case("\npathlib.Path('inside').write_text('codex')\n")
+        self.assertEqual(result.returncode, 0, result.stdout)
+        self.assertIn('PASS: require-change', result.stdout)
+
+    def test_colon_subdirectory_scopes_snapshot_and_report(self):
+        sub = self.work / ':scope'
+        write(sub / 'inside', 'original\n')
+        write(self.work / 'outside', 'original\n')
+        self.commit_all('scope')
+        executable(self.bin / 'codex', FAKE_CODEX +
+                   "\npathlib.Path('inside').write_text('changed')\n"
+                   "pathlib.Path('new-inside').write_text('new')\n"
+                   "pathlib.Path('../outside').write_text('changed')\n"
+                   "pathlib.Path('../new-outside').write_text('new')\n")
+        result = subprocess.run([str(SCRIPTS / 'codex-dispatch'), '-C', str(sub), '-r', '0', str(self.brief)],
+                                cwd=self.work, env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn('PASS: require-change', result.stdout)
+        report = '\n'.join(self.report(result))
+        self.assertIn('inside', report)
+        self.assertNotIn('outside', report)
+        self.assertIn('1 untracked file(s)', report)
+
     def test_nested_repo_does_not_break_snapshot(self):
         nested = self.work / 'sub'
         subprocess.run(['git', 'init', '-q', str(nested)], check=True, env=self.env)

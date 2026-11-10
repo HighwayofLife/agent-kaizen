@@ -17,7 +17,7 @@ It was built while developing a game with Claude Code coordinating Claude subage
 
 ## Why I built this
 
-I've been building a Colonization-inspired colonial-era game with Claude Code doing the coordinating and handing work off to Codex and other Claude agents. It worked. It also got expensive. And I ran out of usage within an hour of each 5h reset.
+I've been building a Colonization-inspired colonial-era game with Claude Code doing the coordinating and handing work off to Codex and other Claude agents. It worked. It also got expensive. And in my own experience I ran out of usage within an hour of each 5h reset.
 
 So I wrote a script to go through my own session logs and found some very disturbing results.
 
@@ -174,6 +174,8 @@ Project files (`docs/kaizen/`), reports in `<Claude config dir>/audits/` and bac
 | `CODEX_DISPATCH_CODEX_TIMEOUT` | `codex-dispatch` | Seconds before a Codex run is killed; default 0 = no limit |
 | `SESSION_NOTES_TIMEOUT` | Session-notes hook | Seconds allowed for each helper call; default 20 |
 | `KAIZEN_SKIP_CHECKS` | Scheduler | `1` skips the drift, rules-lint, notes and project-report steps of a scheduled run |
+| `KAIZEN_SESSION_ID` | Backup script | Session id recorded as `session_id` in each backup manifest; the scheduled runner sets it for each run |
+| `XDG_CONFIG_HOME` | `install-schedule` | Base directory for systemd user units (`systemd/user` under it); default `~/.config` |
 | `KAIZEN_USAGE_DB` | `usage-db` | SQLite file; default `kaizen-usage.db` in the Claude config dir |
 | `KAIZEN_REVIEW_MODEL` | Scheduler | Review model; default `sonnet`. Read when you run `install-schedule` (or `kaizen-scheduled` by hand), not by installed jobs |
 | `KAIZEN_REVIEW_MAX_TURNS` | Scheduler | Review turn limit; default 40. Read like `KAIZEN_REVIEW_MODEL` |

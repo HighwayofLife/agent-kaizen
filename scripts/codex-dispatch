@@ -108,11 +108,16 @@ def rewrite_check(command, cwd):
     return rewritten if result.returncode == 0 and rewritten else command
 
 
+NO_CHANGE_FOR_CODEX = ("No files changed since dispatch started.",
+                       "Make the change the brief asks for, or state plainly why no change is needed.")
+
+
 def tree_snapshot(cwd, out, warnings):
     """Return the worktree fingerprint and number of changed paths, if in Git.
 
     The fingerprint covers HEAD, tracked changes and untracked files, but not
-    ignored files. The scope is the whole repository, minus the output directory.
+    ignored files. The scope is the whole repository, or only the -C directory when
+    that is a subdirectory of it, minus the output directory.
     """
     try:
         return _tree_snapshot(cwd, out)
@@ -138,7 +143,13 @@ def _tree_snapshot(cwd, out):
     def git(*args):
         return subprocess.run(["git", *args], cwd=root, capture_output=True, check=True).stdout
 
-    status = git("status", "--porcelain=v1", "-uall", "-z")
+    try:
+        scope = str(Path(os.path.realpath(cwd)).relative_to(Path(os.path.realpath(root))))
+    except ValueError:
+        scope = "."
+
+    scope = "." if scope == "." else f":(literal){scope}"
+    status = git("status", "--porcelain=v1", "-uall", "-z", "--", scope)
     try:
         head = git("rev-parse", "HEAD").strip()
     except subprocess.CalledProcessError:
@@ -146,10 +157,10 @@ def _tree_snapshot(cwd, out):
     try:
         excluded_path = str(out.relative_to(Path(os.path.realpath(root))))
         excluded = os.fsencode(excluded_path)
-        pathspec = ("--", ".", f":(exclude,literal){excluded_path}")
+        pathspec = ("--", scope, f":(exclude,literal){excluded_path}")
     except ValueError:
         excluded = None
-        pathspec = ()
+        pathspec = ("--", scope)
     try:
         diff = git("diff", "HEAD", "--binary", *pathspec)
     except subprocess.CalledProcessError:
@@ -202,7 +213,8 @@ def untracked_count(cwd, out):
     try:
         root = subprocess.run(["git", "rev-parse", "--show-toplevel"], cwd=cwd, capture_output=True, check=True).stdout
         root = Path(os.path.realpath(os.fsdecode(root.rstrip(b"\n"))))
-        pathspec = ["--", "."]
+        scope = str(Path(os.path.realpath(cwd)).relative_to(root))
+        pathspec = ["--", "." if scope == "." else f":(literal){scope}"]
         try:
             pathspec.append(f":(exclude,literal){out.relative_to(root)}")
         except ValueError:
@@ -309,7 +321,12 @@ def main():
             check_lines = check_lines[:7] + [" | ".join(check_lines[7:])]
         end = [f"Rounds used: {rounds}/{args.r} resumes", f"OUTDIR: {out}", f"STATUS: {status}"]
         statlog = out / "git-diff-stat.log"
-        run_logged(["git", "diff", "--stat"], cwd, statlog)
+        stat_pathspec = ["--", "."]
+        try:
+            stat_pathspec.append(f":(exclude,literal){out.relative_to(Path(os.path.realpath(cwd)))}")
+        except ValueError:
+            pass
+        run_logged(["git", "diff", "--stat", *stat_pathspec], cwd, statlog)
         untracked = untracked_count(cwd, out)
         stat = statlog.read_text(errors="replace").splitlines()
         if stat and stat[0].startswith(("warning:", "fatal:", "error:")):
@@ -421,7 +438,8 @@ def main():
                 return report("CODEX FAILED", 2)
             brief = out / f"resume-{attempt + 1}.md"
             brief.write_text("Fix the failing checks below. Do not commit or push.\n\n" + "\n\n".join(
-                f"Check {number}: {command}\n" + "\n".join(relevant(log))
+                f"Check {number}: {command}\n" + ("\n".join(NO_CHANGE_FOR_CODEX) if command == "require-change"
+                                                  else "\n".join(relevant(log)))
                 for number, command, _, log, _ in failures))
             rounds += 1
     except (OSError, ValueError, subprocess.SubprocessError) as exc:

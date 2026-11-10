@@ -61,6 +61,39 @@ def matches(raw, args, folder=None):
     return True
 
 
+def open_usage_db(prog):
+    """(usage-db module, read-only connection) for --from-db; exit with one line if there is no usable database."""
+    module = load_sibling('kaizen_usage_db', 'usage-db')
+    try:
+        return module, module.open_read(module.db_path(argparse.Namespace(db=None)))
+    except module.Fatal as exc:
+        print(f'{prog}: {exc}', file=sys.stderr)
+        sys.exit(exc.code)
+
+
+def db_selection(conn, args):
+    """SQL conditions for --project / --cwd, matched against the stored project path."""
+    if not (args.cwd or args.project):
+        return []
+    cache = {}
+    def keep(project, source):
+        if (project, source) not in cache:
+            # A Claude project stored without a working directory holds the transcript folder name.
+            is_path = project is None or project.startswith('/') or re.match(r'[A-Za-z]:[\\/]', project)
+            if source == 'codex' or project is None:
+                found = matches(project, args)
+            elif is_path:
+                # --project matches the transcript folder name: the working directory with every
+                # character outside a-z, A-Z, 0-9 turned into '-'. Rebuild it from the stored path.
+                found = matches(project, args, re.sub(r'[^a-zA-Z0-9]', '-', project))
+            else:
+                found = matches(None, args, project)
+            cache[project, source] = int(found)
+        return cache[project, source]
+    conn.create_function('kaizen_keep_project', 2, keep)
+    return ['kaizen_keep_project(project, source)']
+
+
 def claude_files(args, since=None):
     """Transcripts that can hold rows at or after `since` (default args.since): older mtimes cannot."""
     since = since or args.since
@@ -218,6 +251,41 @@ def database_rows(path, args):
                           (args.since.timestamp(), args.stop.timestamp())).fetchall()
 
 
+NOT_STORED = ('wakeups wakeup_avg_ctx main_images main_reads spawns_total codex_threads_db codex_tokens_db').split()
+
+
+def scan_usage_db(args, days, agents, priced):
+    """Fill `days` and `agents` from the usage-db store instead of transcripts (same pricing code as usage-db)."""
+    usage_db, conn = open_usage_db('usage-series')
+    where = ['day >= ?', 'day < ?'] + db_selection(conn, args)
+    params = [args.since.date().isoformat(), args.stop.date().isoformat()]
+    for (day, agent), source, model, calls, tokens, peak, cost, unpriced in usage_db.priced_rows(
+            conn, priced, where, params, ['day', "COALESCE(agent, 'unknown')"]):
+        context = sum(tokens[:4])
+        days[day]['unpriced_calls'] += unpriced
+        if source == 'codex':
+            key = AUDIT.pricing_key(priced['_pricing'], model)
+            days[day]['cost_codex_model_' + key if key else 'cost_codex_other_model'] += cost
+            days[day]['cost_' + family(model, True)] += cost
+            continue
+        days[day]['claude_context_tokens'] += context
+        days[day]['claude_output_tokens'] += tokens[4]
+        days[day]['cost_' + family(model)] += cost
+        if agent == 'main':
+            days[day]['main_context_tokens'] += context
+            main = days[day + ':main']
+            main.update(calls=calls, context=context)
+            main['peak'] = max(main['peak'], peak)
+        else:
+            days[day]['sub_context_tokens'] += context
+            days[day]['sub_calls'] += calls
+            agents[day, agent].update(calls=calls, context=context, cost=cost)
+    for day, sessions in conn.execute(
+            "SELECT day, COUNT(DISTINCT session) FROM calls" + usage_db.sql_where(where + ["source = 'codex'"]) + " GROUP BY day", params):
+        days[day]['codex_sessions'] += sessions
+    conn.close()
+
+
 def scan_database(args, days, warnings):
     files = [(int(m[1]), p) for p in AUDIT.codex_home().glob('state_*.sqlite')
              for m in [re.fullmatch(r'state_(\d+)\.sqlite', p.name)] if m]
@@ -290,6 +358,12 @@ def main():
     parser.add_argument('--out', type=Path, required=True)
     parser.add_argument('--git', type=Path, action='append', default=[])
     parser.add_argument('--count-command', action='append', default=[], metavar='NAME=REGEX')
+    parser.add_argument('--from-db', action='store_true', help=(
+        'Calls without an id that share the same second and usage are counted once in the database. '
+        'read calls, tokens and cost from the usage-db store ($KAIZEN_USAGE_DB, else <CLAUDE_CONFIG_DIR or ~/.claude>/kaizen-usage.db) '
+        'instead of transcripts, for windows whose transcripts are gone. Not stored, so written as n/a: '
+        + ', '.join(NOT_STORED) + ', codex_tokens_db_*, command_* and the runs column of daily-agents.csv. '
+        '--cwd matches the stored working directory and --project its folder-style name. --git still reads git.'))
     args = parser.parse_args()
     args.stop = (args.until or datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)) + timedelta(days=1)
     if args.stop <= args.since:
@@ -309,12 +383,15 @@ def main():
         warnings['pricing unavailable'] += 1
     days, agents, seen, paths = defaultdict(Counter), defaultdict(Counter), set(), set()
     priced = price_state(pricing)
-    for path, main_session in claude_files(args):
-        if path.resolve() not in paths:
-            paths.add(path.resolve())
-            scan_claude(path, main_session, args, days, agents, warnings, priced, seen)
-    scan_codex(args, days, warnings, priced)
-    scan_database(args, days, warnings)
+    if args.from_db:
+        scan_usage_db(args, days, agents, priced)
+    else:
+        for path, main_session in claude_files(args):
+            if path.resolve() not in paths:
+                paths.add(path.resolve())
+                scan_claude(path, main_session, args, days, agents, warnings, priced, seen)
+        scan_codex(args, days, warnings, priced)
+        scan_database(args, days, warnings)
     scan_git(args, days, warnings)
     if priced['cost']['unpriced']:
         warnings['unpriced models; costs are incomplete: ' + ', '.join(sorted(priced['cost']['unpriced']))] += 1
@@ -322,6 +399,7 @@ def main():
     fields = (BASE + ['cost_' + f for f in CLAUDE + CODEX] + model_fields + ['cost_codex_other_model', 'cost_total']
               + ['codex_tokens_db_' + f for f in CODEX] + ['command_' + n for n, _ in args.commands]
               + (['commits', 'lines_changed'] if args.git else []))
+    missing = set(NOT_STORED + [f for f in fields if f.startswith(('codex_tokens_db_', 'command_'))]) if args.from_db else set()
     args.out.mkdir(parents=True, exist_ok=True)
     count = 0
     with (args.out / 'daily.csv').open('w', newline='') as stream:
@@ -336,14 +414,14 @@ def main():
                            main_peak_ctx=main_usage['peak'], wakeups=wakeup['calls'],
                            wakeup_avg_ctx=wakeup['context'] / max(wakeup['calls'], 1))
             counter['cost_total'] = sum(counter['cost_' + f] for f in CLAUDE + CODEX)
-            writer.writerow(dict(date=day, **{k: round(counter[k], 8) for k in fields if k != 'date'}))
+            writer.writerow(dict(date=day, **{k: 'n/a' if k in missing else round(counter[k], 8) for k in fields if k != 'date'}))
             count += 1
             current += timedelta(days=1)
     with (args.out / 'daily-agents.csv').open('w', newline='') as stream:
         writer = csv.writer(stream)
         writer.writerow(('date', 'agent_type', 'runs', 'calls', 'avg_context', 'cost'))
         for (day, agent), usage in sorted(agents.items()):
-            writer.writerow((day, agent, usage['runs'], usage['calls'], usage['context'] / max(usage['calls'], 1), round(usage['cost'], 8)))
+            writer.writerow((day, agent, 'n/a' if args.from_db else usage['runs'], usage['calls'], usage['context'] / max(usage['calls'], 1), round(usage['cost'], 8)))
     print(f'{count} days written; {sum(warnings.values())} warnings')
     for warning, number in warnings.items():
         print(f'Warning: {warning} ({number})')

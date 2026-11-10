@@ -273,6 +273,155 @@ class SeriesTests(StubCase):
         self.assertFalse(list(self.config.rglob('*.md')))
         self.assertFalse(list(self.config.rglob('*.extract.json')))
 
+    def from_db_pair(self, *args):
+        """Run usage-series on transcripts and from the database; return both daily/agents tables."""
+        self.env['KAIZEN_USAGE_DB'] = str(self.root / 'store' / 'usage.db')
+        self.run_script('usage-db', 'ingest', '--quiet')
+        tables = []
+        for flags in ((), ('--from-db',)):
+            self.output = self.root / ('series-db' if flags else 'series')
+            self.series(*args, *flags)
+            with (self.output / 'daily-agents.csv').open() as stream:
+                tables.append([self.read_daily(), list(csv.DictReader(stream))])
+        return tables
+
+    def assert_same_except_not_stored(self, transcripts, stored):
+        not_stored = set(SERIES['NOT_STORED']) | {'codex_tokens_db_' + f for f in SERIES['CODEX']} | {'command_example'}
+        self.assertEqual(len(transcripts[0]), len(stored[0]))
+        seen = set()
+        for left, right in zip(transcripts[0], stored[0]):
+            self.assertEqual(left.keys(), right.keys())
+            for key in left:
+                if key in not_stored:
+                    self.assertEqual(right[key], 'n/a', key)
+                    seen.add(key)
+                else:
+                    self.assertEqual(left[key], right[key], (left['date'], key))
+        for left, right in zip(transcripts[1], stored[1]):
+            self.assertEqual(right.pop('runs'), 'n/a')
+            left.pop('runs')
+            self.assertEqual(left, right)
+        return seen
+
+    def test_from_db_equals_transcripts_where_both_have_data(self):
+        self.fixtures()
+        transcripts, stored = self.from_db_pair('--count-command', 'example=^tools/example')
+        seen = self.assert_same_except_not_stored(transcripts, stored)
+        self.assertIn('command_example', seen)
+        self.assertIn('wakeups', seen)
+        # The fixture exercises Claude main and sub-agent calls, Codex deltas, and real costs.
+        row = {r['date']: r for r in transcripts[0]}['2025-01-01']
+        self.assertGreater(float(row['cost_total']), 0)
+        self.assertEqual(row['sub_calls'], '1')
+        self.assertEqual(row['codex_sessions'], '1')
+        self.assertEqual(len(transcripts[1]), 1)
+
+    def test_from_db_equals_transcripts_for_a_selection(self):
+        self.fixtures()
+        # Claude names a project folder after the working directory; make the fixture do the same.
+        slug = lambda path: ''.join(c if c.isalnum() else '-' for c in path)
+        (self.config / 'projects/example').rename(self.config / 'projects' / slug(self.cwd))
+        (self.config / 'projects/else').rename(self.config / 'projects' / slug('/elsewhere'))
+        for flag in (('--cwd', self.cwd), ('--project', 'PRIVATE-FIXTURE'), ('--project', 'nothing-like-this')):
+            transcripts, stored = self.from_db_pair(*flag)
+            self.assert_same_except_not_stored(transcripts, stored)
+        self.assertEqual({r['main_calls'] for r in transcripts[0]}, {'0'})
+        transcripts, stored = self.from_db_pair('--project', 'PRIVATE-FIXTURE')
+        self.assertEqual({r['main_calls'] for r in stored[0]}, {'1', '0'})
+
+    def test_from_db_reports_a_window_whose_transcripts_are_gone(self):
+        self.fixtures()
+        self.env['KAIZEN_USAGE_DB'] = str(self.root / 'store' / 'usage.db')
+        self.run_script('usage-db', 'ingest', '--quiet')
+        for path in list(self.config.rglob('*.jsonl')) + list(self.codex.rglob('*.jsonl')):
+            path.unlink()
+        self.series()
+        self.assertEqual(sum(float(r['cost_total']) for r in self.read_daily()), 0)
+        self.series('--from-db')
+        self.assertGreater(sum(float(r['cost_total']) for r in self.read_daily()), 0)
+        self.assertEqual(self.read_daily()[0]['main_calls'], '2')
+
+    def test_from_db_without_a_database_is_one_line(self):
+        self.env['KAIZEN_USAGE_DB'] = str(self.root / 'absent' / 'usage.db')
+        result = self.run_script('usage-series', '--out', self.output, '--from-db', code=1)
+        self.assertEqual(result.stderr.count('\n'), 1)
+        self.assertIn('usage-series: no database at', result.stderr)
+        self.assertFalse((self.root / 'absent').exists())
+        self.assertIn('--from-db', self.run_script('usage-series', '--help').stdout)
+        self.assertIn('n/a', self.run_script('usage-series', '--help').stdout)
+        self.assertIn(' '.join('Calls without an id that share the same second and usage are counted once in the database.'.split()),
+                      ' '.join(self.run_script('usage-series', '--help').stdout.split()))
+
+    def compare_transcripts(self):
+        """Two main files and two sub-agent files on either side of the cutoff; none spans it."""
+        def call(day, ident, **usage):
+            row = self.row(day, ident=ident)
+            row['message']['usage'] = dict(input_tokens=100, output_tokens=10, **usage)
+            return row
+        early, late = self.config / 'projects/example/early.jsonl', self.config / 'projects/example/late.jsonl'
+        jsonl(early, [self.row(1, 'user', self.secret), call(1, 'e1'), call(2, 'e2', cache_read_input_tokens=900),
+                      call(2, 'e3', cache_creation_input_tokens=50)])
+        jsonl(early.parent / 'early/subagents/s.jsonl', [call(2, 's1', cache_read_input_tokens=400)])
+        write((early.parent / 'early/subagents/s.meta.json'), json.dumps(dict(agentType='worker')))
+        jsonl(late, [self.row(3, 'user', self.secret), call(3, 'l1', cache_read_input_tokens=2000), call(4, 'l2'),
+                     self.row(4, 'user', '<task-notification>done</task-notification>'), call(4, 'l3'),
+                     self.row(4, 'user', [dict(type='tool_result', tool_use_id='x', content=[dict(type='image')])])])
+        jsonl(late.parent / 'late/subagents/s.jsonl', [call(4, 's2')])
+        stamp = SERIES['date']('2025-01-03').timestamp() - 10
+        for path in (early, early.parent / 'early/subagents/s.jsonl'):
+            os.utime(path, (stamp, stamp))
+        return ('--cutoff', '2025-01-03', '--before-from', '2025-01-01', '--after-to', '2025-01-04',
+                '--pricing', self.pricing)
+
+    def test_compare_from_db_equals_clean_split_where_both_have_data(self):
+        args = self.compare_transcripts()
+        self.env['KAIZEN_USAGE_DB'] = str(self.root / 'store' / 'usage.db')
+        self.run_script('usage-db', 'ingest', '--quiet')
+        want = json.loads(self.run_script('usage-compare', '--clean-split', *args, '--json').stdout)
+        got = json.loads(self.run_script('usage-compare', '--clean-split', '--from-db', *args, '--json').stdout)
+        self.assertGreater(want['before']['metrics']['Claude cost/day'], 0)
+        for side in ('before', 'after'):
+            for name, value in want[side]['metrics'].items():
+                if name in ('wake-ups/day', 'images/day'):
+                    self.assertIsNone(got[side]['metrics'][name], name)
+                    self.assertGreater(want['after']['metrics'][name], 0)
+                else:
+                    self.assertAlmostEqual(got[side]['metrics'][name], value, places=12, msg=(side, name))
+            self.assertEqual(got[side]['window_days'], want[side]['window_days'])
+        # The table a person reads is identical on every metric that is stored.
+        shown = lambda *flags: [l for l in self.run_script('usage-compare', '--clean-split', *flags, *args).stdout.splitlines()
+                                if not l.startswith(('wake-ups/day', 'images/day', 'Warning'))]
+        self.assertEqual(shown(), shown('--from-db'))
+        table = self.run_script('usage-compare', '--clean-split', '--from-db', *args).stdout
+        self.assertRegex(table, r'wake-ups/day\s+n/a\s+n/a')
+        self.assertRegex(table, r'images/day\s+n/a\s+n/a')
+
+    def test_compare_from_db_reads_a_window_whose_transcripts_are_gone(self):
+        args = self.compare_transcripts()
+        self.env['KAIZEN_USAGE_DB'] = str(self.root / 'store' / 'usage.db')
+        self.run_script('usage-db', 'ingest', '--quiet')
+        for path in self.config.rglob('*.jsonl'):
+            path.unlink()
+        gone = json.loads(self.run_script('usage-compare', '--clean-split', *args, '--json').stdout)
+        self.assertEqual(gone['after']['metrics']['main calls/day'], 0)
+        kept = json.loads(self.run_script('usage-compare', '--clean-split', '--from-db', *args, '--json').stdout)
+        self.assertEqual(kept['after']['metrics']['main calls/day'], 1.5)
+
+    def test_compare_from_db_errors_and_help(self):
+        args = self.compare_transcripts()
+        self.env['KAIZEN_USAGE_DB'] = str(self.root / 'absent' / 'usage.db')
+        result = self.run_script('usage-compare', '--clean-split', '--from-db', *args, code=1)
+        self.assertEqual(result.stderr.count('\n'), 1)
+        self.assertIn('usage-compare: no database at', result.stderr)
+        self.assertFalse((self.root / 'absent').exists())
+        self.assertIn('--clean-split', self.run_script('usage-compare', '--from-db', '--cutoff', '2025-01-03',
+                                                       '--series', self.output, code=2).stderr)
+        help_text = self.run_script('usage-compare', '--help').stdout
+        self.assertIn('--from-db', help_text)
+        self.assertIn('n/a', help_text)
+        self.assertIn('Calls without an id that share the same second and usage are counted once in the database.',
+                      ' '.join(help_text.split()))
+
     def test_help_and_invalid_arguments(self):
         for name in ('usage-series', 'usage-compare'):
             self.assertIn('usage:', self.run_script(name, '--help').stdout)

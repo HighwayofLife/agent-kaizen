@@ -14,6 +14,7 @@ Plugin cache installs use copies so jobs survive plugin moves; re-run to refresh
 Claude home is CLAUDE_CONFIG_DIR or ~/.claude; Codex home is CODEX_HOME or ~/.codex.
 Jobs record PATH and those config variables (and KAIZEN_BACKUP_DIR, KAIZEN_USAGE_DB) when set, and use absolute Python.
 --apply without --review (or --auto) removes an installed review job; the audit job stays.
+A review job left in another scheduler is not touched; a warning gives the command to remove it.
 Without --apply or --remove, prints jobs and config commands without writing config.
 """
 import argparse
@@ -164,6 +165,32 @@ def preview_drop(args, found):
     """Say what happens to a review job that is installed but not requested."""
     if found and not args.remove and not args.review:
         print(("removed " if args.apply else "would remove ") + DROP_NOTE)
+
+
+def other_review_jobs(scheduler):
+    """Review jobs left in the backends this run does not write to: (backend, name, remove command)."""
+    found = []
+    plist_path = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.review.plist"
+    if scheduler != "launchd" and plist_path.exists():
+        found.append(("launchd", str(plist_path),
+                      f"launchctl bootout gui/{os.getuid()} {shlex.quote(str(plist_path))}; "
+                      f"rm {shlex.quote(str(plist_path))}"))
+    if scheduler != "systemd" and (unit_dir() / "agent-kaizen-review.timer").exists():
+        found.append(("systemd", "agent-kaizen-review.timer",
+                      "systemctl --user disable --now agent-kaizen-review.timer; "
+                      f"rm {shlex.quote(str(unit_dir() / 'agent-kaizen-review.timer'))} "
+                      f"{shlex.quote(str(unit_dir() / 'agent-kaizen-review.service'))}"))
+    if scheduler != "cron" and shutil.which("crontab"):
+        try:
+            listing = subprocess.run(["crontab", "-l"], capture_output=True, text=True,
+                                     env={**os.environ, "LC_ALL": "C", "LANG": "C"})
+        except OSError:
+            listing = None
+        if listing and listing.returncode == 0 and any(
+                line.rstrip("\r\n").endswith(f"{MARK}-review") for line in listing.stdout.splitlines()):
+            found.append(("cron", f"crontab line ending '{MARK}-review'",
+                          f"crontab -l | grep -v '{MARK}-review$' | crontab -"))
+    return found
 
 
 def mac(args, selected):
@@ -434,6 +461,10 @@ def main(argv=None):
         if args.apply and scheduler == "cron" and any(unit_dir().glob("agent-kaizen-*.timer")):
             print(f"note: agent-kaizen systemd timers are also installed in {unit_dir()}; "
                   "remove them with --scheduler systemd --remove", file=sys.stderr)
+    if status == 0 and drops_review(args) and not cleanup:
+        for backend, name, command in other_review_jobs(scheduler):
+            print(f"warning: a review job is still installed in {backend} ({name}) and keeps running; "
+                  f"remove it with: {command}", file=sys.stderr)
     if args.remove:
         try:
             record.unlink(missing_ok=True)

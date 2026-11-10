@@ -494,6 +494,114 @@ class KaizenBackupTests(unittest.TestCase):
         self.run_script('undo', 'run')
         self.assertFalse(target.exists())
 
+    def finished(self, path, text, **kw):
+        change = self.change(path, **kw)
+        Path(path).write_text(text)
+        self.run_script('finish', change)
+        return change
+
+    def age(self, change, days):
+        import datetime
+        manifest = Path(change) / 'manifest.json'
+        data = json.loads(manifest.read_text())
+        data['created_at'] = (datetime.datetime.now(datetime.timezone.utc)
+                              - datetime.timedelta(days=days)).isoformat()
+        manifest.write_text(json.dumps(data))
+
+    def test_undo_run_ignores_older_changes_that_reused_the_run_id(self):
+        old, mid, new = (self.tmp / n for n in ('old', 'mid', 'new'))
+        for path in (old, mid, new):
+            path.write_text('v1')
+        self.finished(old, 'v2', run='r1')
+        self.finished(mid, 'v2', run='r2')
+        self.finished(new, 'v2', run='r1')
+        result = self.run_script('undo', 'run')
+        self.assertEqual((old.read_text(), mid.read_text(), new.read_text()), ('v2', 'v2', 'v1'))
+        self.assertIn('run id r1 also appears on older changes; not undoing:', result.stderr)
+
+    def test_undo_run_splits_back_to_back_runs_with_one_id_by_session(self):
+        one, two = (self.tmp / n for n in ('one', 'two'))
+        for path in (one, two):
+            path.write_text('v1')
+        self.env['KAIZEN_SESSION_ID'] = 'session-a'
+        self.finished(one, 'v2', run='r1')
+        self.env['KAIZEN_SESSION_ID'] = 'session-b'
+        self.finished(two, 'v2', run='r1')
+        result = self.run_script('undo', 'run')
+        self.assertIn('run id r1 also appears on older changes; not undoing:', result.stderr)
+        self.assertEqual((one.read_text(), two.read_text()), ('v2', 'v1'))
+
+    def test_prune_is_a_dry_run_unless_applied_and_keeps_new_unfinished_and_corrupt(self):
+        a, b, c, d = (self.tmp / n for n in 'abcd')
+        for path in (a, b, c, d):
+            path.write_text('v1')
+        old = self.finished(a, 'v2', run='old')
+        fresh = self.finished(b, 'v2', run='fresh')
+        unfinished = self.change(c, run='open')
+        corrupt = self.finished(d, 'v2', run='bad')
+        self.age(old, 40)
+        self.age(unfinished, 40)
+        self.age(corrupt, 40)
+        (Path(corrupt) / 'manifest.json').write_text('{ not json')
+        dry = self.run_script('prune', '--older-than', '30')
+        self.assertIn('would remove', dry.stdout)
+        self.assertIn('would free', dry.stdout)
+        self.assertIn('1 change(s)', dry.stdout)
+        for folder in (old, fresh, unfinished, corrupt):
+            self.assertTrue(Path(folder).exists())
+        self.assertIn('corrupt manifest', dry.stdout)
+        self.assertIn('unfinished', dry.stdout)
+        done = self.run_script('prune', '--older-than', '30', '--apply')
+        self.assertIn('freed', done.stdout)
+        self.assertFalse(Path(old).exists())
+        for folder in (fresh, unfinished, corrupt):
+            self.assertTrue(Path(folder).exists())
+
+    def test_prune_skips_symlinked_change_folder(self):
+        target = self.tmp / 'target'
+        target.write_text('v1')
+        change = Path(self.finished(target, 'v2'))
+        self.age(change, 40)
+        outside = self.tmp / 'outside'
+        change.rename(outside)
+        change.symlink_to(outside, target_is_directory=True)
+        manifest = (outside / 'manifest.json').read_bytes()
+        result = self.run_script('prune', '--older-than', '30', '--apply')
+        self.assertIn('is a symlink', result.stdout)
+        self.assertTrue(change.is_symlink())
+        self.assertEqual((outside / 'manifest.json').read_bytes(), manifest)
+        self.assertEqual(target.read_text(), 'v2')
+
+    def test_prune_treats_naive_created_at_as_utc(self):
+        target = self.tmp / 'target'
+        target.write_text('v1')
+        change = Path(self.finished(target, 'v2'))
+        self.age(change, 40)
+        manifest = change / 'manifest.json'
+        data = json.loads(manifest.read_text())
+        data['created_at'] = data['created_at'].replace('+00:00', '')
+        manifest.write_text(json.dumps(data))
+        self.run_script('prune', '--older-than', '30', '--apply')
+        self.assertFalse(change.exists())
+
+    def test_prune_refuses_less_than_one_day(self):
+        for value in ('0', '-3'):
+            result = self.run_script('prune', '--older-than', value, '--apply', ok=False)
+            self.assertEqual(result.returncode, 2)
+            self.assertIn('at least 1 day', result.stderr)
+
+    def test_prune_of_an_older_change_keeps_undo_of_the_newer_one_working(self):
+        target = self.tmp / 'chain'
+        target.write_text('v1')
+        first = self.finished(target, 'v2', run='r1')
+        self.finished(target, 'v3', run='r2')
+        self.age(first, 40)
+        self.run_script('prune', '--older-than', '30', '--apply')
+        self.assertFalse(Path(first).exists())
+        result = self.run_script('undo', 'last')
+        self.assertNotIn('CONFLICT', result.stdout)
+        self.assertEqual(target.read_text(), 'v2')
+
     def test_undo_unfinished_change_with_created_file_is_a_conflict(self):
         edited, created = self.tmp / 'edited', self.tmp / 'created'
         edited.write_text('original')

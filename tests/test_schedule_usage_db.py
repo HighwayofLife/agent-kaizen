@@ -1,6 +1,10 @@
 """The scheduled audit feeds usage-db after the token audit and never changes its result."""
+import io
+from contextlib import redirect_stdout
 import os
 import sqlite3
+import subprocess
+from unittest.mock import patch
 
 from test_schedule_security import SecurityCase
 from test_scripts import jsonl
@@ -40,6 +44,27 @@ class UsageDbStepTests(SecurityCase):
         result = self.audit_run(code=3)
         self.assertIn('step usage-db: failed (', result.stdout)
         self.assertIn('audit: failed (exit 3)', result.stdout)
+
+    def test_ingest_timeout_is_reported_and_exit_code_kept(self):
+        real = subprocess.run
+
+        def slow_ingest(command, **kwargs):
+            if 'usage-db' in ' '.join(str(part) for part in command):
+                raise subprocess.TimeoutExpired(command, kwargs['timeout'])
+            return real(command, **kwargs)
+
+        for audit_exit, expected in ((0, 0), (3, 3)):
+            with self.subTest(audit_exit=audit_exit):
+                self.env['STUB_AUDIT_EXIT'] = str(audit_exit)
+                os.environ['STUB_AUDIT_EXIT'] = str(audit_exit)
+                self.addCleanup(os.environ.pop, 'STUB_AUDIT_EXIT', None)
+                with patch.object(self.runner.subprocess, 'run', side_effect=slow_ingest), \
+                        redirect_stdout(io.StringIO()) as output:
+                    code = self.runner.main(['audit', '--audits', str(self.audits), '--token-audit',
+                                             str(self.audit), '--pricing', str(self.pricing)])
+                self.assertEqual(code, expected)
+                self.assertIn('step usage-db: failed (timed out after 600 s)', output.getvalue())
+                self.assertFalse(self.db.exists())
 
     def test_ingest_stderr_reaches_the_log(self):
         with (self.cfg / 'projects' / 'p' / 's.jsonl').open('a') as stream:

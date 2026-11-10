@@ -16,7 +16,7 @@ CI (.github/workflows/ci.yml) also checks that every JSON file parses and that e
 
 ## Rules
 
-- **Version and changelog:** any change under `skills/`, `agents/`, `hooks/`, `scripts/`, `templates/` or `.claude-plugin/` bumps `version` in `.claude-plugin/plugin.json` and adds a `## x.y.z (date)` entry to CHANGELOG.md. CI enforces this on PRs.
+- **Version and changelog:** any change under `skills/`, `agents/`, `hooks/`, `scripts/`, `templates/` or `.claude-plugin/`, or to `docs/autonomy.md` or `docs/outcome-log.md` (skills read them at runtime), bumps `version` in `.claude-plugin/plugin.json` and adds a `## x.y.z (date)` entry to CHANGELOG.md. CI enforces this on PRs.
 - **Skills:** frontmatter `name` equals the folder name, `description` is quoted, and `disable-model-invocation: true`. Every skill is listed in the README skills table. Tests check all three.
 - **Privacy:** no home-directory paths, personal emails or key-like strings in any file git tracks (tests/test_repo.py). Never commit audit reports or transcripts.
 - **Scripts:** Python 3.9+, standard library only. `token-audit` must stay zero-token and fast; time it against `git show HEAD:scripts/token-audit` when changing the scan.

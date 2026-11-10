@@ -13,7 +13,13 @@
   kaizen-backup undo [last|run|CHANGE_DIR] [--force]
         Restore files; delete created files whose hash still matches; print recorded
         actions' undo commands (it never runs them). A file changed since `finish` is a
-        conflict: nothing is restored unless --force.
+        conflict: nothing is restored unless --force. `undo run` takes the newest
+        group of consecutive changes with one run id and session; older changes that
+        reuse the id are left alone and named.
+  kaizen-backup prune --older-than DAYS [--apply]
+        List finished changes created more than DAYS days ago (DAYS >= 1). Dry run
+        unless --apply, which deletes them. Unfinished changes, corrupt manifests and
+        changes without created_at are never removed.
 
 Backups live in KAIZEN_BACKUP_DIR (default <CLAUDE_CONFIG_DIR or ~/.claude>/kaizen-backups),
 in folders only the owner can read.
@@ -219,9 +225,65 @@ def targets(which):
         sys.exit("kaizen-backup: nothing to undo")
     if which == "last":
         return [open_changes[0]]
-    if which == "run":
-        run_id = open_changes[0][1]["run_id"]
-        return [item for item in open_changes if item[1]["run_id"] == run_id]
+    # A run id can be reused by a later run. Take only the newest consecutive group
+    # (same run id and session); older changes with that id are left alone and named.
+    newest = open_changes[0][1]
+    key = (newest["run_id"], newest.get("session_id"))
+    group = []
+    for item in changes():  # newest first, reverted ones included
+        if (item[1]["run_id"], item[1].get("session_id")) != key:
+            if group:
+                break
+            continue
+        if not item[1].get("reverted"):
+            group.append(item)
+    left = [item[0].name for item in open_changes
+            if item[1]["run_id"] == newest["run_id"] and item not in group]
+    if left:
+        print(f"kaizen-backup: run id {newest['run_id']} also appears on older changes; not undoing: {', '.join(left)}",
+              file=sys.stderr)
+    return group
+
+
+def tree_size(path):
+    return sum(item.stat().st_size for item in Path(path).rglob("*") if item.is_file() and not item.is_symlink())
+
+
+def prune(args):
+    if args.older_than < 1:
+        raise ValueError("--older-than must be at least 1 day")
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=args.older_than)
+    verb = "removed" if args.apply else "would remove"
+    count = freed = 0
+    for manifest in sorted(ROOT.glob("*/manifest.json")):
+        folder = manifest.parent
+        if folder.is_symlink():
+            print(f"skipped {folder.name}: is a symlink")
+            continue
+        try:
+            data = read_manifest(manifest)
+        except ValueError as error:
+            print(f"skipped {folder.name}: corrupt manifest ({error})")
+            continue
+        if not data.get("finished"):
+            print(f"skipped {folder.name}: unfinished")
+            continue
+        try:
+            created = datetime.datetime.fromisoformat(str(data.get("created_at")))
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=datetime.timezone.utc)
+        except ValueError:
+            print(f"skipped {folder.name}: no usable created_at")
+            continue
+        if created >= cutoff:
+            continue
+        size = tree_size(folder)
+        if args.apply:
+            shutil.rmtree(change_dir(folder))
+        print(f"{verb} {folder.name}\t{data['created_at']}\t{size} bytes")
+        count += 1
+        freed += size
+    print(f"{verb} {count} change(s), {'freed' if args.apply else 'would free'} {freed} bytes")
 
 
 def plugin_roots():
@@ -306,6 +368,10 @@ def main(argv=None):
     p.add_argument("target", nargs="?", default="last")
     p.add_argument("--force", action="store_true")
     p.set_defaults(func=undo)
+    p = sub.add_parser("prune")
+    p.add_argument("--older-than", type=int, required=True, metavar="DAYS")
+    p.add_argument("--apply", action="store_true")
+    p.set_defaults(func=prune)
     args = parser.parse_args(argv)
     try:
         ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)

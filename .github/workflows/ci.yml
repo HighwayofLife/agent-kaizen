@@ -76,7 +76,7 @@ jobs:
           BASE_REF: ${{ github.base_ref }}
         run: |
           base=origin/$BASE_REF
-          changed=$(git diff --name-only "$base"...HEAD -- skills agents hooks scripts templates .claude-plugin)
+          changed=$(git diff --name-only "$base"...HEAD -- skills agents hooks scripts templates .claude-plugin docs/autonomy.md docs/outcome-log.md)
           [ -z "$changed" ] && { echo "No plugin files changed."; exit 0; }
           old=$(git show "$base":.claude-plugin/plugin.json | jq -r .version)
           new=$(jq -r .version .claude-plugin/plugin.json)

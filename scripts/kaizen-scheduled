@@ -302,7 +302,7 @@ def failure_text(error):
 
 
 @contextlib.contextmanager
-def run_lock(audits):
+def run_lock(audits, watchdog=False):
     """Hold <audits>/.lock for a whole run; yield False if another run keeps it past KAIZEN_LOCK_WAIT."""
     if fcntl is None:
         yield True
@@ -327,11 +327,17 @@ def run_lock(audits):
                     yield False
                     return
                 time.sleep(min(1, remaining))
-        yield True
+        if watchdog:
+            SIGNALS["lease"] = handle.fileno()
+        try:
+            yield True
+        finally:
+            if watchdog:
+                SIGNALS["lease"] = None
 
 
 class Terminated(BaseException):
-    """A SIGTERM or SIGHUP; unwinds through the finally blocks that roll back and verify the ledger."""
+    """A handled signal; unwinds through rollback and ledger verification."""
 
     def __init__(self, number):
         super().__init__(number)
@@ -339,26 +345,123 @@ class Terminated(BaseException):
         self.name = signal.Signals(number).name
 
 
-# fired: first signal seen; raised: Terminated already thrown; deferred: depth of protected() sections.
-SIGNALS = {"fired": None, "raised": False, "deferred": 0}
+# fired: first signal seen; raised: Terminated already thrown; deferred: depth of protected() sections;
+# child: the model run's process, killed by the handler while cleanup is deferred; stoppable: set by run_group.
+SIGNALS = {"fired": None, "raised": False, "deferred": 0, "child": None, "stoppable": False}
 
 
 def _on_signal(number, frame):
     if SIGNALS["fired"] is None:
         SIGNALS["fired"] = number
     if SIGNALS["raised"] or SIGNALS["deferred"]:
-        return  # one exception only; cleanup keeps running
+        # One exception only; cleanup keeps running. A deferred signal must still stop the model run.
+        child = SIGNALS["child"]
+        if child is not None:
+            child.kill()
+        return
     SIGNALS["raised"] = True
     raise Terminated(number)
 
 
+class GroupPopen(subprocess.Popen):
+    """A child in its own session; kill() takes down its whole process group, so a step's helpers
+    do not outlive a timeout or a signal. Used only through run_group (subprocess.run calls kill())."""
+
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault("start_new_session", True)
+        self.grouped = kwargs["start_new_session"]
+        self.group_killed = False
+        if SIGNALS.get("watchdog") is not None:
+            reader, lease = SIGNALS["watchdog"]
+            args = ([sys.executable, "-c", WATCHDOG, str(reader), str(lease), *args[0]], *args[1:])
+        # Defer handled signals until the child is registered. Popen's caller has not
+        # installed its context manager yet, so construction must do its own cleanup.
+        fired_before = SIGNALS["fired"]
+        with protected():
+            super().__init__(*args, **kwargs)
+            if SIGNALS["stoppable"]:
+                SIGNALS["child"] = self
+            if (SIGNALS["fired"] is not None and not SIGNALS["raised"]
+                    and (SIGNALS["stoppable"] or fired_before is None)):
+                self.kill()
+                self.wait()
+
+    def kill(self):
+        if self.grouped:
+            if self.group_killed:
+                return  # KILL was already delivered; never target a dying/reused group twice
+            try:
+                os.killpg(self.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            self.group_killed = True
+        else:
+            super().kill()
+
+
+# Only the runner owns the pipe's write end. The watcher retains the protected
+# run lock until KILL is delivered, so recovery cannot race an orphaned writer.
+WATCHDOG = r'''
+import os, signal, sys, time
+reader, lease = int(sys.argv[1]), int(sys.argv[2])
+if os.fork() == 0:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    signal.signal(signal.SIGINT, signal.SIG_IGN)
+    signal.signal(signal.SIGHUP, signal.SIG_IGN)
+    for descriptor in range(max(reader, lease) + 1):
+        if descriptor not in (reader, lease):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+    os.closerange(max(reader, lease) + 1, 1048576)
+    while os.read(reader, 1):
+        pass
+    os.killpg(os.getpgrp(), signal.SIGTERM)
+    time.sleep(0.15)
+    os.killpg(os.getpgrp(), signal.SIGKILL)
+os.close(reader)
+if lease >= 0:
+    os.close(lease)
+os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
+'''
+
+
+def run_group(command, stoppable=False, **kwargs):
+    """subprocess.run in a new session whose whole group is killed on timeout or error. With
+    stoppable, a signal held back by protected() also kills it (the model run)."""
+    original = subprocess.Popen
+    reader = writer = None
+    try:
+        if stoppable:
+            reader, writer = os.pipe()  # non-inheritable; only reader is passed
+            lease = SIGNALS.get("lease")
+            kwargs["pass_fds"] = (*kwargs.get("pass_fds", ()), reader,
+                                  *((lease,) if lease is not None else ()))
+            SIGNALS["watchdog"] = (reader, lease if lease is not None else -1)
+        subprocess.Popen = GroupPopen
+        SIGNALS["stoppable"] = stoppable
+        return subprocess.run(command, **kwargs)
+    finally:
+        subprocess.Popen = original
+        child = SIGNALS["child"]
+        try:
+            if child is not None:
+                child.kill()  # stop helpers before rollback, even after a successful exit
+        finally:
+            SIGNALS.update(child=None, stoppable=False, watchdog=None)
+            for descriptor in (reader, writer):
+                if descriptor is not None:
+                    os.close(descriptor)
+
+
 @contextlib.contextmanager
 def terminating_on_signals():
-    """Turn SIGTERM and SIGHUP into Terminated. The child process is killed as the exception unwinds
+    """Turn SIGTERM, SIGHUP and SIGINT into Terminated. The child is killed as the exception unwinds
     through subprocess.run."""
-    SIGNALS.update(fired=None, raised=False, deferred=0)
+    SIGNALS.update(fired=None, raised=False, deferred=0, child=None, stoppable=False)
     previous = {}
-    for name in ("SIGTERM", "SIGHUP"):
+    for name in ("SIGTERM", "SIGHUP", "SIGINT"):
         number = getattr(signal, name, None)
         try:
             if number is not None and signal.getsignal(number) != signal.SIG_IGN:  # nohup stays honoured
@@ -444,7 +547,7 @@ class Project:
 
 def _git(directory, *arguments):
     try:
-        result = subprocess.run(["git", "-C", str(directory), *arguments],
+        result = run_group(["git", "-C", str(directory), *arguments],
                                 capture_output=True, text=True, timeout=STEP_TIMEOUT)
     except (OSError, UnicodeError, subprocess.TimeoutExpired):
         return None
@@ -898,6 +1001,14 @@ def auto_edit_allow(project_dir=None):
     return [f"{tool}({path}/**)" for path in paths for tool in ("Edit", "Write")]
 
 
+def auto_read_allow(project_dir=None, audits=None):
+    """Read, and through it Grep and Glob, only under the roots a run needs."""
+    roots = (Path(project_dir) if project_dir is not None else Path.cwd(), claude_home(), codex_home(),
+             HERE.parent, audits_dir(), audits if audits is not None else audits_dir())
+    paths = dict.fromkeys(deny_path(root, resolve=value) for root in roots for value in (False, True))
+    return [f"Read({path}/**)" for path in paths]
+
+
 def ledger_paths():
     # notes-ledger reads the raw global value too: never use effective()'s fallback here.
     ledger = load_config(global_config_path(), strict=True).get("notesLedger", {})
@@ -1053,13 +1164,13 @@ class LedgerGuard:
         return problems
 
 
-def review_command(options, mode, report, session_id, project_dir=None):
+def review_command(options, mode, report, session_id, project_dir=None, audits=None):
     auto = mode == "auto"
     ledger = HERE / "notes-ledger"
     allowed = REVIEW_TOOLS
     if auto:
         ledger_rules = ledger_deny()  # Validate before granting notes-ledger add.
-        allowed_tools = ["Read", "Grep", "Glob",
+        allowed_tools = [*auto_read_allow(project_dir, audits),
                          *auto_edit_allow(project_dir), *READ_ONLY_BASH]
         # File-writing Bash tools bypass Edit/Write denies; grant only the scoped helpers.
         backup = HERE / "kaizen-backup"
@@ -1184,6 +1295,21 @@ def housekeep(audits, cfg, dry_run=False, now=None):
     plan = []
     planned = set()
     identities = {}
+    # Recovery must retain its authenticated baseline even on propose-only
+    # retries or a separately invoked housekeep. Unreadable state pins all
+    # ledger snapshots because its individual paths cannot be recovered safely.
+    pinned_snapshots = set()
+    pin_all_snapshots = False
+    try:
+        for marker in recovery_markers(backup_root().resolve()):
+            try:
+                data = read_recovery_json(marker)
+                for entry in data["ledger"]:
+                    pinned_snapshots.add(Path(entry["snapshot"]).absolute())
+            except (OSError, ValueError, KeyError, TypeError):
+                pin_all_snapshots = True
+    except OSError:
+        pin_all_snapshots = True
 
     def add(path, info, kind, reason):
         if path not in planned:
@@ -1203,6 +1329,8 @@ def housekeep(audits, cfg, dry_run=False, now=None):
             groups = {}
             for pattern in patterns:
                 for path in retention_matches(audits, pattern):
+                    if kind == "ledger-runs" and (pin_all_snapshots or path in pinned_snapshots):
+                        continue
                     if family == "cycle" and path.name.endswith(".failed.md"):
                         continue
                     info = retention_stat(audits, path)
@@ -1283,7 +1411,14 @@ def run_audit(audits, options):
 def run_review(audits, project_dirs, options, clock):
     safety = {"ledger_violation": False, "stopped": False}
     try:
-        result = _run_review(audits, project_dirs, options, clock, safety)
+        # Shared across audit overrides, and inherited by the model watchdog. It
+        # remains locked after a hard kill until all orphaned writers are stopped.
+        lock = (contextlib.nullcontext(True) if same_directory(audits, backup_root())
+                else run_lock(backup_root().resolve(), watchdog=True))
+        with lock as held:
+            if not held:
+                return 0
+            result = _run_review(audits, project_dirs, options, clock, safety)
         return result
     except Terminated:
         safety["stopped"] = True  # a stopped run does no housekeeping
@@ -1301,7 +1436,7 @@ def run_step(name, options, arguments, success=(0,)):
     except FileNotFoundError:
         return None
     try:
-        result = subprocess.run([options.python, str(script), *map(str, arguments)],
+        result = run_group([options.python, str(script), *map(str, arguments)],
                                 capture_output=True, text=True, timeout=STEP_TIMEOUT)
         if result.returncode in success:
             return "\n".join(result.stdout.strip().splitlines()[:30])
@@ -1403,7 +1538,7 @@ def run_usage_db(options):
         return
     lines = []
     try:
-        result = subprocess.run([options.python, str(script), "ingest", "--quiet"],
+        result = run_group([options.python, str(script), "ingest", "--quiet"],
                                 capture_output=True, text=True, timeout=STEP_TIMEOUT)
         lines = result.stderr.strip().splitlines()
         if not result.returncode:
@@ -1431,7 +1566,7 @@ def _run_token_audit(audits, options):
     audit_steps(audits, options)
     try:
         with (audits / "run.log").open("a", encoding="utf-8") as errors:
-            result = subprocess.run(audit_command(options, audits), stdout=subprocess.PIPE,
+            result = run_group(audit_command(options, audits), stdout=subprocess.PIPE,
                                     stderr=errors, text=True, timeout=STEP_TIMEOUT)
         if not result.returncode:
             report = report_path(result.stdout)
@@ -1463,7 +1598,7 @@ def backup_directories(root):
     return paths, inodes
 
 
-def rollback_auto_changes(options, run_id, session_id, started, root, before):
+def rollback_auto_changes(options, run_id, session_id, started, root, before, recovery=False):
     """Undo only this cycle's unfinished or failed changes, newest first."""
     pending, messages, problems = [], [], []
     for manifest in root.glob("*/manifest.json"):
@@ -1478,13 +1613,20 @@ def rollback_auto_changes(options, run_id, session_id, started, root, before):
             if (data.get("run_id") != run_id and data.get("session_id") != session_id
                     or created is None or created <= started or data.get("reverted")):
                 continue
+            if recovery and (data.get("run_id") != run_id or data.get("session_id") != session_id):
+                continue
             if not data.get("finished") or data.get("verification") == "failed":
+                if recovery and not data.get("finished"):
+                    # begin has no after hash. We cannot distinguish an abandoned
+                    # edit from a later legitimate edit; never overwrite either.
+                    raise ValueError("CONFLICT: unfinished change has no verified after hash")
                 pending.append((created, manifest.parent))
         except (OSError, ValueError, AttributeError) as error:
             problems.append(f"rollback failed: {manifest.parent}: {error}")
     for _, change in sorted(pending, reverse=True):
         try:
-            result = subprocess.run([options.python, str(HERE / "kaizen-backup"), "undo", str(change), "--force"],
+            result = run_group([options.python, str(HERE / "kaizen-backup"), "undo", str(change),
+                                *([] if recovery else ["--force"])],
                                     capture_output=True, text=True, timeout=STEP_TIMEOUT,
                                     env=dict(os.environ, KAIZEN_BACKUP_DIR=str(root)))
             if result.returncode:
@@ -1494,6 +1636,182 @@ def rollback_auto_changes(options, run_id, session_id, started, root, before):
         except (OSError, ValueError, subprocess.TimeoutExpired) as error:
             problems.append(f"rollback failed: {change}: {failure_text(error)}")
     return messages, problems
+
+
+ACTIVE_RUN = ".active-run.json"
+EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+
+def write_active_run(audits, run_id, session_id, mode, guard):
+    """Create runner-owned state exclusively in the backup tree, which tools deny.
+    Never replace an unresolved marker, even during a subsequent propose-only run.
+    """
+    root = backup_root().resolve()
+    root.mkdir(parents=True, exist_ok=True)
+    path = root / ACTIVE_RUN
+    payload = {"run_id": run_id, "session_id": session_id, "mode": mode,
+               "ledger": [{key: str(value) if isinstance(value, Path) else value
+                           for key, value in entry.items() if key != "data"}
+                          for entry in guard.entries]}
+    while True:
+        try:
+            descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
+            break
+        except FileExistsError:
+            # No -NN- component: kaizen-backup's <run>-NN-<skill> names
+            # cannot occupy this namespace, regardless of either argument.
+            path = root / (".active-run." + uuid.uuid4().hex + ".json")
+    with os.fdopen(descriptor, "w", encoding="utf-8") as output:
+        os.fchmod(output.fileno(), 0o600)
+        json.dump(payload, output)
+        output.flush()
+        os.fsync(output.fileno())
+    return path
+
+
+def read_recovery_json(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, "r", encoding="utf-8") as source:
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600:
+            raise ValueError("marker must be a regular file with mode 0600")
+        return json.load(source)
+
+
+def recovery_ledger(data, root):
+    """Authenticate every snapshot before verifying or restoring any ledger."""
+    entries = data["ledger"]
+    if not isinstance(entries, list):
+        raise ValueError("missing authenticated ledger metadata")
+    guard = LedgerGuard(None)
+    for item in entries:
+        entry = dict(item)
+        if entry["kind"] not in ("csv", "timeline"):
+            raise ValueError("invalid ledger kind")
+        for name in ("path", "resolved", "snapshot"):
+            entry[name] = Path(entry[name])
+            if not entry[name].is_absolute():
+                raise ValueError("ledger paths must be absolute")
+        descriptor = os.open(entry["snapshot"], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "rb") as source:
+            info = os.fstat(source.fileno())
+            if not stat.S_ISREG(info.st_mode):
+                raise ValueError("snapshot is not a regular file")
+            if type(entry["size"]) is not int or entry["size"] < 0 or info.st_size != entry["size"]:
+                raise ValueError("snapshot hash mismatch")
+            old = source.read(entry["size"] + 1)
+        if len(old) != entry["size"] or hashlib.sha256(old).hexdigest() != entry["sha256"]:
+            raise ValueError("snapshot hash mismatch")
+        entry["data"] = old
+        guard.entries.append(entry)
+    # Rejected bytes must not be written through a model-controlled snapshot folder.
+    guard.folder = Path(tempfile.mkdtemp(dir=root, prefix=".ledger-recovery-"))
+    for entry in guard.entries:
+        entry["snapshot"] = guard.folder / entry["kind"]
+        entry["snapshot"].write_bytes(entry["data"])
+    return guard
+
+
+def recovery_markers(root):
+    for path in sorted(root.glob(".active-run*.json")):
+        # Include first-round UUID names for upgrades, but never directories,
+        # symlinks or other objects that a backup helper could create.
+        if (path.name == ACTIVE_RUN
+                or re.fullmatch(r"\.active-run\.[0-9a-f]{32}\.json", path.name)
+                or re.fullmatch(r"\.active-run-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\.json", path.name)):
+            if stat.S_ISREG(path.lstat().st_mode):
+                yield path
+
+
+def removal_command(path):
+    # lstat avoids recursing through a symlink to a directory.
+    recursive = stat.S_ISDIR(path.lstat().st_mode)
+    return shlex.join(["rm", *(["-r"] if recursive else []), "--", str(path)])
+
+
+def unresolved_recovery(path, run_id, problems, options, root, data=None):
+    """Print complete owner actions, including a way out of untrusted state."""
+    command = None
+    if data is not None:
+        for manifest in sorted(root.glob("*/manifest.json"), reverse=True):
+            if manifest.is_symlink() or manifest.parent.is_symlink():
+                continue
+            try:
+                change = json.loads(manifest.read_text(encoding="utf-8"))
+                if (change.get("run_id") == data["run_id"]
+                        and change.get("session_id") == data["session_id"]
+                        and not change.get("reverted")):
+                    assignments = []
+                    home = claude_home().resolve()
+                    if home != (Path.home() / ".claude").resolve():
+                        assignments.append("CLAUDE_CONFIG_DIR=" + shlex.quote(str(home)))
+                    if root != home / "kaizen-backups":
+                        assignments.append("KAIZEN_BACKUP_DIR=" + shlex.quote(str(root)))
+                    command = " ".join([*assignments, shlex.join([
+                        options.python, str(HERE / "kaizen-backup"), "undo", str(manifest.parent)])])
+                    break
+            except (OSError, ValueError, AttributeError):
+                continue
+    action = f"; recovery command: {command}" if command else ""
+    return (f"interrupted run {run_id}: " + "; ".join(problems) + action
+            + "; resolve changes and ledger by hand if needed, then discard recovery record: "
+            + removal_command(path))
+
+
+def recover_interrupted_run(audits, options):
+    """With both locks held, retry every unresolved runner-owned record.
+    Audit-local legacy state cannot authorize rollback or ledger restoration.
+    """
+    root = backup_root().resolve()
+    statuses = []
+    legacy = audits / ACTIVE_RUN
+    if legacy.parent.resolve() != root and (legacy.exists() or legacy.is_symlink()):
+        statuses.append(unresolved_recovery(legacy, "unknown",
+                        [f"ledger-unverified: untrusted legacy marker {legacy}"], options, root))
+    for path in recovery_markers(root):
+        run_id = "unknown"
+        try:
+            data = read_recovery_json(path)
+            run_id, session_id = data["run_id"], data["session_id"]
+            if not (isinstance(run_id, str) and run_id and isinstance(session_id, str) and session_id):
+                raise ValueError("bad ids")
+            if data.get("mode") not in ("auto", "propose-only"):
+                raise ValueError("bad mode")
+        except (OSError, ValueError, KeyError, TypeError, UnicodeError) as error:
+            statuses.append(unresolved_recovery(path, run_id,
+                            [f"ledger-unverified: unreadable marker ({error})"], options, root))
+            continue
+        problems = []
+        if data.get("mode") == "auto":
+            try:
+                messages, problems = rollback_auto_changes(options, run_id, session_id, EPOCH, root,
+                                                           (set(), set()), recovery=True)
+            except Exception as error:
+                messages, problems = [], [f"rollback failed: {error}"]
+            for message in messages:
+                log(f"interrupted run {run_id}: {message}")
+        guard = None
+        violations = []
+        try:
+            guard = recovery_ledger(data, root)
+            violations = guard.verify()
+            if violations:
+                log(f"interrupted run {run_id}: ledger-violation: " + "; ".join(violations))
+                # A successful restoration is verified again before dropping state.
+                if any("; restore failed (" in item for item in violations) or guard.verify():
+                    problems.append("ledger-unverified: ledger restoration remains unresolved")
+                else:
+                    statuses.append(f"interrupted run {run_id}: ledger-violation: restored authenticated snapshot")
+        except Exception as error:
+            problems.append(f"ledger-unverified: {error}")
+        finally:
+            if guard is not None and guard.folder is not None and not violations:
+                shutil.rmtree(guard.folder, ignore_errors=True)
+        if problems:
+            statuses.append(unresolved_recovery(path, run_id, problems, options, root, data))
+        else:
+            path.unlink()
+    return "; ".join(statuses) or None
 
 
 def _run_review(audits, project_dirs, options, clock, safety):
@@ -1508,6 +1826,9 @@ def _run_review(audits, project_dirs, options, clock, safety):
     write_index(audits, projects)
     run_checks(audits, options, projects)
     rollback_failed = config_failed = False
+    degraded = recover_interrupted_run(audits, options)
+    if degraded:
+        log(f"recovery: {degraded}; every project runs as propose-only this cycle")
     cache = {}
     for project in sorted(projects, key=lambda project: project.canonical):
         project.folder = audits / "projects" / project.key
@@ -1520,7 +1841,7 @@ def _run_review(audits, project_dirs, options, clock, safety):
         try:
             project.folder.mkdir(parents=True, exist_ok=True)
             with (audits / "run.log").open("a", encoding="utf-8") as errors:
-                result = subprocess.run(audit_command(options, project.folder, project),
+                result = run_group(audit_command(options, project.folder, project),
                                         stdout=subprocess.PIPE, stderr=errors, text=True,
                                         timeout=STEP_TIMEOUT)
             if result.returncode:
@@ -1536,7 +1857,7 @@ def _run_review(audits, project_dirs, options, clock, safety):
             log(f"{project.canonical}: {audit_error}")
             continue
         run_project_report(audits, project.canonical, project.key, options)
-        mode = cycle_mode(cfg, options)
+        mode = "propose-only" if degraded else cycle_mode(cfg, options)
         session_id = str(uuid.uuid4())
         ignored = state.get("ignore_sessions", [])
         ignored = [value for value in ignored if isinstance(value, str)] if isinstance(ignored, list) else []
@@ -1556,6 +1877,7 @@ def _run_review(audits, project_dirs, options, clock, safety):
         path_error = config_error = timed_out = terminated = None
         rollbacks, rollback_problems = [], []
         guard = None
+        active_marker = None
         try:
             run_id = started.astimezone().strftime("%Y%m%d-%H%M%S") + "-" + session_id
             root = backup_root().resolve()
@@ -1580,27 +1902,47 @@ def _run_review(audits, project_dirs, options, clock, safety):
                     ledger_problems.append(str(error))
                 if not ledger_problems and config_error is None:
                     limit = review_timeout()
-                    try:
-                        result = subprocess.run(review_command(options, mode, report, session_id, project.canonical),
-                                                cwd=project.canonical, env=env, stdout=output, stderr=errors,
-                                                timeout=limit)
-                    except subprocess.TimeoutExpired:
-                        timed_out = limit
-                    finally:
-                        with protected():  # a signal now waits until rollback and the ledger check are done
+                    active_marker = write_active_run(audits, run_id, session_id, mode, guard)
+                    with protected():  # from here a signal waits for rollback and the ledger check
+                        try:
+                            result = run_group(review_command(options, mode, report, session_id, project.canonical, audits),
+                                               stoppable=True, cwd=project.canonical, env=env, stdout=output,
+                                               stderr=errors, timeout=limit)
+                        except subprocess.TimeoutExpired:
+                            timed_out = limit
+                        finally:
                             if mode == "auto":
                                 try:
                                     rollbacks, rollback_problems = rollback_auto_changes(
                                         options, run_id, session_id, started, root, before)
                                 except Exception as error:
                                     rollback_problems.append(f"rollback failed: {error}")
+                            ledger_resolved = False
                             try:
                                 ledger_problems.extend(guard.verify())
                                 if not ledger_problems:
-                                    shutil.rmtree(guard.folder)
+                                    ledger_resolved = True
+                                elif not any("; restore failed (" in item for item in ledger_problems):
+                                    recheck = guard.verify()
+                                    ledger_problems.extend(recheck)
+                                    ledger_resolved = not recheck
                             except Exception as error:
                                 paths = ", ".join(str(entry["path"]) for entry in guard.entries)
                                 ledger_problems.append(f"{paths}: ledger guard failed ({error}); snapshots: {guard.folder}")
+                            if not rollback_problems and ledger_resolved:
+                                # The marker is the commit point. A kill before
+                                # unlink retries verification; a kill afterwards
+                                # leaves only disposable, already-verified files.
+                                active_marker.unlink(missing_ok=True)
+                                if not ledger_problems:
+                                    shutil.rmtree(guard.folder)
+                            else:
+                                problems = [*rollback_problems]
+                                if not ledger_resolved:
+                                    problems.append("ledger-unverified: ledger restoration remains unresolved")
+                                degraded = unresolved_recovery(active_marker, run_id, problems, options, root,
+                                                              {"run_id": run_id, "session_id": session_id})
+                                log(f"recovery: {degraded}; every project runs as propose-only this cycle")
                             for message in [*rollbacks, *rollback_problems]:
                                 output.write("\n" + message + "\n")
             if ledger_problems:
@@ -1731,17 +2073,31 @@ def canonical_project(directory):
     return directory
 
 
+@contextlib.contextmanager
+def config_lock(path):
+    """Serialize read-modify-write of a config file with flock on <name>.lock beside the file (beside the link when the file is a symlink)."""
+    if fcntl is None:
+        yield
+        return
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(str(path) + ".lock", "a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        yield
+
+
 def update_auto_projects(project, enable):
     """Add or remove a project's canonical path in the global autoProjects list."""
-    raw = load_config(global_config_path(), strict=True).get("autoProjects", [])
-    if not valid_value("autoProjects", raw):
-        raise ValueError("autoProjects in the global config is invalid; fix it first")
-    listed = any(same_directory(item, project) for item in raw)
-    if enable and not listed:
-        write_config(global_config_path(), {"autoProjects": [*raw, str(project)]})
-    elif listed and not enable:
-        write_config(global_config_path(), {"autoProjects": [
-            item for item in raw if not same_directory(item, project)]})
+    with config_lock(global_config_path()):
+        raw = load_config(global_config_path(), strict=True).get("autoProjects", [])
+        if not valid_value("autoProjects", raw):
+            raise ValueError("autoProjects in the global config is invalid; fix it first")
+        listed = any(same_directory(item, project) for item in raw)
+        if enable and not listed:
+            write_config(global_config_path(), {"autoProjects": [*raw, str(project)]})
+        elif listed and not enable:
+            write_config(global_config_path(), {"autoProjects": [
+                item for item in raw if not same_directory(item, project)]})
 
 
 def show_config(project_dir=None):
@@ -1819,7 +2175,7 @@ def main(argv=None):
             if args.command == "review" and args.dry_run:
                 review_dry_run(audits, args.project_dir, now(fixed), options, args.json)
                 return 0
-            with terminating_on_signals(), run_lock(audits) as held:
+            with terminating_on_signals(), run_lock(audits, watchdog=args.command == "review") as held:
                 if not held:
                     return 0
                 rotate_log(audits)
@@ -1876,7 +2232,11 @@ def main(argv=None):
                 except ValueError as error:
                     print(f"kaizen-scheduled: {error}", file=sys.stderr)
                     return 2
-        write_config(path, updates)
+        if args.project_dir is None:
+            with config_lock(path):  # the global file is also edited by `config set --for`
+                write_config(path, updates)
+        else:
+            write_config(path, updates)
         if note:
             print(note, file=sys.stderr)
     show_config(args.project_dir)

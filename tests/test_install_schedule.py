@@ -106,6 +106,40 @@ class InstallScheduleTests(StubCase):
         self.assertIn(['--user', 'disable', '--now', 'agent-kaizen-review.timer'], log)
         self.assertNotIn(REMOVED, self.schedule('Linux', '--scheduler', 'systemd', '--apply').stdout)
 
+    def warnings(self, result):
+        return [line for line in result.stderr.splitlines() if 'review job is still installed' in line]
+
+    def test_apply_warns_about_review_jobs_in_other_backends(self):
+        self.schedule('Linux', '--scheduler', 'systemd', '--apply', '--review')
+        self.schedule('Darwin', '--scheduler', 'launchd', '--apply', '--review')
+        self.schedule('Linux', '--scheduler', 'cron', '--apply', '--review')
+        result = self.schedule('Linux', '--scheduler', 'cron', '--apply')
+        lines = self.warnings(result)
+        self.assertEqual(len(lines), 2, result.stderr)
+        self.assertTrue(any('launchd' in l and 'launchctl bootout' in l and 'com.agent-kaizen.review.plist' in l
+                            for l in lines))
+        self.assertTrue(any('systemd' in l and 'systemctl --user disable --now agent-kaizen-review.timer' in l
+                            for l in lines))
+        again = self.warnings(self.schedule('Linux', '--scheduler', 'systemd', '--apply'))
+        self.assertEqual(len(again), 1)
+        self.assertIn('launchd', again[0])
+        self.assertEqual(self.warnings(self.schedule('Linux', '--scheduler', 'cron')), [])
+
+    def test_apply_warns_about_a_cron_review_job_from_systemd(self):
+        self.schedule('Linux', '--scheduler', 'cron', '--apply', '--review')
+        result = self.schedule('Linux', '--scheduler', 'systemd', '--apply')
+        lines = self.warnings(result)
+        self.assertEqual(len(lines), 1, result.stderr)
+        self.assertIn('cron', lines[0])
+        self.assertIn("grep -v '# agent-kaizen-review$' | crontab -", lines[0])
+
+    def test_no_warning_without_a_foreign_review_job_or_with_review(self):
+        self.schedule('Linux', '--scheduler', 'systemd', '--apply', '--review')
+        self.assertEqual(self.warnings(self.schedule('Linux', '--scheduler', 'cron', '--apply', '--review')), [])
+        (self.cron_file).unlink()
+        self.schedule('Linux', '--scheduler', 'systemd', '--apply')
+        self.assertEqual(self.warnings(self.schedule('Linux', '--scheduler', 'cron', '--apply')), [])
+
     def test_auto_keeps_review(self):
         self.schedule('Linux', '--scheduler', 'cron', '--apply', '--review')
         result = self.schedule('Linux', '--scheduler', 'cron', '--apply', '--auto', 'none')

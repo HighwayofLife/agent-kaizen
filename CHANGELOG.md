@@ -2,6 +2,59 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.9.1 (2026-11-10)
+
+Follow-up fixes to 0.9.0. Each fix has a regression test.
+
+`kaizen-backup`:
+
+- New `kaizen-backup prune --older-than DAYS [--apply]` removes finished changes created more than DAYS days ago (DAYS 1 or more). It is a dry run unless `--apply` is given. It never removes unfinished changes, changes with a corrupt manifest, changes without a usable `created_at`, or anything newer than the cutoff; each is reported as `skipped`. Pruning an older change does not affect `undo` of a newer change to the same file.
+- `kaizen-backup undo run` now undoes only the newest group of consecutive changes that share one run id and session. Older changes that reused the id are left open, and stderr names them. Undo those with `kaizen-backup undo CHANGE_DIR`.
+
+`install-schedule`:
+
+- `--apply` without `--review` still removes the review job of the backend it writes to. A review job in another backend (launchd, systemd, cron) is left alone, and a warning on stderr gives the command that removes it.
+
+`codex-dispatch`:
+
+- The resume prompt sent after a failed require-change check no longer mentions `--allow-no-change`. The report and `--help` still name the flag.
+- When `-C` is a subdirectory of a Git repository, the require-change snapshot covers only that subdirectory. Changes elsewhere in the repo no longer count as Codex's change. With `-C` at the repo root nothing changes.
+
+`packet-report`:
+
+- An escalation is also counted when only the effort rises between rounds (same model). Such pairs are labelled with model and effort, for example `terra:medium->terra:high`. Model-only changes keep the model path label.
+
+`usage-db`, `usage-series`, `usage-compare`:
+
+- New `usage-db prune --older-than DAYS [--apply] [--db PATH]` deletes old calls and vacuums the file when `--apply` is given. It is otherwise a dry run. Nothing is pruned automatically. A transcript that still exists and later changes is read again in full, which stores its pruned calls again.
+- The usage database schema is now version 2. Codex call ids start with the session id stored inside the session file, so a session file that is copied or moved to a new name is no longer counted twice.
+- New `usage-series --from-db` reads calls, tokens and cost from the usage database instead of transcripts. Columns the database does not store (wake-ups, images, reads, spawns, Codex database counts, `command_*`, and `runs` in `daily-agents.csv`) are written as `n/a`.
+- New `usage-compare --from-db` (with `--clean-split`) computes the clean-split metrics from the usage database, Claude calls only. `wake-ups/day` and `images/day` print `n/a`. Calls without an id that share the same second and usage count once in the database.
+
+`kaizen-scheduled`:
+
+- A run creates a protected `<backup-root>/.active-run.json` before each model run. Reviews lock the backup root, and a watchdog stops the model process group after runner death before recovery takes the lock. Unresolved markers are retained and retried across audits folders; later runs use `.active-run.<32-lowercase-hex-uuid>.json`. The scan also accepts older hyphenated UUID markers and only reads regular files with mode 0600.
+- Hard-kill recovery matches both run and session ids. It undoes finished failed changes only when their after hashes match, without `--force`; unfinished changes require manual resolution. Ledger snapshots are authenticated before verification or restoration. A restored violation makes that cycle propose-only. A marker is removed only after rollback and ledger verification or restoration succeed; restored ledgers are verified again. Unresolved cleanup retains the marker and snapshots, and every retry remains propose-only. Housekeeping protects referenced snapshots, or all ledger snapshots if a marker is unreadable. The status reports the problem, a non-forced undo command when available, and a command to discard the record after manual resolution. Legacy audit-local markers are untrusted and require inspection.
+- Every step the runner starts (model run, token audit, usage-db ingest, git, rollback) runs in its own session. On timeout or error the whole process group is killed, even if its leader has exited. The model group is also stopped before normal rollback.
+- SIGTERM, SIGHUP or SIGINT during a model run stops the model group, runs rollback and the ledger check, and exits 143, 129 or 130.
+- Auto-mode Read rules now scope Read, Grep and Glob to the project, config homes, plugin root, default audits folder and actual `--audits` folder. Propose mode retains bare Read, Grep and Glob.
+- The live permission probe covers the newer write denies and scoped reads. It skips the Codex `AGENTS.md` deny when the Codex home is missing or the file already exists.
+- `config set` (global and `--for`) takes a lock file, `agent-kaizen.json.lock`, beside the global config.
+
+Other:
+
+- `scripts/pricing.json`: added `claude-fable-5-2` from the vendor pricing page and pointed the `fable` alias at it. All other rows were re-checked against both vendors' pricing pages on 2026-11-10, with no changes.
+- CI: `docs/autonomy.md` and `docs/outcome-log.md` now count for the version-bump check, because skills read them at runtime.
+- Docs: `docs/autonomy.md` no longer repeats the scheduled-runner permission detail from `docs/scheduling.md`. The README environment table lists `KAIZEN_SESSION_ID` and `XDG_CONFIG_HOME`.
+
+Upgrade notes:
+
+- The usage database upgrades from version 1 to 2 in place on the next `usage-db ingest`, with no flag or prompt. Codex rows whose session file still exists are re-keyed, and rows stored twice under two file names collapse to one. Rows whose file was deleted before the upgrade keep their old ids, so a copied session can stay counted twice. `status`, `report` and `sql` read a version 1 database without migrating it.
+- Behaviour change: `kaizen-backup undo run` no longer undoes older changes that reused a run id.
+- Behaviour change: with `codex-dispatch -C` set to a subdirectory of a repo, only changes inside that subdirectory satisfy the require-change check.
+- Behaviour change: `packet-report` counts effort-only rises as escalations, so escalation counts can go up.
+- After a hard kill, a restored ledger violation makes the recovery cycle propose-only. Unresolved recovery keeps every retry propose-only until resolved. Inspect the reported recovery command and retained marker.
+
 ## 0.9.0 (2026-11-10)
 
 From a full review of the plugin. Each fix has a regression test.

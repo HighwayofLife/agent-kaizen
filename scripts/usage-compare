@@ -160,6 +160,47 @@ def clean_split(args, warnings=None):
     return results
 
 
+def database_split(args):
+    """The clean-split windows read from the usage-db store: Claude calls only, split by timestamp.
+
+    Same windows and metric formulas as clean_split. The file-modification-time rule cannot be applied
+    (the store does not link calls to files), and the two metrics that need transcript content are n/a."""
+    start = args.before_from or args.cutoff - timedelta(days=30)
+    stop = args.after_to + timedelta(days=1) if args.after_to else datetime.now(timezone.utc)
+    if stop <= args.cutoff:
+        raise ValueError('clean split after window is empty')
+    usage_db, conn = SERIES.open_usage_db('usage-compare')
+    pricing, _ = SERIES.AUDIT.load_pricing(args.pricing.expanduser())
+    state = SERIES.price_state(pricing)
+    keep = SERIES.db_selection(conn, args)
+    bound = lambda moment: moment.strftime('%Y-%m-%dT%H:%M:%S')
+    results = []
+    for since, until in ((start, args.cutoff), (args.cutoff, stop)):
+        # ts text is ISO with a trailing Z; a bound without the Z sorts correctly against it.
+        where = ["source = 'claude'", 'ts >= ?', 'ts < ?'] + keep
+        calls = context = peak = 0
+        cost = 0.0
+        for (main,), _, _, count, tokens, top, price, _ in usage_db.priced_rows(
+                conn, state, where, [bound(since), bound(until)], ["agent = 'main'"]):
+            cost += price
+            if main:
+                calls += count
+                context += sum(tokens[:4])
+                peak = max(peak, top)
+        duration = (until - since).total_seconds() / 86400
+        results.append(dict(window_days=duration, calls=calls, metrics={
+            'main calls/day': divide(calls, duration),
+            'avg context': divide(context, calls),
+            'peak context': peak,
+            'wake-ups/day': None,
+            'images/day': None,
+            'Claude cost/day': divide(cost, duration),
+            'Claude cost/main call': divide(cost, calls),
+        }, active_days=[], unavailable=[], logs_missing=False))
+    conn.close()
+    return results
+
+
 def display(result):
     print('metric                            before                  after       ratio')
     before, after = result['before'], result['after']
@@ -188,8 +229,16 @@ def main():
     parser.add_argument('--active-min-calls', type=int, default=50)
     parser.add_argument('--json', action='store_true')
     parser.add_argument('--clean-split', action='store_true', help='isolated Claude file sets; rates per elapsed UTC day, not active day')
+    parser.add_argument('--from-db', action='store_true', help=(
+        'Calls without an id that share the same second and usage are counted once in the database. '
+        'with --clean-split, read the Claude calls from the usage-db store ($KAIZEN_USAGE_DB, else '
+        '<CLAUDE_CONFIG_DIR or ~/.claude>/kaizen-usage.db) instead of transcripts, for windows whose transcripts are gone. '
+        'Windows are split by call time, so the file-modification-time exclusion is not applied. '
+        'wake-ups/day and images/day are not stored and print as n/a. --project and --cwd match the stored working directory'))
     SERIES.selection(parser)
     args = parser.parse_args()
+    if args.from_db and not args.clean_split:
+        parser.error('--from-db needs --clean-split (--series reads a CSV, not transcripts)')
     if not args.clean_split and args.series is None:
         parser.error('--series is required unless --clean-split is used')
     if args.active_min_calls < 0:
@@ -201,8 +250,11 @@ def main():
     try:
         if args.clean_split:
             warnings = []
-            before, after = clean_split(args, warnings)
-            warnings.insert(0, 'clean split uses Claude transcripts only and elapsed UTC days; series active-day threshold does not apply')
+            before, after = database_split(args) if args.from_db else clean_split(args, warnings)
+            warnings.insert(0, 'clean split uses ' + (
+                'the usage database (Claude calls only, split by call time; wake-ups/day and images/day are n/a)'
+                if args.from_db else 'Claude transcripts only') +
+                ' and elapsed UTC days; series active-day threshold does not apply')
             for side, data in (('before', before), ('after', after)):
                 if not data['calls']:
                     warnings.append(f'{side}: 0 calls in clean split window')

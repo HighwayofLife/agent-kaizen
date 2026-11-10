@@ -522,8 +522,11 @@ csv.write_text(csv.read_text().replace('active', 'done') + '2026-10-02,user,Adde
             with self.subTest(name):
                 path = self.auto_fixture(tamper=False, hang=False)
                 Path(str(self.csv) + '.lock').unlink(missing_ok=True)
+                # Recovery of the preceding subtest may create a regular lock
+                # before the model starts. Replace it with this case's fixture.
                 executable(self.claude, '#!' + sys.executable + '\nimport os\n'
-                           'lock = os.environ["CSV"] + ".lock"\n' + make + '\n')
+                           'lock = os.environ["CSV"] + ".lock"\n'
+                           'if os.path.lexists(lock):\n    os.unlink(lock)\n' + make + '\n')
                 self.review('--project-dir', path, '--force', code=1)
                 state = self.state(path)
                 self.assertEqual(state['status'], 'ledger-violation')
