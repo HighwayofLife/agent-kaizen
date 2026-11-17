@@ -99,7 +99,7 @@ Phase 5: build it.
 Phase 6: verify and record.
 - Smoke-test each agent and script with a tiny read-only task, and report pass or fail.
 - Add a ledger row per vendor or agent added (docs/kaizen/LEDGER.md), with how the next
-  audit will show whether it helps (per-pool usage, per-agent cost and success rate).
+  audit will show whether it helps (per-pool usage, per-agent cost and success rate). Include metric command and review date using `${CLAUDE_PLUGIN_ROOT}/skills/start/SKILL.md`.
 - Remind me that /agent-kaizen:models and /agent-kaizen:cycle re-check the roster
   periodically.
 ```

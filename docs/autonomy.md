@@ -78,7 +78,7 @@ Use the bundled script for the bookkeeping. Call `<Claude config dir>/bin/kaizen
    - `claude plugin validate` or the project's checks pass where relevant;
    - agents and skills still have valid frontmatter.
 4. **Finish or roll back:** if verification passes, run `kaizen-backup finish <change folder>`, which records the after-hashes undo uses to detect later edits. If it fails interactively, run `kaizen-backup undo <change folder> --force`, report the failure, and skip the change. In scheduled auto runs, leave the backup unfinished (or record `finish <change folder> --verification failed`) and report the failed check. The runner performs forced rollback after the cycle exits; the model never gets `undo` or `action`.
-5. **Ledger row** in `docs/kaizen/LEDGER.md`, with the backup folder, so `/agent-kaizen:undo` can reverse it.
+5. **Ledger row** in `docs/kaizen/LEDGER.md`, with the backup folder, so `/agent-kaizen:undo` can reverse it. Include metric command and review date using `${CLAUDE_PLUGIN_ROOT}/skills/start/SKILL.md`.
 6. **Summary at the end:** what was applied, what was skipped and why (hard stop, cap reached, missing permission), and what was rolled back.
 
 ## Permissions

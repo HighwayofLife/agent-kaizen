@@ -57,6 +57,16 @@ class ProjectReportTests(unittest.TestCase):
         self.assertTrue(any('Totals:' in line for line in sections['Packet outcomes']))
         self.assertTrue(sections['Calibration proposals'])
 
+    def test_eight_column_ledger_pending(self):
+        (self.project / 'docs/kaizen/LEDGER.md').write_text(
+            '| date | change | why | expected effect | measured effect | keep/revert | metric command | review date |\n'
+            '| --- | --- | --- | --- | --- | --- | --- | --- |\n'
+            '| 2020-01-01 | old change | | | pending | | | |\n', encoding='utf-8')
+        result = self.invoke('--json')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        sections = {s['title']: s['lines'] for s in json.loads(result.stdout)['sections']}
+        self.assertTrue(any('2020-01-01 old change' in line for line in sections['Project ledger rows pending']))
+
     def test_failures_and_truncation(self):
         self.configure({'shadowStatus': [sys.executable, '-c', 'import sys; sys.exit(3)'],
                         'slowTests': ['nonexistent-project-report-command'],
