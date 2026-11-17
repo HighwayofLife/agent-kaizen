@@ -66,6 +66,19 @@ class ConfigKeysTests(unittest.TestCase):
                     self.assertEqual(json.loads(result.stdout)[name],
                                      {"value": DEFAULTS[name], "source": "default"})
 
+    def test_pending_days_project_and_global(self):
+        self.assertEqual(json.loads(self.run_config("show").stdout)["pendingDays"]["value"], 10)
+        for args, path in (((), self.config), (("--for", str(self.project)), self.project / "docs/kaizen/config.json")):
+            result = self.run_config("set", *args, "pendingDays=5")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(path.read_text())["pendingDays"], 5)
+        for value in (0, -1, "x", True):
+            with self.subTest(value=value):
+                result = self.run_config("set", "pendingDays=" + json.dumps(value))
+                self.assertNotEqual(result.returncode, 0)
+                self.config.write_text(json.dumps({"pendingDays": value}))
+                self.assertEqual(json.loads(self.run_config("show").stdout)["pendingDays"]["value"], 10)
+
     def test_global_only(self):
         project_config = self.project / "docs/kaizen/config.json"
         project_config.write_text(json.dumps(DEFAULTS))

@@ -64,13 +64,72 @@ if [ -z "$latest" ]; then
         fi
     done < <(ls -t "$dir"/token-audit-*.md 2>/dev/null)
 fi
-[ -n "$latest" ] && [ ! -e "${latest%.md}.reviewed" ] || exit 0
-marker="${latest%.md}.noticed-$(date +%F)"
-[ -e "$marker" ] && exit 0
-extra=""
-[ -n "$proposal" ] && [ "$proposal" -nt "$latest" ] && extra=" A propose-only review is ready too: $proposal."
-msg="An unreviewed usage audit exists: $latest.$extra When there is a pause, run /agent-kaizen:review (read the headline and flagged sections, not the whole file), propose changes to the user, then touch ${latest%.md}.reviewed."
+audit_msg=
+audit_marker=
+if [ -n "$latest" ] && [ ! -e "${latest%.md}.reviewed" ]; then
+    marker="${latest%.md}.noticed-$(date +%F)"
+    if [ ! -e "$marker" ]; then
+        extra=""
+        [ -n "$proposal" ] && [ "$proposal" -nt "$latest" ] && extra=" A propose-only review is ready too: $proposal."
+        audit_msg="An unreviewed usage audit exists: $latest.$extra When there is a pause, run /agent-kaizen:review (read the headline and flagged sections, not the whole file), propose changes to the user, then touch ${latest%.md}.reviewed."
+        audit_marker=$marker
+    fi
+fi
+
+experiment_msg=
+experiment_marker=
+plugin_root=${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)}
+checker=$plugin_root/scripts/experiment-check
+if [ -n "$root" ] && command -v python3 >/dev/null 2>&1 && [ -f "$checker" ]; then
+    checksum=$(printf '%s' "$root" | cksum)
+    checksum=${checksum%% *}
+    marker="$dir/experiments-$checksum.noticed-$(date +%F)"
+    if [ -n "$checksum" ] && [ ! -e "$marker" ]; then
+        if command -v timeout >/dev/null 2>&1; then
+            output=$(timeout "${KAIZEN_NOTICE_TIMEOUT:-10}" python3 "$checker" --project "$root" 2>/dev/null)
+            status=$?
+        elif command -v gtimeout >/dev/null 2>&1; then
+            output=$(gtimeout "${KAIZEN_NOTICE_TIMEOUT:-10}" python3 "$checker" --project "$root" 2>/dev/null)
+            status=$?
+        else
+            output=$(
+                tmp=$(mktemp) || exit 2
+                python3 "$checker" --project "$root" >"$tmp" 2>/dev/null &
+                pid=$!
+                (sleep "${KAIZEN_NOTICE_TIMEOUT:-10}"; kill "$pid" 2>/dev/null) >/dev/null 2>&1 &
+                watchdog=$!
+                wait "$pid" 2>/dev/null
+                status=$?
+                kill "$watchdog" 2>/dev/null
+                wait "$watchdog" 2>/dev/null
+                head -n 12 "$tmp"
+                rm -f "$tmp"
+                exit "$status"
+            )
+            status=$?
+        fi
+        if [ "$status" -eq 1 ]; then
+            output=$(printf '%s\n' "$output" | head -n 12)
+            experiment_msg="Experiments need attention in this project (docs/kaizen/LEDGER.md):
+$output
+When there is a pause, run /agent-kaizen:review."
+            experiment_marker=$marker
+        fi
+    fi
+fi
+
+msg=$audit_msg
+if [ -n "$experiment_msg" ]; then
+    msg="${msg:+$msg
+
+}$experiment_msg"
+fi
+[ -n "$msg" ] || exit 0
 out=$(jq -n --arg c "$msg" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}') || exit 0
 [ -n "$out" ] || exit 0
-touch "$marker" 2>/dev/null
 printf '%s\n' "$out"
+[ -n "$audit_marker" ] && touch "$audit_marker" 2>/dev/null
+if [ -n "$experiment_marker" ]; then
+    mkdir -p "$dir" 2>/dev/null && touch "$experiment_marker" 2>/dev/null
+fi
+exit 0

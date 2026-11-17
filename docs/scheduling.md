@@ -79,6 +79,7 @@ Settings live in `agent-kaizen.json` in the Claude config directory and in each 
 | Key | Scope | Values and default |
 |---|---|---|
 | `enabled` | Global | `true` (default), `false` disables all scheduled work |
+| `pendingDays` | Global or project | Positive integer; pending experiments are flagged after this many days, default `10` |
 | `schedule` | Global or project | `active` (default), `always`, `off` |
 | `scheduledAutonomy` | Global or project | `propose` (default), `auto`. A project file's `auto` counts only if the project is in `autoProjects` |
 | `autoProjects` | Global only | List of absolute project paths, default `[]`; the opt-in for project-level `auto` |
@@ -125,6 +126,8 @@ Reports carry a scope line and compare only with an earlier report of the same s
 
 Each report has a machine-local JSON extract with per-agent usage and a cheaper-model hint. Extracts go in `<audits>/extracts/`, for scheduled and interactive runs alike. They never go into `docs/kaizen/`.
 
+The checks report includes an experiments section for each project with findings or a checker failure. Session start also notices experiment findings once per day per project using a marker in the audits directory; `KAIZEN_NOTICE_TIMEOUT` bounds the check in seconds (default 10).
+
 The scheduled `audit` job runs `usage-db ingest --quiet` after the token audit, so the SQLite usage store keeps history after Claude Code deletes old transcripts. The database is `KAIZEN_USAGE_DB`, default `kaizen-usage.db` under the Claude config dir. A failure there is logged as a step failure and never fails the audit.
 
 ### Retention
@@ -153,7 +156,7 @@ Environment variables read by the scheduled runner:
 |---|---|
 | `KAIZEN_REVIEW_TIMEOUT` | Seconds allowed for one model run; default 3600, `0` = no limit. Every other step has a fixed 600-second limit |
 | `KAIZEN_LOCK_WAIT` | Seconds a run waits for the run lock; default 1800 |
-| `KAIZEN_SKIP_CHECKS` | `1` skips the project discovery and index update, the `checks-*.md` report (drift, stale rules, notes-ledger due) and the per-project report. The token audit, the review and housekeeping still run |
+| `KAIZEN_SKIP_CHECKS` | `1` skips the project discovery and index update, the `checks-*.md` report (drift, stale rules, notes-ledger due, experiments) and the per-project report. The token audit, the review and housekeeping still run |
 | `KAIZEN_BACKUP_DIR` | Backup root, default `<Claude config dir>/kaizen-backups`; empty counts as unset |
 | `KAIZEN_USAGE_DB` | Usage database, default `kaizen-usage.db` under the Claude config dir |
 | `KAIZEN_REVIEW_MODEL`, `KAIZEN_REVIEW_MAX_TURNS` | Defaults for `review --model` and `--max-turns` (Sonnet, 40) |
