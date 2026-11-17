@@ -210,6 +210,7 @@ All skills are user-triggered (`disable-model-invocation: true`), so their descr
 | `/agent-kaizen:guardrails` | Hooks: big-read guard, image guard, compaction, all with overrides | After the audit shows the patterns |
 | `/agent-kaizen:batch-wakeups` | Swarm lead plus merged reviews, so the main session wakes once | Many small spawns |
 | `/agent-kaizen:planning` | Plan dirs, standalone briefs, right-sized planners, exploration budget | Multi-step features |
+| `/agent-kaizen:flow` | Packet state events and flow reports | Orchestrated packet work |
 | `/agent-kaizen:test-loop` | Tiered tests for game/engine projects, engine slots, fast worktrees | Slow test feedback |
 | `/agent-kaizen:models` | New Claude and Codex models vs your routing rows, with sources | Monthly |
 | `/agent-kaizen:whats-new` | Claude Code and Codex release notes and new CLI tools vs your setup | Monthly |
