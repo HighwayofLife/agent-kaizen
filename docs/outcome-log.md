@@ -15,6 +15,7 @@ A packet is one brief in a plan (see `/agent-kaizen:planning`). Your own landing
 | risk | no | string: low, normal, high, or untagged; default untagged |
 | fix_origin | no | string or null; default null |
 | fixes | no | list of packet ID strings; default [] |
+| review_severities | no | list of strings or null; [] means no MUST-FIX, missing or null means unknown |
 | dispatches | no | number; default 1 |
 | dispatch_models | no | list in dispatch order of objects with model and effort strings and rounds integer, one per dispatch |
 | rounds | no | number; default 0 |
@@ -45,3 +46,5 @@ import json, os; fd = os.open('out/packets.jsonl', os.O_WRONLY | os.O_CREAT | os
 A project is enrolled when it has `docs/kaizen/`. The owner may name optional commands in global config under `projectCommands`: `shadowStatus`, `slowTests`, and `speedReport`. Each is an argv list run with the project root as its working directory and prints Markdown or plain lines. Shadow status may write state in the project, such as a STOP flag.
 
 First-pass is the share of rows without a fix origin whose status is DONE, dispatches is 1, and rounds is 0. Fix rate is the share of rows whose ID appears in another row's fixes. Fixes from the whole log count even when dates filter samples. For groups of at least eight, propose UP if first-pass is below 70% or fix rate exceeds 30%. Propose DOWN if first-pass is at least 95% and no row was fixed by a batch-review or final-audit fix. Smaller groups have too few samples. Proposals are never applied automatically.
+
+Review economics counts selected fix packets, landed rows, fix-of-fix packets, unknown references, and severity coverage. A fix-of-fix names another fix packet in the full log. An UP becomes HOLD only when at least one attributed fix exists and all attributed fixes have explicit valid lines and known input and output tokens, strictly below the configured small-fix thresholds. Fix attribution uses the full log; unknown evidence leaves UP in place.

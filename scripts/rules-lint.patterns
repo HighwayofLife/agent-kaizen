@@ -4,3 +4,4 @@ project-repos\.txt
 copies the runner, token-audit
 # Model aliases no longer depend only on the ladder.
 Names are normalised against the calibration ladder
+calibration changes up or down one rung only
