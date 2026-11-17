@@ -57,6 +57,12 @@ class ProjectReportTests(unittest.TestCase):
         self.assertTrue(any('Totals:' in line for line in sections['Packet outcomes']))
         self.assertTrue(sections['Calibration proposals'])
 
+    def test_review_economics_stays_in_outcomes(self):
+        sections = {s['title']: s['lines'] for s in json.loads(self.invoke('--json').stdout)['sections']}
+        self.assertIn('Review economics', sections['Packet outcomes'])
+        self.assertNotIn('Review economics', sections['Calibration proposals'])
+        self.assertTrue(sections['Calibration proposals'])
+
     def test_eight_column_ledger_pending(self):
         (self.project / 'docs/kaizen/LEDGER.md').write_text(
             '| date | change | why | expected effect | measured effect | keep/revert | metric command | review date |\n'

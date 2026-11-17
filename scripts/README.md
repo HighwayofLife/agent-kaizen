@@ -539,12 +539,15 @@ Read outcomes and propose calibration changes using the [outcome log contract](.
 ```text
 usage: packet-report [-h] [--packets PACKETS | --project PROJECT]
                      [--since SINCE] [--until UNTIL] [--ladder LADDER]
+                     [--small-fix-lines N] [--small-fix-tokens N]
                      [--markdown | --json]
 ```
 
 An escalation is labelled by its full path of model names, with consecutive duplicates removed (`terra->sol->terra`). Labels are lowercased; a label that is not a known model becomes its single known hyphen- or colon-separated segment. Known models include ladder names and haiku, sonnet, opus, terra and sol. Labels with no known segment or multiple different known segments stay unchanged. `rounds: 1.0` is accepted; `1.5` and NaN make that history invalid. An escalation is also counted when only the effort rises between rounds (same model); such a pair is labelled with model and effort (`terra:medium->terra:high`). When only the model changes the label stays the model path (`terra->sol`). If both change, every step is labelled `model:effort`.
 
 The additive JSON keys `unknown_models`, `data_coverage`, and `landed_failing` report data quality for rows selected by `--since` and `--until`. Input token counts of zero are ambiguous; missing or invalid evidence is reported, and cost is never estimated.
+
+The `review_economics` JSON key reports landed and fix counts, fixes per landed row, fix-of-fix counts and rates, unknown references, severity coverage, no-MUST-FIX IDs, and thresholds. Counts follow date filters; fix attribution uses the full log. UP proposals include `fix_evidence` and become HOLD only when every attributed fix has complete evidence strictly below `--small-fix-lines` (default 100) and `--small-fix-tokens` (default 4000000). Otherwise `hold_blocked` explains why UP remains. Thresholds accept non-negative integers.
 
 Example: `packet-report --project . --markdown`.
 

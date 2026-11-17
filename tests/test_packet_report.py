@@ -21,11 +21,86 @@ class PacketReportTests(unittest.TestCase):
         result = self.run_report('--packets', FIXTURE, '--json')
         self.assertEqual(result.returncode, 0, result.stderr)
         data = json.loads(result.stdout)
-        self.assertEqual(set(data), {'groups', 'area_groups', 'totals', 'fix_origins', 'proposals', 'escalations', 'dispatch_models_coverage', 'unknown_models', 'data_coverage', 'landed_failing', 'rule', 'disclaimer'})
-        self.assertIn({'model': 'sonnet', 'effort': 'high', 'direction': 'UP'}, data['proposals'])
+        self.assertEqual(set(data), {'groups', 'area_groups', 'totals', 'fix_origins', 'proposals', 'escalations', 'dispatch_models_coverage', 'unknown_models', 'data_coverage', 'landed_failing', 'review_economics', 'rule', 'disclaimer'})
+        self.assertTrue(any(p['model'] == 'sonnet' and p['direction'] == 'UP' for p in data['proposals']))
         self.assertIn({'model': 'opus', 'effort': 'high', 'direction': 'DOWN'}, data['proposals'])
         self.assertIn('too few', self.run_report('--packets', FIXTURE, '--since', '2026-02-01').stdout)
         self.assertIsNone(data['groups'][0]['median_wall_s'])
+
+    def economics_report(self, fix_changes=None, extra=(), flags=()):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'rows'
+            rows = [dict(ts='2026-01-02T00:00:00Z', id=str(i), model='gpt-6.1-terra',
+                         effort='high', status='CODEX FAILED', merge_sha='abc') for i in range(8)]
+            fix = dict(ts='2026-01-01T00:00:00Z', id='fix', model='terra', effort='high',
+                       fix_origin='review', fixes=['0'], lines=0, tokens_in=1, tokens_out=0,
+                       review_severities=[])
+            if fix_changes is not None:
+                for key, value in fix_changes.items():
+                    if value == 'DELETE':
+                        fix.pop(key, None)
+                    else:
+                        fix[key] = value
+            rows.extend([fix, *extra])
+            path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            args = ('--packets', path, '--ladder', 'terra high', '--since', '2026-01-02', *flags)
+            result = self.run_report(*args, '--json')
+            self.assertEqual(result.returncode, 0, result.stderr)
+            return json.loads(result.stdout), self.run_report(*args).stdout
+
+    def test_hold_complete_and_alias_outside_filter(self):
+        data, output = self.economics_report()
+        proposal = data['proposals'][0]
+        self.assertEqual(proposal['direction'], 'HOLD')
+        self.assertTrue(proposal['fix_evidence']['small'])
+        self.assertIn(proposal['reason'], output)
+        self.assertIn('100 lines, 4000000 tokens', output)
+        self.assertLess(output.index('Review economics'), output.index('Calibration proposals'))
+
+    def assert_blocked(self, changes, reason):
+        data, _ = self.economics_report(changes)
+        self.assertEqual(data['proposals'][0]['direction'], 'UP')
+        self.assertIn(reason, data['proposals'][0]['hold_blocked'])
+
+    def test_zero_input_blocks_hold(self):
+        self.assert_blocked({'tokens_in': 0}, 'unknown evidence: fix')
+
+    def test_missing_lines_blocks_hold(self):
+        self.assert_blocked({'lines': 'DELETE'}, 'unknown evidence: fix')
+
+    def test_missing_output_blocks_hold(self):
+        self.assert_blocked({'tokens_out': 'DELETE'}, 'unknown evidence: fix')
+
+    def test_threshold_blocks_hold(self):
+        self.assert_blocked({'lines': 100}, 'fix not small: fix')
+        self.assert_blocked({'tokens_in': 4000000}, 'fix not small: fix')
+
+    def test_no_attributed_fix_blocks_hold(self):
+        self.assert_blocked({'fixes': []}, 'no attributed fixes')
+
+    def test_custom_thresholds_and_invalid_flags(self):
+        data, _ = self.economics_report({'lines': 100, 'tokens_in': 4000000},
+                                        flags=('--small-fix-lines', '101', '--small-fix-tokens', '4000001'))
+        self.assertEqual(data['proposals'][0]['direction'], 'HOLD')
+        for flag in ('--small-fix-lines', '--small-fix-tokens'):
+            for value in ('-1', 'bad'):
+                self.assertEqual(self.run_report(flag, value).returncode, 2)
+
+    def test_review_economics_and_severity(self):
+        base = dict(ts='2026-01-02T00:00:00Z', model='sol', effort='low', fix_origin='review')
+        extra = [dict(base, id='f1', fixes=['fix', 'f1', 'missing'], review_severities=[]),
+                 dict(base, id='f2', fixes=['fix', 'f1'], review_severities=['MUST-FIX', 'NIT']),
+                 dict(base, id='f3', fixes=[], review_severities=None),
+                 dict(base, id='f4', fixes=[])]
+        data, _ = self.economics_report(extra=extra)
+        econ = data['review_economics']
+        self.assertEqual((econ['landed'], econ['fix_packets'], econ['fix_per_landed']), (8, 4, .5))
+        self.assertEqual(econ['fix_of_fix'], dict(count=2, rate=.5, unknown_references=1))
+        self.assertEqual(econ['no_must_fix'], dict(count=1, ids=['f1']))
+        self.assertEqual(econ['severity_coverage'], dict(known=2, unknown=2, unknown_ids=['f3', 'f4']))
+        empty = json.loads(self.run_report('--packets', '/nonexistent', '--json').stdout)['review_economics']
+        self.assertIsNone(empty['fix_per_landed'])
+        self.assertIsNone(empty['fix_of_fix']['rate'])
 
     def test_dates_and_fixes(self):
         result = self.run_report('--packets', FIXTURE, '--since', '2026-01-01', '--until', '2026-01-02', '--json')
