@@ -124,13 +124,53 @@ def check(path, today, days):
     return findings, legacy_rows, not all(name in columns for name in ('metric command', 'review date'))
 
 
+CHECK_CADENCES = {'models': 30, 'roster': 60, 'whats-new': 30}
+
+
+def due_checks(path, today):
+    try:
+        data = json.loads(path.read_text(encoding='utf-8'))
+        if not isinstance(data, dict):
+            raise ValueError('expected an object')
+        error = None
+    except FileNotFoundError:
+        data, error = {}, None
+    except (OSError, UnicodeError, ValueError) as exc:
+        data, error = {}, str(exc)
+    checks = []
+    for name, cadence in CHECK_CADENCES.items():
+        last = data.get(name)
+        age = None
+        if error:
+            status, reason = 'unknown', 'unreadable or invalid state file'
+        elif name not in data:
+            status, reason = 'never_run', 'never run'
+        else:
+            try:
+                day = iso(last) if isinstance(last, str) else None
+                if day is None or day > today:
+                    raise ValueError()
+                age = (today - day).days
+                status = 'overdue' if age > cadence else 'fresh'
+                reason = status
+            except ValueError:
+                status, reason = 'unknown', 'invalid or future date'
+        checks.append(dict(name=name, last=last, cadence_days=cadence, age_days=age,
+                           status=status, reason=reason))
+    return checks
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__, epilog='Exit codes: 0 no findings, 1 findings, 2 usage or ledger error. pendingDays is read from project then global config.')
     parser.add_argument('--project', required=True, type=Path)
     parser.add_argument('--pending-days', type=positive)
     parser.add_argument('--today', type=iso, default=date.today())
     parser.add_argument('--json', action='store_true')
+    parser.add_argument('--checks', action='store_true')
+    parser.add_argument('--state-file', type=Path)
     args = parser.parse_args()
+    if args.checks and args.state_file is None:
+        parser.error('--checks requires --state-file')
     project = args.project.expanduser().resolve()
     days = pending_days(args.pending_days, project)
     path = project / 'docs/kaizen/LEDGER.md'
@@ -147,10 +187,15 @@ def main():
                   ledger=ledger, legacy_table=legacy_table, legacy_rows=legacy_rows,
                   metadata_since=METADATA_SINCE.isoformat(), findings=findings, counts=counts,
                   status='findings' if findings else 'ok')
+    checks = due_checks(args.state_file, args.today) if args.checks else []
+    due_count = sum(item['status'] != 'fresh' for item in checks)
+    if args.checks:
+        result['checks'] = checks
+        result['status'] = 'findings' if findings or due_count else 'ok'
     if args.json:
         print(json.dumps(result))
     else:
-        print(f'experiment-check: {len(findings)} finding(s)')
+        print(f'experiment-check: {len(findings) + due_count} finding(s)')
         if ledger is None:
             print('no ledger')
         for kind, title in zip(KINDS, TITLES):
@@ -163,7 +208,17 @@ def main():
                     print(f'... {len(group) - 8} more')
         if legacy_table or legacy_rows:
             print(f'legacy: {legacy_rows} row(s) have no metric command or review date (not a finding)')
-    return bool(findings)
+        if args.checks:
+            print('## Due checks')
+            for item in checks:
+                detail = item['reason']
+                if item['age_days'] is not None:
+                    detail = f"last {item['last']}, {item['age_days']} days ago"
+                line = f"- {item['name']}: {detail} (cadence {item['cadence_days']} days)"
+                if item['status'] in ('overdue', 'fresh'):
+                    line += f": {item['status']}"
+                print(line)
+    return bool(findings or due_count)
 
 
 if __name__ == '__main__':

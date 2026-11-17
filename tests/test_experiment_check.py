@@ -86,6 +86,25 @@ class ExperimentCheckTests(unittest.TestCase):
         project_config.unlink()
         self.assertEqual(self.data()[1]['pending_days'], 10)
 
+    def test_due_checks(self):
+        state = self.root / 'checks.json'
+        self.assertEqual(self.run_check('--checks').returncode, 2)
+        result, data = self.data('--checks', '--state-file', str(state))
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual([c['status'] for c in data['checks']], ['never_run'] * 3)
+        state.write_text(json.dumps({'models': '2026-10-28', 'roster': '2026-09-27',
+                                     'whats-new': '2026-10-27', 'other': 'kept'}))
+        original = state.read_bytes()
+        result, data = self.data('--checks', '--state-file', str(state))
+        self.assertEqual([c['status'] for c in data['checks']], ['fresh', 'overdue', 'overdue'])
+        self.assertEqual(set(data['checks'][0]), {'name', 'last', 'cadence_days', 'age_days', 'status', 'reason'})
+        self.assertEqual(state.read_bytes(), original)
+        state.write_text('{"models": "2026-11-28", "roster": 3, "whats-new": "bad"}')
+        self.assertEqual([c['status'] for c in self.data('--checks', '--state-file', str(state))[1]['checks']], ['unknown'] * 3)
+        state.write_text('{')
+        self.assertEqual([c['status'] for c in self.data('--checks', '--state-file', str(state))[1]['checks']], ['unknown'] * 3)
+        self.assertEqual(self.run_check().stdout, 'experiment-check: 0 finding(s)\nno ledger\n')
+
     def test_errors_and_bounded_output(self):
         self.ledger('| date | change |\n| --- | --- |\n')
         self.assertEqual(self.run_check().returncode, 2)
