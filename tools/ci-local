@@ -1,0 +1,89 @@
+#!/usr/bin/env python3
+"""Run the release checks locally."""
+import argparse
+import json
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--python', help='run tests with this Python version using uv')
+    parser.add_argument('--tag', help='also check the release tag')
+    parser.add_argument('--skip-tests', action='store_true', help=argparse.SUPPRESS)
+    parser.add_argument('--version-only', action='store_true', help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    failures = []
+
+    def stage(name, fn):
+        try:
+            fn()
+        except (OSError, ValueError, SyntaxError, subprocess.CalledProcessError) as exc:
+            if str(exc).startswith('::error::'):
+                print(str(exc), flush=True)
+            print('FAIL: {} ({})'.format(name, exc), flush=True)
+            failures.append(name)
+        else:
+            print('PASS: {}'.format(name), flush=True)
+
+    def run(command):
+        subprocess.run(command, cwd=str(ROOT), check=True)
+
+    def version():
+        value = json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version']
+        if not re.search(r'^## ' + re.escape(value) + r'(?: |$)', (ROOT / 'CHANGELOG.md').read_text(), re.M):
+            raise ValueError('::error::CHANGELOG.md has no \'## {}\' entry.'.format(value))
+        if args.tag and args.tag != 'v' + value:
+            raise ValueError('::error::Tag {} does not match v{}.'.format(args.tag, value))
+
+    if not args.version_only:
+        if not args.skip_tests:
+            def tests():
+                if not args.python:
+                    run([sys.executable, '-m', 'unittest', 'discover', '-s', 'tests'])
+                    return
+                # Use the alias for the test process as well as its subprocesses.
+                with tempfile.TemporaryDirectory() as directory:
+                    runner = ("import os, sys; "
+                              "alias = sys.argv[1]; "
+                              "os.symlink(sys.executable, alias); "
+                              "os.environ['PATH'] = os.path.dirname(alias) + os.pathsep + os.environ['PATH']; "
+                              "os.execv(alias, [alias, '-m', 'unittest', 'discover', '-s', 'tests'])")
+                    run(['uv', 'run', '--python', args.python, 'python', '-c', runner,
+                         str(Path(directory) / 'python3')])
+            stage('unit tests', tests)
+        hooks = sorted(str(p) for p in (ROOT / 'hooks').glob('*.sh'))
+        stage('shellcheck', lambda: run(['shellcheck', '-S', 'warning'] + hooks))
+        def json_check():
+            for pattern in ('.claude-plugin/*.json', 'hooks/hooks.json', 'templates/*.json', 'scripts/pricing.json'):
+                for path in ROOT.glob(pattern):
+                    json.loads(path.read_text())
+        stage('JSON', json_check)
+        scripts = subprocess.check_output(['git', 'ls-files', 'scripts/*', ':!:scripts/preambles', ':!:scripts/prompts'], cwd=str(ROOT), text=True).splitlines()
+        files = [ROOT / p for p in scripts if (ROOT / p).is_file() and not (ROOT / p).is_symlink()]
+        def compile_scripts():
+            for path in files:
+                if path.suffix not in ('.json', '.md', '.patterns'):
+                    compile(path.read_text(), str(path), 'exec')
+        stage('Python compile', compile_scripts)
+        def help_scripts():
+            for path in files:
+                if path.suffix not in ('.json', '.md', '.patterns', '.py'):
+                    subprocess.run([str(path), '--help'], cwd=str(ROOT), stdout=subprocess.DEVNULL, check=True)
+        stage('script help', help_scripts)
+        if shutil.which('claude'):
+            stage('plugin validation', lambda: run(['claude', 'plugin', 'validate', '.']))
+        else:
+            print('SKIP: plugin validation (claude not found)', flush=True)
+    stage('version and changelog', version)
+    return 1 if failures else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
