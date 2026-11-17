@@ -123,7 +123,8 @@ print('proposal')
     def test_experiment_sections_and_failures(self):
         from types import SimpleNamespace
         second = self.root / 'second'
-        projects = [SimpleNamespace(canonical=path) for path in (self.project, second)]
+        projects = [SimpleNamespace(canonical=path, folder=self.audits / "projects" / self.module.key(path))
+                    for path in (self.project, second)]
         options = SimpleNamespace(python=sys.executable)
         record = self.root / 'calls'
         self.stub('experiment-check', """
@@ -137,7 +138,8 @@ sys.exit(int(os.environ.get('EXPERIMENT_EXIT', '1')))
             text = self.check_text()
             for project in projects:
                 self.assertIn('## Experiments: ' + str(project.canonical), text)
-                self.assertIn('--project ' + str(project.canonical), record.read_text())
+                self.assertIn('--project ' + str(project.canonical) + ' --checks --state-file ' +
+                              str(project.folder / 'checks.json'), record.read_text())
             for path in self.audits.glob('checks-*.md'):
                 path.unlink()
             with patch.dict(os.environ, {'EXPERIMENT_OUTPUT': 'experiment-check: 0 finding(s)', 'EXPERIMENT_EXIT': '0'}):

@@ -63,6 +63,12 @@ class RulesLintTest(unittest.TestCase):
         self.assertEqual(result.returncode, 1, result.stderr)
         self.assertEqual(json.loads(result.stdout)["count"], 1)
 
+    def test_old_models_date_inference(self):
+        write(self.repo / "CLAUDE.md", "if the last `models-*.md` audit or ledger entry is old\n")
+        result = self.run_lint("--repo", self.repo, "--json")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["count"], 1)
+
     def test_old_calibration_wording(self):
         write(self.repo / "CLAUDE.md", "Propose calibration changes up or down one rung only.\n")
         result = self.run_lint("--repo", self.repo, "--json")

@@ -1501,7 +1501,8 @@ def run_checks(audits, options, projects=None):
             if output is not None:
                 sections.append(f"## {title}\n\n{output}")
         for project in projects:
-            output = run_step("experiment-check", options, ["--project", str(project.canonical)], (0, 1))
+            output = run_step("experiment-check", options, ["--project", str(project.canonical),
+                              "--checks", "--state-file", str(project.folder / "checks.json")], (0, 1))
             if output is not None and not output.startswith("experiment-check: 0 finding"):
                 sections.append(f"## Experiments: {project.canonical}\n\n{output}")
         if sections:
