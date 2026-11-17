@@ -5,6 +5,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -353,6 +354,69 @@ class HookTests(unittest.TestCase):
                       ['hookSpecificOutput']['additionalContext'])
         self.assertIsNone(run('audit-notice.sh', {'cwd': str(project)}, env))  # once per day
         self.assertIsNone(run('audit-notice.sh', {'cwd': str(self.tmp)}, env))  # not a kaizen project
+
+    def test_experiment_notice_and_audit(self):
+        project = self.tmp / 'project'
+        ledger = project / 'docs/kaizen/LEDGER.md'
+        ledger.parent.mkdir(parents=True)
+        ledger.write_text('| date | change | measured effect | keep/revert | review date |\n'
+                          '| --- | --- | --- | --- | --- |\n'
+                          '| 2020-01-01 | test | pending | | 2020-01-02 |\n')
+        audits = self.tmp / 'audits'
+        env = {'AUDIT_DIR': str(audits), 'CLAUDE_CONFIG_DIR': str(self.tmp / 'cfg'),
+               'CLAUDE_PLUGIN_ROOT': str(ROOT)}
+        payload = {'cwd': str(project)}
+        text = run('audit-notice.sh', payload, env)['hookSpecificOutput']['additionalContext']
+        self.assertIn('Experiments need attention', text)
+        self.assertIsNone(run('audit-notice.sh', payload, env))
+        for marker in audits.glob('experiments-*.noticed-*'):
+            marker.unlink()
+        (audits / 'token-audit-1.md').write_text('audit')
+        text = run('audit-notice.sh', payload, env)['hookSpecificOutput']['additionalContext']
+        self.assertIn('Experiments need attention', text)
+        self.assertIn('unreviewed usage audit', text)
+        self.assertIsNone(run('audit-notice.sh', payload, env))
+        ledger.write_text('')
+        for marker in audits.glob('*.noticed-*'):
+            marker.unlink()
+        text = run('audit-notice.sh', payload, env)['hookSpecificOutput']['additionalContext']
+        self.assertNotIn('Experiments need attention', text)
+
+    def test_experiment_failures_preserve_audit(self):
+        project = self.tmp / 'project'
+        ledger = project / 'docs/kaizen/LEDGER.md'
+        ledger.parent.mkdir(parents=True)
+        ledger.mkdir()  # Unreadable as a ledger, even when running as root.
+        audits = self.tmp / 'audits'
+        audits.mkdir()
+        (audits / 'token-audit-1.md').write_text('audit')
+        plugin = self.tmp / 'plugin'
+        (plugin / 'scripts').mkdir(parents=True)
+        checker = plugin / 'scripts/experiment-check'
+        env = {'AUDIT_DIR': str(audits), 'CLAUDE_CONFIG_DIR': str(self.tmp / 'cfg'),
+               'CLAUDE_PLUGIN_ROOT': str(ROOT), 'KAIZEN_NOTICE_TIMEOUT': '1'}
+        payload = {'cwd': str(project)}
+        for case in ('ledger', 'missing', 'no_python', 'hung'):
+            with self.subTest(case=case):
+                for marker in audits.glob('*.noticed-*'):
+                    marker.unlink()
+                env['CLAUDE_PLUGIN_ROOT'] = str(ROOT if case in ('ledger', 'no_python') else plugin)
+                if case == 'hung':
+                    checker.write_text('import time\ntime.sleep(20)\n')
+                path = None
+                if case == 'no_python':
+                    path = bare_path('jq', 'ls', 'head', 'grep', 'date', 'dirname', 'touch')
+                    env['PATH'] = path.name
+                start = time.monotonic()
+                try:
+                    text = run('audit-notice.sh', payload, env)['hookSpecificOutput']['additionalContext']
+                finally:
+                    if path:
+                        path.cleanup()
+                        env.pop('PATH')
+                self.assertLess(time.monotonic() - start, 5)
+                self.assertIn('unreviewed usage audit', text)
+                self.assertNotIn('Experiments need attention', text)
 
     def test_audit_notice_project_and_worktree_index(self):
         cfg = (self.tmp / 'cfg').resolve()

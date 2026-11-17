@@ -113,6 +113,7 @@ def valid_auto_projects(value):
 
 SCHEMA = {
     "enabled": {"kind": "bool", "default": True, "global_only": True},
+    "pendingDays": {"kind": "int", "default": 10, "minimum": 1},
     "schedule": {"kind": "enum", "default": "active", "choices": ("active", "always", "off")},
     "scheduledAutonomy": {"kind": "enum", "default": "propose", "choices": ("propose", "auto")},
     "autoProjects": {"kind": "strings", "default": [], "global_only": True,
@@ -1497,6 +1498,10 @@ def run_checks(audits, options, projects=None):
             output = run_step(name, options, arguments, success)
             if output is not None:
                 sections.append(f"## {title}\n\n{output}")
+        for project in projects:
+            output = run_step("experiment-check", options, ["--project", str(project.canonical)], (0, 1))
+            if output is not None and not output.startswith("experiment-check: 0 finding"):
+                sections.append(f"## Experiments: {project.canonical}\n\n{output}")
         if sections:
             audits.mkdir(parents=True, exist_ok=True)
             (audits / f"checks-{step_stamp()}.md").write_text(

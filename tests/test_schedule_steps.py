@@ -120,6 +120,40 @@ print('proposal')
     def check_text(self):
         return next(self.audits.glob('checks-*.md')).read_text()
 
+    def test_experiment_sections_and_failures(self):
+        from types import SimpleNamespace
+        second = self.root / 'second'
+        projects = [SimpleNamespace(canonical=path) for path in (self.project, second)]
+        options = SimpleNamespace(python=sys.executable)
+        record = self.root / 'calls'
+        self.stub('experiment-check', """
+import os, pathlib, sys
+with open(os.environ['EXPERIMENT_CALLS'], 'a') as f: f.write(' '.join(sys.argv[1:]) + '\\n')
+print(os.environ.get('EXPERIMENT_OUTPUT', 'experiment-check: 1 finding(s)'))
+sys.exit(int(os.environ.get('EXPERIMENT_EXIT', '1')))
+""")
+        with patch.dict(os.environ, {**self.env, 'EXPERIMENT_CALLS': str(record)}, clear=True):
+            self.module.run_checks(self.audits, options, projects)
+            text = self.check_text()
+            for project in projects:
+                self.assertIn('## Experiments: ' + str(project.canonical), text)
+                self.assertIn('--project ' + str(project.canonical), record.read_text())
+            for path in self.audits.glob('checks-*.md'):
+                path.unlink()
+            with patch.dict(os.environ, {'EXPERIMENT_OUTPUT': 'experiment-check: 0 finding(s)', 'EXPERIMENT_EXIT': '0'}):
+                self.module.run_checks(self.audits, options, projects)
+                self.assertNotIn('## Experiments:', self.check_text())
+            for path in self.audits.glob('checks-*.md'):
+                path.unlink()
+            with patch.dict(os.environ, {'EXPERIMENT_EXIT': '2'}):
+                self.module.run_checks(self.audits, options, projects)
+                self.assertEqual(self.check_text().count('unavailable: exit 2'), 2)
+            for path in self.audits.glob('checks-*.md'):
+                path.unlink()
+            with patch.dict(os.environ, {'KAIZEN_SKIP_CHECKS': '1'}):
+                self.module.run_checks(self.audits, options, projects)
+            self.assertFalse(list(self.audits.glob('checks-*.md')))
+
     def test_audit_reports_findings_and_step_failure(self):
         self.index()
         self.env['LEDGER_EXIT'] = '1'
