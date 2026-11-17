@@ -10,7 +10,7 @@
 <Root cause, constraints, owner decisions, earlier attempts.>
 
 ## Scope
-Edit only: <files>. Don't touch: <files or areas>. Under ~400 changed lines. Don't commit or push. Never add a dependency yourself: stop and report.
+Creates: <new files, or none>. Mark runtime or user-project paths with ` (external)` immediately after the inline-code path. Edit only: <files>. Don't touch: <files or areas>. Under ~400 changed lines. Don't commit or push. Never add a dependency yourself: stop and report.
 
 ## Acceptance criteria
 1. <Testable criterion.>
