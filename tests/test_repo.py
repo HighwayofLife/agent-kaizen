@@ -59,6 +59,9 @@ class RepoTests(unittest.TestCase):
 
     def test_plugin_root_references_exist(self):
         for path in TEXT:
+            # Implementation plans may reference files that later packets create.
+            if path.relative_to(ROOT).parts[:2] == ('docs', 'plans'):
+                continue
             for ref in re.findall(r'\$\{CLAUDE_PLUGIN_ROOT\}/([A-Za-z0-9_./*-]+)', path.read_text()):
                 ref = ref.rstrip('.,`)')
                 with self.subTest(file=str(path.relative_to(ROOT)), ref=ref):
