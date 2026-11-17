@@ -43,7 +43,7 @@ In this skill, `<Claude config dir>` means `$CLAUDE_CONFIG_DIR` or `~/.claude`, 
 6. Propose at most 5 changes, each with the expected effect, the risk, how to try it
    safely (one routing row first, for a week), and how the next audit will show whether
    it worked.
-Wait for my OK. Add a ledger row (docs/kaizen/LEDGER.md) for each change we make.
+Wait for my OK. Add a ledger row (docs/kaizen/LEDGER.md) for each change we make. Include metric command and review date using `${CLAUDE_PLUGIN_ROOT}/skills/start/SKILL.md`.
 ```
 
 ## Done when

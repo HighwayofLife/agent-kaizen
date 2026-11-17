@@ -34,7 +34,7 @@ Add every new self-improvement tool or process to the plugin so it runs on the p
    - Read "In `auto`, these are NOT reasons to skip a change" in `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md` before deciding to skip anything.
    - **`propose-only`:** print the proposal and stop.
 
-8. **Record.** After each applied change, add a project ledger row and run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/notes-ledger add --date <date> --category <category> --change <change> --why <why> --measure <measurement> --source <source>` when `notesLedger` is configured. In scheduled runs, use the given `notes-ledger-path` in place of `${CLAUDE_PLUGIN_ROOT}/scripts/notes-ledger`. Exit 3 means not configured; skip it.
+8. **Record.** After each applied change, add a project ledger row with metric command and review date using `${CLAUDE_PLUGIN_ROOT}/skills/start/SKILL.md`, and run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/notes-ledger add --date <date> --category <category> --change <change> --why <why> --measure <measurement> --source <source>` when `notesLedger` is configured. In scheduled runs, use the given `notes-ledger-path` in place of `${CLAUDE_PLUGIN_ROOT}/scripts/notes-ledger`. Exit 3 means not configured; skip it.
 
 9. **Tidy.** Outside scheduled runs, run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled housekeep` once. Mention in the summary how many of the plugin's own old files it removed. In a scheduled run the runner does this; skip it. Use `--dry-run` first if the user asked to see what would go.
 
