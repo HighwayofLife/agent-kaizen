@@ -43,6 +43,8 @@ If you're ready for it, there's a yolo (auto) mode where it applies the changes 
 
 The full list of findings and fixes is in [docs/what-we-learned.md](docs/what-we-learned.md).
 
+A longer measured case study from one user's setup, with 30 charts: [docs/examples/early-findings-white-paper.pdf](docs/examples/early-findings-white-paper.pdf) ([about it](docs/examples/README.md)).
+
 ## How it works
 
 So this plugin is built as a **loop**:
