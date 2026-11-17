@@ -2,8 +2,12 @@ name: CI
 
 on:
   push:
-    branches: [main]
-  pull_request:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
@@ -12,11 +16,17 @@ jobs:
   tests:
     name: Tests (Python ${{ matrix.python }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
-        python: ["3.9", "3.13"]
+        include:
+          - os: ubuntu-latest
+            python: '3.9'
+          - os: ubuntu-latest
+            python: '3.13'
+          - os: macos-latest
+            python: '3.13'
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -28,58 +38,52 @@ jobs:
       - name: Unit, hook and repo-consistency tests
         run: python3 -m unittest discover -s tests -v
 
-  lint:
-    name: Lint
+  checks:
+    name: Lint, plugin validation and version
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - name: shellcheck hooks
-        run: shellcheck -S warning hooks/*.sh
-      - name: JSON parses
-        run: for f in .claude-plugin/*.json hooks/hooks.json templates/*.json scripts/pricing.json; do jq empty "$f" || exit 1; done
-      - name: Python scripts compile
-        run: |
-          for f in $(git ls-files 'scripts/*' ':!:scripts/preambles' ':!:scripts/prompts' | grep -Ev '\.(json|md|patterns)$'); do
-            [ -f "$f" ] && [ ! -L "$f" ] || continue
-            python3 -c "import sys; compile(open(sys.argv[1]).read(), sys.argv[1], 'exec')" "$f" || exit 1
-          done
-      - name: Scripts answer --help
-        run: |
-          for f in $(git ls-files 'scripts/*' ':!:scripts/preambles' ':!:scripts/prompts' | grep -Ev '\.(json|md|patterns|py)$'); do
-            [ -f "$f" ] && [ ! -L "$f" ] || continue
-            "$f" --help > /dev/null || { echo "::error::$f --help failed"; exit 1; }
-          done
-
-  plugin:
-    name: claude plugin validate
-    runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: "22"
+          node-version: '22'
       - name: Install Claude Code
         run: npm install -g @anthropic-ai/claude-code
-      - name: Validate plugin and marketplace
-        run: claude plugin validate .
+      - name: Local checks
+        run: tools/ci-local --skip-tests
+      - name: Check release tag
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+        env:
+          TAG: ${{ github.ref_name }}
+        run: tools/ci-local --version-only --tag "$TAG"
 
-  version:
-    name: Version bump and changelog
-    if: github.event_name == 'pull_request'
+  release:
+    needs: [tests, checks]
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Plugin changes bump the version and add a CHANGELOG entry
+      - name: Publish release if missing
         env:
-          BASE_REF: ${{ github.base_ref }}
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
         run: |
-          base=origin/$BASE_REF
-          changed=$(git diff --name-only "$base"...HEAD -- skills agents hooks scripts templates .claude-plugin docs/autonomy.md docs/outcome-log.md)
-          [ -z "$changed" ] && { echo "No plugin files changed."; exit 0; }
-          old=$(git show "$base":.claude-plugin/plugin.json | jq -r .version)
-          new=$(jq -r .version .claude-plugin/plugin.json)
-          [ "$old" != "$new" ] && [ "$(printf '%s\n%s\n' "$old" "$new" | sort -V | tail -n 1)" = "$new" ] || { echo "::error::Plugin files changed but version $new is not greater than $old. Bump .claude-plugin/plugin.json (users on a GitHub install only get new versions)."; exit 1; }
-          pattern="^## ${new//./\\.}( |\$)"
-          grep -Eq "$pattern" CHANGELOG.md || { echo "::error::CHANGELOG.md has no '## $new' entry."; exit 1; }
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists."
+            exit 0
+          fi
+          version=$(jq -r .version .claude-plugin/plugin.json)
+          python3 - "$version" > release-notes.md <<'PY'
+          import re, sys
+          from pathlib import Path
+          version = sys.argv[1]
+          text = Path('CHANGELOG.md').read_text()
+          match = re.search(r'^## ' + re.escape(version) + r'(?: |$)[^\n]*\n(.*?)(?=^## |\Z)', text, re.M | re.S)
+          if not match:
+              sys.exit('::error::Missing changelog section')
+          print(match.group(1).strip())
+          PY
+          gh release create "$TAG" --verify-tag --title "Agent Kaizen $version" --notes-file release-notes.md

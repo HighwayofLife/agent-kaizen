@@ -19,3 +19,14 @@ shellcheck -S warning hooks/*.sh
 claude plugin validate .
 ```
 Bump `version` in `.claude-plugin/plugin.json` and add a CHANGELOG entry for any user-visible change, and for any change under `skills/`, `agents/`, `hooks/`, `scripts/`, `templates/` or `.claude-plugin/`, or to `docs/autonomy.md` or `docs/outcome-log.md` (skills read them at runtime).
+
+
+## Release
+
+Bump `version` in `.claude-plugin/plugin.json` and add a matching CHANGELOG entry. Run `tools/ci-local --python 3.9`, then commit the changes and run:
+
+```sh
+git tag vX.Y.Z && git push origin main vX.Y.Z
+```
+
+CI tests the tag and publishes the release. CI does not run on PRs or main pushes. To run it by hand, use `gh workflow run CI`.

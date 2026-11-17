@@ -2,6 +2,11 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## Unreleased
+
+- Fixed: SQL with multiple statements now returns a clear error on Python 3.9.
+- Tests: checkpoint the WAL through a writable connection when checking database pruning on Python 3.9.
+
 ## 0.9.1 (2026-11-10)
 
 Follow-up fixes to 0.9.0. Each fix has a regression test.
