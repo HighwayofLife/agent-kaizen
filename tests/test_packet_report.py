@@ -276,6 +276,22 @@ class PacketReportTests(unittest.TestCase):
             self.assertEqual(result.returncode, 2)
             self.assertTrue(result.stderr)
 
+    def test_ladder_model_case_and_alias(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rows = [dict(ts='2026-01-02T00:00:00Z', id=str(i), model='terra',
+                         effort='high', status='CODEX FAILED') for i in range(8)]
+            path = root / 'packets.jsonl'
+            path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            proposals = []
+            for rung in ('terra high', 'TERRA high', 'gpt-6.1-terra HIGH'):
+                (root / 'agent-kaizen.json').write_text(json.dumps({'calibrationLadder': [rung]}))
+                result = self.run_report('--packets', path, '--json', config=root)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                proposals.append(json.loads(result.stdout)['proposals'])
+            self.assertTrue(proposals[0])
+            self.assertEqual(proposals, [proposals[0]] * 3)
+
     def test_ladder_config_override_and_project(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

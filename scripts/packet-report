@@ -71,6 +71,7 @@ def evidence_states(row):
 
 def summarize(rows, since=None, until=None, ladder=None, small_fix_lines=100, small_fix_tokens=4000000):
     ladder = ladder or parse_ladder(DEFAULT_LADDER)
+    ladder = [(normalize_model(model, set()), effort.lower()) for model, effort in ladder]
     models = {model for model, _ in ladder}
     fixed = {packet for row in rows for packet in row['fixes'] if packet != row['id']}
     audited = {packet for row in rows if row['fix_origin'] in ('batch-review', 'final-audit')

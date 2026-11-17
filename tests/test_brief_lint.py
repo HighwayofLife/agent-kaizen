@@ -81,6 +81,24 @@ python3 -m unittest discover -s tests
         self.run_lint(BASE.replace('true\n', 'touch ' + str(marker) + '\n'))
         self.assertFalse(marker.exists())
 
+    def test_shell_control_and_quoted_commands(self):
+        commands = [
+            'for m in test_a test_b; do python3 -m unittest discover -s tests -p "$m.py" || exit 1; done',
+            'env COLUMNS=72 python3 -m unittest discover -s tests',
+            'python3 --help 2>&1 | python3 --help',
+            "python3 -m unittest -k \"playmode filter 'A|B'\"",
+            "python3 -c \"a|b\" 'x;y' # missing-tool | missing-tool",
+            '$(missing-tool) || missing-tool',
+            'echo `missing-tool`',
+            'if true; then cd dir && export X=1; fi',
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                result = self.run_lint(BASE.replace('true\n', command + '\n'))
+                self.assertEqual(result.returncode, 0, result.stdout)
+                if '$(' in command or '`' in command:
+                    self.assertIn('warning: cannot check command:', result.stdout)
+
     def test_size_json_and_multiple(self):
         for text, warning in [(BASE + '\n' * (200 - len(BASE.splitlines())), False),
                               (BASE + '\n' * (201 - len(BASE.splitlines())), True),

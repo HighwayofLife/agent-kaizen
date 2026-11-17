@@ -24,7 +24,8 @@ ALIASES = {
     'verify': ['verify', 'verification', 'verify commands'],
     'scope': ['scope', 'do not touch', "don't touch"],
 }
-BUILTINS = set('cd export set echo test [ source . exit true false unset :'.split())
+BUILTINS = set('cd export set echo test [ [[ source . exit true false unset :'.split())
+KEYWORDS = set('do done while until if then elif else fi case esac ! { }'.split())
 HEADING = re.compile(r'^\s*#{1,6}\s+(.+?)\s*#*\s*$')
 FENCE = re.compile(r'^\s*(`{3,}|~{3,})')
 SPAN = re.compile(r'`([^`\n]+)`')
@@ -109,23 +110,50 @@ def lint(text, repo, aliases):
             continue
         if line.startswith('$ '):
             line = line[2:].strip()
+        # Split only on unquoted shell operators; shlex then handles words and
+        # comments within each segment. Substitutions need a real shell parser.
+        if '$(' in line or '`' in line:
+            warnings.append('cannot check command: ' + line)
+            continue
+        segments, current, quote, escaped, token_start = [], [], None, False, True
+        for char in line:
+            if escaped:
+                current.append(char)
+                escaped = False
+            elif char == "\\" and quote != "'":
+                current.append(char)
+                escaped = True
+            elif quote:
+                current.append(char)
+                if char == quote:
+                    quote = None
+            elif char in "'\"":
+                current.append(char)
+                quote = char
+                token_start = False
+            elif char == '#' and token_start:
+                break
+            elif char == '&' and current and current[-1] in '<>':
+                current.append(char)
+                token_start = False
+            elif char in '&|;':
+                segments.append(''.join(current))
+                current = []
+                token_start = True
+            else:
+                current.append(char)
+                token_start = char.isspace()
+        segments.append(''.join(current))
         try:
-            lexer = shlex.shlex(line, posix=True, punctuation_chars='&|;')
-            lexer.whitespace_split = True
-            lexer.commenters = ''
-            words = list(lexer)
+            groups = [shlex.split(segment, comments=True, posix=True) for segment in segments]
         except ValueError:
             warnings.append('cannot check command: ' + line)
             continue
-        groups = [[]]
-        for word in words:
-            if word and all(c in '&|;' for c in word):
-                groups.append([])
-            else:
-                groups[-1].append(word)
         for group in groups:
-            while group and ASSIGNMENT.match(group[0]):
+            while group and (group[0] in KEYWORDS or ASSIGNMENT.match(group[0]) or group[0] == 'env'):
                 group.pop(0)
+            if group and group[0] == 'for':
+                continue
             if not group:
                 continue
             word = group[0]

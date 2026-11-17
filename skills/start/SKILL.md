@@ -23,7 +23,7 @@ Set up the scaffolding and ask about scheduled settings below. In safe or auto m
 back up every existing file you touch (for example .gitignore) and write a manifest that
 lists the files you create, including `docs/kaizen/config.json`, as docs/autonomy.md requires, so /agent-kaizen:undo works:
 1. Create docs/kaizen/LEDGER.md with a table:
-   date | change | why (which audit finding) | expected effect | measured effect | keep/revert | metric command | review date.
+   date | change | why (which audit finding) | expected effect | measured effect | keep/revert | metric command | review date
    Every new row needs a metric command in backticks (write a literal pipe as `\|`; never run it automatically) and a review date in `YYYY-MM-DD`: the day the metric will be read, normally the next audit, at most 30 days out. For an existing six-column ledger, add the two header cells and separator cells in the same Edit as the first new row; leave older rows untouched.
    Add a short header explaining that every efficiency change gets a row, and that the
    "measured effect" column is filled in by the next audit, not by guessing.
