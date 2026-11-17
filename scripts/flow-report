@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+"""Summarize packet flow from an append-only event log."""
+import argparse
+from collections import defaultdict
+from datetime import datetime, timezone
+import json
+import math
+import re
+import sys
+
+TERMINAL = {'landed', 'failed'}
+WAIT = {'queued', 'slot-wait'}
+STATES = WAIT | TERMINAL | {'dispatched', 'checks', 'review', 'ready'}
+
+
+def timestamp(value):
+    if not isinstance(value, str):
+        raise ValueError('timestamp must be a string')
+    time = datetime.fromisoformat(value.replace('Z', '+00:00'))
+    if time.tzinfo is None or time.utcoffset() is None:
+        raise ValueError('timestamp must have a timezone')
+    return time.astimezone(timezone.utc)
+
+
+def stamp(time):
+    return time.isoformat().replace('+00:00', 'Z')
+
+
+def summarize(lines):
+    packets = defaultdict(list)
+    malformed = events = 0
+    for order, line in enumerate(lines):
+        try:
+            event = json.loads(line)
+            if not isinstance(event, dict):
+                raise ValueError('event must be an object')
+            ident, state = event.get('id'), event.get('state')
+            if (not isinstance(ident, str) or not ident or not isinstance(state, str)
+                    or (state not in STATES and not re.fullmatch(r'round-[1-9][0-9]*', state))):
+                raise ValueError('invalid event')
+            time = timestamp(event.get('ts'))
+        except (ValueError, TypeError, OverflowError):
+            malformed += 1
+            continue
+        events += 1
+        packets[ident].append((time, order, state))
+
+    anomalies, lead_times, waits, changes = [], [], [], []
+    durations = defaultdict(list)
+    wait_s = touch_s = intervals = open_final = 0
+    for ident, entries in sorted(packets.items()):
+        entries.sort()
+        terminal = next((i for i, e in enumerate(entries) if e[2] in TERMINAL), None)
+        valid = entries if terminal is None else entries[:terminal + 1]
+        for time, _, state in entries[len(valid):]:
+            anomalies.append({'id': ident, 'ts': stamp(time), 'state': state,
+                              'reason': 'after terminal event'})
+        complete = terminal is not None
+        lead_times.append({'id': ident, 'seconds': (valid[-1][0] - valid[0][0]).total_seconds()
+                           if complete else None, 'complete': complete})
+        if not complete:
+            open_final += 1
+        counted = valid[0][2] not in TERMINAL
+        for index, (time, order, _) in enumerate(valid):
+            delta = (1 if counted and index == 0 else
+                     -1 if counted and complete and index == len(valid) - 1 else 0)
+            changes.append((time, order, delta))
+        for current, following in zip(valid, valid[1:]):
+            start, _, state = current
+            end = following[0]
+            seconds = (end - start).total_seconds()
+            key = 'round' if state.startswith('round-') else state
+            durations[key].append(seconds)
+            intervals += 1
+            if state in WAIT:
+                wait_s += seconds
+                waits.append({'id': ident, 'state': state, 'start': stamp(start),
+                              'end': stamp(end), 'seconds': seconds})
+            else:
+                touch_s += seconds
+
+    states = {}
+    for state, values in sorted(durations.items()):
+        values.sort()
+        states[state] = {'count': len(values), 'total_s': sum(values),
+                         'p50_s': values[math.ceil(.5 * len(values)) - 1],
+                         'p90_s': values[math.ceil(.9 * len(values)) - 1]}
+    waits.sort(key=lambda item: (-item['seconds'], item['start'], item['id']))
+    changes.sort()
+    wip, count = [], 0
+    for time, _, delta in changes:
+        count += delta
+        point = {'ts': stamp(time), 'wip': count}
+        if wip and wip[-1]['ts'] == point['ts']:
+            wip[-1] = point
+        else:
+            wip.append(point)
+    total = wait_s + touch_s
+    return {'packets': len(packets), 'events': events, 'malformed_lines': malformed,
+            'anomalies': anomalies, 'open_final_states': open_final, 'lead_times': lead_times,
+            'states': states, 'queue_touch': {'wait_s': wait_s, 'touch_s': touch_s,
+            'wait_share': wait_s / total if total else None,
+            'touch_share': touch_s / total if total else None, 'intervals': intervals},
+            'top_waits': waits[:10], 'wip': wip,
+            'max_wip': max((point['wip'] for point in wip), default=0)}
+
+
+def bounded(rows, limit=11):
+    return rows if len(rows) <= limit else rows[:limit - 1] + [f'... {len(rows) - limit + 1} more']
+
+
+def render(result):
+    r = result
+    lines = [f"Flow report: {r['packets']} packets, {r['events']} events, "
+             f"{r['malformed_lines']} malformed line(s), {len(r['anomalies'])} anomaly(ies), "
+             f"{r['open_final_states']} open final state(s)"]
+    if not r['events']:
+        return '\n'.join(lines + ['no events'])
+    lines += ['Lead time'] + bounded([f"{x['id']}: {x['seconds']} s" if x['complete']
+                                      else f"{x['id']}: incomplete" for x in r['lead_times']])
+    lines += ['Time per state'] + bounded([f"{s}: {v['count']} intervals, total {v['total_s']} s, "
+                                           f"p50 {v['p50_s']} s, p90 {v['p90_s']} s"
+                                           for s, v in r['states'].items()] or ['none'])
+    q = r['queue_touch']
+    lines += ['Queue vs touch', f"wait: {q['wait_s']} s ({q['wait_share']}); "
+              f"touch: {q['touch_s']} s ({q['touch_share']}); intervals: {q['intervals']}"]
+    lines += ['Top waits'] + bounded([f"{x['id']} {x['state']}: {x['seconds']} s "
+                                      f"({x['start']} to {x['end']})" for x in r['top_waits']] or ['none'])
+    lines += ['WIP', f"maximum: {r['max_wip']}"] + bounded([f"{x['ts']}: {x['wip']}"
+                                                               for x in r['wip']] or ['none'], 10)
+    if r['anomalies']:
+        lines += ['Anomalies'] + bounded([f"{x['id']} {x['ts']} {x['state']}: {x['reason']}"
+                                           for x in r['anomalies']])
+    return '\n'.join(lines)
+
+
+def main():
+    parser = argparse.ArgumentParser(description='Report packet flow. Wait: queued and slot-wait; '
+                                     'touch: dispatched, round-N, checks, review and ready. '
+                                     'Exit 0 for a report, 2 for usage or file errors.')
+    parser.add_argument('--events', default='out/packet-events.jsonl',
+                        help='event JSONL file (default: out/packet-events.jsonl)')
+    parser.add_argument('--json', action='store_true', help='output JSON')
+    args = parser.parse_args()
+    try:
+        with open(args.events, encoding='utf-8', errors='replace') as source:
+            result = summarize(source)
+    except OSError as exc:
+        print(f'flow-report: {exc}', file=sys.stderr)
+        return 2
+    print(json.dumps(result, sort_keys=True) if args.json else render(result))
+    return 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())
