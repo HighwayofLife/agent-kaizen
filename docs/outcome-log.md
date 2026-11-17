@@ -29,7 +29,10 @@ A packet is one brief in a plan (see `/agent-kaizen:planning`). Your own landing
 | area | no | string; default mixed |
 | tokens_in | no | number or null |
 | tokens_out | no | number or null |
+| cost | no | non-negative API-equivalent dollars or null; never estimated |
 | note | no | string |
+
+`packet-report` treats `tokens_in` of 0 as ambiguous, since some writers cannot measure it.
 
 The writer reads `Risk:`, `Fix-Origin:`, and `Fixes:` trailers on the merge commit. Risk uses the values above. Fix-Origin may be `batch-review` or `final-audit`, or another project-defined origin. Fixes lists the packet IDs fixed by this landing. A self-reference does not count as a fix.
 

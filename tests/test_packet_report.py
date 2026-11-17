@@ -21,7 +21,7 @@ class PacketReportTests(unittest.TestCase):
         result = self.run_report('--packets', FIXTURE, '--json')
         self.assertEqual(result.returncode, 0, result.stderr)
         data = json.loads(result.stdout)
-        self.assertEqual(set(data), {'groups', 'area_groups', 'totals', 'fix_origins', 'proposals', 'escalations', 'dispatch_models_coverage', 'rule', 'disclaimer'})
+        self.assertEqual(set(data), {'groups', 'area_groups', 'totals', 'fix_origins', 'proposals', 'escalations', 'dispatch_models_coverage', 'unknown_models', 'data_coverage', 'landed_failing', 'rule', 'disclaimer'})
         self.assertIn({'model': 'sonnet', 'effort': 'high', 'direction': 'UP'}, data['proposals'])
         self.assertIn({'model': 'opus', 'effort': 'high', 'direction': 'DOWN'}, data['proposals'])
         self.assertIn('too few', self.run_report('--packets', FIXTURE, '--since', '2026-02-01').stdout)
@@ -128,6 +128,56 @@ class PacketReportTests(unittest.TestCase):
             self.assertEqual(data['escalations'], {'count': 4, 'pairs': {
                 'terra:medium->terra:high': 2, 'terra:medium->sol:high': 1, 'terra->sol': 1}})
             self.assertIn('terra:medium->terra:high: 2', self.run_report('--packets', path).stdout)
+
+    def test_data_quality_aliases_and_filters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'packets.jsonl'
+            base = dict(ts='2026-01-01T00:00:00Z', effort='high')
+            rows = [dict(base, id='a', model='gpt-6.1-terra', tokens_in=0,
+                         tokens_out=0, cost=0, status='CHECKS FAILING', merge_sha='abc',
+                         dispatch_models=[dict(model='gpt-6.1-terra', effort='high', rounds=0),
+                                          dict(model='gpt-6.2-sol', effort='high', rounds=1)]),
+                    dict(base, id='b', model='gpt-6.2-sol', tokens_in=None,
+                         tokens_out=True, cost=-1, status='CHECKS FAILING'),
+                    dict(base, id='c', model='claude-sonnet-4-5', tokens_in=4,
+                         tokens_out=2, cost=1, status='DONE', merge_sha='abc'),
+                    dict(base, id='d', model='unknown', tokens_in='4', tokens_out=-1, cost='1'),
+                    dict(base, id='e', model='other', tokens_in=True),
+                    dict(base, id='f', model='terra-sol'),
+                    dict(base, id='g', model='UNKNOWN', ts='2026-01-02T00:00:00Z')]
+            path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            for ladder in ('terra,sol,sonnet', 'opus'):
+                args = ('--packets', path, '--ladder', ladder, '--until', '2026-01-02')
+                result = self.run_report(*args, '--json')
+                self.assertEqual(result.returncode, 0, result.stderr)
+                data = json.loads(result.stdout)
+                self.assertEqual({g['model'] for g in data['groups']},
+                                 {'terra', 'sol', 'sonnet', 'unknown', 'other', 'terra-sol'})
+                self.assertEqual(data['escalations']['pairs'], {'terra->sol': 1})
+                self.assertEqual(data['unknown_models'], {'count': 1, 'ids': ['d']})
+                self.assertEqual(data['landed_failing'], {'count': 1, 'ids': ['a']})
+                self.assertEqual(data['data_coverage']['tokens_in'],
+                                 dict(known=1, zero=1, missing=4, zero_ids=['a'],
+                                      missing_ids=['b', 'd', 'e', 'f']))
+                self.assertEqual(data['data_coverage']['tokens_out']['known'], 2)
+                self.assertEqual(data['data_coverage']['cost']['missing'], 4)
+                for option in ((), ('--markdown',)):
+                    output = self.run_report(*args, *option).stdout
+                    self.assertLess(output.index('Data quality'), output.index('Calibration proposals'))
+                    self.assertIn('Landed with failing checks: 1; ids: a', output)
+            data = json.loads(self.run_report('--packets', path, '--since', '2026-01-02', '--json').stdout)
+            self.assertEqual(data['unknown_models']['ids'], ['g'])
+            self.assertEqual(data['data_coverage']['rows'], 1)
+            self.assertEqual(data['landed_failing']['count'], 0)
+
+    def test_quality_ids_are_bounded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'packets.jsonl'
+            rows = [dict(ts='2026-01-01T00:00:00Z', id=str(i), model='unknown', effort='high')
+                    for i in range(12)]
+            path.write_text(''.join(json.dumps(row) + '\n' for row in rows))
+            output = self.run_report('--packets', path).stdout
+            self.assertIn('... 2 more', output)
 
     def test_config_dir_expands_home(self):
         with tempfile.TemporaryDirectory() as tmp:
