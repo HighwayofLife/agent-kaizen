@@ -1,5 +1,6 @@
 """usage-db: ingest, status, report and sql, with synthetic transcripts in temp dirs."""
 import csv
+from contextlib import closing
 import importlib.util
 from importlib.machinery import SourceFileLoader
 import io
@@ -375,7 +376,9 @@ class PruneTests(UsageDbCase):
         self.main_file([assistant((today - timedelta(days=400)).isoformat() + f'T12:{n // 60:02}:{n % 60:02}Z', f'm{n}')
                         for n in range(3000)] + [assistant(today.isoformat() + 'T00:00:00Z', 'keep')])
         self.ingest()
-        self.run_script('usage-db', 'sql', 'PRAGMA wal_checkpoint(TRUNCATE)')
+        # Checkpointing writes the database; the SQL command deliberately opens it read-only.
+        with closing(sqlite3.connect(self.db)) as conn:
+            conn.execute('PRAGMA wal_checkpoint(TRUNCATE)')
         big = self.db.stat().st_size
         out = self.prune('--older-than', '1', '--apply').stdout
         self.assertIn('deleted 3000 calls', out)

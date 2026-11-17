@@ -545,7 +545,7 @@ def run_sql(args):
         cursor = conn.execute(args.query)
         columns = [d[0] for d in cursor.description or []]
         rows = cursor.fetchall()
-    except (sqlite3.Error, ValueError) as exc:
+    except (sqlite3.Error, sqlite3.Warning, ValueError) as exc:
         raise Fatal(f'SQL error: {exc}'.splitlines()[0])
     print(render(columns, rows, args.format), end='')
     return 0
