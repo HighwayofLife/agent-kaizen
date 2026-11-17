@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -21,7 +22,7 @@ class PacketEventTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         for value in ('queued', 'round-N', 'landed', 'failed',
                       'out/packet-events.jsonl', '0 written', '1 write failed', '2 invalid input'):
-            self.assertIn(value, result.stdout)
+            self.assertIn(value, ' '.join(result.stdout.split()))
 
     def test_write_and_default_path(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -45,13 +46,41 @@ class PacketEventTests(unittest.TestCase):
             cases = [('', 'queued'), ('a\nb', 'queued'), ('a\rb', 'queued'),
                      ('a', 'unknown'), ('a', 'round-0'), ('a', 'round-x'),
                      ('a', 'ROUND-1'), ('a', 'queued', '--ts', '2026-01-01T00:00:00'),
-                     ('a', 'queued', '--ts', 'bad'), ('a', 'queued', '--detail', 'é' * 4096)]
+                     ('a', 'queued', '--ts', 'bad'),
+                     ('a', 'queued', '--ts', '2026-01-01T00:00:00Z:00'),
+                     ('a', 'queued', '--detail', 'é' * 4096)]
             for args in cases:
                 with self.subTest(args=args[:2]):
                     result = self.run_event(*args, '--file', path)
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertEqual(len(result.stderr.splitlines()), 1)
                     self.assertEqual(path.read_text(), 'existing\n')
+
+    def test_invalid_utf8_leaves_log_untouched(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'events'
+            bad = os.fsdecode(b'bad\xff')
+            for args in ((bad, 'queued'), ('id', bad), ('id', 'queued', '--detail', bad)):
+                with self.subTest(args=args):
+                    result = self.run_event(*args, '--file', path)
+                    self.assertEqual(result.returncode, 2)
+                    self.assertEqual(len(result.stderr.splitlines()), 1)
+                    self.assertFalse(path.exists())
+
+    def test_line_size_boundary(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'events'
+            event = {'ts': '2026-01-01T00:00:00Z', 'id': 'id', 'state': 'queued', 'detail': ''}
+            base = (json.dumps(event, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8')
+            detail = 'x' * (4096 - len(base))
+            args = ('id', 'queued', '--ts', event['ts'], '--file', path, '--detail')
+            result = self.run_event(*args, detail)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(len(path.read_bytes()), 4096)
+            original = path.read_bytes()
+            result = self.run_event(*args, detail + 'x')
+            self.assertEqual(result.returncode, 2, result.stderr)
+            self.assertEqual(path.read_bytes(), original)
 
     def test_nested_path_and_directory_error(self):
         with tempfile.TemporaryDirectory() as tmp:

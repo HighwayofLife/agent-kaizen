@@ -40,7 +40,8 @@ def main():
         timestamp = datetime.now(timezone.utc)
     else:
         try:
-            timestamp = datetime.fromisoformat(args.ts.replace('Z', '+00:00'))
+            ts = args.ts[:-1] + '+00:00' if args.ts.endswith('Z') else args.ts
+            timestamp = datetime.fromisoformat(ts)
             if timestamp.tzinfo is None or timestamp.utcoffset() is None:
                 raise ValueError('timezone required')
             timestamp = timestamp.astimezone(timezone.utc)
@@ -50,7 +51,10 @@ def main():
              .replace('+00:00', 'Z'), 'id': args.id, 'state': args.state}
     if args.detail is not None:
         event['detail'] = args.detail
-    line = (json.dumps(event, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8')
+    try:
+        line = (json.dumps(event, ensure_ascii=False, separators=(',', ':')) + '\n').encode('utf-8')
+    except UnicodeEncodeError:
+        return invalid('event contains invalid UTF-8')
     if len(line) > 4096:
         return invalid('event line exceeds 4096 bytes')
 
