@@ -1442,7 +1442,11 @@ def run_step(name, options, arguments, success=(0,)):
         result = run_group([options.python, str(script), *map(str, arguments)],
                                 capture_output=True, text=True, timeout=STEP_TIMEOUT)
         if result.returncode in success:
-            return "\n".join(result.stdout.strip().splitlines()[:30])
+            lines = result.stdout.strip().splitlines()
+            if len(lines) > 30:
+                # Keep the final summary when a helper lists many entries.
+                lines = lines[:28] + ["... (truncated)", lines[-1]]
+            return "\n".join(lines)
         reason = f"exit {result.returncode}"
         detail = (result.stderr or result.stdout).strip().splitlines()
         if detail:

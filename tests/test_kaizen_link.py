@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import runpy
 from pathlib import Path
 import shutil
 import subprocess
@@ -117,6 +118,12 @@ class LinkTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0)
         self.assertIn("2 local", result.stdout)
 
+    def test_all_scripts_are_registered(self):
+        registered = set(runpy.run_path(str(LINK))["SCRIPTS"].values())
+        entries = {p.name for p in (ROOT / "scripts").iterdir()
+                   if p.name not in {"README.md", "__pycache__"} and not p.name.startswith(".")}
+        self.assertEqual(entries - registered, set())
+
     def test_copy_auto_dependencies_and_directories(self):
         fake = self.home / "plugins/cache/example/version"
         shutil.copytree(ROOT / "scripts", fake / "scripts")
@@ -126,6 +133,27 @@ class LinkTests(unittest.TestCase):
         for name in ("usage-series", "usage-compare"):
             result = self.run_script(self.bin / name, "--help")
             self.assertEqual(result.returncode, 0, result.stderr)
+        for name in ("packet-event", "flow-report", "experiment-check", "brief-lint"):
+            path = self.bin / name
+            self.assertTrue(path.is_file())
+            self.assertFalse(path.is_symlink())
+            self.assertTrue(os.access(path, os.X_OK))
+            result = self.run_script(path, "--help")
+            self.assertEqual(result.returncode, 0, result.stderr)
+        events = self.home / "events.jsonl"
+        result = self.run_script(self.bin / "packet-event", "--file", str(events), "p1", "queued")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        event = json.loads(events.read_text())
+        self.assertEqual((event["id"], event["state"]), ("p1", "queued"))
+        self.assertTrue(event["ts"].endswith("Z"))
+        scheduled = runpy.run_path(str(self.bin / "kaizen-scheduled"))
+        self.assertEqual(scheduled["sibling"](None, "experiment-check"), self.bin / "experiment-check")
+        brief = self.home / "invalid.md"
+        brief.write_text("Incomplete brief.\n")
+        result = self.run_script(self.bin / "codex-dispatch", "--brief-lint", "-C", str(self.home), str(brief))
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn("Reason: brief-lint:", result.stdout)
+        self.assertNotIn("not found", result.stdout)
         self.assertTrue((self.bin / "pricing.json").is_file())
         folder = self.bin / "preambles"
         (folder / "extra.md").write_text("extra")

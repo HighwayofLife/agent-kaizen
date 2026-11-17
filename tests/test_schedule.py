@@ -126,7 +126,9 @@ class ScheduleTests(StubCase):
             self.assertEqual(contents.count('# agent-kaizen-audit'), 1)
             self.assertEqual(contents.count('# agent-kaizen-review'), 1)
         for source, target in (('kaizen-scheduled', 'kaizen-scheduled'), ('token-audit', 'kaizen-token-audit'),
-                               ('kaizen-backup', 'kaizen-backup'), ('pricing.json', 'kaizen-pricing.json')):
+                               ('kaizen-backup', 'kaizen-backup'), ('pricing.json', 'kaizen-pricing.json'),
+                               *((name, name) for name in ('packet-event', 'flow-report',
+                                                           'experiment-check', 'brief-lint'))):
             self.assertEqual((self.home / '.claude/bin' / target).read_bytes(),
                              (SCRIPTS / source).read_bytes())
         self.assertTrue(os.access(self.home / '.claude/bin/kaizen-scheduled', os.X_OK))
@@ -258,6 +260,7 @@ class ScheduleTests(StubCase):
         with patch.dict(os.environ, self.env, clear=True):
             output = module.run_drift(module.argparse.Namespace(python=sys.executable))
         self.assertIn('kaizen-link: 0 drift, 0 broken', output)
+        self.assertLessEqual(len(output.splitlines()), 30)
 
     def test_custom_bin_passes_explicit_hooks_dir(self):
         module = self.load_schedule()
