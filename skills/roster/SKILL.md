@@ -110,6 +110,10 @@ Phase 6: verify and record.
 - Agent templates: `${CLAUDE_PLUGIN_ROOT}/templates/agents/*.md`. Role context: `${CLAUDE_PLUGIN_ROOT}/templates/agent-context/`.
 - Routing table skeleton: `${CLAUDE_PLUGIN_ROOT}/templates/global-CLAUDE.md` (the Routing section). An example of a multi-vendor roster: `${CLAUDE_PLUGIN_ROOT}/docs/what-we-learned.md` ("Routing and models").
 
+## Record the check
+
+Only when this interactive run completed the check and delivered its result, run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled checks record --for . roster` as one plain command. Do not record a skipped, declined or failed check, or any scheduled or propose-only run. If the command fails, report the failure; do not edit the state file by hand.
+
 ## Done when
 
 `docs/kaizen/model-roster.md` exists with sourced strengths, and every routing row has a primary, a fallback and an escalation rung. Each new agent or script passed a smoke test, and the ledger has a row for each.

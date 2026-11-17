@@ -111,6 +111,7 @@ The audits directory is `<Claude config dir>/audits`:
 <audits>/extracts/*.extract.json
 <audits>/projects/index.json
 <audits>/projects/<key>/state.json
+<audits>/projects/<key>/checks.json
 <audits>/projects/<key>/token-audit-*.md
 <audits>/projects/<key>/project-report-*.md
 <audits>/projects/<key>/*.extract.json
@@ -125,6 +126,8 @@ A second proposal on the same day is written as `cycle-<date>-2.md`, then `-3`, 
 Reports carry a scope line and compare only with an earlier report of the same scope. Flags use per-call intensity, not volume. Reports from before 0.4.0 lack scope metadata and are never compared.
 
 Each report has a machine-local JSON extract with per-agent usage and a cheaper-model hint. Extracts go in `<audits>/extracts/`, for scheduled and interactive runs alike. They never go into `docs/kaizen/`.
+
+The machine-local `checks.json` records completed models, roster and whats-new checks. `kaizen-scheduled checks path --for DIR` prints its path; `kaizen-scheduled checks record --for DIR NAME` records a completion and keeps the previous file as `checks.json.bak`. Every enrolled project gets due-check notices until its first recorded completion for each check.
 
 The checks report includes an experiments section for each project with findings or a checker failure. Session start also notices experiment findings once per day per project using a marker in the audits directory; `KAIZEN_NOTICE_TIMEOUT` bounds the check in seconds (default 10).
 

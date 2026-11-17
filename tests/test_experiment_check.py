@@ -66,6 +66,15 @@ class ExperimentCheckTests(unittest.TestCase):
         _, data = self.data()
         self.assertIn('| cat', data['findings'][0]['metric_command'])
 
+    def test_table_ends_before_prose_with_pipe(self):
+        valid = '| 2026-11-27 | done | | | done | | | |\n'
+        self.ledger(HEADER + valid + '\nprose | with a pipe\n')
+        result, data = self.data()
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(data['counts']['malformed'], 0)
+        self.ledger(HEADER + '| bad | invalid | | | pending | | | wrong |\n' + valid)
+        self.assertEqual(self.data()[1]['counts']['malformed'], 1)
+
     def test_config_precedence_and_invalid(self):
         global_dir = Path(self.env['CLAUDE_CONFIG_DIR'])
         global_dir.mkdir()

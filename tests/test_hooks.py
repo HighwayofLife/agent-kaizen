@@ -22,7 +22,7 @@ def run_raw(hook, payload, env=None, cwd=None):
 def run(hook, payload, env=None, cwd=None):
     result = run_raw(hook, payload, env, cwd)
     result.check_returncode()
-    return json.loads(result.stdout) if result.stdout.strip() else None
+    return (json.loads(result.stdout) or None) if result.stdout.strip() else None
 
 
 def bare_path(*tools):
@@ -418,6 +418,66 @@ class HookTests(unittest.TestCase):
                 self.assertIn('unreviewed usage audit', text)
                 self.assertNotIn('Experiments need attention', text)
 
+    def test_notice_term_resistant_checker_and_atomic_marker(self):
+        project, audits, plugin = self.tmp / 'project', self.tmp / 'audits', self.tmp / 'plugin'
+        (project / 'docs/kaizen').mkdir(parents=True)
+        (plugin / 'scripts').mkdir(parents=True)
+        checker = plugin / 'scripts/experiment-check'
+        checker.write_text('import signal, time\nsignal.signal(signal.SIGTERM, signal.SIG_IGN)\ntime.sleep(20)\n')
+        audits.mkdir()
+        (audits / 'token-audit-1.md').write_text('audit')
+        env = {'AUDIT_DIR': str(audits), 'CLAUDE_CONFIG_DIR': str(self.tmp / 'cfg'),
+               'CLAUDE_PLUGIN_ROOT': str(plugin), 'KAIZEN_NOTICE_TIMEOUT': '1'}
+        start = time.monotonic()
+        result = run_raw('audit-notice.sh', {'cwd': str(project)}, env)
+        self.assertEqual(result.returncode, 0)
+        self.assertIn('unreviewed usage audit', json.loads(result.stdout)['hookSpecificOutput']['additionalContext'])
+        self.assertLess(time.monotonic() - start, 5)
+        for marker in audits.glob('*.noticed-*'):
+            marker.unlink()
+        with bare_path('jq', 'ls', 'head', 'grep', 'date', 'dirname', 'touch', 'python3', 'cksum', 'mktemp', 'sleep', 'rm', 'mkdir') as binpath:
+            start = time.monotonic()
+            result = run_raw('audit-notice.sh', {'cwd': str(project)}, {**env, 'PATH': binpath})
+            self.assertEqual(result.returncode, 0)
+            self.assertIn('unreviewed usage audit', json.loads(result.stdout)['hookSpecificOutput']['additionalContext'])
+            self.assertLess(time.monotonic() - start, 5)
+        for marker in audits.glob('*.noticed-*'):
+            marker.unlink()
+        checker.write_text('import time\ntime.sleep(0.2)\nprint("finding")\nraise SystemExit(1)\n')
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _: run_raw('audit-notice.sh', {'cwd': str(project)}, env), range(2)))
+        messages = [json.loads(result.stdout).get('hookSpecificOutput', {}).get('additionalContext', '') for result in results]
+        self.assertEqual(sum('unreviewed usage audit' in m for m in messages), 1)
+        self.assertEqual(sum('Experiments need attention' in m for m in messages), 1)
+
+    def test_due_checks_index_and_worktree(self):
+        cfg, project, worktree = (self.tmp / 'cfg').resolve(), (self.tmp / 'project').resolve(), (self.tmp / 'worktree').resolve()
+        (project / 'docs/kaizen').mkdir(parents=True)
+        subprocess.run(['git', 'init', '-q', str(project)], check=True)
+        subprocess.run(['git', '-C', str(project), '-c', 'user.name=Test', '-c', 'user.email=test@localhost', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-qm', 'initial'], check=True)
+        subprocess.run(['git', '-C', str(project), 'worktree', 'add', '-q', '-b', 'test-worktree', str(worktree)], check=True)
+        (worktree / 'src').mkdir()
+        audits = cfg / 'audits'
+        env = {'CLAUDE_CONFIG_DIR': str(cfg), 'CLAUDE_PLUGIN_ROOT': str(ROOT)}
+        state = Path(subprocess.check_output(['python3', str(ROOT / 'scripts/kaizen-scheduled'), 'checks', 'path', '--for', str(project)], env={**os.environ, **env}, text=True).strip())
+        state.parent.mkdir(parents=True)
+        (audits / 'projects/index.json').write_text(json.dumps({'projects': {str(project): state.parent.name, str(worktree): state.parent.name}}))
+        for path in (project, worktree / 'src'):
+            text = run('audit-notice.sh', {'cwd': str(path)}, env)['hookSpecificOutput']['additionalContext']
+            self.assertIn('models: never run', text)
+            for marker in audits.glob('experiments-*.noticed-*'):
+                marker.unlink()
+        for name in ('models', 'roster', 'whats-new'):
+            result = subprocess.run(['python3', str(ROOT / 'scripts/kaizen-scheduled'), 'checks', 'record', '--for', str(project), name], env={**os.environ, **env}, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(state.exists())
+        for marker in audits.glob('*.noticed-*'):
+            marker.unlink()
+        self.assertIsNone(run('audit-notice.sh', {'cwd': str(project)}, env))
+        self.assertIsNone(run('audit-notice.sh', {'cwd': str(worktree / 'src')}, env))
+        (audits / 'projects/index.json').unlink()
+        self.assertIsNone(run('audit-notice.sh', {'cwd': str(project)}, env))
+
     def test_audit_notice_project_and_worktree_index(self):
         cfg = (self.tmp / 'cfg').resolve()
         audits = cfg / 'audits'
@@ -506,7 +566,7 @@ class HookTests(unittest.TestCase):
         bash, jq = shutil.which('bash'), shutil.which('jq')
         self.assertIsNotNone(bash)
         self.assertIsNotNone(jq)
-        for name in ('ls', 'head', 'date', 'touch', 'grep'):
+        for name in ('ls', 'head', 'date', 'touch', 'grep', 'rm'):
             (bindir / name).symlink_to(shutil.which(name))
         env = {**os.environ, 'HOME': str(self.tmp / 'home'), 'CLAUDE_CONFIG_DIR': str(cfg),
                'AUDIT_DIR': '', 'PATH': str(bindir)}
@@ -514,12 +574,12 @@ class HookTests(unittest.TestCase):
             return subprocess.run([bash, str(HOOKS / 'audit-notice.sh')],
                                   input=json.dumps({'cwd': str(project)}), text=True,
                                   capture_output=True, env=env, check=True)
-        self.assertEqual(invoke().stdout, '')
+        self.assertEqual(json.loads(invoke().stdout), {})
         self.assertEqual(list(audits.glob('*.noticed-*')), [])
         stub = bindir / 'jq'
         stub.write_text('#!/bin/bash\n[ "$1" = -n ] && exit 1\nexec "' + jq + '" "$@"\n')
         stub.chmod(0o755)
-        self.assertEqual(invoke().stdout, '')
+        self.assertEqual(json.loads(invoke().stdout), {})
         self.assertEqual(list(audits.glob('*.noticed-*')), [])
 
     def test_after_compact(self):

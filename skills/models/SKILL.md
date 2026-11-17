@@ -46,6 +46,10 @@ In this skill, `<Claude config dir>` means `$CLAUDE_CONFIG_DIR` or `~/.claude`, 
 Wait for my OK. Add a ledger row (docs/kaizen/LEDGER.md) for each change we make. Include metric command and review date using `${CLAUDE_PLUGIN_ROOT}/skills/start/SKILL.md`.
 ```
 
+## Record the check
+
+Only when this interactive run completed the check and delivered its result, run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled checks record --for . models` as one plain command. Do not record a skipped, declined or failed check, or any scheduled or propose-only run. If the command fails, report the failure; do not edit the state file by hand.
+
 ## Done when
 
 You have a short, sourced table (current model → candidate → why → expected effect) and, after approval, changed routing rows with ledger entries.

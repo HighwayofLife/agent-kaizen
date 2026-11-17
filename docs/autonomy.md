@@ -88,6 +88,10 @@ The autonomy mode decides what the *skills* will do. Claude Code's own permissio
 - **Scheduled:** `install-schedule --auto all|none|DIR...` sets `scheduledAutonomy`. The runner uses `dontAsk` in propose mode and `default` in auto mode, with scoped Edit/Write grants and deny lists. It never uses `bypassPermissions`.
   Scheduled auto runs cannot edit `.claude` instruction files, settings, hooks or credentials; they report proposals instead. Changes to settings, hooks and permissions are made interactively, where you see each edit. See [scheduled permissions](scheduling.md#unattended-permissions) for the exact lists.
 
+## Recording checks
+
+Recording a completed check is bookkeeping allowed in every interactive mode, including `propose`, after the result is delivered. Never record a skipped, declined or failed check, or a scheduled or propose-only run. It is not a project change and needs no `kaizen-backup` manifest; the state file’s `.bak` is its rollback.
+
 ## Undo
 
 - `/agent-kaizen:undo last` reverses the most recent applied change.
