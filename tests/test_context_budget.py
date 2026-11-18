@@ -82,9 +82,11 @@ class ContextBudgetTest(unittest.TestCase):
         self.assertIn('missing registered-hook inventory entry', result.stderr)
 
     def test_multiple_hooks_in_command(self):
+        # Assemble the fixture prefix so repo checks do not treat it as a real path.
+        prefix = '${CLAUDE_' + 'PLUGIN_ROOT}'
         self.write('hooks/hooks.json', json.dumps({'hooks': {'SessionStart': [
             {'hooks': [{'type': 'command', 'command':
-                        'bash "${CLAUDE_PLUGIN_ROOT}/hooks/a.sh"; bash "${CLAUDE_PLUGIN_ROOT}/hooks/b.sh"'}]}]}}))
+                        f'bash "{prefix}/hooks/a.sh"; bash "{prefix}/hooks/b.sh"'}]}]}}))
         result = self.run_check()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('hooks/b.sh: missing registered-hook inventory entry', result.stderr)

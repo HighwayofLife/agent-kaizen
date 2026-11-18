@@ -82,6 +82,22 @@ class LinkTests(unittest.TestCase):
             result = self.run_script(self.bin / name, "--help")
             self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_release_helpers_and_demo_in_both_install_modes(self):
+        for mode in ("link", "copy"):
+            with self.subTest(mode=mode):
+                result = self.run_link("--apply", "--mode", mode)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                for name in ("kaizen-scan", "kaizen-demo-fixtures", "kaizen-doctor"):
+                    path = self.bin / name
+                    self.assertTrue(path.is_file())
+                    self.assertEqual(path.is_symlink(), mode == "link")
+                    result = self.run_script(path, "--help")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                result = self.run_script(self.bin / "kaizen-scan", "--demo")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("PASS", result.stdout)
+                self.assertEqual(self.run_link("--unlink").returncode, 0)
+
     def test_drift_replace_broken_and_prefixed(self):
         self.bin.mkdir()
         (self.bin / "token-audit").write_text("old")

@@ -187,6 +187,8 @@ dates use UTC. The five threshold flags are `--stuck-repeats` (3), `--fact-sessi
 `--days` must be 0 to 36500. There are no model environment variables. `--codex` is accepted for compatibility; sessions are already
 included by default.
 
+`--no-write` writes neither report nor extract; with `--json`, both paths are null. Run `token-audit --help` for options.
+
 `--extract-out DIR` selects the machine-readable extract folder. Its default is
 `<Claude config dir>/audits/extracts/`, independent of `--out`. Each report has a
 matching `<report stem>.extract.json` file, where the stem is the report file name
@@ -469,7 +471,8 @@ usage-db status [--db PATH]
 usage-db report [--db PATH] [--since YYYY-MM-DD] [--until YYYY-MM-DD]
                 [--by day|model|project|agent|session|source]
                 [--project SUBSTR] [--source claude|codex]
-                [--format table|csv|json] [--pricing PATH]
+                [--format table|csv|json] [--pricing PATH] [--cache]
+usage-db guard [--help]
 usage-db prune --older-than DAYS [--apply] [--db PATH]
 usage-db sql QUERY [--db PATH] [--format table|csv|json]
 ```
@@ -498,6 +501,10 @@ day and last ingest time. A missing database exits 1.
 
 `report` groups calls, tokens, cost and unpriced calls by `--by` (default
 `day`) and adds a total row. Dates are UTC days and `--until` is inclusive.
+
+`report --cache` groups cache writes and full-rewrite counts by preceding idle gap and main or subagent attribution. Subagent gaps are approximate; old rows may have unknown attribution. Codex has no cache-write data. Filters and output formats still apply. A missing database exits 1.
+
+`guard` reads history without writing and prints regression lines or an explicit no-regression or insufficient-data result. Run `usage-db guard --help` for thresholds and overrides.
 
 Cost is not stored. `report` prices each call when it runs, with `pricing.json`
 (or `--pricing`), so a corrected price also corrects old rows. Models without a
