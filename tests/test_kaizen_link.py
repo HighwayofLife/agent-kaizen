@@ -140,6 +140,44 @@ class LinkTests(unittest.TestCase):
                    if p.name not in {"README.md", "__pycache__"} and not p.name.startswith(".")}
         self.assertEqual(entries - registered, set())
 
+    def test_friction_registration_and_absent_sources(self):
+        expected = {
+            "kaizen-friction-catalog.json": "friction-catalog.json",
+            "kaizen-host-probe": "host-probe",
+            "kaizen-worktree-prune": "worktree-prune",
+            "kaizen-host-fix": "host-fix",
+            "kaizen-allow-rule": "allow-rule",
+            "kaizen_worktree_facts.py": "kaizen_worktree_facts.py",
+            "kaizen_friction_actions.py": "kaizen_friction_actions.py",
+            "kaizen_friction_sample.py": "kaizen_friction_sample.py",
+            "kaizen_friction_prepare.py": "kaizen_friction_prepare.py",
+            "kaizen_friction_apply.py": "kaizen_friction_apply.py",
+        }
+        scripts = runpy.run_path(str(LINK))["SCRIPTS"]
+        self.assertEqual({name: scripts.get(name) for name in expected}, expected)
+        for location in ("plugin", "plugins/cache/example/version"):
+            with self.subTest(location=location):
+                fake = self.home / location
+                (fake / "scripts").mkdir(parents=True)
+                (fake / "scripts/token-audit").write_text("fixture")
+                self.bin.mkdir(exist_ok=True)
+                local = self.bin / "kaizen-host-fix"
+                local.write_text("local file")
+                unrelated = self.bin / "unrelated"
+                unrelated.write_text("owner file")
+                for action in ("--apply", "--check"):
+                    result = self.run_link(action, root=fake)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    for name in expected:
+                        self.assertNotIn(name, result.stdout)
+                    self.assertEqual(local.read_text(), "local file")
+                    self.assertEqual(unrelated.read_text(), "owner file")
+                    for name in expected.keys() - {local.name}:
+                        self.assertFalse((self.bin / name).exists())
+                        self.assertFalse((self.bin / name).is_symlink())
+                (self.bin / "token-audit").unlink()
+                (self.bin / "kaizen-token-audit").unlink()
+
     def test_copy_auto_dependencies_and_directories(self):
         fake = self.home / "plugins/cache/example/version"
         shutil.copytree(ROOT / "scripts", fake / "scripts")

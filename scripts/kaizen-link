@@ -41,6 +41,14 @@ SCRIPTS = {
     "prompts": "prompts", "preambles": "preambles",
     "packet-event": "packet-event", "flow-report": "flow-report",
     "experiment-check": "experiment-check", "brief-lint": "brief-lint",
+    "kaizen-friction-catalog.json": "friction-catalog.json", "kaizen-host-probe": "host-probe",
+    "kaizen-worktree-prune": "worktree-prune", "kaizen-host-fix": "host-fix",
+    "kaizen-allow-rule": "allow-rule",
+    "kaizen_worktree_facts.py": "kaizen_worktree_facts.py",
+    "kaizen_friction_actions.py": "kaizen_friction_actions.py",
+    "kaizen_friction_sample.py": "kaizen_friction_sample.py",
+    "kaizen_friction_prepare.py": "kaizen_friction_prepare.py",
+    "kaizen_friction_apply.py": "kaizen_friction_apply.py",
 }
 HOOKS = ("after-compact.sh", "block-image-read.sh", "limit-big-read.sh",
          "subagent-context.sh", "session-notes.sh")
