@@ -7,11 +7,14 @@ if __name__ == '__main__' and not sys.flags.isolated:
     os.execv(sys.executable, [sys.executable, '-I', os.path.abspath(__file__), *sys.argv[1:]])
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+import fcntl
 from fnmatch import fnmatchcase
 from functools import partial
+import hmac
 import json
 from pathlib import Path
+import re
 import runpy
 import stat
 import time
@@ -19,7 +22,10 @@ import time
 HERE = Path(__file__).resolve().parent
 CATALOG_ID = 'linux-localsearch'
 MARKER = '.nomedia'
-PENDING = 'marker writes are disabled pending recovery and Linux compatibility checks'
+LINUX_WRITES = False  # S3 must verify LocalSearch honors the private payload.
+PENDING = 'marker writes are disabled pending Linux compatibility checks'
+KEY = r'(?:direct_|fa1_)[0-9a-f]{64}'
+STAMP = re.compile(rb'Agent Kaizen marker v1 (' + KEY.encode() + rb') [0-9a-f]{64}\n')
 PROTECTED_ROOTS = {'.git', '.ssh', '.aws', '.gnupg', '.config', '.kube', '.docker', '.azure', '.claude', '.codex'}
 DIR_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
 LIMIT = 1024 * 1024
@@ -28,7 +34,8 @@ PLATFORM = sys.platform
 if __name__ == '__main__':
     sys.dont_write_bytecode = True
     sys.path.insert(0, str(HERE))
-from kaizen_friction_actions import HostActions, _unique
+from kaizen_friction_actions import (ACTION_ID, HostActions, _check_directory, _directory,
+                                     _private_file, _read, _replace, _unique)
 from kaizen_worktree_facts import GIT_PATHS, file_id, git, records, regular_bytes
 
 
@@ -114,7 +121,12 @@ def sensitive(part):
             or folded.endswith(('.key', '.pem')) or folded.startswith(('id_rsa', 'id_ed25519')))
 
 
-def check_policy(global_path, members, name, names, valid_paths):
+def check_deadline(deadline):
+    if time.monotonic() >= deadline:
+        raise Refused('host-fix checks exceed deadline')
+
+
+def check_policy(global_path, members, name, names, valid_paths, deadline):
     configs = [(None, global_path)]
     configs.extend((member, member / 'docs/kaizen/config.json') for member in sorted(members))
     output_lists = []
@@ -125,10 +137,17 @@ def check_policy(global_path, members, name, names, valid_paths):
         if member is None or 'frictionOutputDirs' not in config:
             continue
         outputs = config['frictionOutputDirs']
-        if not valid_paths(outputs) or any(
-                sensitive(part) or member.joinpath(*entry.split('/')[:i]).is_symlink()
-                for entry in outputs for i, part in enumerate(entry.split('/'), 1)):
+        if (not isinstance(outputs, list) or any(
+                not isinstance(entry, str) or len(entry) > 4096 or len(os.fsencode(entry)) > 4096
+                or entry.count('/') >= 64 for entry in outputs) or not valid_paths(outputs)):
             raise Refused('invalid project output directories')
+        for entry in outputs:
+            prefix = member
+            for part in entry.split('/'):
+                check_deadline(deadline)
+                prefix /= part
+                if sensitive(part) or prefix.is_symlink():
+                    raise Refused('invalid project output directories')
         output_lists.append(members[member].as_posix() in outputs)
     if name not in names and (not output_lists or not all(output_lists)):
         raise Refused('path is not a recognized output directory')
@@ -209,17 +228,13 @@ def eligible_path(run, project, path, cloud):
     outermost = min(owners, key=lambda item: len(item.parts))
     members = {parent: path.relative_to(parent) for parent in path.parents
                if parent == outermost or outermost in parent.parents}
-    members.update(dict.fromkeys(owners | {top}, relative))
+    members.setdefault(top, relative)
     members.setdefault(project, path.relative_to(project) if project in path.parents else relative)
     return members
 
 
 def marker_identity(info):
     return (*file_id(info), info.st_ctime_ns)
-
-
-def marker_stamp():
-    return b'Agent Kaizen marker v1 ' + os.urandom(32).hex().encode('ascii') + b'\n'
 
 
 def marker_present(directory):
@@ -230,24 +245,80 @@ def marker_present(directory):
     return True
 
 
-def create_marker(directory, stamp):
+def stage_marker(directory, stamp):
+    # An anonymous inode avoids leaving an empty or partly written marker on interruption.
+    fd = os.open('.', os.O_WRONLY | os.O_TMPFILE, 0o600, dir_fd=directory)
     try:
-        fd = os.open(MARKER, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
-    except FileExistsError:
+        with os.fdopen(fd, 'wb', closefd=False) as stream:
+            os.fchmod(fd, 0o600)
+            stream.write(stamp)
+            stream.flush()
+            os.fsync(fd)
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def publish_marker(directory, fd):
+    # linkat follows the procfd link to the prepared inode and refuses an existing name.
+    os.link(f'/proc/self/fd/{fd}', MARKER, dst_dir_fd=directory, follow_symlinks=True)
+
+
+def direct_key(directory):
+    try:
+        info = os.stat(MARKER, dir_fd=directory, follow_symlinks=False)
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 200:
+            return None
+        match = STAMP.fullmatch(_read(directory, MARKER, 200, durable=False))
+    except (OSError, ValueError):
         return None
-    with os.fdopen(fd, 'wb') as stream:
-        os.fchmod(fd, 0o600)
-        stream.write(stamp)
-        stream.flush()
-        os.fsync(fd)
-        return marker_identity(os.fstat(fd))
+    key = match[1].decode('ascii') if match else ''
+    return key if key.startswith('direct_') else None
 
 
-def apply(args):
-    names, cloud = marker_catalog(args.catalog_id)
-    project = exact_path(args.project)
-    path = exact_path(args.path, project)
-    info = path.lstat()
+def marker_version(directory, record):
+    with _private_file(directory, MARKER) as fd, os.fdopen(fd, 'rb', closefd=False) as stream:
+        stamp = record['stamp'].encode('ascii')
+        contents = stream.read(len(stamp) + 1)
+        version = list(marker_identity(os.fstat(fd)))
+    if (contents != stamp or record['marker'] != version[:len(record['marker'])]
+            or version != list(marker_identity(os.stat(MARKER, dir_fd=directory, follow_symlinks=False)))):
+        raise Refused('marker was changed or replaced')
+    return version
+
+
+def lock_state(state):
+    try:
+        fcntl.flock(state, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        raise Refused('another marker transaction is in progress') from None
+
+
+def record_mac(store, name, record):
+    payload = json.dumps(record, sort_keys=True).encode('ascii')
+    return hmac.digest(store._secret(), b'host-fix-v1\0' + name.encode('ascii') + b'\0' + payload,
+                       'sha256').hex()
+
+
+def read_record(state, name, store):
+    try:
+        raw = _read(state, name, LIMIT, replaced=True)
+    except FileNotFoundError:
+        return None
+    record = json.loads(raw, object_pairs_hook=_unique)
+    signature = record.pop('mac', '')
+    if not hmac.compare_digest(signature, record_mac(store, name, record)):
+        raise Refused('invalid marker record authentication')
+    return record
+
+
+def write_record(state, name, store, record):
+    signed = dict(record, mac=record_mac(store, name, record))
+    _replace(state, name, json.dumps(signed).encode('ascii') + b'\n')
+
+
+def runtime():
     executable = next((name for name in GIT_PATHS if os.access(name, os.X_OK)), None)
     deadline = time.monotonic() + 20
     run = partial(git, executable, deadline=deadline)
@@ -260,26 +331,159 @@ def apply(args):
 
     scope.__globals__['_git'] = scope_git
     store = HostActions(runner['audits_dir'](), runner['backup_root'](), scope, runner['key'])
-    with checked_directory(path, info) as directory:
+    return runner, store, run, deadline
+
+
+def binding(project, project_info, path, info):
+    return dict(project=str(project), project_identity=list(file_id(project_info)),
+                path=str(path), directory_identity=list(file_id(info)))
+
+
+def recheck(project, project_info, path, info):
+    try:
+        with checked_directory(project, project_info), checked_directory(path, info):
+            if file_id(path.lstat()) != file_id(info) or path.resolve(strict=True) != path:
+                raise Refused('output directory identity changed')
+    except OSError:
+        raise Refused('project or output directory identity changed') from None
+
+
+def already_present(action_id):
+    if action_id is not None:
+        raise Refused('marker already present without a matching transaction')
+    print('host-fix: already present')
+
+
+def apply(args, *, action_id=None):
+    """The trusted runner supplies action_id through this entry point only."""
+    if action_id is not None and not ACTION_ID.fullmatch(action_id):
+        raise Refused('invalid marker transaction key')
+    names, cloud = marker_catalog(args.catalog_id)
+    project = exact_path(args.project)
+    path = exact_path(args.path, project)
+    project_info, info = project.lstat(), path.lstat()
+
+    def authorize():
         members = eligible_path(run, project, path, cloud)
-        canonical, subject = scope(project, selector=path)
-        members[canonical] = subject.relative_to(canonical)
-        check_policy(runner['global_config_path'](), members, path.name, names, runner['valid_relative_paths'])
+        canonical, subject = store.canonical_project(project, selector=path)
+        members.setdefault(canonical, subject.relative_to(canonical))
+        check_policy(runner['global_config_path'](), members, path.name, names,
+                     runner['valid_relative_paths'], deadline)
         check_contents(directory, deadline)
         if not any(
                 row['catalog_id'] == CATALOG_ID and row['selector_key'] == str(subject)
                 and row['status'] == 'open' and row['evidence'] and row.get('flaps', 0) < 2
+                and (action_id is None or row['id'] == action_id)
                 for row in store.scoped(canonical)):
-            raise Refused('no open eligible action for this output')
-        with checked_directory(path, info):
-            if marker_present(directory):
-                print('host-fix: already present')
-                return
-    raise Refused('eligible output. ' + PENDING)
+            raise Refused('no open eligible action for this output and transaction key')
+        _check_directory(directory, owner=True, store=True)
+
+    with checked_directory(path, info) as directory, ExitStack() as stack:
+        present = marker_present(directory)
+        if present and action_id is None and (not LINUX_WRITES or not direct_key(directory)):
+            return already_present(action_id)
+        runner, store, run, deadline = runtime()
+        if not LINUX_WRITES:
+            authorize()
+            raise Refused('eligible output. ' + PENDING)
+        root = store.friction / 'host-fixes'
+        create = not root.is_dir()
+        if create:
+            if present:
+                return already_present(action_id)
+            authorize()
+        state = stack.enter_context(_directory(root, create=create, private=True))
+        lock_state(state)
+        present = marker_present(directory)
+        bound = binding(project, project_info, path, info)
+        key = action_id or (direct_key(directory) if present else None)
+        name = (key or 'direct_' + os.urandom(32).hex()) + '.json'
+        try:
+            record = read_record(state, name, store) if key else None
+            if record and (record['binding'] != bound or record['phase'] not in ('apply-pending', 'applied')):
+                raise Refused('conflicting marker transaction')
+            if present:
+                if record is None:
+                    return already_present(action_id)
+                version = marker_version(directory, record)
+        except (Refused, OSError, ValueError):
+            if present and action_id is None:
+                return already_present(action_id)
+            raise
+        if present:
+            recheck(project, project_info, path, info)
+        else:
+            if record and record['phase'] == 'applied':
+                raise Refused('verified marker is absent')
+            if not create:
+                authorize()
+            check_deadline(deadline)
+            recheck(project, project_info, path, info)
+            stamp = f'Agent Kaizen marker v1 {name[:-5]} {os.urandom(32).hex()}\n'
+            record = dict(binding=bound, phase='apply-pending', stamp=stamp)
+            fd = stage_marker(directory, record['stamp'].encode('ascii'))
+            try:
+                record['marker'] = list(file_id(os.fstat(fd)))
+                write_record(state, name, store, record)
+                check_deadline(deadline)
+                recheck(project, project_info, path, info)
+                try:
+                    publish_marker(directory, fd)
+                except FileExistsError:
+                    return already_present(action_id)
+                try:
+                    recheck(project, project_info, path, info)
+                except Refused:
+                    marker_version(directory, record)
+                    os.unlink(MARKER, dir_fd=directory)
+                    os.fsync(directory)
+                    raise
+                version = marker_version(directory, record)
+            finally:
+                os.close(fd)
+        if record['phase'] == 'apply-pending':
+            os.fsync(directory)
+            write_record(state, name, store, dict(record, marker=version, phase='applied'))
+        if present and action_id is None:
+            print('host-fix: already present')
+        return root / name
 
 
 def undo(args):
-    raise Refused(PENDING)
+    if not LINUX_WRITES:
+        raise Refused(PENDING)
+    _, cloud = marker_catalog(CATALOG_ID)
+    project = exact_path(args.project)
+    project_info = project.lstat()
+    _, store, run, _ = runtime()
+    root = store.friction / 'host-fixes'
+    target = Path(args.record).absolute()
+    if target.parent != root.absolute() or not re.fullmatch(KEY + r'\.json', target.name):
+        raise Refused('record is outside private marker state')
+    with _directory(root, private=True) as state:
+        lock_state(state)
+        record = read_record(state, target.name, store)
+        if record is None or record['binding']['project'] != str(project):
+            raise Refused('record does not bind this project')
+        path = exact_path(record['binding']['path'])
+        info = path.lstat()
+        if record['binding'] != binding(project, project_info, path, info):
+            raise Refused('project or output directory identity changed')
+        with checked_directory(path, info) as directory:
+            if marker_present(directory):
+                if record['phase'] == 'undone':
+                    raise Refused('marker appeared after undo')
+                eligible_path(run, project, path, cloud)
+                _check_directory(directory, owner=True, store=True)
+                version = marker_version(directory, record)
+                record = dict(record, marker=version, phase='undo-pending')
+                write_record(state, target.name, store, record)
+                recheck(project, project_info, path, info)
+                marker_version(directory, record)
+                os.unlink(MARKER, dir_fd=directory)
+            if record['phase'] != 'undone':
+                os.fsync(directory)
+                write_record(state, target.name, store, dict(record, phase='undone'))
 
 
 def main(argv=None):
@@ -295,7 +499,9 @@ def main(argv=None):
     remove.set_defaults(handler=undo)
     args = parser.parse_args(argv)
     try:
-        args.handler(args)
+        record = args.handler(args)
+        if record is not None:
+            print(record)
     except Refused as error:
         parser.exit(2, f'host-fix: refused: {error}\n')
     except (OSError, ValueError, RuntimeError, KeyError, TypeError, AttributeError):
