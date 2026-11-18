@@ -278,7 +278,7 @@ def effective(project_dir=None):
 def key(path, *, resolved=False):
     path = Path(path) if resolved else Path(path).resolve()
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", path.name).strip("-")[:40] or "root"
-    return slug + "-" + hashlib.sha256(str(path).encode()).hexdigest()[:12]
+    return slug + "-" + hashlib.sha256(os.fsencode(path)).hexdigest()[:12]
 
 
 # --json output must stay parseable, so main() sends log lines to stderr then.
@@ -584,13 +584,15 @@ GIT_LOCATION_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FIL
 
 def _git(directory, *arguments):
     environment = {name: value for name, value in os.environ.items() if name not in GIT_LOCATION_ENV}
+    decoding = {} if arguments[0] == "worktree" else {"encoding": "utf-8", "errors": "surrogateescape"}
     try:
-        # Fixed decoding keeps non-ASCII paths identical under any locale.
-        result = run_group(["git", "-C", str(directory), *arguments], capture_output=True, encoding="utf-8",
-                           errors="surrogateescape", env=environment, timeout=STEP_TIMEOUT)
+        result = run_group(["git", "-C", str(directory), *arguments], capture_output=True,
+                           env=environment, timeout=STEP_TIMEOUT, **decoding)
     except (OSError, UnicodeError, subprocess.TimeoutExpired):
         return None
-    return result.stdout.rstrip("\r\n") if result.returncode == 0 else None
+    if result.returncode == 0:
+        output = result.stdout if decoding else result.stdout.decode("utf-8", "surrogateescape")
+        return output.removesuffix("\n")
 
 
 def canonical_path(path):
@@ -635,21 +637,19 @@ def worktree_paths(directory):
         output = _git(directory, "worktree", "list", "--porcelain")
         if output is None:
             return None
-    listed, complete = [], True
+    listed, complete = [], exact
     for field in output.split("\0" if exact else "\n"):
         if not field.startswith("worktree "):
             continue
         try:
             path = canonical_path(field[len("worktree "):])
-        except (FileNotFoundError, NotADirectoryError):
-            complete = complete and exact  # A deleted worktree, unless the line was misparsed.
-            continue
+            if not path.is_dir():
+                raise ValueError("worktree is not a directory")
         except (OSError, RuntimeError, ValueError):
             complete = False
             continue
-        if path.is_dir():
-            listed.append(path)
-    return listed, complete
+        listed.append(path)
+    return listed, complete and bool(listed)
 
 
 def discover(claude_root, codex_root, index, project_dirs=None):
@@ -2303,18 +2303,24 @@ def action_project(directory, *, selector=None):
         return project.canonical
 
     target = canonical_path(member / selector)
+
+    def check_owner(path, *, required=True):
+        owner = enrolled_project(path if path.is_dir() else path.parent)
+        if owner is None and required:
+            raise ValueError("action target scope is unknown")
+        if owner is not None and owner != project.canonical:
+            (scope,), _ = discover(None, None, {}, [owner])
+            if scope.unknown or scope.canonical != project.canonical:
+                raise ValueError("action target is outside the canonical project")
+
     # The innermost worktree anchor holding the target, so a worktree nested in another maps correctly.
     anchor = max((path for path in project.anchors if path == target or path in target.parents),
                  key=lambda path: len(path.parts), default=None)
     if anchor is None:
         raise ValueError("action target is outside the enrolled project")
+    check_owner(target, required=False)
     target = canonical_path(project.canonical / target.relative_to(anchor))
-    owner = enrolled_project(target if target.is_dir() else target.parent)
-    if owner != project.canonical:
-        # A nested enrollment belongs to this project only if discovery merges it (enrolled Git root).
-        (scope,), _ = discover(None, None, {}, [owner])
-        if scope.unknown or scope.canonical != project.canonical:
-            raise ValueError("action target is outside the canonical project")
+    check_owner(target)
     return project.canonical, target
 
 
@@ -2323,7 +2329,10 @@ def actions_command(args):
         host = runpy.run_path(str(HERE / "kaizen_friction_actions.py"))["HostActions"]
         store = host(audits_dir(), backup_root(), action_project, key)
         project = args.project_dir
-        if args.action != "list":
+        if args.action == "verify":
+            for ident, result in store.verify(project).items():
+                print(f"{ident} {result}")
+        elif args.action != "list":
             store.mark(project, args.id, args.action)
         elif args.json:
             print(json.dumps(store.scoped(project), indent=2))
@@ -2359,12 +2368,12 @@ def main(argv=None):
             subparser.add_argument("--date", default=datetime.now().date().isoformat())
     host = commands.add_parser("actions", help="track machine-local host actions")
     host_commands = host.add_subparsers(dest="action", required=True)
-    for action in ("list", "done", "dismiss", "reopen"):
+    for action in ("list", "done", "dismiss", "reopen", "verify"):
         subparser = host_commands.add_parser(action)
         subparser.add_argument("--for", dest="project_dir", type=Path, required=True)
         if action == "list":
             subparser.add_argument("--json", action="store_true")
-        else:
+        elif action != "verify":
             subparser.add_argument("id")
     cleanup = commands.add_parser("housekeep", help="delete expired generated audit files")
     cleanup.add_argument("--dry-run", action="store_true", help="preview deletions")

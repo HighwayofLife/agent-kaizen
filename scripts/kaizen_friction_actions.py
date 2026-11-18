@@ -1,4 +1,4 @@
-"""Machine-local identity and manual state for scoped host actions."""
+"""Machine-local identity, import receipts and verification for scoped host actions."""
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 import errno
@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import subprocess
 import sys
 
 try:
@@ -21,13 +22,17 @@ EVIDENCE_LIMIT = 500
 CREATE_RETRIES = 100
 STATES = {"done": "done", "dismiss": "dismissed", "reopen": "open"}
 CATALOG_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
+ACTION_ID = re.compile(r"fa1_[0-9a-f]{64}")
+INTENTS = {"suggest": "terminal", "apply": "pending"}
+BLOCK_PREFIX = "<!-- kaizen-host-actions "
+ROW_OPTIONAL = {"steps", "metric_at_done", "flaps"}
 ROW_FIELDS = set("canonical_project catalog_id selector_key subject projects status first_seen updated_at "
                  "evidence eligible done_by".split())
 ID_FIELDS = ("canonical_project", "catalog_id", "selector_key")
 
 
 def _identity(scope, catalog_id, value):
-    if not (_text(str(scope), 4096) and _text(value, 4096)
+    if not (_text(str(scope), 4096, path=True) and _text(value, 4096, path=True)
             and _text(catalog_id, 64) and CATALOG_ID.fullmatch(catalog_id)):
         raise ValueError("invalid host-action identity")
     return str(scope), catalog_id, value
@@ -140,11 +145,13 @@ def _private_file(directory, name, flags=os.O_RDONLY, replaced=False):
         os.close(fd)
 
 
-def _read(directory, name, limit, replaced=False):
+def _read(directory, name, limit, replaced=False, *, durable=True):
     with _private_file(directory, name, replaced=replaced) as fd, os.fdopen(fd, "rb", closefd=False) as stream:
         raw = stream.read(limit + 1)
     if len(raw) > limit:
         raise ValueError("host-action file exceeds size limit")
+    if durable:
+        os.fsync(directory)  # A prior writer may have stopped after rename.
     return raw
 
 
@@ -183,8 +190,9 @@ def _unique(pairs):
     return result
 
 
-def _text(value, limit):
-    return isinstance(value, str) and 0 < len(value) <= limit and not any(c in value for c in "\0\r\n")
+def _text(value, limit, *, path=False):
+    return (isinstance(value, str) and 0 < len(value) <= limit
+            and not any(c in value for c in ("\0" if path else "\0\r\n")))
 
 
 def _stamp(value):
@@ -192,6 +200,41 @@ def _stamp(value):
         return datetime.fromisoformat(value).tzinfo == timezone.utc
     except (TypeError, ValueError):
         return False
+
+
+def _requests(block):
+    if (not _text(block, 8192) or len(block.encode("utf-8", "surrogatepass")) > 8192
+            or not block.startswith(BLOCK_PREFIX) or not block.endswith(" -->")):
+        raise ValueError("expected one bounded host-actions line")
+    try:
+        data = json.loads(block[len(BLOCK_PREFIX):-4], object_pairs_hook=_unique)
+    except (ValueError, RecursionError):
+        raise ValueError("invalid host-actions JSON") from None
+    if (type(data) is not dict or data.keys() != {"v", "actions"} or type(data["v"]) is not int
+            or data["v"] != 1 or type(data["actions"]) is not list or len(data["actions"]) > 16):
+        raise ValueError("invalid host-actions envelope")
+    requests = {}
+    for item in data["actions"]:
+        if (type(item) is not dict or item.keys() != {"id", "intent"}
+                or type(item["id"]) is not str or not ACTION_ID.fullmatch(item["id"])
+                or item["id"] in requests or type(item["intent"]) is not str or item["intent"] not in INTENTS):
+            raise ValueError("invalid or duplicate host-action request")
+        requests[item["id"]] = item["intent"]
+    return requests
+
+
+def _catalogue():
+    here = Path(__file__).resolve().parent
+    for name in ("kaizen-friction-catalog.json", "friction-catalog.json"):
+        path = here / name
+        if path.is_file():
+            return {entry["id"]: entry for entry in json.loads(path.read_bytes())["actions"]}
+    return {}
+
+
+def _pending(generations):
+    # A journaled action retains its pending receipt until reconciliation completes.
+    return {ident for receipt in generations.values() for ident, state in receipt.items() if state == "pending"}
 
 
 class HostActions:
@@ -228,12 +271,13 @@ class HostActions:
         try:
             raw = _read(directory, self.path.name, STORE_LIMIT, replaced=True)
         except FileNotFoundError:
-            return {}, None
+            return {}, None, {}
         try:
             store = json.loads(raw, object_pairs_hook=_unique)
         except (ValueError, RecursionError):
             raise ValueError("invalid host-action store JSON") from None
-        if (not isinstance(store, dict) or set(store) != {"v", "actions"}
+        if (not isinstance(store, dict) or set(store) - {"receipts"} != {"v", "actions"}
+                or not isinstance(store.get("receipts", {}), dict)
                 or type(store["v"]) is not int or store["v"] != 1 or not isinstance(store["actions"], dict)):
             raise ValueError("invalid host-action store format")
         rows = store["actions"]
@@ -241,27 +285,49 @@ class HostActions:
         for ident, row in rows.items():
             if not self._valid_row(row) or ident != _id(secret, *(row[k] for k in ID_FIELDS)):
                 raise ValueError("invalid host-action record or machine key")
-        return rows, secret
+        receipts = store.get("receipts", {})
+        for project, generations in receipts.items():
+            if not (_text(project, 4096, path=True) and Path(project).is_absolute()
+                    and project == os.path.normpath(project) and isinstance(generations, dict)):
+                raise ValueError("invalid host-action receipt scope")
+            for generation, receipt in generations.items():
+                if (not _text(generation, 128) or not isinstance(receipt, dict) or len(receipt) > 16
+                        or any(ident not in rows or rows[ident]["canonical_project"] != project
+                               or state not in INTENTS.values()
+                               or (state == "pending" and rows[ident]["status"] != "open")
+                               for ident, state in receipt.items())):
+                    raise ValueError("invalid host-action receipt")
+        return rows, secret, receipts
 
     def _valid_row(self, row):
-        if not isinstance(row, dict) or row.keys() != ROW_FIELDS:
+        if not isinstance(row, dict) or row.keys() - ROW_OPTIONAL != ROW_FIELDS:
             return False
         project, status, updated = row["canonical_project"], row["status"], row["updated_at"]
-        return (_text(project, 4096) and Path(project).is_absolute()
+        return (_text(project, 4096, path=True) and Path(project).is_absolute()
                 and project == os.path.normpath(project)
                 and row["projects"] == [self.project_key(project, resolved=True)]
                 and _text(row["catalog_id"], 64) and CATALOG_ID.fullmatch(row["catalog_id"])
-                and _text(row["selector_key"], 4096) and row["subject"] == row["selector_key"]
+                and _text(row["selector_key"], 4096, path=True) and row["subject"] == row["selector_key"]
                 and isinstance(row["evidence"], str) and len(row["evidence"]) <= EVIDENCE_LIMIT
                 and status in STATES.values() and _stamp(row["first_seen"]) and _stamp(updated)
-                and row["done_by"] == ("user" if status == "done" else None)
+                and row["done_by"] in (("user", "verify") if status == "done" else (None,))
+                and type(row.get("flaps", 0)) is int and 0 <= row.get("flaps", 0) <= 2
+                and isinstance(row.get("steps", []), list)
+                and all(isinstance(step, str) for step in row.get("steps", []))
+                and (row.get("metric_at_done") is None or isinstance(row["metric_at_done"], dict))
                 and row["eligible"] is False)
 
-    def _save(self, directory, rows):
-        raw = (json.dumps({"v": 1, "actions": rows}, separators=(",", ":")) + "\n").encode("ascii")
+    def _save(self, directory, rows, receipts):
+        raw = (json.dumps({"v": 1, "actions": rows, "receipts": receipts}, separators=(",", ":")) + "\n").encode("ascii")
         if len(raw) > STORE_LIMIT:
             raise ValueError("host-action store exceeds size limit")
         _replace(directory, self.path.name, raw)
+
+    def _new_row(self, identity, evidence, stamp):
+        project, catalog_id, selector = identity
+        return dict(canonical_project=project, catalog_id=catalog_id, selector_key=selector,
+                    subject=selector, projects=[self.project_key(project, resolved=True)], status="open",
+                    first_seen=stamp, updated_at=stamp, evidence=evidence[:EVIDENCE_LIMIT], eligible=False, done_by=None)
 
     def action_id(self, project, catalog_id, value, *, path=False, allowed=()):
         return self.record(project, catalog_id, value, path=path, allowed=allowed)
@@ -276,23 +342,19 @@ class HostActions:
             scope, target = self.canonical_project(project, selector=value)
             value = str(target)
         else:
-            if not isinstance(value, str) or isinstance(allowed, str) or value not in allowed:
+            if not _text(value, 4096) or isinstance(allowed, str) or value not in allowed:
                 raise ValueError("unknown action selector")
             scope = self._scope(project)
         identity = _identity(scope, catalog_id, value)
-        project, catalog_id, selector = identity
         with _directory(self.path.parent, create=True) as directory, _locked(directory, self.path.name):
-            rows, secret = self._load(directory)
+            rows, secret, receipts = self._load(directory)
             ident = _id(secret or self._secret(create=True), *identity)
             if ident in rows and identity != tuple(rows[ident][k] for k in ID_FIELDS):
                 raise ValueError("host-action ID collision")
             if evidence is not None and ident not in rows:
                 stamp = datetime.now(timezone.utc).isoformat()
-                rows[ident] = dict(canonical_project=project, catalog_id=catalog_id, selector_key=selector,
-                                   subject=selector, projects=[self.project_key(project, resolved=True)], status="open",
-                                   first_seen=stamp, updated_at=stamp, evidence=evidence[:EVIDENCE_LIMIT],
-                                   eligible=False, done_by=None)
-                self._save(directory, rows)
+                rows[ident] = self._new_row(identity, evidence, stamp)
+                self._save(directory, rows, receipts)
             return ident
 
     def scoped(self, project):
@@ -302,20 +364,148 @@ class HostActions:
                 directory = stack.enter_context(_directory(self.path.parent))
             except FileNotFoundError:
                 return []
-            rows, _ = self._load(directory)
-        return [dict(row, id=ident) for ident, row in sorted(rows.items())
+            rows, _, receipts = self._load(directory)
+        pending = _pending(receipts.get(project, {}))
+        return [dict(row, id=ident, **({"pending": True} if ident in pending else {}))
+                for ident, row in sorted(rows.items())
                 if row["canonical_project"] == project]
+
+    def import_actions(self, block, frozen_map, project, generation):
+        """Use the private map's identity, comparable evidence text and mode-filtered intents."""
+        requests = _requests(block)
+        if not _text(generation, 128):
+            raise ValueError("invalid host-action generation")
+        project = str(self._scope(project))
+        secret = self._secret() if requests else None
+        candidates = {}
+        for ident, intent in requests.items():
+            row = frozen_map.get(ident)
+            identity = tuple(row.get(field) for field in ID_FIELDS) if isinstance(row, dict) else ()
+            if (not identity or identity[0] != project or _identity(*identity) != identity
+                    or _id(secret, *identity) != ident or not isinstance(row.get("intents"), (tuple, list))
+                    or intent not in row["intents"] or not _text(row.get("evidence"), EVIDENCE_LIMIT)):
+                raise ValueError("unavailable host-action ID or intent for this project")
+            candidates[ident] = identity, row["evidence"]
+        entries = _catalogue() if candidates else {}
+        if any(identity[1] not in entries for identity, _ in candidates.values()):
+            raise ValueError("host-action catalogue entry is unavailable")
+        receipt = {ident: INTENTS[intent] for ident, intent in requests.items()}
+        with _directory(self.path.parent, create=True) as directory, _locked(directory, self.path.name):
+            rows, stored_secret, receipts = self._load(directory)
+            if candidates and secret != (stored_secret or self._secret()):
+                raise ValueError("host-action machine key changed")
+            generations = receipts.setdefault(project, {})
+            if generation in generations:
+                if generations[generation] != receipt:
+                    raise ValueError("different requests for an imported host-action generation")
+                return receipt
+            pending = _pending(generations)
+            stamp = datetime.now(timezone.utc).isoformat()
+            for ident, (identity, evidence) in candidates.items():
+                row = rows.setdefault(ident, self._new_row(identity, evidence, stamp))
+                if ident not in pending and row["status"] != "dismissed":
+                    if row["status"] == "done" and row["evidence"] and row["evidence"] != evidence:
+                        row.update(status="open", done_by=None, flaps=min(2, row.get("flaps", 0) + 1))
+                    if row["status"] == "open":
+                        row.update(evidence=evidence, updated_at=stamp, steps=entries[identity[1]]["steps"])
+                if receipt[ident] == "pending" and (row["status"] != "open" or row.get("flaps", 0) >= 2):
+                    raise ValueError("host action requires manual resolution")
+            generations[generation] = receipt
+            self._save(directory, rows, receipts)
+        return receipt
+
+    def _metric(self, row, entry):
+        metric = entry.get("metric", {})
+        if metric.get("kind") != "probe":
+            return None
+        folder = self.path.parent / "projects" / row["projects"][0]
+        try:
+            with _directory(folder) as directory:
+                newest = max(name for name in os.listdir(directory)
+                             if name.startswith("host-probe-") and name.endswith(".json"))
+                proof = json.loads(_read(directory, newest, STORE_LIMIT, durable=False), object_pairs_hook=_unique)
+            if (proof.get("project") != row["canonical_project"] or type(proof.get("v")) is not int
+                    or proof["v"] != 1 or not _stamp(proof.get("generated_at"))):
+                return None
+            value = proof
+            for part in metric["key"].split("."):
+                value = value.get(part) if isinstance(value, dict) else None
+            if type(value) in (int, bool) or (isinstance(value, list) and all(isinstance(s, str) for s in value)):
+                return dict(metric, value=value, measured_at=proof["generated_at"])
+        except (OSError, ValueError, AttributeError, RecursionError):
+            pass
+        return None
+
+    def _probe(self, project, row):
+        name, selector = row["catalog_id"], Path(row["selector_key"])
+        try:
+            if name == "inotify-limit" and sys.platform.startswith("linux"):
+                with Path("/proc/sys/fs/inotify/max_user_watches").open("rb") as stream:
+                    value = int(stream.read(32))
+                return value >= 100000, dict(kind="probe", key="facts.inotify_max_user_watches", value=value)
+            if ((name == "linux-localsearch" and sys.platform.startswith("linux"))
+                    or (name == "timemachine-output" and sys.platform == "darwin")) and selector.is_absolute():
+                if self.canonical_project(project, selector=selector) != (Path(project), selector):
+                    return None, None
+                if name == "linux-localsearch":
+                    try:
+                        return stat.S_ISREG((selector / ".nomedia").lstat().st_mode), None
+                    except FileNotFoundError:
+                        return False, None
+                check = subprocess.run(["/usr/bin/tmutil", "isexcluded", str(selector)], capture_output=True,
+                                       stdin=subprocess.DEVNULL, timeout=5)
+                if check.returncode == 0 and re.match(rb"^\[(Excluded|Included)\](?:\s|$)", check.stdout):
+                    return check.stdout.startswith(b"[Excluded]"), None
+        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+            pass
+        return None, None
+
+    def verify(self, project):
+        results, passed = {}, {}
+        for row in self.scoped(project):
+            if row["status"] != "open":
+                continue
+            ident = row.pop("id")
+            if row.get("pending"):
+                results[ident] = "pending"
+                continue
+            success, metric = (None, None) if row.get("flaps", 0) >= 2 else self._probe(row["canonical_project"], row)
+            results[ident] = "unavailable" if success is None else "open"
+            if success:
+                passed[ident] = row, metric
+        if passed:
+            entries = _catalogue()
+            with _directory(self.path.parent, create=True) as directory, _locked(directory, self.path.name):
+                rows, _, receipts = self._load(directory)
+                project = str(self._scope(project))
+                pending = _pending(receipts.get(project, {}))
+                for ident, (snapshot, metric) in passed.items():
+                    if ident in pending:
+                        results[ident] = "pending"
+                    elif snapshot["canonical_project"] == project and rows.get(ident) == snapshot:
+                        entry = entries.get(snapshot["catalog_id"], {})
+                        rows[ident].update(status="done", done_by="verify",
+                                           updated_at=datetime.now(timezone.utc).isoformat(),
+                                           metric_at_done=metric if metric is not None else self._metric(snapshot, entry))
+                        results[ident] = "done"
+                if "done" in results.values():
+                    self._save(directory, rows, receipts)
+        return results
 
     def mark(self, project, ident, command):
         project = str(self._scope(project))
         status = STATES[command]
         with _directory(self.path.parent, create=True) as directory, _locked(directory, self.path.name):
-            rows, _ = self._load(directory)
+            rows, _, receipts = self._load(directory)
             row = rows.get(ident)
             if row is None or row["canonical_project"] != project:
                 raise ValueError("unknown host-action ID in this project")
             if row["status"] == status:
                 return
+            if ident in _pending(receipts.get(project, {})):
+                raise ValueError("host action has pending work")
             row.update(status=status, updated_at=datetime.now(timezone.utc).isoformat(),
                        done_by="user" if status == "done" else None)
-            self._save(directory, rows)
+            if status == "done":
+                row["metric_at_done"] = self._metric(row, _catalogue().get(row["catalog_id"], {}))
+            self._save(directory, rows, receipts)
