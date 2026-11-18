@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Backups, manifests and undo for Agent Kaizen changes (see docs/autonomy.md).
 
-  kaizen-backup begin  --skill NAME --ledger TEXT [--run RUN_ID] FILE...
+  kaizen-backup begin  --skill NAME --ledger TEXT [--run RUN_ID] [--repo DIR] FILE...
         Back up FILEs (existing ones are copied; missing ones are recorded as created)
         and print the change folder. Credential paths are refused. Run BEFORE editing.
   kaizen-backup finish CHANGE_DIR [--verification passed|failed]
@@ -32,9 +32,15 @@ import os
 import re
 import runpy
 import shutil
+import stat
+import subprocess
 import sys
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 
 def claude_home():
@@ -54,10 +60,19 @@ def sha(path):
 REQUIRED_KEYS = ("run_id", "change", "skill", "ledger", "files", "actions")
 
 
-def read_manifest(path):
+def read_manifest(path, *, bounded=False):
     """Read one manifest; any problem raises ValueError that names the file."""
     try:
-        data = json.loads(Path(path).read_text())
+        if bounded:
+            limit = 1024 * 1024
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            with os.fdopen(os.open(path, flags), "rb") as stream:
+                raw = stream.read(limit + 1) if stat.S_ISREG(os.fstat(stream.fileno()).st_mode) else b""
+            if not raw or len(raw) > limit:
+                raise ValueError("expected a nonempty regular manifest within 1 MiB")
+        else:
+            raw = Path(path).read_text()
+        data = json.loads(raw)
     except (OSError, ValueError) as error:
         raise ValueError(f"cannot read manifest {path}: {error}") from None
     if not isinstance(data, dict):
@@ -68,9 +83,9 @@ def read_manifest(path):
     return data
 
 
-def load(change):
+def load(change, *, bounded=False):
     refuse_symlinks(Path(change) / "manifest.json")
-    return read_manifest(Path(change) / "manifest.json")
+    return read_manifest(Path(change) / "manifest.json", bounded=bounded)
 
 
 def save(change, manifest):
@@ -154,6 +169,118 @@ def validate_entry(change, entry, roots=()):
     return path
 
 
+def git(directory, *args, input=None):
+    env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+    env.update(GIT_TERMINAL_PROMPT="0", GIT_NO_LAZY_FETCH="1", GIT_ALLOW_PROTOCOL="",
+               GIT_NO_REPLACE_OBJECTS="1")
+    return subprocess.run(
+        ["git", "--no-optional-locks", "-C", str(directory), "-c", "core.fsmonitor=false",
+         "-c", "core.untrackedCache=false", "-c", "core.sparseCheckout=false",
+         "-c", "core.filemode=true", "-c", "core.symlinks=true", "-c", "core.ignorecase=false",
+         "-c", "core.trustctime=true", "-c", "core.checkStat=default", *args],
+        input=input, env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, timeout=10,
+    ).stdout
+
+
+def git_identity(directory):
+    """Read the live identity for comparison, even when the worktree has edits."""
+    root, common, index = (Path(os.fsdecode(git(directory, "rev-parse", "--path-format=absolute",
+                                             *args).removesuffix(b"\n")))
+                           for args in (("--show-toplevel",), ("--git-common-dir",), ("--git-path", "index")))
+    if not all(path.is_absolute() for path in (root, common, index)):
+        raise ValueError("Git returned non-absolute repository paths")
+    common = common.resolve(strict=True)
+    info = common.stat()
+    # Git freshens shared index files even during nominally read-only commands.
+    refuse_symlinks(index)
+    if any(index.parent.glob("sharedindex.*")) or (index.parent / "index.lock").exists():
+        raise ValueError("split or locked Git index")
+    head = git(root, "rev-parse", "--verify", "HEAD^{commit}").decode("ascii").strip()
+    index_info = index.stat()
+    if not stat.S_ISREG(index_info.st_mode):
+        raise ValueError("Git index is not a regular file")
+    return {"root": str(root.resolve(strict=True)), "head": head,
+            "common_dir": {"path": str(common), "dev": info.st_dev, "ino": info.st_ino},
+            "index": {"path": str(index), "dev": index_info.st_dev, "ino": index_info.st_ino,
+                      "sha256": hashlib.sha256(index.read_bytes()).hexdigest()}}
+
+
+GIT_ERRORS = (OSError, ValueError, RuntimeError, subprocess.SubprocessError)
+
+
+def capture_git_baseline(directory):
+    """Return a clean Git stamp, or None. Load with runpy before launching the model."""
+    try:
+        state = git_identity(Path(directory).expanduser().resolve())
+        root = state["root"]
+        records = git(root, "ls-files", "-v", "--stage", "--sparse", "-z").split(b"\0")[:-1]
+        # Refuse hidden/sparse entries, unmerged entries and submodules.
+        if any(not row.startswith((b"H 100644 ", b"H 100755 ", b"H 120000 ")) for row in records):
+            return None
+        keys = git(root, "config", "--null", "--name-only", "--list").split(b"\0")
+        filters = {key[7:].rsplit(b".", 1)[0] for key in keys
+                   if key.startswith(b"filter.") and key.endswith((b".clean", b".process"))}
+        if filters:
+            # Git status can execute clean filters even with optional locks disabled.
+            paths = b"".join(row.split(b"\t", 1)[1] + b"\0" for row in records)
+            attrs = git(root, "check-attr", "-z", "--stdin", "filter", input=paths)
+            if filters.intersection(attrs.split(b"\0")[2::3]):
+                return None
+        if git(root, "status", "--porcelain=v1", "-z", "--untracked-files=all",
+               "--ignored", "--ignore-submodules=none") or git_identity(root) != state:
+            return None
+        return dict(state, clean_start=True)
+    except GIT_ERRORS:
+        return None
+
+
+def git_start(directory, run_id, number):
+    if number == 1:
+        return capture_git_baseline(directory)
+    prefix = f"{run_id}-01-"
+    first = [path for path in ROOT.iterdir() if path.name.startswith(prefix)]
+    if len(first) != 1:
+        return None
+    try:
+        data = load(first[0], bounded=True)
+        state = data.get("git")
+        if (data["run_id"] == run_id and data["change"] == 1 and data.get("session_id") is None
+                and isinstance(state, dict)
+                and dict(git_identity(Path(directory).expanduser().resolve()), clean_start=True) == state):
+            return state
+    except GIT_ERRORS:
+        pass
+    return None
+
+
+def validate_change_handoff(root, change, *, run_id, session_id, started, before):
+    """Read an ordinary manifest and its inode against independently captured run state."""
+    root, change = Path(root).resolve(), Path(change)
+    if change.parent != root or change.resolve() != change:
+        raise ValueError("change folder is not a canonical child of the backups root")
+    info = change.lstat()
+    identity = (info.st_dev, info.st_ino)
+    if not stat.S_ISDIR(info.st_mode) or change in before[0] or identity in before[1]:
+        raise ValueError("change folder is not new to this run")
+    data = load(change, bounded=True)
+    if not session_id or data["run_id"] != run_id or data.get("session_id") != session_id or "git" in data:
+        raise ValueError("change manifest does not match the ordinary run and session")
+    number, skill = data["change"], data["skill"]
+    if (type(number) is not int or number < 1 or not isinstance(skill, str)
+            or change.name != f"{valid_id(run_id)}-{number:02d}-{valid_id(skill)}"):
+        raise ValueError("change folder name does not match its manifest")
+    created = data.get("created_at")
+    if not isinstance(created, str):
+        raise ValueError("change manifest has no creation timestamp")
+    created = datetime.datetime.fromisoformat(created)
+    if created.tzinfo is None or not started < created <= datetime.datetime.now(datetime.timezone.utc):
+        raise ValueError("change manifest timestamp is outside the run")
+    info = change.lstat()
+    if (info.st_dev, info.st_ino) != identity:
+        raise ValueError("change folder was replaced during validation")
+    return data, identity
+
+
 def begin(args):
     # Preflight every input before copying anything or creating a change folder.
     for name in args.files:
@@ -162,11 +289,27 @@ def begin(args):
         path = Path(name).expanduser().resolve()
         if path.exists() and not path.is_file():
             sys.exit(f"kaizen-backup: {path} is not a regular file")
+    if fcntl is None:
+        return write_backup(args)
+    # Serialize numbering and baseline selection across simultaneous begins.
+    descriptor = os.open(ROOT, os.O_RDONLY)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        return write_backup(args)
+    finally:
+        os.close(descriptor)
+
+
+def write_backup(args):
     created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     run_id = args.run or os.environ.get("KAIZEN_RUN_ID") or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    session_id = os.environ.get("KAIZEN_SESSION_ID")
     valid_id(run_id)
     valid_id(args.skill)
     number = next_number(run_id)
+    stamp = {}
+    if args.repo is not None:
+        stamp["git"] = git_start(args.repo, run_id, number) if fcntl and session_id is None else None
     change = change_dir(ROOT / f"{run_id}-{number:02d}-{args.skill}")
     change.mkdir(mode=0o700)
     try:
@@ -181,7 +324,7 @@ def begin(args):
                 shutil.copy2(path, change / entry["backup"])
             entries.append(entry)
         save(change, {"run_id": run_id, "change": number, "skill": args.skill, "ledger": args.ledger,
-                      "created_at": created_at, "session_id": os.environ.get("KAIZEN_SESSION_ID"),
+                      "created_at": created_at, "session_id": session_id, **stamp,
                       "files": entries, "actions": [], "finished": False, "verification": None,
                       "reverted": None})
     except BaseException:
@@ -350,6 +493,7 @@ def main(argv=None):
     p.add_argument("--skill", required=True)
     p.add_argument("--ledger", required=True)
     p.add_argument("--run")
+    p.add_argument("--repo", metavar="DIR", help="capture a clean Git baseline for this interactive run")
     p.add_argument("files", nargs="+")
     p.set_defaults(func=begin)
     p = sub.add_parser("finish")
