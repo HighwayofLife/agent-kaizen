@@ -49,3 +49,14 @@ Report changed files and line counts, exact checks and outcomes, known uncertain
 ## Delta (BF13b residual, batch review 6 finding 2)
 
 Before any prepared candidate can drive a scheduled action, bind the report to its extract at initial preparation: `scripts/token-audit` records the SHA-256 of each friction extract it writes (and its size) in the report's friction block; `scripts/kaizen_friction_prepare.py` reads the extract through the existing safe-open path, recomputes the digest and refuses (with a recorded reason) on mismatch or absence. The later receipt check already detects swaps after preparation (`test_swapped_extract_after_receipt_is_refused`). Add a test that swaps the extract between audit and first preparation and asserts refusal. Add `scripts/token-audit` to this packet's owned files for that change only (P18d lands first).
+
+## Delta after P24b, BF15a and BF15b landed (2026-11-18)
+
+Build on what landed; do not duplicate or rework it.
+
+- P24b (merge 6114fab) already provides authenticated broker receipts, idempotent action-ledger recovery, scoped undo, and binding to P18d's generation-bound broker IDs. The native ID is fsync'd in the pending intent before the native effect. Receipt binding is derived from signed evidence, never supplied by the caller. Displaced ledger bytes are never deleted: they are kept under a recorded path and reported. Helpers launch with `python3 -I` from outside the checkout, with state paths resolved before chdir. Reuse these mechanisms. Do not reintroduce caller-supplied bindings, unbound IDs or deletion of displaced bytes.
+- S2 stays closed for 0.13.0: the allow-rule operation remains proposal-only. P24 must not enable allow-rule settings writes. Any S2-only hardening belongs to P18e (`briefs/18e-*.md`, items 1–7), not here.
+- BF15b (merge 9fc83c5) added the host-probe refresh, the lock-time policy/receipt/generation recheck before import, and publish-before-acknowledge in `scripts/kaizen-scheduled`. Keep them, and run P24's broker only after that import path succeeds.
+- The BF13b digest-binding change described above (token-audit records extract SHA-256 and size, prepare recomputes and refuses on mismatch) is still P24's to do if `scripts/token-audit` and `scripts/kaizen_friction_prepare.py` don't already have it: check first with `rg -n "sha256|digest" scripts/token-audit scripts/kaizen_friction_prepare.py`. For this change only, P24 may edit those two files plus `tests/test_friction_prepare.py`.
+- Line references above are stale. Find code by function name.
+- Also run `python3 -m unittest discover -s tests -p 'test_friction_review.py'` and `python3 -m unittest discover -s tests -p 'test_allow_rule.py'`.
