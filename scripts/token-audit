@@ -102,7 +102,7 @@ def canary_row(line, since, counts, codex, session_version):
         version = row.get("version") or row.get("cli_version") or (payload.get("cli_version") if codex else None)
         if isinstance(version, str) and re.fullmatch(r"[A-Za-z0-9._+-]{1,64}", version):
             session_version = version
-        version = (session_version if codex else version) or "unknown"
+        version = (session_version if codex else (version if isinstance(version, str) and re.fullmatch(r"[A-Za-z0-9._+-]{1,64}", version) else None)) or "unknown"
         timestamp = row.get("timestamp")
         if not isinstance(timestamp, str) or date_time(timestamp) < since:
             return session_version
@@ -144,9 +144,18 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
     try:
         with path.open("rb") as stream:
             for line_number, line in enumerate(stream):
-                if canary is not None:
-                    session_version = canary_row(line, since, canary, keep_model, session_version)
                 prefix = line[:1024]
+                if canary is not None and b'"timestamp"' in prefix:
+                    stamp = TIMESTAMP.search(line)
+                    if stamp:
+                        value = stamp[1].decode("ascii", "replace")
+                        try:
+                            recent = (value[:19] >= cutoff if value.endswith(("Z", "+00:00"))
+                                      else date_time(value) >= since)
+                            if recent or (keep_model and b'"session_meta"' in prefix):
+                                session_version = canary_row(line, since, canary, keep_model, session_version)
+                        except (ValueError, TypeError, OverflowError):
+                            pass
                 if (bounds is not None and last_stamp is not None and line.startswith(last_prefix)
                         and keep_model and not keep_tools and not CODEX_ROW.search(prefix)
                         and b'"model"' not in line):
@@ -189,7 +198,15 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                            else date_time(timestamp) < since)
                     if old and keep_tools:
                         if b'"usage"' in line and b'"assistant"' in prefix:
-                            saved_call = (line, timestamp)
+                            try:
+                                candidate = json.loads(line)
+                                message = candidate.get("message") or {}
+                                usage = message.get("usage") or {}
+                                if (message.get("model") != "<synthetic>" and isinstance(usage, dict)
+                                        and (context(usage) or usage.get("output_tokens"))):
+                                    saved_call = (line, timestamp)
+                            except (ValueError, TypeError, AttributeError):
+                                pass
                         if metadata:
                             if b'"api-request-shape"' in prefix:
                                 saved_shape = (line, timestamp)

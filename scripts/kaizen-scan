@@ -91,10 +91,11 @@ def main():
                   for status in ('FAIL', 'WARN', 'PASS', 'SKIP')]
         print(f'{counts[0]} fail, {counts[1]} warn, {counts[2]} pass, {counts[3]} skipped')
         if warning:
-            print('Audit note: ' + warning, file=sys.stderr)
+            print('Audit note: ' + warning.replace(str(Path.home()), '~'), file=sys.stderr)
         return 0
     except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
-        print(f'FAIL scan: {exc}; check that token-audit and its fixture script are installed.', file=sys.stderr)
+        print('FAIL scan: {}; check that token-audit and its fixture script are installed.'.format(
+            str(exc).replace(str(Path.home()), '~')), file=sys.stderr)
         print('1 fail, 0 warn, 0 pass, 0 skipped', file=sys.stderr)
         return 1
 

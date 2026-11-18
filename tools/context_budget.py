@@ -13,13 +13,23 @@ def frontmatter(path):
     if not lines or lines[0] != '---' or '---' not in lines[1:]:
         raise ValueError('{}: malformed frontmatter delimiters'.format(path))
     fields = {}
-    for line in lines[1:lines.index('---', 1)]:
+    front = lines[1:lines.index('---', 1)]
+    for index, line in enumerate(front):
         if not line.strip() or line.lstrip().startswith('#') or line[0].isspace():
             continue
         match = re.fullmatch(r'([\w-]+):\s*(.*)', line)
         if not match or match.group(1) in fields:
             raise ValueError('{}: malformed frontmatter line: {}'.format(path, line))
         key, value = match.groups()
+        if value in ('>', '>-', '|', '|-'):
+            block = []
+            for following in front[index + 1:]:
+                if following and not following[0].isspace():
+                    break
+                block.append(following.strip())
+            value = (' ' if value.startswith('>') else '\n').join(block)
+            if not match.group(2).endswith('-'):
+                value += '\n'
         if value.startswith(('[', '{')):
             stack = []
             quote = None

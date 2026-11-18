@@ -93,6 +93,21 @@ class DoctorTests(unittest.TestCase):
         (self.root / 'hooks/hooks.json').unlink()
         self.assertIn('FAIL plugin hook', self.doctor())
 
+    def test_session_audit_registration_and_cron(self):
+        path = self.root / 'hooks/hooks.json'
+        data = json.loads(path.read_text())
+        data['hooks']['SessionStart'][0]['hooks'].pop()
+        path.write_text(json.dumps(data))
+        self.assertIn('FAIL plugin hook', self.doctor())
+        self.executable('crontab', "echo '0 0 * * * command # agent-kaizen-audit'")
+        self.assertIn('scheduler job file found', self.doctor())
+
+    def test_prefixed_canary(self):
+        self.canary('format_canary: v1 unknown_records=1 missing_usage=0 cli=2.0')
+        self.assertIn('WARN latest audit reports transcript format drift', self.doctor())
+        self.canary('format_canary: v1 unknown_records=0 missing_usage=0 cli=2.0')
+        self.assertIn('PASS latest audit format canary clean', self.doctor())
+
     def test_dependencies(self):
         (self.bin / 'jq').unlink()
         self.executable('python3', 'echo Python 3.8.0')
