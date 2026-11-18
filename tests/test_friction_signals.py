@@ -1,10 +1,62 @@
 """Offline signal coverage with synthetic transcript rows."""
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import json
+from pathlib import Path
 
 from test_friction_claude import AUDIT, OPTIONS, SINCE, FrictionClaudeTests, start, end
 from test_friction_codex import call, result, row
+from test_schedule_security import SecurityCase
 from test_scripts import jsonl
+
+
+class SignedTranscriptTests(SecurityCase):
+    def test_extract_store_rejects_custom_mode_and_symlink_ancestor(self):
+        from unittest.mock import patch
+        data = dict(since='2025-01-01', agent_usage={})
+        custom = self.root / 'custom'
+        custom.mkdir(mode=0o755)
+        custom.chmod(0o755)
+        self.assertIsNone(AUDIT['write_extract'](data, self.root / 'report.md', custom, {}))
+        self.assertEqual(custom.stat().st_mode & 0o777, 0o755)
+        link = self.root / 'link'
+        link.symlink_to(custom, target_is_directory=True)
+        self.assertIsNone(AUDIT['write_extract'](data, self.root / 'report.md', link / 'extracts', {}))
+        default = self.cfg / 'audits/extracts'
+        default.mkdir(parents=True, mode=0o755)
+        default.chmod(0o755)
+        with patch.dict(__import__('os').environ, CLAUDE_CONFIG_DIR=str(self.cfg)):
+            self.assertIsNotNone(AUDIT['write_extract'](data, self.root / 'report.md', default, {}))
+        self.assertEqual(default.stat().st_mode & 0o777, 0o700)
+
+    def test_unsafe_transcripts_do_not_supply_signed_counters(self):
+        project = self.project("signed-evidence")
+        folder = self.cfg / "projects" / "fixture"
+        safe = folder / "safe.jsonl"
+        now = datetime.now(timezone.utc) - timedelta(minutes=1)
+
+        def events(ident):
+            begin = start(ident, 0, "ls", cwd=str(project))
+            finish = end(ident, 1, cwd=str(project), toolUseResult=dict(durationMs=1),
+                         permissionDecision=dict(source="user", decision="accept"))
+            return [dict(begin, timestamp=now.isoformat()),
+                    dict(finish, timestamp=(now + timedelta(seconds=1)).isoformat())]
+
+        jsonl(safe, events("safe"))
+        group_writable = folder / "group.jsonl"
+        jsonl(group_writable, events("group"))
+        group_writable.chmod(0o664)
+        external = self.root / "external.jsonl"
+        jsonl(external, events("link"))
+        (folder / "link.jsonl").symlink_to(external)
+        unsafe_folder = folder.with_name("unsafe-ancestor")
+        jsonl(unsafe_folder / "permissions.jsonl", events("ancestor"))
+        unsafe_folder.chmod(0o775)
+        data = json.loads(self.run_script("token-audit", "--cwd", project, "--json").stdout)
+        extract = json.loads(Path(data["extract_path"]).read_bytes())
+        self.assertIn("allow_rule_mac", extract)
+        self.assertEqual(extract["friction"]["permission_acceptance"][0]["accepted"], 1)
+        self.assertEqual(data["warnings"]["unsafe permission transcript"], 3)
+        self.assertEqual(data["friction"]["summary"]["measured"], 4)
 
 
 class FrictionSignalTests(FrictionClaudeTests):

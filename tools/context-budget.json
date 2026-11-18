@@ -3,7 +3,7 @@
   "hooks": {
     "hooks/audit-notice.sh": {
       "literal_bytes": 592,
-      "sha256": "15e470eb8d9f45023ff40ffe8452f8b251ed8e52541251ef793efaf4997e4f32",
+      "sha256": "ff953e549ecffcaf11b9b2f7a203c847c2721d51c79683ddbba2049f90dc685f",
       "literal_text": "An unreviewed usage audit exists: . A propose-only review is ready too: . When there is a pause, run /agent-kaizen:review (read the headline and flagged sections, not the whole file), propose changes to the user, then touch .reviewed.\n\nExperiments need attention in this project (docs/kaizen/LEDGER.md):\n\nWhen there is a pause, run /agent-kaizen:review.\n\nREGRESSION expensive_agent_calls  vs \n\n open host action(s): run python3 -c 'import runpy,sys;r=runpy.run_path(sys.argv.pop(1));d=sys.argv.pop(1);r[\"main\"].__globals__[\"audits_dir\"]=lambda:r[\"Path\"](d);r[\"main\"]()'   actions list --for ."
     },
     "hooks/bash-burst.sh": {

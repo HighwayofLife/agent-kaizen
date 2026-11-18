@@ -123,6 +123,28 @@ class FrictionCodexTests(unittest.TestCase):
                                      call('inside', cwd=self.work + '/child/..'), result('inside', cwd=self.work)])
                 self.assertEqual(self.collect(cwd=[self.work])['friction']['summary']['measured'], 1)
 
+    def test_future_header_allows_independent_in_window_turn_cwd(self):
+        for header_cwd in (self.work, str(self.root / 'elsewhere')):
+            with self.subTest(header_cwd=header_cwd):
+                jsonl(self.rollout, [row('session_meta', 20, cwd=header_cwd),
+                                     row('turn_context', -1, cwd=self.work),
+                                     call('header-only'), result('header-only'),
+                                     row('turn_context', 6, cwd=self.work, turn_id='current'),
+                                     call('current', 7, turn_id='current'),
+                                     result('current', 8, turn_id='current')])
+                data = self.collect(cwd=[self.work], now=SINCE + timedelta(seconds=10))
+                self.assertEqual(data['friction']['summary']['measured'], 1)
+
+    def test_out_of_scope_future_header_does_not_exhaust_pair_limit(self):
+        rows = [row('session_meta', 20, cwd=self.work)]
+        rows += [call(str(i), cwd=str(self.root / 'other')) for i in range(3)]
+        rows += [row('turn_context', 2, cwd=self.work), call('inside', 3), result('inside', 4)]
+        jsonl(self.rollout, rows)
+        with patch.dict(AUDIT['scan_codex'].__globals__, FRICTION_PAIR_LIMIT=2):
+            data = self.collect(cwd=[self.work], now=SINCE + timedelta(seconds=10))
+        self.assertFalse(data['friction']['summary']['capped'])
+        self.assertEqual(data['friction']['summary']['measured'], 1)
+
     def test_output_requires_valid_bounded_json(self):
         prefix = 'Wall time: 150 seconds\nOutput:\n'
         jsonl(self.rollout, [self.meta, call('invalid'), call('oversized'),

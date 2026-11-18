@@ -62,14 +62,48 @@ while :; do
 done
 [ -n "$root" ] || [ -n "$key" ] || [ "${KAIZEN_NOTICE_ALL:-0}" = 1 ] || exit 0
 
-[ "$(jq -r '.enabled == false' "$home/agent-kaizen.json" 2>/dev/null)" = true ] && exit 0
-schedule=
-if [ -n "$root" ]; then
-    schedule=$(jq -r 'select(.schedule == "active" or .schedule == "always" or .schedule == "off") | .schedule' "$root/docs/kaizen/config.json" 2>/dev/null)
+# Read config without opening FIFOs or accepting oversized files.
+if ! command -v python3 >/dev/null 2>&1; then
+    [ ! -e "$home/agent-kaizen.json" ] && [ ! -L "$home/agent-kaizen.json" ] || exit 0
+    if [ -n "$root" ]; then
+        [ ! -e "$root/docs/kaizen/config.json" ] && [ ! -L "$root/docs/kaizen/config.json" ] || exit 0
+    fi
+    config_values=
+else
+config_values=$(python3 - "$home/agent-kaizen.json" "${root:+$root/docs/kaizen/config.json}" <<'PYCODE'
+import json, os, stat, sys
+values = []
+for path in sys.argv[1:]:
+    if not path:
+        values.append({})
+        continue
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+    except FileNotFoundError:
+        values.append({})
+        continue
+    except OSError:
+        sys.exit(1)
+    with os.fdopen(fd, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+            sys.exit(1)
+        try:
+            data = stream.read(65537)
+            value = json.loads(data) if len(data) <= 65536 else None
+        except ValueError:
+            value = {}
+        if value is None:
+            sys.exit(1)
+        values.append(value if isinstance(value, dict) else {})
+global_config, project_config = values
+schedule = next((c.get('schedule') for c in (project_config, global_config)
+                 if c.get('schedule') in ('active', 'always', 'off')), '')
+print('off' if global_config.get('enabled') is False else schedule)
+PYCODE
+) || exit 0
 fi
-if [ -z "$schedule" ]; then
-    schedule=$(jq -r 'select(.schedule == "active" or .schedule == "always" or .schedule == "off") | .schedule' "$home/agent-kaizen.json" 2>/dev/null)
-fi
+schedule=$config_values
 [ "$schedule" = off ] && exit 0
 
 latest=

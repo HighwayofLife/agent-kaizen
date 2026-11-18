@@ -57,6 +57,24 @@ class HookTests(unittest.TestCase):
                'CLAUDE_CONFIG_DIR': str(self.tmp / 'cfg'), 'CLAUDE_PLUGIN_ROOT': str(plugin)}
         return project, audits, plugin, env
 
+    def test_notice_rejects_fifo_and_oversized_config(self):
+        project, audits, _, env = self.notice_setup()
+        (audits / 'token-audit-fixture.md').write_text('fixture')
+        for path in (Path(env['CLAUDE_CONFIG_DIR']) / 'agent-kaizen.json',
+                     project / 'docs/kaizen/config.json'):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            for kind in ('fifo', 'oversized'):
+                with self.subTest(path=path, kind=kind):
+                    if kind == 'fifo':
+                        os.mkfifo(path)
+                    else:
+                        path.write_bytes(b' ' * 65537)
+                    result = subprocess.run(['bash', str(HOOKS / 'audit-notice.sh')],
+                                            input=json.dumps({'cwd': str(project)}), text=True,
+                                            capture_output=True, env={**os.environ, **env}, timeout=3)
+                    self.assertEqual(result.stdout, '{}\n')
+                    path.unlink()
+
     def test_scoped_actions_notice(self):
         import runpy
         import sys

@@ -1,6 +1,6 @@
 """Offline tests for the scheduled runner and shared config model."""
 from contextlib import redirect_stderr, redirect_stdout
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.machinery
 import importlib.util
@@ -1525,6 +1525,26 @@ class ExecutionTests(DiscoveryCase):
         self.assertEqual(argv[2:], ['--cwd', str(path), '--days', '6', '--out', str(project.folder),
                                    '--pricing', str(SCRIPTS / 'pricing.json'),
                                    '--extract-out', str(self.audits / 'extracts')])
+
+    def test_audit_repairs_legacy_extract_mode_for_proposals(self):
+        from test_friction_claude import end, start
+
+        path = self.due('legacy extracts')
+        extracts = self.cfg / 'audits/extracts'
+        extracts.mkdir(mode=0o755, parents=True)
+        now = datetime.now(timezone.utc) - timedelta(minutes=1)
+        events = []
+        for number in range(10):
+            ident = str(number)
+            events.extend([dict(start(ident, 0, 'ls', cwd=str(path)), timestamp=now.isoformat()),
+                           dict(end(ident, 1, cwd=str(path), toolUseResult=dict(durationMs=1),
+                                    permissionDecision=dict(source='user', decision='accept')),
+                                timestamp=(now + timedelta(seconds=1)).isoformat())])
+        jsonl(self.cfg / 'projects/legacy/trace.jsonl', events)
+        self.run_script('token-audit', '--cwd', path)
+        self.assertEqual(extracts.stat().st_mode & 0o777, 0o700)
+        proposal = self.run_script('allow-rule', 'add', '--project', path, '--command', 'ls')
+        self.assertEqual(json.loads(proposal.stdout)['status'], 'proposal-only')
 
     def test_dry_run_commands_are_quoted_and_do_not_write_or_run(self):
         path = self.due('dry project')
