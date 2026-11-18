@@ -900,12 +900,14 @@ def friction_block(state, row, block, start, result_count=0, row_event=None, tru
             return
         pairs[key] = [None, None]
     pair = pairs[key]
-    if pair is None:
+    if pair is None and not trusted_source:
         return
     if stamp is None or stamp < state["since"]:
         if stamp is None:
             state["warnings"]["malformed rows"] += 1
         pairs[key] = None
+        if trusted_source:
+            state["trusted_pairs"][key] = None
         return
     if trusted_source:
         permission_observation(state, key, row, block, start, result_count)
@@ -948,10 +950,18 @@ def friction_block(state, row, block, start, result_count=0, row_event=None, tru
     slot = 0 if start else 1
     # Retain both observations until the scan ends, so later replayed rows can
     # invalidate an otherwise plausible but conflicting pair.
-    if pair[slot] is None:
-        pair[slot] = value
-    elif pair[slot] != value:
-        pairs[key] = None
+    if pair is not None:
+        if pair[slot] is None:
+            pair[slot] = value
+        elif pair[slot] != value:
+            pairs[key] = None
+    if trusted_source:
+        trusted = state["trusted_pairs"].setdefault(key, [None, None])
+        if trusted is not None:
+            if trusted[slot] is None:
+                trusted[slot] = value
+            elif trusted[slot] != value:
+                state["trusted_pairs"][key] = None
 
 
 SAMPLE_MAX_BYTES = 50 * 1024 * 1024
@@ -1323,6 +1333,7 @@ def polling_summary(calls, slow_seconds):
 
 def finalize_friction(state, thresholds, window):
     grouped = state["codex_calls"]
+    comparison_groups = defaultdict(list, {key: list(value) for key, value in grouped.items()})
     signals = state["codex_signals"]
     calls = state.get("timeline", [])
     question_wait, prompted_wait, local_load, local_calls = [], [], [], []
@@ -1414,7 +1425,26 @@ def finalize_friction(state, thresholds, window):
         flags.append(dict(id="polling", subject="", value=polling["seconds"],
                           detail="At least ten minutes waiting overlapped slow work."))
     comparison = []
-    for signature, group in sorted(grouped.items()):
+    for key, pair in state["trusted_pairs"].items():
+        if pair is None or None in pair:
+            continue
+        (start, _, signature, skipped, _, name, _), (end, _, cohort_measured, prompted, background, *_) = pair
+        if end < start or skipped or background:
+            continue
+        sample = sample_data["events"].get(key) if name == "Bash" else None
+        join_days = {(end + timedelta(seconds=offset)).astimezone(timezone.utc).date().isoformat()
+                     for offset in (-SAMPLE_JOIN_SECONDS, SAMPLE_JOIN_SECONDS)}
+        incomplete = name == "Bash" and bool(join_days.intersection(sample_data.get("skipped_days", ())))
+        if incomplete:
+            cohort_measured = None
+        if (sample is not None and not incomplete and cohort_measured is None
+                and abs(sample[0] - end.timestamp()) <= SAMPLE_JOIN_SECONDS):
+            cohort_measured = sample[1]
+        if prompted and cohort_measured is None:
+            continue
+        seconds = cohort_measured if cohort_measured is not None else (end - start).total_seconds()
+        comparison_groups[signature].append((seconds, cohort_measured is not None))
+    for signature, group in sorted(comparison_groups.items()):
         for measured_basis in (True, False):
             values = [seconds for seconds, measured in group if measured == measured_basis]
             if len(values) >= 3:
@@ -1471,7 +1501,7 @@ def friction_sections(friction):
     return lines
 
 
-def scan_claude(path, agent, since, data, seen_messages, project, source=None, *, friction_allowed=True):
+def scan_claude(path, agent, since, data, seen_messages, project, source=None):
     main = agent is None
     counter = Counter()
     tools = {}
@@ -1482,7 +1512,7 @@ def scan_claude(path, agent, since, data, seen_messages, project, source=None, *
     turn = None
     cache_previous = None
     cache_seen = False
-    friction = data.get("_friction") if friction_allowed else None
+    friction = data.get("_friction")
     cached_head = lru_cache(maxsize=64)(bash_head)
     cached_command = lru_cache(maxsize=64)(command_info)
     for row in rows(path, since, data["warnings"], keep_tools=True, canary=data["format_canary"],
@@ -1919,7 +1949,7 @@ def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=No
                 codex=defaultdict(Counter), codex_sessions=[], briefs=defaultdict(list), codex_briefs=defaultdict(list), warnings=Counter(), codex_files_scanned=0)
     data["format_canary"] = defaultdict(Counter)
     if friction:
-        data["_friction"] = dict(pairs={}, capped=False, since=since, usage_limits=set(),
+        data["_friction"] = dict(pairs={}, trusted_pairs={}, capped=False, since=since, usage_limits=set(),
                                  until=now or datetime.now(timezone.utc),
                                  cwd=set(cwd or ()), permissions={}, warnings=data["warnings"], codex_calls=defaultdict(list),
                                  codex_signals=Counter(), codex_samples=0, timeline=[],
@@ -1957,15 +1987,13 @@ def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=No
 
     def scan(path, agent, project):
         source = None
-        rejected = False
         if friction:
             try:
                 source = open_permission_transcript(path)
             except (OSError, ValueError, AttributeError, ImportError):
                 data["warnings"]["unsafe permission transcript"] += 1
-                rejected = True
         with (source if source is not None else nullcontext()):
-            scan_claude(path, agent, since, data, seen_messages, project, source, friction_allowed=not rejected)
+            scan_claude(path, agent, since, data, seen_messages, project, source)
 
     for project in projects:
         for path in project.glob("*.jsonl"):
