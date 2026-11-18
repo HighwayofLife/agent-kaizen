@@ -109,6 +109,38 @@ Tiers: `luna` = short docs-only edits with exact wording; `terra` = code, tests,
 | P07 | README install per host, hosts table, manifest descriptions | P01-P06 | C | luna / low | low | M | none (D1, D2 decided: yes) | `python3 -m unittest tests.test_repo`; `claude plugin validate .`; `jq -r .description .claude-plugin/plugin.json` |
 | P09 | Release 0.12.0 and end-to-end gate | all | D | terra / medium | low | S | none | `tools/ci-local`; `UV_OFFLINE=1 tools/ci-local --python 3.9`; `tools/host-probe --host all --worktree` (Codex all PASS); `git diff --exit-code d1accc4 -- hooks/hooks.json` |
 
+### P09 end-to-end result (2026-11-17)
+
+```text
+$ git diff --exit-code d1accc4 -- hooks/hooks.json
+hooks.json diff exit 0
+$ tools/host-probe --host all --worktree
+not run: checkout-local TMPDIR rejected (exit 1); retried with /private/tmp:
+PASS codex cli version: codex-cli 0.167.0
+PASS codex marketplace add
+PASS codex plugin add
+PASS codex installed version: 0.12.0
+PASS codex skills hidden: 0 listed
+PASS codex hooks discovered: 4 hooks
+SKIP copilot cli: copilot not found on PATH
+exit 0
+$ tools/ci-local
+not run: interrupted after test failures; sandbox denies ps (operation not permitted).
+A fail-fast run reproduced test_dispatch_status failure from the denied ps (exit 1).
+$ UV_OFFLINE=1 tools/ci-local --python 3.9
+not run: the same unit suite requires ps, which the sandbox denies; owner O5.
+$ tools/ci-local --skip-tests (TMPDIR=/private/tmp)
+PASS: context budget
+PASS: shellcheck
+PASS: JSON
+PASS: Python compile
+PASS: script help
+PASS: plugin validation
+PASS: host probe
+PASS: version and changelog
+exit 0
+```
+
 Parallel groups (separate worktrees, no shared files within a group):
 - **A, start now:** P01, P02, P03, P05, P06. File sets are disjoint: P01 owns `tools/host-probe`, `tests/test_host_probe.py`, `probe-results.md`; P02 owns `skills/*/agents/openai.yaml`, `tests/test_repo.py`, `tools/context_budget.py`, `tests/test_context_budget.py`, `changelog/P02.md`; P03 owns `docs/hosts.md`, `docs/autonomy.md`, `changelog/P03.md`; P05 owns the three hooks, `tests/test_hooks.py`, `tests/test_hook_schedule.py`, `tests/test_regression_notice.py` (and `tests/test_usage_guard.py`, `tests/test_schedule_robustness.py` only if the env-scrub check in P05 fails), `tests/fixtures/hooks/*`, `tools/context-budget.json`, `changelog/P05.md`; P06 owns `scripts/kaizen-doctor`, `scripts/kaizen-scan`, `scripts/token-audit`, `scripts/README.md`, `tests/test_doctor.py`, `tests/test_scan.py`, `tests/test_token_audit_fixes.py`, `changelog/P06.md`.
 - **B:** P04 (after P02 and P03; it also edits `tests/test_repo.py`) and P08 (after P01 and P02: the probe's "zero skills" check fails without the P02 sidecars) run in parallel with each other. They share no files.
