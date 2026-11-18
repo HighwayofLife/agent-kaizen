@@ -47,6 +47,7 @@ class RunnerTests(StubCase):
         result = self.config("show")
         self.assertEqual(json.loads(result.stdout), {
             "enabled": {"value": True, "source": "default"},
+            "autoAudit": {"value": True, "source": "default"},
             "pendingDays": {"value": 10, "source": "default"},
             "schedule": {"value": "active", "source": "default"},
             "scheduledAutonomy": {"value": "propose", "source": "default"},
@@ -644,7 +645,7 @@ class DiscoveryTests(DiscoveryCase):
         for name in ("curl", "wget", "claude"):
             executable(self.bin / name, '#!/bin/sh\nprintf called >> "$RECORD"\n')
         output = self.preview()
-        self.assertIn("config: enabled=true (default); pendingDays=10 (default); schedule=always (project); scheduledAutonomy=propose (default)", output)
+        self.assertIn("config: enabled=true (default); autoAudit=true (default); pendingDays=10 (default); schedule=always (project); scheduledAutonomy=propose (default)", output)
         self.assertIn("gate: due (schedule always)", output)
         self.assertFalse(self.record.exists())
         with patch.object(self.runner.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")) as run:
@@ -1097,7 +1098,7 @@ class ExecutionTests(DiscoveryCase):
                 path = self.due('mode' + str(number))
                 write(self.cfg / 'agent-kaizen.json', json.dumps({**global_cfg, 'autoProjects': [str(path)]}))
                 write(path / 'docs/kaizen/config.json', json.dumps(local_cfg))
-                self.review('--project-dir', path)
+                self.review('--project-dir', path, '--python', sys.executable)
                 argv = self.calls()[-1]['argv']
                 self.assertIn(f'/agent-kaizen:cycle {mode} ', self.values(argv, '-p')[0])
                 auto = mode == 'auto'
@@ -1393,7 +1394,7 @@ class ExecutionTests(DiscoveryCase):
     def test_dry_run_commands_are_quoted_and_do_not_write_or_run(self):
         path = self.due('dry project')
         before = {p: p.read_bytes() if p.is_file() else None for p in self.root.rglob('*')}
-        output = self.review('--dry-run').stdout
+        output = self.review('--dry-run', '--python', sys.executable).stdout
         audit = shlex.split(next(line.split('audit command: ', 1)[1] for line in output.splitlines() if 'audit command: ' in line))
         review = shlex.split(next(line.split('review command: ', 1)[1] for line in output.splitlines() if 'review command: ' in line))
         self.assertEqual(audit, [sys.executable, str(self.audit), '--cwd', str(path),
