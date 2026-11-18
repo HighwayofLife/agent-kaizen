@@ -52,6 +52,8 @@ class HookScheduleTests(StubCase):
         self.env.update(CLAUDE_CONFIG_DIR=str(self.cfg), CODEX_HOME=str(self.root / 'codex'),
                         CLAUDE_PLUGIN_ROOT=str(self.scripts.parent), AUDIT_CALLS=str(self.calls),
                         KAIZEN_SKIP_CHECKS='1', KAIZEN_USAGE_DB=str(self.cfg / 'kaizen-usage.db'))
+        for key in ('KAIZEN_HOST', 'PLUGIN_ROOT', 'COPILOT_PLUGIN_ROOT'):
+            self.env.pop(key, None)
         self.payload = FIXTURE.read_text()
 
     def hook(self, **env):
@@ -65,6 +67,20 @@ class HookScheduleTests(StubCase):
     def set_age(self, days):
         last = datetime.now(timezone.utc) - timedelta(days=days)
         return write(self.state, json.dumps({'last_audit_ok': last.isoformat()})).read_bytes()
+
+    def test_copilot_detaches_held_audit(self):
+        release = self.root / 'release-audit'
+        start = time.monotonic()
+        try:
+            self.hook(COPILOT_PLUGIN_ROOT=str(self.scripts.parent),
+                      PLUGIN_ROOT=str(self.scripts.parent), HOLD_AUDIT=str(release))
+            self.assertLess(time.monotonic() - start, 2)
+            wait_for(self.calls, seconds=5)
+            self.assertFalse(self.state.exists())
+        finally:
+            release.touch()
+            wait_for(self.state, seconds=10)
+        self.assertEqual(len(self.call_args()), 1)
 
     def test_registration_and_absent_then_fresh_state(self):
         hooks = json.loads((ROOT / 'hooks/hooks.json').read_text())['hooks']

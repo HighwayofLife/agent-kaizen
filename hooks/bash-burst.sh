@@ -4,6 +4,36 @@
 # KAIZEN_BASH_BURST=N nudges every N calls (default 8; non-numeric uses 8); 0 turns the hook off.
 # enabled=false in ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/agent-kaizen.json also turns it off.
 # State: one byte per call appended to a file in a private per-user temp directory.
+# --- host helper ---
+case ${KAIZEN_HOST:-} in
+    claude|codex|copilot) kaizen_host=$KAIZEN_HOST ;;
+    *)
+        if [[ -n ${COPILOT_PLUGIN_ROOT:-} ]]; then
+            kaizen_host=copilot
+        elif [[ -n ${PLUGIN_ROOT:-} ]]; then
+            kaizen_host=codex
+        else
+            kaizen_host=claude
+        fi
+        ;;
+esac
+kaizen_skill() {
+    if [[ $kaizen_host == codex ]]; then
+        printf '$agent-kaizen:%s' "$1"
+    else
+        printf '/agent-kaizen:%s' "$1"
+    fi
+}
+kaizen_context() {
+    if [[ $kaizen_host == copilot ]]; then
+        jq -n --arg c "$2" '{additionalContext:$c}'
+    elif [[ $1 == SessionStart ]]; then
+        jq -n --arg c "$2" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}'
+    else
+        jq -n --arg event "$1" --arg message "$2" '{hookSpecificOutput:{hookEventName:$event,additionalContext:$message}}'
+    fi
+}
+# --- end host helper ---
 [[ ${KAIZEN_BASH_BURST-} == 0 ]] && exit 0
 command -v jq >/dev/null 2>&1 || exit 0
 config=${CLAUDE_CONFIG_DIR:-${HOME-}/.claude}/agent-kaizen.json
@@ -26,7 +56,8 @@ case "$event" in
         [[ -e $dir/$session ]] && : > "$dir/$session" 2>/dev/null
         ;;
     PostToolUse|PostToolUseFailure)
-        [[ $tool == Bash && $agent == false && $interrupt == false ]] || exit 0
+        [[ $tool == Bash || ( $kaizen_host == copilot && $tool == bash ) ]] &&
+            [[ $agent == false && $interrupt == false ]] || exit 0
         threshold=${KAIZEN_BASH_BURST:-8}
         [[ $threshold =~ ^[1-9][0-9]*$ && ${#threshold} -le 6 ]] || threshold=8
         [[ -d $dir ]] || mkdir -m 700 -- "$dir" 2>/dev/null   # a parallel call may win the race
@@ -38,7 +69,7 @@ case "$event" in
         count=$((10#$count))
         if (( count % threshold == 0 )); then
             message="$count Bash calls this turn. Chain the remaining steps into one command or script that prints a summary, or hand the investigation to a cheaper read-only subagent."
-            jq -n --arg event "$event" --arg message "$message" '{hookSpecificOutput:{hookEventName:$event,additionalContext:$message}}'
+            kaizen_context "$event" "$message"
         fi
         ;;
 esac
