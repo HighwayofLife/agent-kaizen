@@ -171,12 +171,18 @@ time.sleep(12)
         self.assertLess(time.monotonic() - started, 10)
         self.assertTrue((self.audits / 'token-audit-ok.md').is_file())
         self.assertEqual(self.state.read_bytes(), original)
+        self.assertIn('auto-audit: stopped by SIGALRM; will retry next session',
+                      (self.audits / 'run.log').read_text())
         for pid in map(int, pids.read_text().split()):
             deadline = time.monotonic() + 3
             while True:
                 try:
                     os.kill(pid, 0)
                 except ProcessLookupError:
+                    break
+                status = subprocess.run(['ps', '-o', 'stat=', '-p', str(pid)],
+                                        capture_output=True, text=True).stdout.strip()
+                if not status or status.startswith('Z'):
                     break
                 if time.monotonic() >= deadline:
                     os.kill(pid, signal.SIGKILL)

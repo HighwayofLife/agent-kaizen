@@ -1446,7 +1446,11 @@ def run_auto_audit(args):
             rotate_log(audits)
             with (audits / "run.log").open("a", encoding="utf-8", buffering=1) as stream:
                 with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
-                    run_audit(audits, options)
+                    try:
+                        run_audit(audits, options)
+                    except Terminated as error:
+                        log(f"auto-audit: stopped by {error.name}; will retry next session")
+                        raise
 
 
 def run_review(audits, project_dirs, options, clock):

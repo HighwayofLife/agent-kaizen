@@ -248,7 +248,7 @@ docs/               what-we-learned.md, scheduling.md, autonomy.md, outcome-log.
 assets/             banner, teaser animation and loop diagram; assets/src/ has the scripts that draw them
 ```
 
-The guardrail hooks and templates are **opt-in**: `/agent-kaizen:guardrails` and `/agent-kaizen:lean-agents` install and adapt them with your approval. Installing the plugin enables the audit notice and Bash burst hook.
+The guardrail hooks and templates are **opt-in**: `/agent-kaizen:guardrails` and `/agent-kaizen:lean-agents` install and adapt them with your approval. Installing the plugin enables the audit notice, Bash burst, and session-audit hooks. Session-audit runs the zero-token audit at session start when the last successful audit is over 3 days old, prints nothing, and can be turned off with `"autoAudit": false` in the global `agent-kaizen.json`; see [scheduling](docs/scheduling.md).
 
 The Bash burst hook counts main-session Bash calls per user turn, failed calls included. Every eight calls by default it adds: "N Bash calls this turn. Chain the remaining steps into one command or script that prints a summary, or hand the investigation to a cheaper read-only subagent." Set `KAIZEN_BASH_BURST` to change the threshold. To turn it off, set `KAIZEN_BASH_BURST=0` or put `"enabled": false` in `agent-kaizen.json` in the Claude config dir.
 

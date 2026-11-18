@@ -156,7 +156,7 @@ The database is `KAIZEN_USAGE_DB`, default `kaizen-usage.db` under the Claude
 config dir. An ingest failure is logged separately in `<audits>/run.log` for
 the hook and for installed OS jobs.
 
-Successful global runs with a report update `<audits>/auto-audit-state.json`.
+Successful global runs with a report update `<audits>/auto-audit-state.json`. An async hook can be cancelled when a session ends, notably in short `claude -p` runs; a cancelled run does not record success and retries at the next session start, so users who only run short sessions can keep the OS job (`install-schedule`).
 To delete generated data, stop any active runs and disable the hook and OS jobs
 if you want the data to stay deleted. Delete the database and any matching
 `-wal` and `-shm` files to clear usage history. Delete the audits directory
@@ -174,7 +174,7 @@ The runner tidies after each scheduled audit and review; interactive cycles run 
 | `temp` | `projects/*/cycle-*.md.*` (temporary files of a killed run) | 1 day |
 | `reports` | `token-audit-*.md`, `projects/*/token-audit-*.md`, `projects/*/cycle-*.md`, `checks-*.md`, `projects/*/project-report-*.md` | 365 days; newest 5 per folder and family kept |
 
-A report's `.reviewed` marker is removed with it. Only regular files inside the audits folder are deleted; symlinks are skipped. Each deletion is logged: in `run.log` for scheduled runs, on screen for manual ones. Housekeeping does not touch `host-actions.json`, `host-fixes/`, `projects/index.json`, project `state.json` files, `run.log`, `kaizen-backups/`, transcripts, Codex sessions or project files.
+A report's `.reviewed` marker is removed with it. Only regular files inside the audits folder are deleted; symlinks are skipped. Each deletion is logged: in `run.log` for scheduled runs, on screen for manual ones. Housekeeping does not touch `auto-audit-state.json`, `host-actions.json`, `host-fixes/`, `projects/index.json`, project `state.json` files, `run.log`, `kaizen-backups/`, transcripts, Codex sessions or project files.
 
 Set `retention=off` to keep everything. Override a kind with `kaizen-scheduled config set retentionOverrides='{"extracts":{"days":14}}'`. Each kind accepts positive integer `days`, `hours` and `maxMB`; `hours` takes precedence over `days`.
 
