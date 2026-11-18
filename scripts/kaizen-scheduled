@@ -321,7 +321,7 @@ def freeze_mutation_config(project, backup):
 def key(path, *, resolved=False):
     path = Path(path) if resolved else Path(path).resolve()
     slug = re.sub(r"[^a-zA-Z0-9]+", "-", path.name).strip("-")[:40] or "root"
-    return slug + "-" + hashlib.sha256(os.fsencode(path)).hexdigest()[:12]
+    return slug + "-" + hashlib.sha256(str(path).encode("utf-8", "surrogateescape")).hexdigest()[:12]
 
 
 # --json output must stay parseable, so main() sends log lines to stderr then.
@@ -627,14 +627,13 @@ GIT_LOCATION_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FIL
 
 def _git(directory, *arguments):
     environment = {name: value for name, value in os.environ.items() if name not in GIT_LOCATION_ENV}
-    decoding = {} if arguments[0] == "worktree" else {"encoding": "utf-8", "errors": "surrogateescape"}
     try:
         result = run_group(["git", "-C", str(directory), *arguments], capture_output=True,
-                           env=environment, timeout=STEP_TIMEOUT, **decoding)
+                           env=environment, timeout=STEP_TIMEOUT)
     except (OSError, UnicodeError, subprocess.TimeoutExpired):
         return None
     if result.returncode == 0:
-        output = result.stdout if decoding else result.stdout.decode("utf-8", "surrogateescape")
+        output = result.stdout.decode("utf-8", "surrogateescape")
         return output.removesuffix("\n")
 
 
@@ -665,7 +664,8 @@ def enrolled_project(directory):
 def git_common_dir(directory):
     # Relative to `directory`; git < 2.31 echoes back --path-format=absolute.
     common = _git(directory, "rev-parse", "--git-common-dir")
-    return (directory / common).resolve() if common else None
+    return ((directory / common).resolve() if common and not any(c in str(directory) + common for c in "\r\n")
+            else None)
 
 
 def in_git_checkout(directory):
@@ -680,14 +680,30 @@ def worktree_paths(directory):
         output = _git(directory, "worktree", "list", "--porcelain")
         if output is None:
             return None
+    if not output:
+        return [], False
     listed, complete = [], exact
+    common = git_common_dir(directory)
     for field in output.split("\0" if exact else "\n"):
         if not field.startswith("worktree "):
             continue
         try:
-            path = canonical_path(field[len("worktree "):])
-            if not path.is_dir():
-                raise ValueError("worktree is not a directory")
+            name = field[len("worktree "):]
+            if any(c in name for c in "\r\n"):
+                raise ValueError("invalid worktree path")
+            path = canonical_path(name)
+            dotgit = path / ".git"
+            if not path.is_dir() or not dotgit.exists():
+                raise ValueError("worktree registration is missing")
+            gitdir = _git(path, "rev-parse", "--absolute-git-dir")
+            if not gitdir or any(c in gitdir for c in "\r\n") or git_common_dir(path) != common:
+                raise ValueError("worktree gitdir is unavailable")
+            gitdir = canonical_path(gitdir)
+            if dotgit.is_dir():
+                if canonical_path(dotgit) != gitdir:
+                    raise ValueError("worktree gitdir mismatch")
+            elif canonical_path(Path(os.fsdecode((gitdir / "gitdir").read_bytes()).removesuffix("\n"))) != dotgit:
+                raise ValueError("worktree registration mismatch")
         except (OSError, RuntimeError, ValueError):
             complete = False
             continue
@@ -783,6 +799,8 @@ def discover(claude_root, codex_root, index, project_dirs=None):
         prefixes = {}
         for directory in directories:
             prefix = "" if directory in roots else _git(directory, "rev-parse", "--show-prefix")
+            if prefix is not None and any(c in prefix for c in "\r\n"):
+                prefix = None
             prefixes.setdefault(prefix.rstrip("/") if prefix is not None else None, []).append(directory)
         for prefix, members in prefixes.items():
             if prefix is None:
@@ -2347,6 +2365,8 @@ def action_project(directory, *, selector=None):
     directory = canonical_path(Path(directory).expanduser())
     if not directory.is_dir():
         raise ValueError("expected a project directory")
+    if any(c in str(directory) for c in "\r\n"):
+        raise ValueError("project scope is unknown")
     member = enrolled_project(directory)
     if member is None:
         raise ValueError("host actions require an enrolled project")
@@ -2357,6 +2377,8 @@ def action_project(directory, *, selector=None):
         return project.canonical
 
     target = canonical_path(member / selector)
+    if any(c in str(target) for c in "\r\n"):
+        raise ValueError("action target scope is unknown")
 
     def check_owner(path, *, required=True):
         owner = enrolled_project(path if path.is_dir() else path.parent)
@@ -2374,6 +2396,8 @@ def action_project(directory, *, selector=None):
         raise ValueError("action target is outside the enrolled project")
     check_owner(target, required=False)
     target = canonical_path(project.canonical / target.relative_to(anchor))
+    if target != project.canonical and project.canonical not in target.parents:
+        raise ValueError("action target scope is unknown")
     check_owner(target)
     return project.canonical, target
 

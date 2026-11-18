@@ -282,9 +282,18 @@ class HostActions:
             raise ValueError("invalid host-action store format")
         rows = store["actions"]
         secret = self._secret() if rows else None
+        skipped = set()
         for ident, row in rows.items():
-            if not self._valid_row(row) or ident != _id(secret, *(row[k] for k in ID_FIELDS)):
+            if not self._valid_row(row, check_key=False) or ident != _id(secret, *(row[k] for k in ID_FIELDS)):
                 raise ValueError("invalid host-action record or machine key")
+            try:
+                valid_key = row["projects"] == [self.project_key(row["canonical_project"], resolved=True)]
+            except UnicodeError:
+                valid_key = False
+            if not valid_key:
+                skipped.add(ident)
+        if skipped:
+            print(f"host actions: skipped {len(skipped)} row(s) with unreadable project keys", file=sys.stderr)
         receipts = store.get("receipts", {})
         for project, generations in receipts.items():
             if not (_text(project, 4096, path=True) and Path(project).is_absolute()
@@ -297,15 +306,21 @@ class HostActions:
                                or (state == "pending" and rows[ident]["status"] != "open")
                                for ident, state in receipt.items())):
                     raise ValueError("invalid host-action receipt")
+        rows = {ident: row for ident, row in rows.items() if ident not in skipped}
+        receipts = {project: {generation: {ident: state for ident, state in receipt.items() if ident not in skipped}
+                              for generation, receipt in generations.items()}
+                    for project, generations in receipts.items()}
         return rows, secret, receipts
 
-    def _valid_row(self, row):
+    def _valid_row(self, row, check_key=True):
         if not isinstance(row, dict) or row.keys() - ROW_OPTIONAL != ROW_FIELDS:
             return False
         project, status, updated = row["canonical_project"], row["status"], row["updated_at"]
         return (_text(project, 4096, path=True) and Path(project).is_absolute()
                 and project == os.path.normpath(project)
-                and row["projects"] == [self.project_key(project, resolved=True)]
+                and isinstance(row["projects"], list) and len(row["projects"]) == 1
+                and isinstance(row["projects"][0], str)
+                and (not check_key or row["projects"] == [self.project_key(project, resolved=True)])
                 and _text(row["catalog_id"], 64) and CATALOG_ID.fullmatch(row["catalog_id"])
                 and _text(row["selector_key"], 4096, path=True) and row["subject"] == row["selector_key"]
                 and isinstance(row["evidence"], str) and len(row["evidence"]) <= EVIDENCE_LIMIT
@@ -375,6 +390,7 @@ class HostActions:
         requests = _requests(block)
         if not _text(generation, 128):
             raise ValueError("invalid host-action generation")
+        original_project = project
         project = str(self._scope(project))
         secret = self._secret() if requests else None
         candidates = {}
@@ -391,6 +407,8 @@ class HostActions:
             raise ValueError("host-action catalogue entry is unavailable")
         receipt = {ident: INTENTS[intent] for ident, intent in requests.items()}
         with _directory(self.path.parent, create=True) as directory, _locked(directory, self.path.name):
+            if str(self._scope(original_project)) != project:
+                raise ValueError("host-action scope changed; try again")
             rows, stored_secret, receipts = self._load(directory)
             if candidates and secret != (stored_secret or self._secret()):
                 raise ValueError("host-action machine key changed")

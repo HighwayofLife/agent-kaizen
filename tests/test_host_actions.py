@@ -637,26 +637,75 @@ class HostActionsTests(unittest.TestCase):
             self.store.scoped(peer)
 
     def test_special_character_worktree_paths_keep_cli_and_scheduled_ids(self):
-        names = ('a "q\\ wt\r', "n\nwt", "z-wt")
-        _, members = self.linked(*names)
+        _, members = self.linked('a "q\\ wt', "z-wt")
         expected = members[0]
         for member in members:
-            with self.subTest(member=member.parent.name):
+            with self.subTest(member=member):
                 project, = RUNNER["discover"](None, None, {}, [member])[0]
                 self.assertEqual(project.canonical, expected)
                 self.assertTrue(set(members) <= set(project.paths))
                 self.assertFalse(project.unknown)
-        ident = self.record(members[2])
+        ident = self.record(members[0])
         self.assertEqual({self.record(member) for member in members}, {ident})
         row, = json.loads(self.cli("list", "--json", project=members[1]))
         self.assertEqual((row["id"], row["canonical_project"]), (ident, str(expected)))
+
+    def test_worktree_paths_without_git_null_output_fail_closed(self):
+        _, members = self.linked('a "q\\ wt', "z-wt")
         namespace = RUNNER["discover"].__globals__
         real = namespace["_git"]
-        with patch.dict(namespace, _git=lambda directory, *arguments:  # git < 2.36 rejects -z.
+        with patch.dict(namespace, _git=lambda directory, *arguments:
                         None if "-z" in arguments else real(directory, *arguments)):
             for member in members:
-                with self.subTest(member=member.parent.name, git="old"), self.assertRaisesRegex(ValueError, "unknown"):
+                with self.subTest(member=member), self.assertRaisesRegex(ValueError, "unknown"):
                     self.record(member)
+
+    def test_newline_worktree_paths_fail_closed(self):
+        _, members = self.linked("a\rworktree", "z-worktree")
+        for member in members:
+            with self.subTest(member=member), self.assertRaisesRegex(ValueError, "unknown"):
+                self.record(member)
+
+    def test_import_refuses_scope_change_after_lock(self):
+        main, (member,) = self.linked("worktree")
+        ident = self.store.action_id(member, "low-disk", "ls", allowed=LITERALS)
+        project = str(RUNNER["action_project"](member))
+        frozen = {ident: dict(canonical_project=project, catalog_id="low-disk", selector_key="ls",
+                              intents=["apply"], evidence="observed")}
+        flock = actions.fcntl.flock
+
+        def enroll(fd, operation):
+            flock(fd, operation)
+            (main / "docs/kaizen").mkdir(parents=True, exist_ok=True)
+
+        with patch.object(actions.fcntl, "flock", side_effect=enroll), \
+                self.assertRaisesRegex(ValueError, "scope changed; try again"):
+            self.store.import_actions(block((ident, "apply")), frozen, member, "race")
+        self.assertFalse(self.store.path.exists())
+
+    def test_existing_worktree_directory_without_registration_is_unknown(self):
+        _, (member, peer) = self.linked("worktree", "peer")
+        (member.parent / ".git").unlink()
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            self.record(peer)
+
+    def test_mapped_selector_cannot_escape_canonical_checkout(self):
+        main, (member, peer) = self.linked("a-worktree", "z-worktree")
+        (main / "docs/kaizen").mkdir(parents=True)
+        (main / "escape").symlink_to(peer.parent / " component" / "File")
+        (member.parent / "escape").touch()
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            self.store.record(member, "target", member.parent / "escape", "evidence", path=True)
+
+    def test_unrecoverable_project_key_skips_only_bad_rows(self):
+        bad = self.record()
+        good = self.record(self.other)
+        document = json.loads(self.store.path.read_text())
+        document["actions"][bad]["projects"] = ["legacy-key"]
+        self.store.path.write_text(json.dumps(document))
+        with patch("sys.stderr", new_callable=__import__("io").StringIO) as warning:
+            self.assertEqual([row["id"] for row in self.store.scoped(self.other)], [good])
+        self.assertIn("skipped 1 row(s)", warning.getvalue())
 
     def test_git_location_environment_cannot_change_scope(self):
         _, (canonical, member) = self.linked("a-wt", "z-wt")
