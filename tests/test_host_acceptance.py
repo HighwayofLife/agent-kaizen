@@ -268,6 +268,73 @@ class AcceptanceTests(unittest.TestCase):
         state = json.loads((self.home / 'config/agent-kaizen/host-acceptance/vscode.json').read_text())
         self.assertEqual(state['install'], 'manual')
 
+    def without_copilot(self):
+        for name in ('python3', 'git'):
+            (self.home / 'bin' / name).symlink_to(shutil.which(name))
+        self.env['PATH'] = str(self.home / 'bin')
+
+    def test_vscode_settings_jsonc_and_repeat(self):
+        self.without_copilot()
+        root = self.home / 'vscode'
+        path = root / 'User/settings.json'
+        path.parent.mkdir(parents=True)
+        original = '{\n    // comment\n    "url": "https://example.invalid/a", /* block */\n}\n'
+        path.write_text(original)
+        first = self.command('install', '--host', 'vscode')
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertIn('settings changed', first.stdout)
+        backup, = path.parent.glob('settings.json.bak-agent-kaizen-*')
+        self.assertEqual(backup.read_text(), original)
+        content = path.read_text()
+        self.assertIn('// comment', content)
+        self.assertIn('/* block */', content)
+        import runpy
+        clean = runpy.run_path(str(TOOL))['jsonc_clean']
+        data = json.loads(clean(content))
+        source = str((self.home / 'cache/agent-kaizen-acceptance/source').absolute())
+        self.assertTrue(data['chat.plugins.enabled'])
+        self.assertTrue(data['chat.pluginLocations'][source])
+        self.assertEqual(data['url'], 'https://example.invalid/a')
+        second = self.command('install', '--host', 'vscode')
+        self.assertIn('settings unchanged', second.stdout)
+        self.assertEqual(path.read_text(), content)
+        self.assertEqual(list(path.parent.glob('settings.json.bak-agent-kaizen-*')), [backup])
+        state = json.loads((self.home / 'config/agent-kaizen/host-acceptance/vscode.json').read_text())
+        self.assertEqual(state['vscode_settings'], [str(path)])
+        cleanup = self.command('cleanup', '--host', 'vscode')
+        self.assertIn('chat.pluginLocations', cleanup.stdout)
+        self.assertIn('restore the backup', cleanup.stdout)
+
+    def test_vscode_existing_locations_and_disabled(self):
+        self.without_copilot()
+        path = self.home / 'vscode/User/settings.json'
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps({'chat.plugins.enabled': False, 'chat.pluginLocations': {'other': True}}))
+        result = self.command('install', '--host', 'vscode')
+        self.assertIn('Set chat.plugins.enabled to true', result.stdout)
+        data = json.loads(path.read_text())
+        self.assertIs(data['chat.plugins.enabled'], False)
+        self.assertTrue(data['chat.pluginLocations']['other'])
+        self.assertTrue(data['chat.pluginLocations'][str((self.home / 'cache/agent-kaizen-acceptance/source').absolute())])
+
+    def test_vscode_invalid_missing_and_print_only(self):
+        self.without_copilot()
+        root = self.home / 'vscode'
+        path = root / 'User/settings.json'
+        path.parent.mkdir(parents=True)
+        path.write_text('{ broken')
+        result = self.command('install', '--host', 'vscode')
+        self.assertIn('Invalid VS Code settings', result.stdout)
+        self.assertEqual(path.read_text(), '{ broken')
+        self.assertFalse(list(path.parent.glob('*.bak-agent-kaizen-*')))
+        path.unlink()
+        result = self.command('install', '--host', 'vscode', '--print-only')
+        self.assertIn('Chat: Install Plugin from Source', result.stdout)
+        self.assertFalse(path.exists())
+        result = self.command('install', '--host', 'vscode')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(path.read_text())['chat.plugins.enabled'])
+
     def test_redaction_before_serialization(self):
         import runpy
         module = runpy.run_path(str(TOOL))

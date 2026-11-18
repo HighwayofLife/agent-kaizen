@@ -89,7 +89,7 @@ def copilot_plugin(home):
     return None, None
 
 
-def vscode_installs():
+def vscode_roots():
     override = os.environ.get('KAIZEN_VSCODE_DATA_DIRS')
     if override is not None:
         roots = [Path(p) for p in override.split(os.pathsep) if p]
@@ -100,8 +100,12 @@ def vscode_installs():
     else:
         config = Path(os.environ.get('XDG_CONFIG_HOME') or HOME / '.config')
         roots = [config / name for name in ('Code', 'Code - Insiders')]
+    return roots
+
+
+def vscode_installs():
     matches = []
-    for root in roots:
+    for root in vscode_roots():
         for manifest in root.glob('agentPlugins/*/*/.claude-plugin/plugin.json'):
             try:
                 if json.loads(manifest.read_text()).get('name') == 'agent-kaizen':
@@ -109,6 +113,137 @@ def vscode_installs():
             except (OSError, ValueError, AttributeError):
                 continue
     return max(matches, key=lambda item: item[0]) if matches else None
+
+
+def jsonc_clean(text):
+    """Mask comments and trailing commas without moving JSON token offsets."""
+    chars = list(text)
+    i = 0
+    in_string = False
+    while i < len(text):
+        if in_string:
+            if text[i] == '\\':
+                i += 2
+                continue
+            if text[i] == '"':
+                in_string = False
+        elif text[i] == '"':
+            in_string = True
+        elif text.startswith('//', i) or text.startswith('/*', i):
+            block = text[i + 1] == '*'
+            end = text.find('*/' if block else '\n', i + 2)
+            if block and end < 0:
+                raise ValueError('unterminated comment')
+            end = len(text) if end < 0 else end + (2 if block else 0)
+            for j in range(i, end):
+                if text[j] not in '\r\n':
+                    chars[j] = ' '
+            i = end
+            continue
+        i += 1
+    masked = ''.join(chars)
+    # Only commas outside strings remain candidates; scan strings again.
+    i = 0
+    while i < len(masked):
+        if masked[i] == '"':
+            _, i = json.JSONDecoder().raw_decode(masked, i)
+            continue
+        if masked[i] == ',':
+            j = i + 1
+            while j < len(masked) and masked[j].isspace():
+                j += 1
+            if j < len(masked) and masked[j] in '}]':
+                chars[i] = ' '
+        i += 1
+    return ''.join(chars)
+
+
+def object_members(clean, start):
+    """Return member value offsets for a parsed object."""
+    decoder = json.JSONDecoder()
+    members = {}
+    i = start + 1
+    while True:
+        while i < len(clean) and clean[i].isspace():
+            i += 1
+        if clean[i] == '}':
+            return members
+        key, i = decoder.raw_decode(clean, i)
+        while clean[i].isspace():
+            i += 1
+        i += 1  # colon
+        while clean[i].isspace():
+            i += 1
+        value_start = i
+        _, i = decoder.raw_decode(clean, i)
+        members[key] = value_start
+        while clean[i].isspace():
+            i += 1
+        if clean[i] == ',':
+            i += 1
+
+
+def register_vscode_settings(path, source):
+    if path.exists():
+        with path.open(encoding='utf-8', newline='') as handle:
+            old = handle.read()
+    else:
+        old = None
+    original = old if old is not None else '{}\n'
+    manual = 'Set chat.plugins.enabled to true and add {}: true to chat.pluginLocations in {}.'.format(
+        redact(json.dumps(str(source))), redact(str(path)))
+    try:
+        clean = jsonc_clean(original)
+        settings = json.loads(clean)
+        if not isinstance(settings, dict):
+            raise ValueError('settings must be an object')
+        start = clean.index('{')
+        members = object_members(clean, start)
+    except (ValueError, IndexError):
+        print('Invalid VS Code settings. ' + manual)
+        print('VS Code settings unchanged: {} (backup: none)'.format(redact(str(path))))
+        return False
+    inserts = []
+    enabled = settings.get('chat.plugins.enabled')
+    if 'chat.plugins.enabled' not in settings:
+        inserts.append('"chat.plugins.enabled": true')
+    elif enabled is not True:
+        print('Set chat.plugins.enabled to true in {}.'.format(redact(str(path))))
+    locations = settings.get('chat.pluginLocations')
+    key = json.dumps(str(source))
+    if 'chat.pluginLocations' not in settings:
+        inserts.append('"chat.pluginLocations": {\n        ' + key + ': true\n    }')
+    elif not isinstance(locations, dict) or (str(source) in locations and locations[str(source)] is not True):
+        print('Set {}: true in chat.pluginLocations in {}.'.format(redact(key), redact(str(path))))
+    elif str(source) not in locations:
+        offset = members['chat.pluginLocations'] + 1
+        entry = '\n        ' + key + ': true' + (',' if locations else '')
+        original = original[:offset] + entry + original[offset:]
+    if inserts:
+        entry = '\n    ' + ',\n    '.join(inserts) + (',' if settings else '')
+        original = original[:start + 1] + entry + original[start + 1:]
+    # A conflicting setting remains a human action, so do not record it as correct.
+    correct = (enabled is True or 'chat.plugins.enabled' not in settings) and (
+        'chat.pluginLocations' not in settings or
+        isinstance(locations, dict) and (str(source) not in locations or locations[str(source)] is True))
+    if old == original:
+        print('VS Code settings unchanged: {} (backup: none)'.format(redact(str(path))))
+    else:
+        backup = None
+        if old is not None:
+            stamp = datetime.datetime.now(datetime.timezone.utc)
+            while True:
+                backup = path.with_name(path.name + '.bak-agent-kaizen-' + stamp.strftime('%Y%m%d%H%M%S'))
+                if not backup.exists():
+                    break
+                stamp += datetime.timedelta(seconds=1)
+            shutil.copy2(path, backup)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('w', encoding='utf-8', newline='') as handle:
+            handle.write(original)
+        print('VS Code settings changed: {} (backup: {})'.format(
+            redact(str(path)), redact(str(backup)) if backup else 'none'))
+    return correct or old != original
 
 
 def main():
@@ -119,6 +254,7 @@ def main():
         p.add_argument('--host', required=True, choices=('codex', 'copilot-cli', 'vscode'))
         if action == 'install':
             p.add_argument('--source', choices=('local', 'github'), default='local')
+            p.add_argument('--print-only', action='store_true', help='print VS Code manual install instructions without editing settings')
         if action == 'check':
             p.add_argument('--install-dir', type=Path)
             p.add_argument('--observe', action='append', type=observe, default=[],
@@ -141,6 +277,10 @@ def main():
     if args.action == 'cleanup':
         (TRACE / 'on').unlink(missing_ok=True)
         print('Trace disabled. Uninstall with: {} plugin {} agent-kaizen@agent-kaizen-tools'.format(cli, 'remove' if cli == 'codex' else 'uninstall'))
+        if args.host == 'vscode':
+            for settings_path in state.get('vscode_settings', []):
+                print('In {}, remove {} from chat.pluginLocations, or restore the backup.'.format(
+                    redact(settings_path), redact(state.get('vscode_source', 'the plugin path'))))
         return 0
     if args.action == 'install':
         available = bool(shutil.which(cli))
@@ -151,10 +291,21 @@ def main():
         source = 'HighwayofLife/agent-kaizen'
         if args.source == 'local':
             source = Path(os.environ.get('XDG_CACHE_HOME') or HOME / '.cache') / 'agent-kaizen-acceptance/source'
+            if manual:
+                source = source.absolute()
             export_source(source)
+        vscode_settings = []
         if manual:
             print('VS Code Agents app: The Agents app loads plugins only from the Copilot CLI install (~/.copilot). Install GitHub Copilot CLI (see https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli), sign in, then run install again.')
-            print('VS Code chat: In VS Code enable chat.plugins.enabled, choose the Copilot session target, and run Chat: Install Plugin from Source using {}.'.format(source))
+            roots = [root for root in vscode_roots() if root.is_dir()]
+            if args.print_only or not roots or args.source != 'local':
+                print('VS Code chat: In VS Code enable chat.plugins.enabled, choose the Copilot session target, and run Chat: Install Plugin from Source using {}.'.format(redact(str(source))))
+            else:
+                for root in roots:
+                    settings_path = root / 'User/settings.json'
+                    if register_vscode_settings(settings_path, source):
+                        vscode_settings.append(str(settings_path))
+                print('VS Code may ask you to trust the folder because chat.pluginLocations is a restricted setting.')
         else:
             if not available:
                 print('Missing {} CLI; install it and sign in first.'.format(cli), file=sys.stderr)
@@ -178,6 +329,10 @@ def main():
         (TRACE / 'trace.jsonl').write_text('')
         (TRACE / 'on').touch()
         state = {'installed_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'install': 'manual' if manual else args.source}
+        if manual:
+            state['vscode_settings'] = vscode_settings
+            if vscode_settings:
+                state['vscode_source'] = str(source)
         statefile.parent.mkdir(parents=True, exist_ok=True)
         statefile.write_text(json.dumps(state, indent=2) + '\n')
         nxt = {'codex': 'quit Codex, start a new Codex session in this folder, run /hooks and trust the Agent Kaizen hooks.',
