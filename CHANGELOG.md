@@ -8,6 +8,8 @@ Codex CLI and GitHub Copilot support: the same plugin installs on Codex CLI and 
 
 `host support`:
 
+- Detect Copilot plugins loaded live from a local directory marketplace.
+
 - GitHub Copilot support is experimental and has not been checked in a live session; Copilot usage is not measured yet.
 
 `skills/*/agents/openai.yaml`:

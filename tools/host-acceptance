@@ -60,6 +60,34 @@ def observe(value):
     return name, status.upper(), note
 
 
+def copilot_plugin(home):
+    installed = home / 'installed-plugins/agent-kaizen-tools/agent-kaizen'
+    if installed.is_dir():
+        return installed, 'installed'
+    try:
+        settings = json.loads((home / 'settings.json').read_text(encoding='utf-8'))
+        if settings['enabledPlugins']['agent-kaizen@agent-kaizen-tools'] is not True:
+            return None, None
+        source = settings['extraKnownMarketplaces']['agent-kaizen-tools']['source']
+        if source['source'] != 'directory' or not isinstance(source['path'], str):
+            return None, None
+        marketplace = Path(source['path']).expanduser()
+        entries = json.loads((marketplace / '.claude-plugin/marketplace.json').read_text(encoding='utf-8'))['plugins']
+        for entry in entries:
+            if entry.get('name') == 'agent-kaizen':
+                plugin_source = entry.get('source', './')
+                if not isinstance(plugin_source, str):
+                    return None, None
+                root = marketplace / plugin_source
+                manifest = json.loads((root / '.claude-plugin/plugin.json').read_text(encoding='utf-8'))
+                if manifest.get('name') == 'agent-kaizen':
+                    return root, 'live'
+                return None, None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        pass
+    return None, None
+
+
 def vscode_installs():
     override = os.environ.get('KAIZEN_VSCODE_DATA_DIRS')
     if override is not None:
@@ -164,16 +192,20 @@ def check(args, state, statefile, cli):
         add('cli', 'PASS' if result.returncode == 0 else 'FAIL', version)
     else:
         add('cli', 'SKIP' if args.host == 'vscode' else 'FAIL', 'CLI not found')
-    base = Path(os.environ.get('CODEX_HOME') or HOME / '.codex') / 'plugins/cache/agent-kaizen-tools/agent-kaizen' / VERSION if cli == 'codex' else Path(os.environ.get('COPILOT_HOME') or HOME / '.copilot') / 'installed-plugins/agent-kaizen-tools/agent-kaizen'
+    copilot_home = Path(os.environ.get('COPILOT_HOME') or HOME / '.copilot').expanduser()
+    copilot_root, kind = copilot_plugin(copilot_home) if cli == 'copilot' else (None, None)
+    base = (Path(os.environ.get('CODEX_HOME') or HOME / '.codex') / 'plugins/cache/agent-kaizen-tools/agent-kaizen' / VERSION if cli == 'codex' else copilot_root or copilot_home / 'installed-plugins/agent-kaizen-tools/agent-kaizen')
     chat_match = vscode_installs() if args.host == 'vscode' and args.install_dir is None else None
     installed = args.install_dir or base
     chat_install = False
-    if chat_match and not (base / '.claude-plugin/plugin.json').is_file():
+    if chat_match and not copilot_root:
         installed = chat_match[1]
         chat_install = True
     elif args.host == 'vscode' and args.install_dir is not None:
         chat_install = 'agentPlugins' in installed.parts
     location = 'VS Code chat: ' + str(chat_match[2] / 'agentPlugins/<install>') if chat_install and chat_match else str(installed)
+    if kind == 'live' and args.install_dir is None and not chat_install:
+        location = 'live plugin from ' + location
     if chat_install and not chat_match:
         location = str(Path(*installed.parts[:installed.parts.index('agentPlugins') + 1]) / '<install>')
     if chat_match and not chat_install:

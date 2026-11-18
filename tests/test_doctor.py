@@ -126,6 +126,18 @@ class DoctorTests(unittest.TestCase):
         (copilot / '.claude-plugin/plugin.json').write_text(json.dumps({'version': '0.0.1'}))
         self.assertIn('fix: copilot plugin install agent-kaizen@agent-kaizen-tools', self.doctor())
 
+    def test_copilot_live_marketplace_and_bad_settings(self):
+        copilot = Path(self.env['COPILOT_HOME'])
+        copilot.mkdir()
+        settings = copilot / 'settings.json'
+        settings.write_text(json.dumps({
+            'enabledPlugins': {'agent-kaizen@agent-kaizen-tools': True},
+            'extraKnownMarketplaces': {'agent-kaizen-tools': {'source': {
+                'source': 'directory', 'path': str(self.root)}}}}))
+        self.assertIn('PASS Copilot: plugin installed (live from local marketplace)', self.doctor())
+        settings.write_text('{invalid')
+        self.assertNotIn('PASS Copilot:', self.doctor())
+
     def test_empty_and_live_wal(self):
         wal = Path(str(self.db) + '-wal')
         wal.touch()

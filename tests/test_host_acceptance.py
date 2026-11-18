@@ -140,6 +140,55 @@ class AcceptanceTests(unittest.TestCase):
         self.assertIn('VS Code chat install also found', rows['installed']['detail'])
         self.assertNotIn('chat only', rows['hooks-live:sessionStart']['detail'])
 
+    def test_copilot_live_marketplace_and_precedence(self):
+        marketplace = self.home / 'marketplace'
+        live = marketplace / 'plugin'
+        shutil.copytree(ROOT, live, ignore=shutil.ignore_patterns('.git', 'out', '__pycache__'))
+        metadata = marketplace / '.claude-plugin'
+        metadata.mkdir()
+        (metadata / 'marketplace.json').write_text(json.dumps({'plugins': [
+            {'name': 'agent-kaizen', 'source': 'plugin'}]}))
+        copilot = self.home / 'copilot'
+        copilot.mkdir()
+        settings = {'enabledPlugins': {'agent-kaizen@agent-kaizen-tools': True},
+                    'extraKnownMarketplaces': {'agent-kaizen-tools': {'source': {
+                        'source': 'directory', 'path': str(marketplace)}}}}
+        settings_file = copilot / 'settings.json'
+        statefile = self.home / 'config/agent-kaizen/host-acceptance/vscode.json'
+        statefile.parent.mkdir(parents=True)
+        statefile.write_text(json.dumps({'install': 'manual', 'installed_at': '2020-01-01T00:00:00+00:00'}))
+        chat = self.home / 'vscode/agentPlugins/file-x/hash'
+        shutil.copytree(live, chat)
+
+        def check(host):
+            self.command('check', '--host', host, '--observe', 'skill_invoked=pass')
+            report = max((ROOT / 'out/host-acceptance').glob(host + '-*.json'), key=lambda p: p.stat().st_mtime_ns)
+            return {r['id']: r for r in json.loads(report.read_text())['checks']}
+
+        settings_file.write_text(json.dumps(settings))
+        for host in ('copilot-cli', 'vscode'):
+            rows = check(host)
+            for name in ('installed', 'files', 'scripts', 'hooks-offline', 'doctor'):
+                self.assertEqual(rows[name]['status'], 'PASS', rows[name])
+            self.assertIn('live plugin from ~', rows['installed']['detail'])
+        manifest = live / '.claude-plugin/plugin.json'
+        original = manifest.read_text()
+        data = json.loads(original)
+        data['version'] = '0.0.0'
+        manifest.write_text(json.dumps(data))
+        self.assertEqual(check('copilot-cli')['installed']['status'], 'FAIL')
+        manifest.write_text(original)
+        settings['enabledPlugins']['agent-kaizen@agent-kaizen-tools'] = False
+        settings_file.write_text(json.dumps(settings))
+        self.assertEqual(check('copilot-cli')['installed']['status'], 'FAIL')
+        settings['enabledPlugins']['agent-kaizen@agent-kaizen-tools'] = True
+        settings_file.write_text(json.dumps(settings))
+        installed = copilot / 'installed-plugins/agent-kaizen-tools/agent-kaizen'
+        shutil.copytree(live, installed)
+        rows = check('vscode')
+        self.assertIn('copilot/installed-plugins', rows['installed']['detail'])
+        self.assertNotIn('live plugin from', rows['installed']['detail'])
+
     def test_vscode_install_without_copilot(self):
         for name in ('python3', 'git'):
             (self.home / 'bin' / name).symlink_to(shutil.which(name))
