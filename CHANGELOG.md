@@ -20,9 +20,9 @@ First-five-minutes loop: a no-write first scan, a doctor, hook-driven audits, ca
 
 `token-audit`, `usage-db`:
 
-- `token-audit --no-write` skips report and extract writes. Reports include a `format_canary: v1` headline field and show `FORMAT-DRIFT` for unknown records or missing usage fields.
+- `token-audit --no-write` skips report and extract writes. Reports include a `format_canary: v1` headline field and show `FORMAT-DRIFT` for unknown records or missing usage fields, naming the top unknown record types. The canary knows the record types written by Claude Code 2.1.32x and Codex 0.167.
 - `usage-db report --cache` shows cache writes by idle-gap bucket and full-rewrite counts for main sessions and subagents; old rows may have unknown attribution. `token-audit` adds a cache headline.
-- `usage-db guard` reports usage regressions. The session notice shows at most one regression line per day.
+- `usage-db guard` reports usage regressions over the last 120 database days. The session notice shows at most one regression line per day.
 
 `session-audit.sh`, `install-schedule`:
 

@@ -69,13 +69,13 @@ Packet 10's owner-run commands and expected outcomes are mandatory: scan, doctor
 
 | Real-input gate | Status |
 |---|---|
-| First scan and elapsed time | pending (orchestrator) |
-| Doctor | pending (orchestrator) |
-| Cache report | pending (orchestrator) |
-| Regression guard | pending (orchestrator) |
-| Audit format canary | pending (orchestrator) |
-| Tier guard fixture | pending (orchestrator) |
-| SessionStart fixture | pending (orchestrator) |
+| First scan and elapsed time | pass: exit 0, 6.7 s on a real install |
+| Doctor | pass: exit 0, 0.3 s; first run showed two false WARNs (0-byte WAL, stale canary types), fixed in 11 |
+| Cache report | pass: exit 0, 1.6 s |
+| Regression guard | pass: exit 0, 0.6-0.7 s on a real database (hook deadline 2 s) |
+| Audit format canary | pass after 11: first run reported false drift from new CLI record types; clean after 11 |
+| Tier guard fixture | pass: allow, deny, allow with reason; 0.12 s |
+| SessionStart fixture | pass: silent, 0.65 s, wrote last_audit_ok, skipped when not due |
 
 ## Risks and mitigations
 
