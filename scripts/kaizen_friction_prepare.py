@@ -14,6 +14,7 @@ from pathlib import Path
 import re
 import runpy
 import stat
+import warnings
 from datetime import datetime, timedelta, timezone
 
 
@@ -62,7 +63,6 @@ def compare_flags(project, window, thresholds, basis, flags, acknowledged):
     if not isinstance(old, dict):
         raise ValueError("invalid acknowledged cohort")
     proposed = dict(old)
-    seen = set()
     new = []
     for flag in flags:
         if (not isinstance(flag, dict) or not isinstance(flag.get("id"), str)
@@ -73,9 +73,6 @@ def compare_flags(project, window, thresholds, basis, flags, acknowledged):
                 or (isinstance(value, float) and not math.isfinite(value))):
             raise ValueError("invalid flag value")
         ident = json.dumps([flag["id"], flag["subject"]], ensure_ascii=True, separators=(",", ":"))
-        if ident in seen:
-            raise ValueError("duplicate flag identity")
-        seen.add(ident)
         bucket = math.floor(math.log2(value))
         previous = old.get(ident)
         if previous is not None and type(previous) is not int:
@@ -113,14 +110,21 @@ def _read(path, host, current=None, age=None, limit=LIMIT):
     """No symlink components, devices, writable foreign files or unbounded reads."""
     with host["_directory"](path.parent) as directory:
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-        with os.fdopen(fd, "rb") as stream:
-            info = os.fstat(stream.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
-                    or info.st_nlink != 1 or info.st_mode & 0o022):
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
                 raise ValueError("unsafe evidence file")
-            host["_check_acl"](stream.fileno(), "evidence")
-            raw = stream.read(limit + 1)
-            after = os.fstat(stream.fileno())
+            stream = os.fdopen(fd, "rb")
+            fd = None
+            with stream:
+                if (info.st_uid != os.geteuid() or info.st_nlink != 1 or info.st_mode & 0o022):
+                    raise ValueError("unsafe evidence file")
+                host["_check_acl"](stream.fileno(), "evidence")
+                raw = stream.read(limit + 1)
+                after = os.fstat(stream.fileno())
+        finally:
+            if fd is not None:
+                os.close(fd)
     if (len(raw) > limit or (info.st_size, info.st_mtime_ns, info.st_ctime_ns)
             != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
         raise ValueError("oversized or changing evidence")
@@ -235,26 +239,30 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
         for folder in folders:
             for candidate in _files(folder, r"token-audit-[\w.-]+\.md", host):
                 try:
-                    evidence = _evidence(candidate, audits, project, cfg, current, host)
-                    candidates.append((evidence[2]["report"]["mtime_ns"], candidate.name, evidence))
-                except (OSError, ValueError, KeyError, TypeError):
+                    info = candidate.lstat()
+                    if stat.S_ISREG(info.st_mode) and info.st_size <= LIMIT:
+                        candidates.append((info.st_mtime_ns, candidate.name, candidate))
+                except OSError:
                     continue
-        if not candidates:
+        for _, _, candidate in sorted(candidates, reverse=True)[:8]:
+            try:
+                scope, block, identities = _evidence(candidate, audits, project, cfg, current, host)
+                break
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        else:
             raise ValueError("no fresh scoped audit")
-        scope, block, identities = max(candidates, key=lambda item: item[:2])[2]
-    if block is None:
-        if _check is not None:
-            raise ValueError("missing friction gate")
-        return None
-    probes = _files(project.folder, r"host-probe-[\w.-]+\.json", host)
-    if not probes:
-        raise ValueError("no recent probe")
-    probe_raw, identities["probe"] = _read(max(probes), host, current, PROBE_AGE)
-    probe = _json(probe_raw, host)
-    if (probe.get("project") != str(project.canonical)
-            or not 0 <= (current - _stamp(probe["generated_at"])).total_seconds() <= PROBE_AGE
-            or not isinstance(probe.get("findings"), list) or not isinstance(probe.get("regenerable_dirs"), list)):
-        raise ValueError("invalid probe")
+    probe = {"findings": [], "regenerable_dirs": []}
+    if cfg["hostActions"]["value"] != "off":
+        probes = _files(project.folder, r"host-probe-[\w.-]+\.json", host)
+        if not probes:
+            raise ValueError("no recent probe")
+        probe_raw, identities["probe"] = _read(max(probes), host, current, PROBE_AGE)
+        probe = _json(probe_raw, host)
+        if (probe.get("project") != str(project.canonical)
+                or not 0 <= (current - _stamp(probe["generated_at"])).total_seconds() <= PROBE_AGE
+                or not isinstance(probe.get("findings"), list) or not isinstance(probe.get("regenerable_dirs"), list)):
+            raise ValueError("invalid probe")
     store = host["HostActions"](audits, backups, canonical_project, project_key)
     catalog_path = next((here / name for name in ("kaizen-friction-catalog.json", "friction-catalog.json")
                          if (here / name).is_file()), None)
@@ -298,13 +306,13 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
                                          or any(value != "terminal" for value in imported.values())):
                 raise ValueError("unmatched interactive import receipt")
         cohort = json.dumps([str(project.canonical), scope], sort_keys=True, separators=(",", ":"))
-        if (not isinstance(block.get("flags"), list)
+        if block is not None and (not isinstance(block.get("flags"), list)
                 or any(not isinstance(flag, dict) or flag.get("id") not in LABELS
                        or not isinstance(flag.get("subject"), str) or len(flag["subject"]) > 4096
                        for flag in block["flags"])):
             raise ValueError("unsupported flag")
-        flags, snapshot = compare_flags(cohort, block["window"], block["thresholds"], block["basis"],
-                                        block.get("flags"), baseline)
+        flags, snapshot = (compare_flags(cohort, block["window"], block["thresholds"], block["basis"],
+                                         block.get("flags"), baseline) if block is not None else ([], baseline))
         visible_flags, allowed, actions = [], {}, []
         for flag in flags:
             ident = host["_id"](secret, str(project.canonical), flag["id"], flag["subject"])
@@ -321,16 +329,30 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
             if finding["id"] in ("indexed-output", "sprawl"):
                 if not selector.startswith("/"):
                     raise ValueError("expected a path selector")
-                _, target = canonical_project(project.canonical, selector=selector)
-                if str(target) != selector:
-                    raise ValueError("noncanonical selector")
+                try:
+                    _, target = canonical_project(project.canonical, selector=selector)
+                except (ValueError, OSError):
+                    if finding["id"] != "indexed-output":
+                        raise
+                    warnings.warn("dropping indexed-output finding with invalid selector")
+                    continue
+                selector = str(target)
                 if finding["id"] == "sprawl" and target != project.canonical:
                     raise ValueError("invalid sprawl selector")
-                if finding["id"] == "indexed-output" and not any(
-                        isinstance(row, dict) and row.get("path") == selector
-                        and row.get("size_bytes") == finding["evidence"].get("size_bytes")
-                        for row in probe["regenerable_dirs"]):
-                    raise ValueError("missing regenerable-directory provenance")
+                if finding["id"] == "indexed-output":
+                    matched = False
+                    for row in probe["regenerable_dirs"]:
+                        try:
+                            if (isinstance(row, dict) and isinstance(row.get("path"), str)
+                                    and canonical_project(project.canonical, selector=row["path"])[1] == target
+                                    and row.get("size_bytes") == finding["evidence"].get("size_bytes")):
+                                matched = True
+                                break
+                        except (ValueError, OSError):
+                            continue
+                    if not matched:
+                        warnings.warn("dropping indexed-output finding without matching provenance")
+                        continue
             elif (entry["id"], selector) not in (("low-disk", "project-volume"), ("inotify-limit", "inotify")) and not (
                     entry["id"] == "cloud-sync-repo" and selector in project.canonical.parts
                     and any(fnmatch.fnmatchcase(selector, pattern) for pattern in catalog_data["cloud_sync_names"])):
@@ -344,6 +366,8 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
             if (imported is not None and ident in imported and not old.get("pending")
                     and old.get("status") == "open" and old.get("evidence") == evidence):
                 old = {}
+            if old.get("flaps", 0) >= 2:
+                continue
             if not old.get("pending") and (old.get("status") == "dismissed"
                     or old.get("status") in ("open", "done") and old.get("evidence") == evidence):
                 continue
@@ -360,9 +384,9 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
         receipt = dict(v=1, generation=generation, created=_check["created"] if _check else current.isoformat(),
                        channel="interactive" if interactive else "scheduled", baseline=baseline,
                        project=str(project.canonical), scope=scope,
-                       identities=identities, policy=dict(mode=mode, window=block["window"],
-                       thresholds=block["thresholds"], basis=block["basis"], hostActions=cfg["hostActions"]["value"]),
-                       comparison=snapshot, allowed=allowed, permission_provenance=block.get("permission_acceptance", []))
+                       identities=identities, policy=dict(mode=mode, window=block["window"] if block else None,
+                       thresholds=block["thresholds"] if block else None, basis=block["basis"] if block else None, hostActions=cfg["hostActions"]["value"]),
+                       comparison=snapshot, allowed=allowed, permission_provenance=block.get("permission_acceptance", []) if block else [])
         view = dict(v=1, generation=generation, flags=visible_flags, actions=actions)
         public = _encode(view)
         receipt["view_sha256"] = hashlib.sha256(public).hexdigest()

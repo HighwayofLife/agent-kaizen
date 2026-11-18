@@ -42,6 +42,12 @@ class ComparisonTests(unittest.TestCase):
             self.assertEqual(bool(self.compare(state, flag)[0]), expected)
         self.assertEqual(state["cohorts"][next(iter(state["cohorts"]))].popitem()[1], 2)
 
+    def test_duplicate_mixed_basis_flags(self):
+        flags = [dict(self.flag, basis="measured"), dict(self.flag, basis="row_gap", value=8)]
+        new, state = self.compare({}, flags=flags, basis="mixed")
+        self.assertEqual(len(new), 2)
+        self.assertFalse(self.compare(state, flags=flags, basis="mixed")[0])
+
     def test_policy_switches_and_switch_back(self):
         _, initial = self.compare({})
         for change in (dict(project="/other"), dict(basis="row_gap"),
@@ -126,6 +132,75 @@ class PreparationTests(unittest.TestCase):
         self.write_evidence()
         inputs = self.run_prepare()
         return inputs, json.loads(inputs.read_text())["actions"][0]["id"]
+
+    def test_automatic_selection_bounds_parses(self):
+        for i in range(30):
+            self.write(self.obj.folder / ("token-audit-%03d.md" % i), "bad")
+        original = prepare._evidence
+        with patch.object(prepare, "_evidence", side_effect=original) as read:
+            try:
+                self.run_prepare()
+            except ValueError:
+                pass
+            self.assertLessEqual(read.call_count, 8)
+
+    def test_directory_read_does_not_leak_descriptors(self):
+        fd_dir = pathlib.Path("/dev/fd")
+        if not fd_dir.exists():
+            self.skipTest("descriptor directory unavailable")
+        host = runpy.run_path(str(PATH.parent / "kaizen_friction_actions.py"))
+        before = len(list(fd_dir.iterdir()))
+        for _ in range(30):
+            with self.assertRaises((OSError, ValueError)):
+                prepare._read(self.project / "docs", host)
+        self.assertEqual(len(list(fd_dir.iterdir())), before)
+
+    def test_host_actions_off_needs_no_probe(self):
+        self.write(self.project / "docs/kaizen/config.json", '{"hostActions":"off"}')
+        self.probe_path.unlink()
+        self.assertTrue(self.run_prepare())
+
+    def test_probe_without_friction_block(self):
+        self.candidate()
+        data = json.loads(self.extract.read_text())
+        del data["friction"]
+        self.extract.write_text(json.dumps(data))
+        self.assertTrue(json.loads(self.run_prepare().read_text())["actions"])
+
+    def test_linked_worktree_finding_uses_canonical_provenance(self):
+        linked = str(self.root / "linked" / "build")
+        canonical = self.project / "build"
+        self.probe["findings"] = [dict(id="indexed-output", catalog_id="spotlight-output",
+                                       subject=linked, evidence=dict(size_bytes=42))]
+        self.probe["regenerable_dirs"] = [dict(path=str(canonical), size_bytes=42)]
+        self.write_evidence()
+        original = self.runner["action_project"]
+        def canonicalize(project, *, selector=None):
+            if selector in (linked, str(canonical)):
+                return self.project, canonical
+            return original(project, selector=selector)
+        with patch.dict(self.runner, {"action_project": canonicalize}):
+            self.assertEqual(len(json.loads(self.run_prepare().read_text())["actions"]), 1)
+            self.probe["regenerable_dirs"] = []
+            self.write_evidence()
+            with self.assertWarns(UserWarning):
+                self.assertEqual(json.loads(self.run_prepare().read_text())["actions"], [])
+
+    def test_flapping_action_is_held(self):
+        _, ident = self.candidate()
+        host = runpy.run_path(str(PATH.parent / "kaizen_friction_actions.py"))
+        store = host["HostActions"](self.config / "audits", self.backups, self.runner["action_project"], self.runner["key"])
+        row = dict(id=ident, status="open", evidence="old", flaps=2)
+        # Patch the class returned by the module loaded by prepare.
+        original = prepare.runpy.run_path
+        def load(path):
+            module = original(path)
+            module["HostActions"].scoped = lambda self, project: [row]
+            return module
+        self.block["flags"] = []
+        self.write_evidence()
+        with patch.object(prepare.runpy, "run_path", side_effect=load):
+            self.assertIsNone(self.run_prepare())
 
     def test_interruption_empty_import_and_idempotent_ack(self):
         first = self.run_prepare()
@@ -256,6 +331,16 @@ class PreparationTests(unittest.TestCase):
             return result
 
         with patch.object(prepare, "_read", side_effect=changing_read), self.assertRaises(ValueError):
+            self.reconcile(inputs, self.actions())
+
+    def test_swapped_extract_after_receipt_is_refused(self):
+        inputs = self.run_prepare()
+        info = self.extract.stat()
+        raw = self.extract.read_bytes()
+        self.extract.write_bytes(raw.replace(b'private subject', b'forged  subject'))
+        os.utime(self.extract, ns=(info.st_atime_ns, info.st_mtime_ns))
+        self.assertEqual(self.extract.stat().st_size, info.st_size)
+        with self.assertRaises(ValueError):
             self.reconcile(inputs, self.actions())
 
     def test_receipt_redaction_generation_and_read_only_ack(self):
