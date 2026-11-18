@@ -53,3 +53,10 @@ P16b landed after three Sol high rounds. Carry into this packet, which extends t
 1. Ref-backed undo restores require the target's parent directory to exist and can drop filesystem flags or extended attributes. Refuse a restore when the backup recorded xattrs/flags that cannot be reapplied, or reapply them, with a test; a missing parent stays a clear refusal.
 2. Accepted same-UID residuals, do not reopen: a symlink planted under `refs/` that resolves into `refs/kaizen/`, a concurrent move of the undo target's directory during the descriptor-bound copy, and the final POSIX rename race after the fd-bound recheck.
 3. Scheduled commits must reuse P16b's journal, pins and Git re-trust path; do not add a second recovery mechanism.
+
+## Delta (after P24 landed, 2026-11-18)
+
+1. P24 landed after five Sol high rounds (merge 755874b). Reuse its broker mechanisms and do not add parallel ones: the reservation, native journal and per-action cancellation; receipt binding and terminal-suggestion downgrade; the policy stamp built from config identity and digest; and `scheduled_action_refusal`.
+2. S7 stays closed in 0.13.0. `scheduled_marker_refusal()` refuses broker effects because there is no verified stream version, so a scheduled commit must also be refused, or downgraded to a proposal, through the same gate. Build and test the commit path with the gate opened in tests via `patch`, as P24's tests do. In the shipped code a scheduled run never commits while S7 is closed. Add a test for that too.
+3. The P16b delta item 1 changes `scripts/kaizen-backup`, so the owned files add `scripts/kaizen-backup` and `tests/test_kaizen_backup.py`.
+4. The gated items G1–G8 in `plan.md` are out of scope. Line references in this brief may be stale; find code with `rg`.
