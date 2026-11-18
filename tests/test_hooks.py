@@ -81,8 +81,13 @@ class HookTests(unittest.TestCase):
             clear()
             output = notice(KAIZEN_HOST=host)
             text = output['additionalContext'] if host == 'copilot' else output['hookSpecificOutput']['additionalContext']
-            self.assertEqual(text, '1 open host action(s): run kaizen-scheduled actions list --for .')
-            self.assertLessEqual(len(text.encode()) + 2, 200)
+            self.assertIn('1 open host action(s): run python3 -c', text)
+            self.assertIn(str(ROOT / 'scripts/kaizen-scheduled'), text)
+            self.assertIn(str(audits), text)
+            command = text.split(': run ', 1)[1]
+            result = subprocess.run(command, shell=True, cwd=project, env={**os.environ, **env}, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn('one', result.stdout)
             self.assertIsNone(notice(KAIZEN_HOST=host))
             self.assertIsNotNone(notice(other, KAIZEN_HOST=host))
         clear()
@@ -120,6 +125,27 @@ class HookTests(unittest.TestCase):
         path.symlink_to(target)
         clear()
         self.assertIsNone(notice())
+
+    def test_actions_worktree_canonical_opt_out(self):
+        import runpy
+        import sys
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        self.addCleanup(sys.path.remove, str(ROOT / 'scripts'))
+        from kaizen_friction_actions import HostActions
+        self.tmp = self.tmp.resolve()
+        project, audits, _, env = self.notice_setup()
+        project = project.resolve()
+        subprocess.run(['git', 'init', '-q', str(project)], check=True)
+        subprocess.run(['git', '-C', str(project), '-c', 'user.name=Test', '-c', 'user.email=test@localhost', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-qm', 'initial'], check=True)
+        worktree = self.tmp.resolve() / 'worktree'
+        subprocess.run(['git', '-C', str(project), 'worktree', 'add', '-qb', 'linked', str(worktree)], check=True)
+        (worktree / 'docs/kaizen').mkdir(parents=True, exist_ok=True)
+        runner = runpy.run_path(str(ROOT / 'scripts/kaizen-scheduled'))
+        backup = self.tmp / 'backup'
+        env.update(CLAUDE_PLUGIN_ROOT=str(ROOT), KAIZEN_BACKUP_DIR=str(backup))
+        HostActions(audits, backup, runner['action_project'], runner['key']).record(project, 'test', 'one', 'evidence', allowed=('one',))
+        (project / 'docs/kaizen/config.json').write_text('{"hostActions":"off"}')
+        self.assertIsNone(run('audit-notice.sh', {'cwd': str(worktree)}, env))
 
     def test_claude_notice_golden(self):
         # Captured from d1accc4 scripts, not JSON reserialization; <TMP> replaces the temp root.

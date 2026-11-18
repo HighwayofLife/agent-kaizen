@@ -1115,7 +1115,7 @@ class ExecutionTests(DiscoveryCase):
             self.assertIn('--strict-mcp-config', argv)
             self.assertNotIn('--no-session-persistence', argv)
             self.assertEqual(self.values(audit_args, '--cwd'), [str(path)])
-            self.assertEqual(self.values(audit_args, '--days'), ['7'])
+            self.assertEqual(self.values(audit_args, '--days'), ['6'])
             self.assertEqual(self.values(audit_args, '--out'), [str(self.folder(path))])
             state = self.state(path)
             self.assertEqual(state['status'], 'ok')
@@ -1507,7 +1507,7 @@ class ExecutionTests(DiscoveryCase):
         options = self.runner.command_options(type('Args', (), {'dry_run': True})())
         project = self.runner.Project(path, [path], self.folder(path))
         argv = self.runner.audit_command(options, project.folder, project)
-        self.assertEqual(argv[2:], ['--cwd', str(path), '--days', '7', '--out', str(project.folder),
+        self.assertEqual(argv[2:], ['--cwd', str(path), '--days', '6', '--out', str(project.folder),
                                    '--pricing', str(SCRIPTS / 'pricing.json'),
                                    '--extract-out', str(self.audits / 'extracts')])
 
@@ -1518,7 +1518,7 @@ class ExecutionTests(DiscoveryCase):
         audit = shlex.split(next(line.split('audit command: ', 1)[1] for line in output.splitlines() if 'audit command: ' in line))
         review = shlex.split(next(line.split('review command: ', 1)[1] for line in output.splitlines() if 'review command: ' in line))
         self.assertEqual(audit, [sys.executable, str(self.audit), '--cwd', str(path),
-                                 '--days', '7', '--out', str(self.folder(path)), '--pricing', str(self.pricing),
+                                 '--days', '6', '--out', str(self.folder(path)), '--pricing', str(self.pricing),
                                  '--extract-out', str(self.audits / 'extracts')])
         self.assertEqual(review[0], str(self.claude))
         self.assertEqual(self.values(review, '-p'), [f'/agent-kaizen:cycle propose-only <report path from audit stdout> notes-ledger-path={SCRIPTS}/notes-ledger'])

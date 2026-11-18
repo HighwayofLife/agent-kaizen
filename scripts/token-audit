@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Stream Claude project transcripts and Codex sessions into a compact audit."""
 import argparse
+from bisect import bisect_left, bisect_right
 from contextlib import ExitStack
 import fnmatch
 import importlib.util
@@ -881,6 +882,10 @@ def friction_block(state, row, block, start, result_count=0, row_event=None):
     if not (isinstance(session_id, str) and 0 < len(session_id) <= 256 and
             isinstance(tool_id, str) and 0 < len(tool_id) <= 256):
         return
+    ts = row.get("timestamp")
+    stamp = friction_stamp(ts) if isinstance(ts, str) and len(ts) <= 40 else None
+    if stamp is not None and stamp > state["until"]:
+        return
     key = (session_id, tool_id)
     pairs = state["pairs"]
     if key not in pairs:
@@ -891,8 +896,6 @@ def friction_block(state, row, block, start, result_count=0, row_event=None):
     pair = pairs[key]
     if pair is None:
         return
-    ts = row.get("timestamp")
-    stamp = friction_stamp(ts) if isinstance(ts, str) and len(ts) <= 40 else None
     if stamp is None or stamp < state["since"]:
         if stamp is None:
             state["warnings"]["malformed rows"] += 1
@@ -956,7 +959,7 @@ def default_samples_dir():
 
 def read_samples(directory, since, warnings, until=None):
     """Pin private storage, then read only bounded UTC days; never create storage."""
-    result = dict(events={}, load=[], procs=[], hours=set())
+    result = dict(events={}, load=[], procs=[], hours=set(), skipped_days=set())
     until = until or datetime.now(timezone.utc)
     if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "geteuid"):
         return result
@@ -986,7 +989,8 @@ def read_samples(directory, since, warnings, until=None):
             spec.loader.exec_module(helper)
             if sys.platform == "darwin" and helper.has_extended_acl(fd):
                 raise ValueError("sample ACL")
-            first, last = since.astimezone(timezone.utc).date().isoformat(), until.date().isoformat()
+            first = since.astimezone(timezone.utc).date().isoformat()
+            last = (until.astimezone(timezone.utc) + timedelta(seconds=SAMPLE_JOIN_SECONDS)).date().isoformat()
             paths = []
             with os.scandir(fd) as entries:
                 for count, entry in enumerate(entries):
@@ -1001,7 +1005,14 @@ def read_samples(directory, since, warnings, until=None):
                 day = name[:10]
                 try:
                     child = os.open(day + ".tsv", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
-                    with os.fdopen(child, "rb") as stream:
+                    try:
+                        if not stat.S_ISREG(os.fstat(child).st_mode):
+                            raise ValueError("not a regular sample file")
+                        stream = os.fdopen(child, "rb")
+                    except BaseException:
+                        os.close(child)
+                        raise
+                    with stream:
                         size = helper.file_info(fd, day + ".tsv", stream.fileno()).st_size
                         if sys.platform == "darwin" and helper.has_extended_acl(stream.fileno()):
                             raise ValueError("sample ACL")
@@ -1070,6 +1081,7 @@ def read_samples(directory, since, warnings, until=None):
                     continue  # Missing days and retention races are normal.
                 except (OSError, ValueError):
                     warnings["skipped sample files"] += 1
+                    result["skipped_days"].add(day)
     except FileNotFoundError:
         pass
     except (OSError, ValueError, ImportError, AttributeError):
@@ -1168,13 +1180,31 @@ def heavy_timeline(calls, thresholds, samples=(), local_calls=()):
         cohorts[(call[3], call[4])][0 if ident in overlapped else 1].append(call[2])
         if ident in overlapped:
             over_groups[(call[3], call[4])].append(call)
+    # Only local calls can establish that a local load sample describes the overlap.
+    local_events = Counter()
+    for call in ordered:
+        if local_counts[call]:
+            local_counts[call] -= 1
+            local_events[call[0]] += 1
+            local_events[call[1]] -= 1
+    local_counts = Counter(local_calls)
+    active, previous, local_intervals = 0, None, []
+    for stamp, delta in sorted(local_events.items()):
+        if active >= 2 and previous is not None:
+            local_intervals.append((previous, stamp))
+        active += delta
+        previous = stamp
+    local_starts = [start for start, _ in local_intervals]
+    local_ends = [end for _, end in local_intervals]
     contention = []
     for (signature, basis), (over, alone) in sorted(cohorts.items()):
         ratio = None
         if len(over) >= 3 and len(alone) >= 3 and statistics.median(alone) > 0:
             ratio = statistics.median(over) / statistics.median(alone)
         cohort = over_groups[(signature, basis)]
-        load = median_load_ratio(samples, [(c[0], c[1]) for c in cohort]) if cohort and not (Counter(cohort) - local_counts) else None
+        intervals = [(max(c[0], start), min(c[1], end)) for c in cohort
+                     for start, end in local_intervals[bisect_right(local_ends, c[0]):bisect_left(local_starts, c[1])]]
+        load = median_load_ratio(samples, intervals) if cohort and not (Counter(cohort) - local_counts) else None
         status = "insufficient" if ratio is None else "unconfirmed" if ratio >= 1.5 else "ok"
         if ratio is not None and ratio >= 1.5 and load is not None:
             status = "flagged" if load >= 0.8 else "ok"
@@ -1258,7 +1288,13 @@ def finalize_friction(state, thresholds, window):
         if name == "AskUserQuestion" and end >= start and not background:
             question_wait.append((end - start).total_seconds())
         sample = sample_data["events"].get(key) if name == "Bash" else None
-        comparable = sample is not None and abs(sample[0] - end.timestamp()) <= SAMPLE_JOIN_SECONDS
+        join_days = {(end + timedelta(seconds=offset)).astimezone(timezone.utc).date().isoformat()
+                     for offset in (-SAMPLE_JOIN_SECONDS, SAMPLE_JOIN_SECONDS)}
+        incomplete = name == "Bash" and bool(join_days.intersection(sample_data.get("skipped_days", ())))
+        if incomplete:
+            measured = None
+        comparable = (sample is not None and not incomplete
+                      and abs(sample[0] - end.timestamp()) <= SAMPLE_JOIN_SECONDS)
         if comparable and measured is not None and sample[1] is not None and abs(measured - sample[1]) > 0.001:
             comparable = False
         if comparable and measured is None:
@@ -1400,7 +1436,9 @@ def scan_claude(path, agent, since, data, seen_messages, project):
         if (friction is not None and row.get("type") == "system"
                 and row.get("subtype") == "informational" and not row.get("_before_window")):
             text = row.get("content")
-            if isinstance(text, str) and "usage limit" in text[:400].lower():
+            timestamp = row.get("timestamp")
+            stamp = friction_stamp(timestamp) if isinstance(timestamp, str) and len(timestamp) <= 40 else None
+            if stamp is not None and stamp <= friction["until"] and isinstance(text, str) and "usage limit" in text[:400].lower():
                 if len(friction["usage_limits"]) < FRICTION_PAIR_LIMIT:
                     friction["usage_limits"].add(tuple(str(row.get(key, ""))[:256]
                                                        for key in ("sessionId", "uuid", "timestamp")))
@@ -1614,18 +1652,22 @@ def cwd_of_file(path, limit=50):
     return None
 
 
-def cwd_matches(raw, targets, realpaths):
-    def canonical(path):
-        if path not in realpaths:
-            try:
-                realpaths[path] = os.path.normpath(os.path.realpath(path))
-            except (OSError, ValueError):
-                realpaths[path] = None
+def canonical_cwd(path, realpaths):
+    if path in realpaths:
         return realpaths[path]
+    try:
+        result = os.path.normpath(os.path.realpath(path))
+    except (OSError, ValueError):
+        result = None
+    if len(path) <= 4096 and (result is None or len(result) <= 4096) and len(realpaths) < 1024:
+        realpaths[path] = result
+    return result
 
+
+def cwd_matches(raw, targets, realpaths):
     if not isinstance(raw, str) or not os.path.isabs(raw) or "\0" in raw:
         return False
-    location = canonical(raw)
+    location = canonical_cwd(raw, realpaths)
     return location is not None and any(
         target is not None and os.path.commonpath((location, target)) == target
         for target in targets
@@ -1663,7 +1705,8 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                         admit=admit if cwd is not None else None):
             if "_codex_tool" in row:
                 kind, ident, observation = row["_codex_tool"]
-                if ident is None:
+                stamp = row["timestamp"]
+                if ident is None or (stamp is not None and stamp > friction["until"]):
                     continue
                 if ident not in pairs:
                     if len(pairs) >= FRICTION_PAIR_LIMIT:
@@ -1673,7 +1716,6 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                 pair = pairs[ident]
                 if pair is None:
                     continue
-                stamp = row["timestamp"]
                 if observation is None or stamp is None or stamp < since:
                     pairs[ident] = None
                     continue
@@ -1683,7 +1725,7 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                     location = turns.get(turn, current_cwd) if isinstance(turn, (str, tuple)) else current_cwd
                 if location is not None:
                     in_scope = cwd_matches(location, cwd or (), realpaths)
-                    location = realpaths.get(location) if isinstance(location, str) else None
+                    location = canonical_cwd(location, realpaths) if isinstance(location, str) else None
                     if location is None or (cwd is not None and not in_scope):
                         pairs[ident] = None
                         continue
@@ -1784,7 +1826,7 @@ def finish_codex_pairs(pairs, friction, session=None):
 
 
 def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=None, *,
-            friction=True, friction_thresholds=None, friction_window=None, samples_dir=None):
+            friction=True, friction_thresholds=None, friction_window=None, samples_dir=None, now=None):
     if cwd is not None:
         cwd = [os.path.normpath(os.path.realpath(path)) for path in cwd]
     data = dict(models=defaultdict(Counter), sessions=[], agents=defaultdict(list),
@@ -1794,6 +1836,7 @@ def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=No
     data["format_canary"] = defaultdict(Counter)
     if friction:
         data["_friction"] = dict(pairs={}, capped=False, since=since, usage_limits=set(),
+                                 until=now or datetime.now(timezone.utc),
                                  cwd=set(cwd or ()), permissions={}, warnings=data["warnings"], codex_calls=defaultdict(list),
                                  codex_signals=Counter(), codex_samples=0, timeline=[],
                                  samples=read_samples(samples_dir if samples_dir is not None else default_samples_dir(), since, data["warnings"]))
@@ -2469,7 +2512,7 @@ def report(data, out, scope):
     return "\n".join(lines + extra + ["<!-- token-audit-complete -->"]) + "\n", headline + headlines
 
 
-def write_extract(data, out, directory, scope):
+def write_extract(data, out, directory, scope, now=None):
     temporary = None
     try:
         directory = directory.expanduser().resolve()
@@ -2480,6 +2523,8 @@ def write_extract(data, out, directory, scope):
         friction = data.get("friction")
         if friction and (friction["summary"]["samples"] or friction["summary"]["capped"] or any(friction["signals"].values()) or friction["permission_acceptance"] or friction.get("host_load")):
             value["friction"] = friction
+            if now is not None and friction["permission_acceptance"]:
+                value["friction"] = dict(friction, audited_at=now.isoformat())
         with tempfile.NamedTemporaryFile(mode="w", dir=directory, delete=False) as stream:
             temporary = stream.name
             json.dump(value, stream)
@@ -2585,7 +2630,7 @@ def main():
                                                         policy="utc-now-floor-second")
         data = collect(projects, codex_root, since, pricing, pricing_error, options, cwd,
                        friction=not args.no_friction, friction_thresholds=friction_thresholds,
-                       friction_window=friction_window, samples_dir=args.samples_dir)
+                       friction_window=friction_window, samples_dir=args.samples_dir, now=now)
         data["cost"]["pricing_warning"] = pricing_age_warning(pricing, now)
         data["scope"] = scope
         apply_regression(data, out, scope, args.extract_out)
@@ -2596,7 +2641,7 @@ def main():
         if not args.no_write:
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(text)
-            extract_path = write_extract(data, out, args.extract_out, scope)
+            extract_path = write_extract(data, out, args.extract_out, scope, now)
         if args.json:
             print(json.dumps(dict(report_path=None if args.no_write else str(out), extract_path=extract_path, **data), indent=2))
         else:

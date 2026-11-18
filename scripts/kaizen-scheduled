@@ -626,8 +626,15 @@ GIT_LOCATION_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FIL
                     "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM")
 
 
-def _git(directory, *arguments):
-    environment = {name: value for name, value in os.environ.items() if name not in GIT_LOCATION_ENV}
+def _git(directory, *arguments, trusted_path=False):
+    if trusted_path:
+        environment = dict(PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", LC_ALL="C",
+                           GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0",
+                           GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1", GIT_ALLOW_PROTOCOL="")
+        arguments = tuple(arg for target in ("normal", "perf", "event")
+                          for arg in ("-c", f"trace2.{target}Target=")) + arguments
+    else:
+        environment = {name: value for name, value in os.environ.items() if name not in GIT_LOCATION_ENV}
     try:
         result = run_group(["git", "-C", str(directory), *arguments], capture_output=True,
                            env=environment, timeout=STEP_TIMEOUT)
@@ -833,12 +840,13 @@ def discover(claude_root, codex_root, index, project_dirs=None):
                 except (OSError, RuntimeError, ValueError):
                     uncertain = True
                     continue
-                if peer not in enrolled_peers and (peer / "docs/kaizen").is_dir():
+                if peer not in enrolled_peers:
                     peer_common = git_common_dir(peer)
                     if peer_common != common:
                         uncertain = uncertain or peer_common is None
                         continue
-                    enrolled_peers.add(peer)
+                    if (peer / "docs/kaizen").is_dir():
+                        enrolled_peers.add(peer)
                 peers[worktree] = peer
             main = peers.get(root)
             canonical = main if main in enrolled_peers else min(enrolled_peers)
@@ -1158,7 +1166,7 @@ def audit_command(options, out, project=None):
     if project is not None:
         for path in sorted(project.paths):
             command.extend(["--cwd", str(path)])
-        command.extend(["--days", "7"])
+        command.extend(["--days", "6"])
     extracts = out.parent.parent / "extracts" if project is not None else out / "extracts"
     return command + ["--out", str(out), "--pricing", str(options.pricing),
                       "--extract-out", str(extracts)]
