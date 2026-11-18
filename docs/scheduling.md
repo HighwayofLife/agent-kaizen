@@ -6,6 +6,8 @@
 | Per-project review (`kaizen-scheduled review`) | Weekly, when due | One headless Sonnet run per project |
 | Session notice | Session start | None |
 
+Scheduled reviews run only through Claude Code for now. On Codex CLI and Copilot, run the `cycle` skill by hand when the session notice appears.
+
 ## Session-start audits
 
 Claude Code starts the audit in the background at startup or resume. The hook
