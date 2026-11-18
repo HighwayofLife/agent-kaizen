@@ -146,6 +146,10 @@ def codex_fields(prefix, pos=0, wrapped=False):
 
 
 def envelope_timestamp(line):
+    # The usual envelope puts the timestamp first or just after type.
+    lead = re.match(rb'^\s*\{\s*(?:"type"\s*:\s*"[^"\\]*"\s*,\s*)?"timestamp"\s*:\s*"([^"\n]+)"', line)
+    if lead:
+        return lead[1].decode('ascii', 'replace')
     # Skip nested values and strings without decoding potentially huge outputs.
     depth, pos = 0, 0
     token = re.compile(rb'["{}\[\]]')
@@ -280,7 +284,7 @@ def codex_evidence(value):
 UNPARSED = object()
 
 
-def canary_row(line, since, counts, codex, session_version, output_type=None, row=UNPARSED, envelope_stamp=UNPARSED):
+def canary_row(line, since, counts, codex, session_version, output_type=None, row=UNPARSED, envelope_stamp=UNPARSED, nested_output=False):
     # Decode candidate records for classification; never retain their content.
     known = CODEX_TYPES if codex else CLAUDE_TYPES
     prefix = line[:1024] if codex else b""
@@ -288,6 +292,11 @@ def canary_row(line, since, counts, codex, session_version, output_type=None, ro
     # Large ordinary Codex response items are content, not usage records.
     # Their session metadata carries the version; avoid decoding their bodies.
     if output_type is not None or (match and match[1] == b"response_item" and not VERSION_FIELD.search(prefix)):
+        if output_type is not None and nested_output and not line[-64:].rstrip().endswith(b'}}') and not re.search(rb'}\s*}\s*$', line[-64:]):
+            try:
+                json.loads(line)
+            except (ValueError, RecursionError):
+                return session_version
         stamp = envelope_timestamp(line) if envelope_stamp is UNPARSED else envelope_stamp
         if stamp and (output_type is None or CODEX_OUTPUT_END.search(line[-64:])):
             try:
@@ -352,7 +361,7 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
     last_prefix, last_timestamp, last_stamp = None, None, None
     session_version = None
     try:
-        with (path.open("rb") if source is None else nullcontext(source)) as stream:
+        with (open_untrusted_transcript(path) if source is None else nullcontext(source)) as stream:
             first_row = None
             lines = stream
             if admit is not None:
@@ -384,7 +393,7 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                                     decoded = json.loads(line)
                                 session_version = canary_row(line, since, canary, keep_model, session_version,
                                                              output_type, decoded,
-                                                             tool_stamp if tool else UNPARSED)
+                                                             tool_stamp if tool else UNPARSED, bool(tool and tool[0] == b"response_item"))
                         except (ValueError, TypeError, OverflowError, RecursionError):
                             pass
                 if (bounds is not None and last_stamp is not None and last_prefix is not None and line.startswith(last_prefix)
@@ -436,6 +445,12 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                     timestamp = last_timestamp
                 else:
                     match = TIMESTAMP.search(line)
+                    if keep_signals and match and (b'"tool_use"' in line or b'"tool_result"' in line):
+                        outer = envelope_timestamp(line)
+                        if outer is None:
+                            match = None
+                        else:
+                            timestamp = outer
                     if not match:
                         if keep_signals and (b'"tool_use"' in line or b'"tool_result"' in line):
                             warnings["malformed rows"] += 1
@@ -446,7 +461,8 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                             except (ValueError, RecursionError):
                                 pass
                         continue
-                    timestamp = match[1].decode("ascii", "replace")
+                    if not (keep_signals and (b'"tool_use"' in line or b'"tool_result"' in line)):
+                        timestamp = match[1].decode("ascii", "replace")
                 try:
                     old = (timestamp[:19] < cutoff if timestamp.endswith(("Z", "+00:00"))
                            else date_time(timestamp) < since)
@@ -497,7 +513,7 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                         yield row
                 except (ValueError, TypeError, UnicodeError):
                     warnings["malformed rows"] += 1
-    except OSError:
+    except (OSError, ValueError):
         warnings["unreadable files"] += 1
 
 
@@ -1889,8 +1905,6 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                 try:
                     source = open_untrusted_transcript(path)
                 except (OSError, ValueError):
-                    if cwd is None:
-                        data["warnings"]["unsafe permission transcript"] += 1
                     return
         with (source if source is not None else nullcontext()):
             yield from rows(path, since, data["warnings"], keep_model=True, bounds=bounds,
@@ -2284,7 +2298,7 @@ def add_unscanned_tools(data, scanned, since):
                 continue
             # Only parse potential tool-use records from unscanned files.
             try:
-                with path.open("rb") as stream:
+                with open_untrusted_transcript(path) as stream:
                     for line in stream:
                         if b'"tool_use"' not in line:
                             continue
@@ -2978,7 +2992,7 @@ def main():
                     print("token-audit: could not authenticate regression evidence", file=sys.stderr)
         text, headline = report(data, out, scope, binding, extract_mac)
         if not args.no_write:
-            out.write_text(text)
+            out.write_text(text, encoding="utf-8")
         if args.json:
             print(json.dumps(dict(report_path=None if args.no_write else str(out), extract_path=extract_path, **data), indent=2))
         else:

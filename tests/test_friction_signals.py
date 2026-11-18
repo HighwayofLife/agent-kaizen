@@ -43,9 +43,30 @@ class SignedTranscriptTests(SecurityCase):
         for path in (self.cfg / 'projects/fixture/pipe.jsonl', self.cx / 'sessions/2025/01/01/pipe.jsonl'):
             path.parent.mkdir(parents=True, exist_ok=True)
             os.mkfifo(path)
-        result = subprocess.run([sys.executable, str(Path(AUDIT['__file__'])), '--json'],
+        for flags in ([], ['--no-friction']):
+            result = subprocess.run([sys.executable, str(Path(AUDIT['__file__'])), '--json', *flags],
+                                    cwd=self.work, env=self.env, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if not flags:
+                self.assertEqual(json.loads(result.stdout)['warnings']['unsafe permission transcript'], 2)
+
+    def test_report_writes_utf8_with_legacy_locale(self):
+        import subprocess
+        import sys
+        wrapper = """import pathlib, runpy, sys
+original = pathlib.Path.write_text
+def checked(self, data, *args, **kwargs):
+    if self.suffix == '.md' and kwargs.get('encoding') != 'utf-8':
+        raise AssertionError('report encoding must be UTF-8')
+    return original(self, data, *args, **kwargs)
+pathlib.Path.write_text = checked
+sys.argv = [sys.argv[1], '--json']
+runpy.run_path(sys.argv[0], run_name='__main__')
+"""
+        result = subprocess.run([sys.executable, '-c', wrapper, str(Path(AUDIT['__file__']))],
                                 cwd=self.work, env=self.env, capture_output=True, text=True, timeout=5)
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('≥', Path(json.loads(result.stdout)['report_path']).read_text(encoding='utf-8'))
 
     def test_darwin_deny_acl_is_safe_but_allow_acl_is_not(self):
         import os
@@ -211,6 +232,7 @@ class FrictionSignalTests(FrictionClaudeTests):
         yes = end('conflict', 2, cwd=root, permissionDecision=dict(source='user', decision='accept'), toolUseResult=dict(durationMs=1000))
         no = end('conflict', 2, cwd=root, permissionDecision=dict(source='user', decision='reject'))
         del no['timestamp']
+        no['nested'] = {'timestamp': '2020-01-01T00:00:00Z'}
         jsonl(self.session, [start('conflict', 0, 'ls', cwd=root), yes, no])
         evidence = self.collect(cwd=[root])['friction']['permission_acceptance'][0]
         self.assertEqual((evidence['accepted'], evidence['ambiguous']), (0, 1))

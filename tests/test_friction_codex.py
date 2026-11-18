@@ -78,6 +78,13 @@ class FrictionCodexTests(unittest.TestCase):
         self.assertEqual(data['friction']['summary']['measured'], 1)
         self.assertEqual(data['format_canary']['1.2.3']['records'], 2)
 
+    def test_truncated_numeric_output_is_not_canary_coverage(self):
+        jsonl(self.rollout, [self.meta])
+        with self.rollout.open('ab') as stream:
+            stream.write(json.dumps(result('one', exit_code=0)).encode()[:-1] + b'\n')
+        data = self.collect(cwd=[self.work])
+        self.assertEqual(data['format_canary'].get('1.2.3', {}).get('records', 0), 0)
+
     def test_envelope_timestamp_after_large_payload(self):
         last = result('one', output='Wall time: 10 seconds\nOutput:\n' + 'x' * 5000)
         last = dict(type=last['type'], payload=last['payload'], timestamp=last['timestamp'])
