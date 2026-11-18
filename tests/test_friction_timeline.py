@@ -7,6 +7,7 @@ from pathlib import Path
 import tempfile
 import tracemalloc
 import unittest
+from unittest.mock import patch
 
 import test_friction_claude as claude
 from test_friction_claude import AUDIT, start, end
@@ -61,6 +62,14 @@ class TimelineTests(unittest.TestCase):
         finally:
             tracemalloc.stop()
         self.assertLess(peak, 4 * 1024 * 1024)
+
+    def test_contention_uses_binary_search_for_each_cohort(self):
+        import bisect
+        calls = [call(i * 100, i * 100 + 60, signature=str(i))
+                 for i in range(400) for _ in range(3)]
+        with patch.object(bisect, 'bisect_right', wraps=bisect.bisect_right) as search:
+            AUDIT['heavy_timeline'](calls, THRESHOLDS, (), calls)
+        self.assertEqual(search.call_count, 400)
 
     def test_long_turn_cwds_do_not_accumulate(self):
         from test_friction_codex import row

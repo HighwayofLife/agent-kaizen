@@ -72,7 +72,8 @@ def compare_flags(project, window, thresholds, basis, flags, acknowledged):
         if (type(value) not in (int, float) or value <= 0
                 or (isinstance(value, float) and not math.isfinite(value))):
             raise ValueError("invalid flag value")
-        ident = json.dumps([flag["id"], flag["subject"]], ensure_ascii=True, separators=(",", ":"))
+        ident = json.dumps([flag["id"], flag["subject"], flag.get("basis", "unconfirmed")],
+                           ensure_ascii=True, separators=(",", ":"))
         bucket = math.floor(math.log2(value))
         previous = old.get(ident)
         if previous is not None and type(previous) is not int:
@@ -270,6 +271,11 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
     catalog_data = _json(catalog_raw, host)
     catalog = {row["id"]: row for row in catalog_data["actions"]}
     with host["_directory"](store.friction, True, private=True) as directory, host["_locked"](directory, "prepare"):
+        if _check is not None:
+            live_cfg = canonical_project.__globals__["effective"](project.canonical)
+            current = max(current, datetime.now(timezone.utc))
+            if live_cfg != cfg or live_cfg["enabled"]["value"] is False or live_cfg["friction"]["value"] == "off":
+                raise ValueError("friction policy changed during reconciliation")
         state_name = "prepare-" + project.key + ".json"
         try:
             state = _json(host["_read"](directory, state_name, LIMIT), host)
@@ -334,8 +340,20 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
                 except (ValueError, OSError):
                     if finding["id"] != "indexed-output":
                         raise
-                    warnings.warn("dropping indexed-output finding with invalid selector")
-                    continue
+                    try:
+                        raw = Path(selector)
+                        anchor = max((p for p in project.anchors if p == raw or p in raw.parents),
+                                     key=lambda p: len(p.parts))
+                        resolved = raw.resolve(strict=True)
+                        if resolved != anchor and anchor not in resolved.parents:
+                            raise ValueError("selector escapes worktree")
+                        target = project.canonical / resolved.relative_to(anchor)
+                        mapped = target.resolve()
+                        if mapped != project.canonical and project.canonical not in mapped.parents:
+                            raise ValueError("selector escapes canonical project")
+                    except (ValueError, OSError):
+                        warnings.warn("dropping indexed-output finding with invalid selector")
+                        continue
                 selector = str(target)
                 if finding["id"] == "sprawl" and target != project.canonical:
                     raise ValueError("invalid sprawl selector")
@@ -344,7 +362,8 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
                     for row in probe["regenerable_dirs"]:
                         try:
                             if (isinstance(row, dict) and isinstance(row.get("path"), str)
-                                    and canonical_project(project.canonical, selector=row["path"])[1] == target
+                                    and (row["path"] == finding["subject"]
+                                         or canonical_project(project.canonical, selector=row["path"])[1] == target)
                                     and row.get("size_bytes") == finding["evidence"].get("size_bytes")):
                                 matched = True
                                 break
@@ -372,7 +391,16 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
                     or old.get("status") in ("open", "done") and old.get("evidence") == evidence):
                 continue
             if ident in allowed:
-                raise ValueError("duplicate candidate identity")
+                existing = allowed[ident]
+                provenance = existing["provenance"]
+                if not isinstance(provenance, list):
+                    provenance = [provenance]
+                provenance.append(finding)
+                existing["provenance"] = provenance
+                if sum(finding["evidence"].values()) > sum(json.loads(existing["evidence"]).values()):
+                    existing["evidence"] = evidence
+                    next(action for action in actions if action["id"] == ident)["evidence"] = list(finding["evidence"].values())
+                continue
             allowed[ident] = dict(canonical_project=str(project.canonical), catalog_id=entry["id"],
                                  selector_key=selector, evidence=evidence,
                                  intents=(["suggest", "apply"] if not interactive and mode == "auto"
