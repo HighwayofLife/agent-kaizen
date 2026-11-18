@@ -2,6 +2,42 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.12.0 (2026-11-17)
+
+Codex CLI and GitHub Copilot support: the same plugin installs on Codex CLI and the Copilot runtime. Claude Code behaviour is unchanged.
+
+`host support`:
+
+- GitHub Copilot support is experimental and has not been checked in a live session; Copilot usage is not measured yet.
+
+`skills/*/agents/openai.yaml`:
+
+- Codex no longer lists every skill on every turn: each skill ships agents/openai.yaml with implicit invocation off.
+
+`docs/hosts.md`, `docs/autonomy.md`:
+
+- New docs/hosts.md maps Claude Code, Codex CLI and the Copilot runtime (install, invocation, which features work); on non-Claude hosts, changes to the host's own settings, hooks and agent files stay proposals in every autonomy mode.
+
+`skills`:
+
+- Every skill starts with a two-line plugin-root note and a pointer to docs/hosts.md, so Codex and Copilot find the bundled scripts; Claude Code reads the same text as a plain path.
+
+`hooks`:
+
+- Hooks are host-aware: on Codex the notice says $agent-kaizen:review, on Copilot output uses top-level additionalContext, the Bash-burst nudge also accepts the lowercase bash tool name on Copilot, and the background audit detaches itself on Copilot. Claude Code output is unchanged. Codex users must trust the plugin hooks in /hooks, and trust is asked again after an update that changes a hook script.
+
+`kaizen-doctor`, `kaizen-scan`, `token-audit`:
+
+- kaizen-doctor reports whether the plugin is installed for Claude Code, Codex and Copilot and gives each host its own fix; on a machine without Claude Code it no longer suggests claude commands. kaizen-scan and token-audit say when Copilot sessions exist but are not measured yet.
+- kaizen-doctor describes Codex versions as cached and lists other cached versions when present.
+
+`README`, `plugin.json`:
+
+- The README quick start has install steps for Codex CLI (tested on 0.167.0) and, marked experimental, for Copilot CLI and VS Code with the Copilot harness, plus a table of what works on each host.
+- The plugin and marketplace descriptions now mention Codex CLI and GitHub Copilot support.
+
+Updating on Codex: run `/hooks` again and trust the changed hooks; hooks do nothing until you do.
+
 ## 0.11.0 (2026-11-17)
 
 First-five-minutes loop: a no-write first scan, a doctor, hook-driven audits, cache-write explanations, a regression sentinel and an opt-in agent tier guard.
