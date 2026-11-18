@@ -166,6 +166,7 @@ class DispatchStatusTests(StubCase):
             (self.work / 'new').write_text('new')
             rows = facts.read_facts(self.work, status)
             self.assertFalse(rows[0]['clean'])
+            self.git('update-index', '--no-assume-unchanged', 'task.md')
             self.git('config', 'filter.fixture.clean', 'touch ' + str(self.root / 'executed'))
             (self.work / '.gitattributes').write_text('task.md filter=fixture\n')
             (self.work / 'task.md').write_text('changed')
@@ -178,6 +179,49 @@ class DispatchStatusTests(StubCase):
             subprocess.run(['git', 'init', '-q', str(other)], check=True)
             rows = facts.read_facts(self.work, status)
             self.assertIsNone(rows[1]['clean'])
+
+    def test_facts_command_does_not_use_path_git_or_run_filters(self):
+        wrapper = self.bin / 'git'
+        wrapper.write_text('#!/bin/sh\ntouch "' + str(self.root / 'path-git') + '"\nexit 1\n')
+        wrapper.chmod(0o755)
+        subprocess.run([shutil.which('git'), '-C', str(self.work), 'config',
+                        'filter.fixture.clean', 'touch ' + str(self.root / 'filter-ran')], check=True)
+        (self.work / '.gitattributes').write_text('task.md filter=fixture\n')
+        (self.work / 'task.md').write_text('changed')
+        self.run_script('dispatch-status', '--worktree-facts', self.work)
+        self.assertFalse((self.root / 'path-git').exists())
+        self.assertFalse((self.root / 'filter-ran').exists())
+
+    def test_uninitialized_submodule_does_not_hide_other_dirt(self):
+        tip = self.git('rev-parse', 'HEAD').stdout.strip()
+        self.git('update-index', '--add', '--cacheinfo', f'160000,{tip},sub')
+        self.git('commit', '-qm', 'gitlink')
+        (self.work / 'task.md').write_text('changed')
+        self.assertIn('clean=false', self.run_script('dispatch-status', '--worktree-facts', self.work).stdout)
+
+    def test_submodule_symlink_loop_does_not_abort(self):
+        tip = self.git('rev-parse', 'HEAD').stdout.strip()
+        self.git('update-index', '--add', '--cacheinfo', f'160000,{tip},sub')
+        (self.work / 'sub').symlink_to('sub')
+        self.assertIn('clean=unknown', self.run_script('dispatch-status', '--worktree-facts', self.work).stdout)
+
+    def test_replaced_primary_does_not_supply_cleanliness(self):
+        other = self.root / 'linked'
+        self.git('worktree', 'add', '-qb', 'topic', str(other))
+        replacement = self.root / 'replacement'
+        subprocess.run(['git', 'clone', '-q', str(self.work), str(replacement)], check=True)
+        script_dir = str(Path(__file__).resolve().parents[1] / 'scripts')
+        with patch.object(sys, 'path', [script_dir, *sys.path]):
+            import kaizen_worktree_facts as facts
+            records = facts.records
+            def stale_primary(run, directory):
+                entries = records(run, directory)
+                entries[0][b'worktree'] = os.fsencode(replacement)
+                return entries
+            with patch.object(facts, 'records', side_effect=stale_primary):
+                rows = facts.read_facts(other, lambda run, path: run(path, 'status', '--porcelain'))
+        self.assertIsNone(rows[0]['clean'])
+        self.assertTrue(rows[1]['clean'])
 
     def test_detached_and_unmerged(self):
         other = self.root / 'linked'

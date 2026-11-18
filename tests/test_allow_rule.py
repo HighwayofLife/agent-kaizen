@@ -447,6 +447,20 @@ class AllowRuleTests(SecurityCase):
                 self.extract(self.row(literal="ls -a"))
                 self.assertEqual(tool(self.repo, "ls -a")["status"], "applied")
 
+    def test_editor_added_pending_grant_is_not_adopted(self):
+        tool = self.transaction()
+        state = tool.__globals__
+        action = self.broker_action(self.repo, "ls")
+        with patch.dict(state, write_effect=lambda *_: (_ for _ in ()).throw(OSError("interrupted"))):
+            with self.assertRaises(OSError):
+                tool(self.repo, "ls", action_id=action)
+        self.target.write_text('{"permissions":{"allow":["Bash(ls)"]}}')
+        with self.assertRaises(state["Refused"]):
+            tool(self.repo, "ls", action_id=action)
+        with self.assertRaises(state["Refused"]):
+            tool(self.repo, record=action)
+        self.assertIn("Bash(ls)", self.target.read_text())
+
     def test_recover_published_grant_after_editor_change(self):
         tool = self.transaction()
         state = tool.__globals__

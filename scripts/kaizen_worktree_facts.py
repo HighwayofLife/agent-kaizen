@@ -225,8 +225,14 @@ def safe_status_config(run, path, depth=0):
             header, sep, name = item.partition(b'\t')
             if not sep or not name or b'..' in name.split(b'/'):
                 return False
-            child = (path / os.fsdecode(name)).resolve()
             try:
+                child = (path / os.fsdecode(name)).resolve()
+                if not child.exists():
+                    continue
+                if child.is_dir() and not os.path.lexists(child / '.git'):
+                    with os.scandir(child) as entries:
+                        if next(entries, None) is None:
+                            continue
                 dirs = repository_dirs(child)
                 if not child.is_relative_to(path) or not dirs or dirs[0] != child:
                     return False
@@ -274,10 +280,10 @@ def read_facts(directory, read_status):
         # Verify the registration still points to this repository before status.
         try:
             dirs = repository_dirs(path)
-            primary_dirs = repository_dirs(Path(os.fsdecode(primary[b'worktree'])).resolve())
-            same_repo = (dirs and primary_dirs and dirs[0] == path
+            source_dirs = repository_dirs(Path(directory).resolve())
+            same_repo = (dirs and source_dirs and dirs[0] == path
                          and file_id(dirs[2 if len(dirs) > 2 else 1].stat())
-                         == file_id(primary_dirs[2 if len(primary_dirs) > 2 else 1].stat()))
+                         == file_id(source_dirs[2 if len(source_dirs) > 2 else 1].stat()))
         except (OSError, ValueError, RuntimeError, IndexError):
             same_repo = False
         if same_repo:

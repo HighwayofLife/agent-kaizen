@@ -698,9 +698,20 @@ def publication_recorded(settings, pending, before):
     after = pending["after"]
     temporary = pending["temp"]
     if temporary:
-        if after is None or before[0] is None or before[0][:3] != after[0]:
+        if after is None:
             return False
         parked_name = temporary
+        parked = named_version(settings, parked_name)
+        if parked is None and pending["before"][0] is None:
+            return True  # Creation consumed the staged file.
+        if parked is not None:
+            try:
+                if effect_id(*snapshot(settings, parked_name)) == pending["before"][1]:
+                    return True
+            except (OSError, ValueError, Refused):
+                pass
+        if before[0] is None or before[0][:3] != after[0]:
+            return False
     else:
         if before[0] is not None or not pending.get("backup"):
             return False
@@ -744,7 +755,12 @@ def update_rule(settings, path, entry, records, ident, root, rule, undo, action_
         published = publication_recorded(settings, pending, before)
         # An editor can replace the published inode before the receipt is
         # durable. Keep a managed undo record whenever the exact grant remains.
-        if (pending["undo"] and not count) or (not pending["undo"] and count):
+        if not pending["undo"] and count and not published:
+            cancel_pending(settings, entry, records, save)
+            if same_request:
+                raise Refused("pending grant cancelled because publication was not verified")
+            pending = None
+        elif (pending["undo"] and not count) or (not pending["undo"] and count):
             remove_stage(settings, pending["temp"] or pending.get("backup"),
                          pending["before"][1] if published else pending["after"])
             os.fsync(settings)

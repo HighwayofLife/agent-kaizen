@@ -87,24 +87,27 @@ def main():
         status = [line for line in latest.read_text(errors='replace').splitlines() if line.startswith('STATUS:')]
         print(f'{root}: {status[-1] if status else "STATUS: unknown"} ({latest})')
     print('\nDIRTY WORKTREES (uncommitted paths outside out/, newest change age)')
-    directories = args.directories or worktrees(Path.cwd())
-    seen = set()
-    for directory in directories:
-        root = directory.expanduser().resolve()
-        # Status paths are relative to Git's repository root.
-        result = git(root, 'rev-parse', '--show-toplevel')
-        if result and result.returncode == 0:
-            root = Path(os.fsdecode(result.stdout.rstrip(b'\n'))).resolve()
-        if root in seen:
-            continue
-        seen.add(root)
-        row = dirty_row(root)
-        if row:
-            print(row)
+    if args.worktree_facts:
+        print('Unavailable in advisory mode')
+    else:
+        directories = args.directories or worktrees(Path.cwd())
+        seen = set()
+        for directory in directories:
+            root = directory.expanduser().resolve()
+            # Status paths are relative to Git's repository root.
+            result = git(root, 'rev-parse', '--show-toplevel')
+            if result and result.returncode == 0:
+                root = Path(os.fsdecode(result.stdout.rstrip(b'\n'))).resolve()
+            if root in seen:
+                continue
+            seen.add(root)
+            row = dirty_row(root)
+            if row:
+                print(row)
     if args.worktree_facts:
         print('\nWORKTREE FACTS (advisory)')
         try:
-            from kaizen_worktree_facts import read_facts
+            from kaizen_worktree_facts import read_facts, repository_dirs
         except ImportError:
             print('Worktree facts unavailable')
         else:
@@ -117,9 +120,12 @@ def main():
                 selected = None
                 if args.directories:
                     selected = directory.expanduser().resolve()
-                    result = git(selected, 'rev-parse', '--show-toplevel')
-                    if result and result.returncode == 0:
-                        selected = Path(os.fsdecode(result.stdout.rstrip(b'\n'))).resolve()
+                    try:
+                        roots = repository_dirs(selected)
+                        if roots:
+                            selected = roots[0]
+                    except (OSError, ValueError, RuntimeError):
+                        pass
                 for fact in facts:
                     if (selected is not None and fact['path'] != selected) or fact['path'] in shown:
                         continue
