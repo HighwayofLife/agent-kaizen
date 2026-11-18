@@ -2,6 +2,7 @@
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -21,11 +22,12 @@ class AllowRuleTests(SecurityCase):
         self.repo = self.project("enrolled")
         self.target = self.repo / ".claude/settings.local.json"
         self.extracts = self.cfg / "audits/extracts"
+        self.secret = None
 
     def install(self):
         self.run_script("kaizen-link", "--apply", "--mode", "copy", "--only",
                         "kaizen-allow-rule,kaizen-scheduled,kaizen_credentials.py,"
-                        "kaizen_worktree_facts.py,kaizen-backup,notes-ledger")
+                        "kaizen_worktree_facts.py,kaizen_friction_actions.py,kaizen-backup,notes-ledger")
         return self.cfg / "bin"
 
     def row(self, accepted=10, denied=0, ambiguous=0, literal="ls", root=None):
@@ -41,6 +43,10 @@ class AllowRuleTests(SecurityCase):
                                   summary=dict(capped=False),
                                   permission_acceptance=list(rows)))
         data.update(updates)
+        if self.secret is not None:
+            payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("ascii")
+            data["allow_rule_mac"] = hmac.digest(self.secret, b"allow-rule-extract-v1\0" + payload, "sha256").hex()
+        self.extracts.mkdir(mode=0o700, parents=True, exist_ok=True)
         return write(self.extracts / (name + ".extract.json"), json.dumps(data))
 
     def add(self, literal="ls", project=None, code=0):
@@ -115,7 +121,7 @@ class AllowRuleTests(SecurityCase):
         denial = self.extract(self.row(denied=1), name="denial")
         self.add(code=2)
         legacy = self.cfg / "audits/projects" / self.runner.key(self.repo)
-        legacy.mkdir(parents=True)
+        legacy.mkdir(mode=0o700, parents=True)
         denial.rename(legacy / denial.name)
         self.add(code=2)
 
@@ -172,6 +178,8 @@ class AllowRuleTests(SecurityCase):
         self.assertFalse((linked / ".claude").exists())
 
     def test_p05_distinct_acceptances_from_synthetic_transcript(self):
+        report_dir = self.cfg / "audits/projects" / self.runner.key(self.repo)
+        report_dir.mkdir(mode=0o755, parents=True)
         now = datetime.now(timezone.utc) - timedelta(minutes=1)
         events = []
         for i in range(10):
@@ -191,6 +199,13 @@ class AllowRuleTests(SecurityCase):
         self.assertIn("--days 6", self.add(code=2).stderr)
         self.run_script("token-audit", "--cwd", self.repo)
         self.assertEqual(json.loads(self.add().stdout)["accepted"], 10)
+        extract = max(self.extracts.glob("*.extract.json"))
+        self.assertIn("allow_rule_mac", json.loads(extract.read_bytes()))
+        report_dir.chmod(0o700)
+        self.run_script("token-audit", "--cwd", self.repo, "--extract-out", report_dir)
+        legacy, = report_dir.glob("*.extract.json")
+        self.assertIn("allow_rule_mac", json.loads(legacy.read_bytes()))
+        self.assertEqual(json.loads(self.add().stdout)["accepted"], 10)
         future = (datetime.now(timezone.utc) + timedelta(hours=1)).isoformat()
         jsonl(session, [dict(event, timestamp=future) for event in events])
         self.run_script("token-audit", "--cwd", self.repo)
@@ -203,18 +218,52 @@ class AllowRuleTests(SecurityCase):
                         patch.dict(os.environ, KAIZEN_HOST="claude")):
             enabled.start()
             self.addCleanup(enabled.stop)
+        lib = runpy.run_path(str(SCRIPTS / "kaizen_friction_actions.py"))
+        store = lib["HostActions"](self.cfg / "audits", self.cfg / "kaizen-backups", None, None)
+        self.secret = store._secret(create=True)
         self.extract(self.row(), self.row(literal="ls -a"))
         return tool
 
+    def broker_action(self, project, literal):
+        ident = runpy.run_path(str(SCRIPTS / "kaizen_friction_actions.py"))["_id"]
+        scope = json.dumps([literal, str(project)], separators=(",", ":"))
+        return ident(self.secret, str(project), "allow-rule", scope)
+
+    def test_extract_requires_private_stores_ancestors_and_files(self):
+        extract = self.extract(self.row())
+        for path, unsafe in ((self.extracts, 0o755), (self.cfg / "audits", 0o777), (extract, 0o666)):
+            with self.subTest(path=path.name):
+                mode = path.stat().st_mode & 0o777
+                path.chmod(unsafe)
+                try:
+                    self.assertIn("unsafe", self.add(code=2).stderr)
+                finally:
+                    path.chmod(mode)
+        moved = self.extracts.rename(self.cfg / "moved")
+        self.extracts.symlink_to(moved, target_is_directory=True)
+        self.assertIn("unsafe", self.add(code=2).stderr)
+
+    def test_settings_write_requires_authentic_extract(self):
+        tool = self.transaction()
+        path = self.extracts / "fixture.extract.json"
+        signed = path.read_bytes()
+        for tamper in (lambda data: data.pop("allow_rule_mac"),
+                       lambda data: data["friction"]["permission_acceptance"][0].update(accepted=999)):
+            data = json.loads(signed)
+            tamper(data)
+            path.write_text(json.dumps(data))
+            with self.assertRaisesRegex(tool.__globals__["Refused"], "authentication"):
+                tool(self.repo, "ls")
+            self.assertFalse(self.target.exists())
+        path.write_bytes(signed)
+        self.assertEqual(tool(self.repo, "ls")["status"], "applied")
+
     def test_managed_undo_preserves_user_settings_and_existing_rules(self):
         tool = self.transaction()
-        original = dict(permissions=dict(allow=["Bash(ls -l)"], deny=["Bash(rm:*)"]))
+        original = dict(permissions=dict(allow=["Bash(ls -l)"], deny=["Bash(rm:*)"]), other=7)
         write(self.target, json.dumps(original))
         first = tool(self.repo, "ls")["record"]
         second = tool(self.repo, "ls -a")["record"]
-        data = json.loads(self.target.read_bytes())
-        data["other"] = original["other"] = 7
-        self.target.write_text(json.dumps(data))
         tool(self.repo, record=first)
         tool(self.repo, record=second)
         self.assertEqual(json.loads(self.target.read_bytes()), original)
@@ -227,6 +276,32 @@ class AllowRuleTests(SecurityCase):
         self.target.write_text(json.dumps(data))
         tool(self.repo, record=first)
         self.assertEqual(json.loads(self.target.read_bytes()), data)
+
+    def test_revoke_then_readd_identical_bytes_survives_undo(self):
+        tool = self.transaction()
+        record = tool(self.repo, "ls")["record"]
+        granted = self.target.read_bytes()
+        self.target.write_text('{"permissions":{"allow":[]}}')
+        self.target.write_bytes(granted)
+        with self.assertRaisesRegex(tool.__globals__["Refused"], "ownership"):
+            tool(self.repo, record=record)
+        self.assertEqual(self.target.read_bytes(), granted)
+
+    def test_edited_tool_created_file_is_preserved(self):
+        tool = self.transaction()
+        for created in (True, False):
+            with self.subTest(created=created):
+                if not created:
+                    self.target.unlink()
+                    tool(self.repo, record=record)
+                    write(self.target, '{"unrelated":1}')
+                record = tool(self.repo, "ls")["record"]
+                edited = (' { "permissions" : { "allow" : [ "Bash(ls)" ] } }\n' if created
+                          else '{"permissions":{"allow":["Bash(ls)"]},"userSetting":true}')
+                self.target.write_text(edited)
+                with self.assertRaisesRegex(tool.__globals__["Refused"], "ownership"):
+                    tool(self.repo, record=record)
+                self.assertEqual(self.target.read_text(), edited)
 
     def test_creation_revocation_and_replacement(self):
         tool = self.transaction()
@@ -249,7 +324,7 @@ class AllowRuleTests(SecurityCase):
     def test_interrupted_broker_transaction_reconciles_only_its_own_key(self):
         tool = self.transaction()
         state = tool.__globals__
-        action = "fa1_" + "a" * 64
+        action = self.broker_action(self.repo, "ls")
         def interrupt_stage(directory, name, *_):
             fd = os.open(name, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600, dir_fd=directory)
             os.close(fd)
@@ -284,6 +359,55 @@ class AllowRuleTests(SecurityCase):
             tool(self.repo, record=action)
         self.assertFalse(self.target.exists())
         self.assertEqual(tool(self.repo, record=action)["status"], "undone")
+
+    def test_first_broker_use_requires_matching_prepared_identity(self):
+        tool = self.transaction()
+        for action in (self.broker_action(self.project("other"), "ls"),
+                       self.broker_action(self.repo, "ls -a"), "fa1_" + "a" * 64):
+            with self.subTest(action=action), self.assertRaisesRegex(tool.__globals__["Refused"], "binding"):
+                tool(self.repo, "ls", action_id=action)
+            self.assertFalse(self.target.exists())
+        self.assertEqual(tool(self.repo, "ls", action_id=self.broker_action(self.repo, "ls"))["status"], "applied")
+
+    def test_stale_pending_grant_cancels_and_unblocks_undo(self):
+        def interrupt(*_):
+            raise OSError("fixture interruption before settings publication")
+
+        for change in ("settings", "evidence", "denial", "clock"):
+            with self.subTest(change=change):
+                self.repo = self.project(change)
+                self.target = self.repo / ".claude/settings.local.json"
+                tool = self.transaction()
+                state = tool.__globals__
+                first = tool(self.repo, "ls")["record"]
+                action = self.broker_action(self.repo, "ls -a")
+                with patch.dict(state, write_effect=interrupt), self.assertRaises(OSError):
+                    tool(self.repo, "ls -a", action_id=action)
+                staged, = self.target.parent.glob("settings.kaizen-*.json")
+                stamp = datetime.now(timezone.utc)
+                if change == "settings":
+                    self.target.rename(self.target.with_name("parked"))
+                    self.target.write_text('{"userSetting":true}')
+                elif change == "evidence":
+                    self.extract(self.row(), self.row(literal="ls -a"))
+                elif change == "denial":
+                    self.extract(self.row(), self.row(denied=1, literal="ls -a"))
+                else:
+                    stamp += timedelta(days=6, seconds=1)
+                with patch.dict(state, datetime=type("AuditClock", (datetime,), {
+                        "now": staticmethod(lambda tz: stamp)})):
+                    if change == "settings":
+                        with self.assertRaisesRegex(state["Refused"], "cancelled"):
+                            tool(self.repo, "ls -a", action_id=action)
+                        self.assertEqual(self.target.read_text(), '{"userSetting":true}')
+                        self.assertEqual(tool(self.repo, record=first)["status"], "undone")
+                    else:
+                        self.assertEqual(tool(self.repo, record=first)["status"], "undone")
+                self.assertFalse(staged.exists())
+                journal = self.cfg / "kaizen-backups/friction/allow-rules.json"
+                self.assertEqual(json.loads(journal.read_bytes())["records"][action][2], "cancelled")
+                self.extract(self.row(literal="ls -a"))
+                self.assertEqual(tool(self.repo, "ls -a")["status"], "applied")
 
     def test_journal_loss_or_forgery_never_adopts_existing_permission(self):
         tool = self.transaction()
@@ -326,6 +450,53 @@ class AllowRuleTests(SecurityCase):
         with patch.dict(state, stage=change), self.assertRaises(state["Refused"]):
             tool(self.repo, "ls")
         self.assertFalse(self.target.exists())
+
+    def test_last_settings_check_preserves_concurrent_editor_bytes(self):
+        tool = self.transaction()
+        state = tool.__globals__
+        write(self.target, '{"userSetting":1}')
+        snapshot = state["snapshot"]
+        publish = state["write_effect"]
+
+        def race(directory, name=self.target.name):
+            verified = snapshot(directory, name)
+            if name == self.target.name:
+                self.target.write_text('{"userSetting":2}')
+            return verified
+
+        def interrupted_publication(*args):
+            with patch.dict(state, snapshot=race):
+                publish(*args)
+
+        with patch.dict(state, write_effect=interrupted_publication), self.assertRaises(state["Refused"]):
+            tool(self.repo, "ls")
+        self.assertEqual(self.target.read_text(), '{"userSetting":2}')
+
+    def test_last_staged_check_rejects_name_swap(self):
+        tool = self.transaction()
+        state = tool.__globals__
+        snapshot = state["snapshot"]
+        publish = state["write_effect"]
+
+        def swap(directory, name=self.target.name):
+            verified = snapshot(directory, name)
+            if name == self.target.name:
+                staged, = self.target.parent.glob("settings.kaizen-*.json")
+                staged.rename(staged.with_name("parked"))
+                staged.write_text('{"permissions":{"allow":["Bash(*)"]}}')
+            return verified
+
+        def interrupted_publication(*args):
+            with patch.dict(state, snapshot=swap):
+                publish(*args)
+
+        with patch.dict(state, write_effect=interrupted_publication), self.assertRaises(state["Refused"]):
+            tool(self.repo, "ls")
+        self.assertFalse(self.target.exists())
+        with self.assertRaisesRegex(state["Refused"], "cancelled"):
+            tool(self.repo, "ls")
+        staged, = self.target.parent.glob("settings.kaizen-*.json")
+        self.assertEqual(staged.read_text(), '{"permissions":{"allow":["Bash(*)"]}}')
 
     def test_settings_conflicts_and_undo_leave_bytes_alone(self):
         self.extract(self.row())

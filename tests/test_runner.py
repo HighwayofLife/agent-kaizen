@@ -665,6 +665,19 @@ class DiscoveryTests(DiscoveryCase):
         self.assertEqual(projects[0].paths, [a, b])
         self.assertEqual(git.call_args_list[0].args, (a, "rev-parse", "--git-common-dir"))
 
+    def test_discovery_scrubs_git_trace_and_config_overrides(self):
+        project = self.repo("enrolled")
+        trace = write(self.root / "git-trace", "")
+        events = write(self.root / "git-events", "")
+        config_trace = write(self.root / "git-config-trace", "")
+        with patch.dict(os.environ, GIT_TRACE=str(trace), GIT_TRACE2_EVENT=str(events),
+                        GIT_CONFIG_COUNT="1", GIT_CONFIG_KEY_0="trace2.perfTarget",
+                        GIT_CONFIG_VALUE_0=str(config_trace), GIT_DIR=str(self.root / "missing")):
+            projects, _ = self.discover([project])
+        self.assertEqual([entry.canonical for entry in projects if not entry.unknown], [project])
+        for path in (trace, events, config_trace):
+            self.assertEqual(path.read_bytes(), b"")
+
     def test_missing_git_is_not_fatal(self):
         path = self.project("standalone")
         with patch.object(self.runner.subprocess, "run", side_effect=FileNotFoundError):
@@ -994,7 +1007,9 @@ class GateTests(DiscoveryCase):
         self.assertTrue(run.called)
         self.assertTrue(all(call.args[0][0] == "git" for call in run.call_args_list))
         log_call = next(call.args[0] for call in run.call_args_list if "log" in call.args[0])
-        self.assertEqual(log_call, ["git", "-C", str(path), "log", "-1", "--branches",
+        self.assertEqual(log_call, ["git", "-C", str(path), "-c", "trace2.normalTarget=",
+                                   "-c", "trace2.perfTarget=", "-c", "trace2.eventTarget=",
+                                   "log", "-1", "--branches",
                                    "--since=@1792454401", "--format=%H"])
 
 

@@ -11,10 +11,12 @@ from itertools import chain
 import json
 import hashlib
 import heapq
+import hmac
 import math
 import os
 from pathlib import Path
 import re
+import runpy
 import shlex
 import statistics
 import stat
@@ -1690,14 +1692,23 @@ def cwd_matches(raw, targets, realpaths):
 def scan_codex(root, since, data, cwd=None, realpaths=None):
     if realpaths is None:
         realpaths = {}
+    friction = data.get("_friction")
+
+    def context_stamp(row):
+        value = row.get("timestamp")
+        return friction_stamp(value) if isinstance(value, str) and len(value) <= 40 else None
+
     def admit(row):
         payload = row.get("payload") if isinstance(row, dict) else None
         if not isinstance(payload, dict) or not cwd_matches(payload.get("cwd"), cwd, realpaths):
             return False
+        # Older rollouts can have an undated header followed by dated records.
+        stamp = context_stamp(row) if friction is not None else None
+        if stamp is not None and stamp > friction["until"]:
+            return False
         data["codex_files_scanned"] += 1
         return True
 
-    friction = data.get("_friction")
     # Session filenames are usually rollout-*.jsonl; scan the standard date tree.
     for path in root.glob("*/*/*/*.jsonl"):
         if too_old(path, since):
@@ -1756,13 +1767,15 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
             if not isinstance(payload, dict):
                 continue
             if friction is not None and row.get("type") in ("session_meta", "turn_context"):
-                location = payload.get("cwd")
-                if isinstance(location, str) and location:
-                    current_cwd = location if len(location) <= 4096 else bounded_turn_id(location)
-                turn = payload.get("turn_id")
-                if isinstance(turn, str) and len(turns) < FRICTION_PAIR_LIMIT:
-                    turn = bounded_turn_id(turn)
-                    turns[turn] = current_cwd
+                stamp = context_stamp(row)
+                if stamp is not None and stamp <= friction["until"]:
+                    location = payload.get("cwd")
+                    if isinstance(location, str) and location:
+                        current_cwd = location if len(location) <= 4096 else bounded_turn_id(location)
+                    turn = payload.get("turn_id")
+                    if isinstance(turn, str) and len(turns) < FRICTION_PAIR_LIMIT:
+                        turn = bounded_turn_id(turn)
+                        turns[turn] = current_cwd
             if row.get("type") == "turn_context" and effort is None:
                 effort = payload.get("effort") or payload.get("reasoning_effort") or "n/a"
             if row.get("model"):
@@ -2529,7 +2542,7 @@ def write_extract(data, out, directory, scope, now=None):
     temporary = None
     try:
         directory = directory.expanduser().resolve()
-        directory.mkdir(parents=True, exist_ok=True)
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         path = directory / (out.stem + ".extract.json")
         value = dict(v=1, scope=scope, since=data["since"], report=out.name,
                      usage=dict(agents=data["agent_usage"], sessions=[], task_switches=[], instructions=[]))
@@ -2538,6 +2551,22 @@ def write_extract(data, out, directory, scope, now=None):
             value["friction"] = friction
             if now is not None and friction["permission_acceptance"]:
                 value["friction"] = dict(friction, audited_at=now.isoformat())
+        audits = claude_home().absolute() / "audits"
+        managed_store = directory == audits / "extracts" or directory.parent == audits / "projects"
+        if (friction and friction["permission_acceptance"] and managed_store
+                and scope.get("cwd") and scope.get("project") is None and not scope.get("project_dirs")):
+            # A standalone audit can still emit an extract. Only an install with
+            # the machine key helper can attest counters for a settings write.
+            helper = Path(__file__).resolve().with_name("kaizen_friction_actions.py")
+            if helper.is_file():
+                try:
+                    actions = runpy.run_path(str(helper))["HostActions"]
+                    backups = Path(os.environ.get("KAIZEN_BACKUP_DIR") or claude_home() / "kaizen-backups").expanduser()
+                    secret = actions(audits, backups, None, None)._secret(create=True)
+                    payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
+                    value["allow_rule_mac"] = hmac.digest(secret, b"allow-rule-extract-v1\0" + payload, "sha256").hex()
+                except (OSError, ValueError):
+                    print("token-audit: could not authenticate allow-rule evidence", file=sys.stderr)
         with tempfile.NamedTemporaryFile(mode="w", dir=directory, delete=False) as stream:
             temporary = stream.name
             json.dump(value, stream)

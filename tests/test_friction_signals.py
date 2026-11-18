@@ -1,11 +1,28 @@
 """Offline signal coverage with synthetic transcript rows."""
+from datetime import timedelta
 import json
 
-from test_friction_claude import AUDIT, FrictionClaudeTests, start, end
+from test_friction_claude import AUDIT, OPTIONS, SINCE, FrictionClaudeTests, start, end
+from test_friction_codex import call, result, row
 from test_scripts import jsonl
 
 
 class FrictionSignalTests(FrictionClaudeTests):
+    def test_future_codex_cwd_records_do_not_scope_tool_pairs(self):
+        root = self.work.resolve()
+        rollout = self.root / '2025/01/01/rollout.jsonl'
+        for kind in ('turn_context', 'session_meta'):
+            with self.subTest(kind=kind):
+                records = [row('event_msg', 0, cwd=str(root)),
+                           row(kind, 20, cwd=str(root), turn_id='future'),
+                           call('future', turn_id='future'), result('future', turn_id='future'),
+                           row('turn_context', 2, cwd=str(root)),
+                           call('current', seconds=3), result('current')]
+                jsonl(rollout, records)
+                data = AUDIT['collect']([], self.root, SINCE, {}, None, OPTIONS,
+                                        cwd=[str(root)], now=SINCE + timedelta(seconds=10))
+                self.assertEqual(data['friction']['summary']['measured'], 1)
+
     def test_signals_are_deduplicated_and_private(self):
         timeout = end('timeout', 5, toolUseResult={'timedOutAfterMs': 5000})
         hint = end('hint', 6)
