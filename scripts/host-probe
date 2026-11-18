@@ -12,6 +12,7 @@ import re
 from pathlib import Path
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -85,22 +86,36 @@ class Probe:
                        for i, stream in enumerate((process.stdout, process.stderr))]
             for thread in threads:
                 thread.start()
+            timed_out = False
             try:
                 process.wait(timeout=min(5, left))
             except subprocess.TimeoutExpired:
+                timed_out = True
+                self.warn('timeout')
+            finally:
                 if os.name == 'posix':
-                    os.killpg(process.pid, signal.SIGKILL)
-                else:
+                    for sig in (signal.SIGTERM, signal.SIGKILL):
+                        try:
+                            os.killpg(process.pid, sig)
+                        except ProcessLookupError:
+                            pass
+                        if sig == signal.SIGTERM:
+                            for thread in threads:
+                                thread.join(timeout=max(0, min(0.05, self.deadline - time.monotonic())))
+                elif process.poll() is None:
                     process.kill()
                 process.wait()
-                self.warn('timeout')
-                return None
-            finally:
                 for thread in threads:
-                    thread.join(timeout=max(0, min(0.1, self.remaining('command'))))
+                    thread.join(timeout=max(0, min(0.05, self.deadline - time.monotonic())))
+            if timed_out:
+                return None
             if any(overflow) or any(thread.is_alive() for thread in threads):
                 self.warn('command_output')
                 return None
+            if process.returncode == 1 and 'merge-base' in argv:
+                return '\0'
+            if process.returncode == 1 and 'check-ignore' in argv:
+                return ''
             if process.returncode:
                 self.warn('command_failed')
                 return None
@@ -156,6 +171,13 @@ class Probe:
         if len(blocks) > 256:
             self.warn('worktrees_limit')
             return None
+        common = self.git(self.project, 'rev-parse', '--git-common-dir')
+        try:
+            common_path = Path(common.strip())
+            common_stat = (self.project / common_path).stat()
+        except (AttributeError, OSError):
+            self.warn('worktrees_unavailable')
+            return None
         trees = []
         for index, block in enumerate(blocks):
             fields = {}
@@ -169,6 +191,17 @@ class Probe:
                 self.warn('worktrees_unavailable')
                 return None
             path = Path(fields['worktree']).resolve()
+            live_common = self.git(path, 'rev-parse', '--git-common-dir')
+            top = self.git(path, 'rev-parse', '--show-toplevel')
+            try:
+                live_stat = (path / live_common.strip()).stat()
+                valid = ((live_stat.st_dev, live_stat.st_ino) == (common_stat.st_dev, common_stat.st_ino)
+                         and Path(top.strip()).resolve() == path)
+            except (AttributeError, OSError):
+                valid = False
+            if not valid:
+                self.warn('worktrees_unavailable')
+                return None
             trees.append({'path': str(path), 'is_main': index == 0,
                           'branch': fields.get('branch'), 'head': fields.get('HEAD'),
                           'locked': 'locked' in fields, 'clean': None, 'merged': None,
@@ -183,7 +216,7 @@ class Probe:
                     and re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', primary)):
                 ancestor = self.git(self.project, 'merge-base', '--is-ancestor', head, primary)
                 if ancestor is not None:
-                    tree['merged'] = True
+                    tree['merged'] = ancestor != '\0'
             stamp = self.git(root, 'log', '-1', '--format=%ct')
             if stamp is not None and stamp.strip().isdigit():
                 tree['last_commit_age_days'] = max(0, int((time.time() - int(stamp.strip())) // 86400))
@@ -229,17 +262,25 @@ class Probe:
         for root in roots:
             configured = []
             try:
-                with (root / 'docs/kaizen/config.json').open('rb') as stream:
-                    config = json.loads(stream.read(LIMIT + 1))
+                fd = os.open(root / 'docs/kaizen/config.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                with os.fdopen(fd, 'rb') as stream:
+                    if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                        raise ValueError('not a regular file')
+                    data = stream.read(LIMIT + 1)
+                if len(data) > LIMIT or self.remaining('config') <= 0:
+                    raise ValueError('config limit')
+                config = json.loads(data)
                 configured = config.get('frictionOutputDirs', [])
                 if not isinstance(configured, list) or len(configured) > 256:
+                    raise ValueError('invalid output directories')
+                if any(not isinstance(entry, str) for entry in configured):
                     self.warn('output_config')
-                    return None
+                configured = [entry for entry in configured if isinstance(entry, str)]
             except FileNotFoundError:
                 pass
             except (OSError, ValueError, AttributeError):
                 self.warn('output_config')
-                return None
+                configured = []
             status = self.git(root, 'status', '--ignored', '--porcelain=v1', '-z', '--untracked-files=normal')
             if status is None:
                 return None
@@ -269,7 +310,7 @@ class Probe:
                 if ignored is None or tracked is None:
                     self.warn('directory_unavailable')
                     return None
-                if tracked:
+                if not ignored or tracked:
                     continue
                 size = self.size(path)
                 if size is None:
@@ -316,8 +357,8 @@ class Probe:
         facts['worktree_count'] = len(linked) if linked is not None else None
         facts['prunable_worktrees'] = (sum(t['clean'] is True and t['merged'] is True and not t['locked'] for t in linked)
                                       if linked is not None and all(t['clean'] is not None and t['merged'] is not None for t in linked) else None)
-        facts['stale_worktrees'] = (sum(t['last_commit_age_days'] > 14 for t in linked)
-                                   if linked is not None and all(t['last_commit_age_days'] is not None for t in linked) else None)
+        facts['stale_worktrees'] = (sum(t['last_commit_age_days'] > 14 and not (t['clean'] is True and t['merged'] is True and not t['locked']) for t in linked)
+                                   if linked is not None and all(t['last_commit_age_days'] is not None and t['clean'] is not None and t['merged'] is not None for t in linked) else None)
         facts['regenerable_bytes'] = sum(d['size_bytes'] for d in directories) if directories is not None else None
         findings = []
 
@@ -364,6 +405,14 @@ class Probe:
                                 for p in ancestors if p == root or root in p.parents)
                             directory['excluded']['spotlight'] = excluded
                             if excluded:
+                                continue
+                            volume = path
+                            while not os.path.ismount(volume):
+                                volume = volume.parent
+                            state = self.command(['mdutil', '-s', str(volume)])
+                            if state is None or not re.search(r'(?im)^\s*Indexing enabled\.\s*$', state):
+                                if state is None or not re.search(r'(?im)^\s*Indexing disabled\.\s*$', state):
+                                    self.warn('spotlight_unknown')
                                 continue
                         if action['id'] == 'timemachine-output':
                             output = self.command(['tmutil', 'isexcluded', str(path)])
@@ -414,7 +463,23 @@ def main(argv=None):
         finally:
             if temporary:
                 os.unlink(temporary)
-        print(payload if args.json else destination, end='' if args.json else '\n')
+        if args.json:
+            public = json.loads(payload)
+            public['project'] = '[project]'
+            public['facts']['cloud_roots'] = ['[cloud root]' for _ in public['facts']['cloud_roots']]
+            for tree in public['worktrees']:
+                tree['path'] = '[project]' if tree['path'] == str(args.project.resolve()) else '[worktree]'
+                if tree['branch'] is not None:
+                    tree['branch'] = '[branch]'
+            for directory in public['regenerable_dirs']:
+                directory['path'] = '[output]'
+                directory['worktree'] = '[worktree]'
+            for finding in public['findings']:
+                if finding['id'] == 'cloud-paths' or os.path.isabs(finding['subject']):
+                    finding['subject'] = '[path]'
+            print(json.dumps(public, indent=2, allow_nan=False))
+        else:
+            print(destination)
         return 0
     except (OSError, ValueError) as exc:
         print('host-probe: output failed: {}'.format(type(exc).__name__), file=sys.stderr)
