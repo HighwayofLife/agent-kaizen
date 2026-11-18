@@ -125,10 +125,17 @@ class BrokerLedger:
             raise ValueError("private broker record exceeds size limit")
         self.host["_replace"](self.state, self.record_name(record["id"]), raw)
 
+    def allow_rule_binding(self, tool, literal):
+        """Derive the native record from signed evidence using the fixed allow-rule helper."""
+        runner = tool["runner_for"]()
+        scope = tool["project_scope"](self.project, runner)
+        if scope.canonical != self.project:
+            raise ValueError("allow-rule project scope changed")
+        count, (generation, _) = tool["evidence"](runner, scope, literal, self.secret)
+        return tool["broker_id"](self.secret, scope, literal, generation), generation, count
+
     def tool_record(self, ident, operation):
         self.record_name(ident)
-        if operation == "allow-rule":
-            return ident
         if operation == "host-fix":
             return str(self.store.friction / "host-fixes" / (ident + ".json"))
         if operation == "worktree-prune":
@@ -246,10 +253,18 @@ class BrokerLedger:
             if match is not None or len("".join(lines).encode("utf-8")) + growth > LEDGER_LIMIT:
                 raise ValueError("broker ledger has a conflicting row or insufficient space")
 
-    def record_verified(self, ident, operation, tool_record, verification, generation, count):
+    def record_verified(self, ident, operation, tool_record, verification, generation, count, *, binding=None):
         """Record a tool-owned effect already verified by the runner, including on recovery."""
-        if (tool_record != self.tool_record(ident, operation) or not re.fullmatch(r"[a-f0-9]{64}", verification)
-                or not self.host["_text"](generation, 128) or type(count) is not int or not 0 <= count <= 10**9):
+        if (not re.fullmatch(r"[a-f0-9]{64}", verification) or not self.host["_text"](generation, 128)
+                or type(count) is not int or not 0 <= count <= 10**9):
+            raise ValueError("invalid verified broker effect")
+        if operation == "allow-rule":
+            # Match the native result against the binding pinned before the transaction.
+            if (binding != (tool_record, generation, count) or not isinstance(tool_record, str)
+                    or not self.host["ACTION_ID"].fullmatch(tool_record)
+                    or not re.fullmatch(r"[a-f0-9]{64}", generation)):
+                raise ValueError("invalid verified allow-rule binding")
+        elif tool_record != self.tool_record(ident, operation):
             raise ValueError("invalid verified broker effect")
         binding = dict(id=ident, operation=operation, tool_record=tool_record, verification=verification,
                        generation=generation, count=count, scope=self.identity)

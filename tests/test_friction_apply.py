@@ -1,6 +1,8 @@
 """Offline runtime-envelope and real backup-helper tests for the dormant broker."""
 import base64
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+import hashlib
+import hmac
 import json
 import os
 from pathlib import Path
@@ -206,11 +208,13 @@ class BrokerLedgerTests(unittest.TestCase):
             installed_runner = runpy.run_path(str(runner))
             store = host["HostActions"](config / "audits", config / "backups",
                                         installed_runner["action_project"], installed_runner["key"])
-            store._secret(create=True)
+            secret = store._secret(create=True)
+            extracts = config / "audits/extracts"
+            extracts.mkdir(mode=0o700, parents=True)
             # Flip only the disposable native helper's live gate to exercise its real transaction and inverse.
             helper = installed / "kaizen-allow-rule"
             helper.write_text(helper.read_text().replace("WRITES_ENABLED = False", "WRITES_ENABLED = True", 1))
-            tool = runpy.run_path(str(helper))["transact"]
+            tool = runpy.run_path(str(helper))
             legacy = "| 2026-11-18 | Ordinary backup | Audit | Less text | pending | pending |\n"
             six = apply.row_line(apply.HEADER[:6], "\n") + apply.row_line(["---"] * 6, "\n") + legacy
             for enabled, literal in ((True, "ls"), (False, "ls -a")):
@@ -221,6 +225,18 @@ class BrokerLedgerTests(unittest.TestCase):
                 target = project / ".claude/settings.local.json"
                 selector = json.dumps([literal, str(project)], separators=(",", ":"))
                 ident = store.record(project, "allow-rule", selector, "fixture", allowed=[selector])
+                now = datetime.now(timezone.utc)
+                row = dict(cwd_id=hashlib.sha256(str(project).encode()).hexdigest(), literal=literal,
+                           accepted=10, denied=0, ambiguous=0)
+                evidence = dict(v=1, since=(now - timedelta(days=1)).isoformat(),
+                                scope=dict(v=1, cwd=[str(project)], project=None, project_dirs=[]),
+                                friction=dict(v=1, audited_at=(now - timedelta(seconds=1)).isoformat(),
+                                              summary=dict(capped=False), permission_acceptance=[row]))
+                payload = json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("ascii")
+                evidence["allow_rule_mac"] = hmac.digest(secret, b"allow-rule-extract-v2\0" + payload, "sha256").hex()
+                extract = extracts / "fixture.extract.json"
+                extract.write_text(json.dumps(evidence))
+                extract.chmod(0o600)
                 undo = ("actions", "undo", ident, "--for", project)
                 with broker.locked(host, store, project) as journal:
                     ledger.write_text("```md\n" + six + "```\n")
@@ -228,13 +244,25 @@ class BrokerLedgerTests(unittest.TestCase):
                         journal.preflight(ident, "allow-rule")
                     ledger.write_text(six)
                     journal.preflight(ident, "allow-rule")
-                    with patch.dict(os.environ, env, clear=True), patch.dict(
-                            tool.__globals__, evidence=lambda *args: (10, ["fixture"])):
-                        result = tool(project, literal, action_id=ident)
-                    self.assertEqual(result, dict(status="applied", record=ident))
+                    with patch.dict(os.environ, env, clear=True):
+                        binding = journal.allow_rule_binding(tool, literal)
+                        native_id, generation, count = binding
+                        self.assertNotEqual(ident, native_id)
+                        with self.assertRaisesRegex(tool["Refused"], "unknown broker transaction binding"):
+                            tool["transact"](project, literal, action_id=ident)
+                        result = tool["transact"](project, literal, action_id=native_id)
+                    self.assertEqual(result, dict(status="applied", record=native_id))
+                    verification = hashlib.sha256(target.read_bytes()).hexdigest()
+                    extract.unlink()  # Receipt recovery and undo use the pinned binding.
+                    with self.assertRaisesRegex(ValueError, "invalid verified allow-rule binding"):
+                        journal.record_verified(ident, "allow-rule", ident, verification,
+                                                generation, count, binding=binding)
                     ledger.unlink()
                     with self.assertRaises(FileNotFoundError):
-                        journal.record_verified(ident, "allow-rule", ident, "a" * 64, "fixture", 10)
+                        journal.record_verified(ident, "allow-rule", result["record"], verification,
+                                                generation, count, binding=binding)
+                    receipt = journal.load(ident)
+                    self.assertEqual((receipt["tool_record"], receipt["generation"], receipt["count"]), binding)
                     ledger.write_text(six)
                     with patch.object(journal, "save", side_effect=OSError("after row")), self.assertRaises(OSError):
                         journal.reconcile(ident)
@@ -249,6 +277,7 @@ class BrokerLedgerTests(unittest.TestCase):
 
                         def interrupted(operation, record):
                             self.assertEqual(operation, "allow-rule")
+                            self.assertEqual(record, native_id)
                             command(helper, "undo", record, "--project", project)
                             raise OSError("after native undo")
 
