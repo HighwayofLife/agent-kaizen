@@ -74,7 +74,7 @@ Codex CLI and GitHub Copilot support: the same plugin installs on Codex CLI and 
 Updating on Codex: run `/hooks` again and trust the changed hooks; hooks do nothing until you do.
 ```
 
-Build the groups from `changelog/P02.md` to `P07.md` (and `C1.md` if present), with the fixed headings listed under Context. Add this sentence as the first bullet of the first group or as its own group `` `host support`: ``: "**[D2]** GitHub Copilot support is experimental and has not been checked in a live session; Copilot usage is not measured yet." Do not add claims that are not in a fragment or in the lines above. Plain, short sentences; no marketing words.
+Build the groups from `changelog/P02.md` to `P07.md` (and `C1.md` if present), with the fixed headings listed under Context. Add this sentence as the first bullet of the first group or as its own group `` `host support`: ``: "GitHub Copilot support is experimental and has not been checked in a live session; Copilot usage is not measured yet." Do not add claims that are not in a fragment or in the lines above. Plain, short sentences; no marketing words.
 
 ### 3. End-to-end gate (real input, once, on the final tree)
 
