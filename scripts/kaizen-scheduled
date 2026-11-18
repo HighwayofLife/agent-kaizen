@@ -627,13 +627,15 @@ GIT_LOCATION_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FIL
 
 def _git(directory, *arguments, trusted_path=False):
     if trusted_path:
-        environment = dict(PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin", LC_ALL="C",
-                           GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT="0",
-                           GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1", GIT_ALLOW_PROTOCOL="")
-        arguments = tuple(arg for target in ("normal", "perf", "event")
-                          for arg in ("-c", f"trace2.{target}Target=")) + arguments
+        environment = dict(PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
     else:
-        environment = {name: value for name, value in os.environ.items() if name not in GIT_LOCATION_ENV}
+        environment = {name: value for name, value in os.environ.items()
+                       if name not in GIT_LOCATION_ENV and not name.startswith(("GIT_TRACE", "GIT_CONFIG"))}
+    environment.update(LC_ALL="C", GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull,
+                       GIT_TERMINAL_PROMPT="0", GIT_OPTIONAL_LOCKS="0", GIT_NO_LAZY_FETCH="1",
+                       GIT_ALLOW_PROTOCOL="")
+    arguments = tuple(arg for target in ("normal", "perf", "event")
+                      for arg in ("-c", f"trace2.{target}Target=")) + arguments
     try:
         result = run_group(["git", "-C", str(directory), *arguments], capture_output=True,
                            env=environment, timeout=STEP_TIMEOUT)
@@ -675,8 +677,9 @@ def git_common_dir(directory):
             else None)
 
 
-def in_git_checkout(directory):
-    return any(os.path.lexists(path / ".git") for path in (directory, *directory.parents))
+def checkout_root(directory):
+    return next((path for path in (directory, *directory.parents)
+                 if os.path.lexists(path / ".git")), None)
 
 
 def worktree_paths(directory):
@@ -709,7 +712,8 @@ def worktree_paths(directory):
             if dotgit.is_dir():
                 if canonical_path(dotgit) != gitdir:
                     raise ValueError("worktree gitdir mismatch")
-            elif canonical_path(gitdir / os.fsdecode((gitdir / "gitdir").read_bytes()).removesuffix("\n")) != dotgit:
+            elif (common is None or gitdir.parent != common / "worktrees"
+                  or canonical_path(gitdir / os.fsdecode((gitdir / "gitdir").read_bytes()).removesuffix("\n")) != dotgit):
                 raise ValueError("worktree registration mismatch")
         except (OSError, RuntimeError, ValueError):
             complete = False
@@ -768,7 +772,7 @@ def discover(claude_root, codex_root, index, project_dirs=None):
     groups, unknown = {}, set()
     for directory in sorted(enrolled):
         common = git_common_dir(directory)
-        if common is None and in_git_checkout(directory):
+        if common is None and checkout_root(directory) is not None:
             unknown.add(directory)  # Never treat a checkout whose probe failed as standalone.
         groups.setdefault(("git", common) if common else ("directory", directory), []).append(directory)
 
@@ -791,9 +795,7 @@ def discover(claude_root, codex_root, index, project_dirs=None):
         if listed:
             valid_directories = []
             for directory in directories:
-                top = next((path for path in (directory, *directory.parents)
-                            if os.path.lexists(path / ".git")), None)
-                if top not in listed:
+                if checkout_root(directory) not in listed:
                     add(directory, {directory}, True)
                 else:
                     valid_directories.append(directory)
@@ -840,6 +842,8 @@ def discover(claude_root, codex_root, index, project_dirs=None):
                     uncertain = True
                     continue
                 if peer not in enrolled_peers:
+                    if checkout_root(peer) != worktree:
+                        continue
                     peer_common = git_common_dir(peer)
                     if peer_common != common:
                         uncertain = uncertain or peer_common is None

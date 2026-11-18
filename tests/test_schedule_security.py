@@ -367,6 +367,19 @@ class DiscoveryRootTests(SecurityCase):
         both, _ = self.discover([repo / 'pkg', worktree / 'pkg'])
         self.assertEqual(len(both), 1)
 
+    def test_unenrolled_peer_cannot_copy_a_registered_git_pointer(self):
+        repo = self.monorepo('pkg')
+        worktree = self.root / 'mono-wt'
+        self.git(repo, 'worktree', 'add', str(worktree), '-b', 'wt')
+        peer = worktree / 'pkg'
+        (peer / 'docs/kaizen/config.json').unlink()
+        (peer / 'docs/kaizen').rmdir()
+        (peer / '.git').write_bytes((worktree / '.git').read_bytes())
+        self.assertEqual(self.git(peer, 'rev-parse', '--git-common-dir').strip(), str(repo / '.git'))
+        projects, _ = self.discover([repo / 'pkg'])
+        self.assertFalse(projects[0].unknown)
+        self.assertEqual(projects[0].paths, [repo / 'pkg'])
+
     def test_review_dry_run_lists_monorepo_subdirectory(self):
         repo = self.monorepo('pkg')
         text = self.review('--dry-run', '--project-dir', repo / 'pkg').stdout
