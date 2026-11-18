@@ -437,7 +437,7 @@ class GroupPopen(subprocess.Popen):
         self.group_killed = False
         if SIGNALS.get("watchdog") is not None:
             reader, lease = SIGNALS["watchdog"]
-            args = ([sys.executable, "-c", WATCHDOG, str(reader), str(lease), *args[0]], *args[1:])
+            args = ([sys.executable, "-I", "-c", WATCHDOG, str(reader), str(lease), *args[0]], *args[1:])
         # Defer handled signals until the child is registered. Popen's caller has not
         # installed its context manager yet, so construction must do its own cleanup.
         fired_before = SIGNALS["fired"]
@@ -2525,9 +2525,9 @@ def actions_command(args):
             broker = runpy.run_path(str(HERE / "kaizen_friction_apply.py"))["BrokerLedger"]
 
             def inverse(operation, record):
-                command = broker_command(argparse.Namespace(python=sys.executable), operation)
-                result = run_group([*command, "undo", record, "--project", str(project)], stoppable=True,
-                                   cwd=project, timeout=30, stdin=subprocess.DEVNULL,
+                python, helper = broker_command(argparse.Namespace(python=sys.executable), operation)
+                result = run_group([python, "-I", helper, "undo", record, "--project", str(project)], stoppable=True,
+                                   cwd="/", timeout=30, stdin=subprocess.DEVNULL,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if result.returncode:
                     raise ValueError("the fixed undo helper could not verify reversal")

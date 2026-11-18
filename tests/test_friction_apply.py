@@ -174,6 +174,205 @@ class MutationEvidenceTests(unittest.TestCase):
 
 
 class BrokerLedgerTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name).resolve()
+        self.project = self.root / "project"
+        self.ledger = self.project / apply.LEDGER
+        self.ledger.parent.mkdir(parents=True)
+        self.table = apply.row_line(apply.HEADER, "\n") + apply.row_line(["---"] * 8, "\n")
+        self.ledger.write_text(self.table)
+        self.runner = runpy.run_path(str(SCRIPTS / "kaizen-scheduled"))
+        self.host = runpy.run_path(str(SCRIPTS / "kaizen_friction_actions.py"))
+        self.tool = runpy.run_path(str(SCRIPTS / "allow-rule"))
+        self.tool["live_writes"].__globals__["WRITES_ENABLED"] = True
+        config = self.root / "config"
+        environment = dict(os.environ, CLAUDE_CONFIG_DIR=str(config), KAIZEN_HOST="claude",
+                           KAIZEN_BACKUP_DIR=str(config / "backups"))
+        for name in ("KAIZEN_RUN_ID", "KAIZEN_SESSION_ID"):
+            environment.pop(name, None)
+        patcher = patch.dict(os.environ, environment, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.store = self.host["HostActions"](config / "audits", config / "backups",
+                                              self.runner["action_project"], self.runner["key"])
+        self.secret = self.store._secret(create=True)
+        self.extracts = config / "audits/extracts"
+        self.extracts.mkdir(mode=0o700, parents=True)
+
+    def action(self, literal, roots):
+        selector = json.dumps([literal, *map(str, roots)], separators=(",", ":"))
+        return self.store.record(self.project, "allow-rule", selector, "fixture", allowed=[selector])
+
+    def signed_extract(self, roots, literals=("ls",)):
+        now = datetime.now(timezone.utc)
+        rows = [dict(cwd_id=hashlib.sha256(os.fsencode(roots[0])).hexdigest(), literal=literal,
+                     accepted=10, denied=0, ambiguous=0) for literal in literals]
+        evidence = dict(v=1, since=(now - timedelta(days=1)).isoformat(),
+                        scope=dict(v=1, cwd=list(map(str, roots)), project=None, project_dirs=[]),
+                        friction=dict(v=1, audited_at=(now - timedelta(seconds=1)).isoformat(),
+                                      summary=dict(capped=False), permission_acceptance=rows))
+        payload = json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode("ascii")
+        evidence["allow_rule_mac"] = hmac.digest(self.secret, b"allow-rule-extract-v2\0" + payload, "sha256").hex()
+        extract = self.extracts / "fixture.extract.json"
+        extract.write_text(json.dumps(evidence))
+        extract.chmod(0o600)
+        return extract
+
+    def locked(self):
+        return apply.BrokerLedger.locked(self.host, self.store, self.project)
+
+    def test_caller_tuple_cannot_bind_an_unissued_action(self):
+        ident, native_id, generation = "fa1_" + "1" * 64, "fa1_" + "2" * 64, "3" * 64
+        with self.locked() as journal:
+            with self.assertRaises((TypeError, ValueError)):
+                journal.record_verified(ident, "allow-rule", native_id, "4" * 64, generation, 10,
+                                        binding=(native_id, generation, 10))
+            with self.assertRaisesRegex(ValueError, "invalid verified allow-rule binding"):
+                journal.begin_allow_rule(ident)
+            self.assertIsNone(journal.load(ident))
+
+    def test_native_receipt_cannot_be_replayed_under_another_action(self):
+        self.signed_extract([self.project], ("ls", "ls -a"))
+        ident = self.action("ls", [self.project])
+        other = self.action("ls -a", [self.project])
+        with self.locked() as journal:
+            # Use the actual P18d binding and transaction to obtain a real native receipt.
+            scope = self.tool["project_scope"](self.project, self.tool["runner_for"]())
+            count, (generation, _) = self.tool["evidence"](self.tool["runner_for"](), scope, "ls", self.secret)
+            native_id = self.tool["broker_id"](self.secret, scope, "ls", generation)
+            self.assertNotEqual(ident, other)
+            result = self.tool["transact"](self.project, "ls", action_id=native_id)
+            target = self.project / self.tool["TARGET"]
+            with self.assertRaises((TypeError, ValueError)):
+                journal.record_verified(other, "allow-rule", result["record"],
+                                        hashlib.sha256(target.read_bytes()).hexdigest(), generation, count,
+                                        binding=(native_id, generation, count))
+            self.assertIsNone(journal.load(other))
+            self.assertNotEqual(journal.begin_allow_rule(other), native_id)
+            with self.assertRaisesRegex(ValueError, "no verified native allow-rule effect"):
+                journal.reconcile(other)
+            self.assertEqual(journal.load(other)["phase"], "apply-pending")
+            self.assertNotIn(other, self.ledger.read_text())
+
+    def test_project_save_after_final_snapshot_is_preserved(self):
+        ident = "fa1_" + "1" * 64
+        edited = self.table + "\nEditor saved here.\n"
+        with self.locked() as journal, journal.table(ident) as (lines, _, _, _, _, write):
+            lines.append("\nBroker wrote here.\n")
+            snapshot = journal.snapshot
+
+            def edit_after_snapshot(*args, **kwargs):
+                before = snapshot(*args, **kwargs)
+                if injected.call_count == 1:
+                    self.ledger.write_text(edited)
+                return before
+
+            with patch.object(journal, "snapshot", side_effect=edit_after_snapshot) as injected:
+                with self.assertRaisesRegex(ValueError, "ledger changed"):
+                    write()
+            self.assertEqual(self.ledger.read_text(), edited)
+
+    def test_project_save_after_publication_stays_live(self):
+        ident = "fa1_" + "1" * 64
+        updated = self.table + "\nEditor saved here.\n"
+        editor = self.ledger.with_name("editor-save")
+        editor.write_text(updated)
+        with self.locked() as journal, journal.table(ident) as (lines, _, _, _, _, write):
+            lines.append("\nBroker wrote here.\n")
+            exchange = journal.allow_rule["rename_effect"]
+
+            def save_after_exchange(*args, **kwargs):
+                exchange(*args, **kwargs)
+                if editor.exists():
+                    editor.replace(self.ledger)
+
+            with patch.dict(journal.allow_rule, rename_effect=save_after_exchange):
+                with self.assertRaisesRegex(ValueError, "ledger changed"):
+                    write()
+            self.assertEqual(self.ledger.read_text(), updated)
+
+    def test_legacy_table_without_outer_pipes_and_malformed_row(self):
+        ident = "fa1_" + "1" * 64
+        legacy = "\n".join(" | ".join(apply.cells(line)) for line in self.table.splitlines()) + "\n"
+        row = "2026-11-18 | Ordinary backup | Audit | Less text | pending | pending"
+        with self.locked() as journal:
+            self.ledger.write_text(legacy + row + " | malformed\n")
+            with self.assertRaisesRegex(ValueError, "invalid broker ledger table row"):
+                journal.preflight(ident, "host-fix", evidence_scope=[str(self.project)])
+            self.ledger.write_text(legacy + row + "\n")
+            tool_record = journal.tool_record(ident, "host-fix")
+            self.assertEqual(journal.record_verified(ident, "host-fix", tool_record, "4" * 64, "fixture", 10,
+                                                     evidence_scope=[str(self.project)]), "recorded")
+            bare = [line.strip().removeprefix("|").removesuffix("|").strip() if ident in line else line
+                    for line in self.ledger.read_text().splitlines()]
+            self.ledger.write_text("\n".join(bare) + "\n")
+            inverse = unittest.mock.Mock()
+            journal.undo(ident, inverse)
+            inverse.assert_called_once_with("host-fix", tool_record)
+            self.assertIn(row + "\n", self.ledger.read_text())
+            self.assertIn("reverted", self.ledger.read_text())
+
+    def test_metric_keeps_both_canonical_worktrees(self):
+        worktree = self.root / "worktree with spaces"
+        for arguments in (["init", "-q"], ["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                           "commit", "--allow-empty", "-qm", "initial"],
+                          ["worktree", "add", "-q", "--detach", str(worktree)]):
+            result = subprocess.run(["git", "-C", str(self.project), *arguments], capture_output=True, text=True,
+                                    env=dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull))
+            self.assertEqual(result.returncode, 0, result.stderr)
+        roots = sorted([self.project, worktree])
+        self.signed_extract(roots)
+        ident = self.action("ls", roots)
+        with self.locked() as journal:
+            with self.assertRaisesRegex(ValueError, "evidence scope is unavailable"):
+                journal.preflight(ident, "allow-rule", evidence_scope=[str(self.root / "unknown")])
+            expected = dict(id=ident, operation="allow-rule", count=10, date=date.today().isoformat(),
+                            evidence_scope=list(map(str, roots)))
+            metric = journal.row(expected)[6]
+            argv = shlex.split(metric.strip("`"))
+            scopes = [(self.project / argv[index + 1]).resolve()
+                      for index, arg in enumerate(argv) if arg == "--cwd"]
+            self.assertEqual(scopes, roots)
+            native_id = journal.begin_allow_rule(ident)
+            self.tool["transact"](self.project, "ls", action_id=native_id)
+            journal.reconcile(ident)
+            self.assertIn(metric, self.ledger.read_text())
+
+    def test_recovery_after_native_publication_without_extract(self):
+        extract = self.signed_extract([self.project])
+        ident = self.action("ls", [self.project])
+        native_globals = self.tool["write_effect"].__globals__
+        rename = native_globals["rename_effect"]
+
+        def crash_after_rename(*args, **kwargs):
+            rename(*args, **kwargs)
+            raise OSError("after native effect")
+
+        with self.locked() as journal:
+            native_id = journal.begin_allow_rule(ident)
+            with patch.dict(native_globals, rename_effect=crash_after_rename):
+                with self.assertRaisesRegex(OSError, "after native effect"):
+                    self.tool["transact"](self.project, "ls", action_id=native_id)
+        extract.unlink()
+        target = self.project / self.tool["TARGET"]
+        self.assertTrue(target.is_file())
+        native_journal = self.store.friction / self.tool["STATE"]
+        raw = native_journal.read_bytes()
+        tampered = dict(json.loads(raw), mac="0" * 64)
+        native_journal.write_text(json.dumps(tampered))
+        with self.locked() as journal:
+            with self.assertRaisesRegex(ValueError, "native allow-rule journal does not authenticate"):
+                journal.reconcile(ident)
+            self.assertEqual(journal.load(ident)["phase"], "apply-pending")
+            native_journal.write_bytes(raw)
+            self.assertEqual(journal.reconcile(ident), "recorded")
+            journal.undo(ident, lambda _, record: self.tool["transact"](self.project, record=record))
+        self.assertFalse(target.exists())
+        self.assertEqual(self.ledger.read_text().count(ident), 1)
+        self.assertIn("reverted", self.ledger.read_text())
+
     def test_copied_install_undo_and_bookkeeping_recovery(self):
         from test_schedule import CRONTAB
 
@@ -193,7 +392,7 @@ class BrokerLedgerTests(unittest.TestCase):
                 env.pop(name, None)
 
             def command(path, *args, code=0, **extra_env):
-                result = subprocess.run([sys.executable, str(path), *map(str, args)], env=dict(env, **extra_env),
+                result = subprocess.run([sys.executable, "-I", str(path), *map(str, args)], env=dict(env, **extra_env),
                                         capture_output=True, text=True, timeout=30)
                 self.assertEqual(result.returncode, code, result.stderr)
 
@@ -238,31 +437,28 @@ class BrokerLedgerTests(unittest.TestCase):
                 extract.write_text(json.dumps(evidence))
                 extract.chmod(0o600)
                 undo = ("actions", "undo", ident, "--for", project)
-                with broker.locked(host, store, project) as journal:
+                with patch.dict(os.environ, env, clear=True), broker.locked(host, store, project) as journal:
                     ledger.write_text("```md\n" + six + "```\n")
                     with self.assertRaises(ValueError):
-                        journal.preflight(ident, "allow-rule")
+                        journal.begin_allow_rule(ident)
                     ledger.write_text(six)
-                    journal.preflight(ident, "allow-rule")
-                    with patch.dict(os.environ, env, clear=True):
-                        binding = journal.allow_rule_binding(tool, literal)
-                        native_id, generation, count = binding
-                        self.assertNotEqual(ident, native_id)
-                        with self.assertRaisesRegex(tool["Refused"], "unknown broker transaction binding"):
-                            tool["transact"](project, literal, action_id=ident)
-                        result = tool["transact"](project, literal, action_id=native_id)
+                    native_id = journal.begin_allow_rule(ident)
+                    pending = journal.load(ident)
+                    self.assertNotEqual(ident, native_id)
+                    with self.assertRaisesRegex(tool["Refused"], "unknown broker transaction binding"):
+                        tool["transact"](project, literal, action_id=ident)
+                    result = tool["transact"](project, literal, action_id=native_id)
                     self.assertEqual(result, dict(status="applied", record=native_id))
                     verification = hashlib.sha256(target.read_bytes()).hexdigest()
                     extract.unlink()  # Receipt recovery and undo use the pinned binding.
-                    with self.assertRaisesRegex(ValueError, "invalid verified allow-rule binding"):
+                    with self.assertRaisesRegex(ValueError, "verified native transaction"):
                         journal.record_verified(ident, "allow-rule", ident, verification,
-                                                generation, count, binding=binding)
+                                                pending["generation"], pending["count"], evidence_scope=[str(project)])
                     ledger.unlink()
                     with self.assertRaises(FileNotFoundError):
-                        journal.record_verified(ident, "allow-rule", result["record"], verification,
-                                                generation, count, binding=binding)
+                        journal.reconcile(ident)
                     receipt = journal.load(ident)
-                    self.assertEqual((receipt["tool_record"], receipt["generation"], receipt["count"]), binding)
+                    self.assertEqual(receipt, dict(pending, verification=verification, phase="effect-verified"))
                     ledger.write_text(six)
                     with patch.object(journal, "save", side_effect=OSError("after row")), self.assertRaises(OSError):
                         journal.reconcile(ident)
@@ -310,7 +506,12 @@ class BrokerLedgerTests(unittest.TestCase):
                     shutil.rmtree(target.parent)
                     moved.rename(target.parent)
                 command(runner, *undo, code=2, KAIZEN_RUN_ID="scheduled")
-                command(runner, *undo)
+                poison = root / "shadow-import"
+                for module in ("signal", "select"):
+                    (project / (module + ".py")).write_text(
+                        f"open({str(poison)!r}, 'a').write({module!r})\nraise SystemExit(0)\n")
+                command(runner, *undo, PYTHONPATH=str(project))
+                self.assertFalse(poison.exists())
                 self.assertFalse(target.exists())
                 self.assertIn(f"reverted ({date.today()})", ledger.read_text())
                 store.mark(project, ident, "done")
@@ -319,4 +520,4 @@ class BrokerLedgerTests(unittest.TestCase):
                 with broker.locked(host, store, project) as journal:
                     self.assertEqual(journal.reconcile(ident), "reverted")
                     with self.assertRaises(ValueError):
-                        journal.preflight(ident, "allow-rule")
+                        journal.preflight(ident, "allow-rule", evidence_scope=[str(project)])
