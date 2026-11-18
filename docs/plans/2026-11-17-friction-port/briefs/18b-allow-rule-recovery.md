@@ -42,3 +42,15 @@ Read `git show wt/p13:scripts/allow-rule` at `validate_head`, `find_extract`, `c
 ## Report
 
 Report changed files and line counts, exact checks and outcomes, known uncertainty and any blocked verification. Label measurements with baseline/conditions. Redact paths and identifiers from shared output. Leave plugin version and release CHANGELOG to P27. Do not commit or push.
+
+## Delta: P18 security review findings and P05 residuals (2026-11-18), fix all before any settings write
+
+P18 landed proposal-only. This packet adds the persistent write, so every item below must be fixed first in `scripts/allow-rule` (and `scripts/token-audit` / P05 evidence code where named), each with a red test in `tests/test_allow_rule.py` (or the P05 test file). Do not delete or weaken existing tests.
+
+1. Freshness (`scripts/allow-rule` ~line 81) checks the extract's start and file time, while `token-audit` counts events after the audit time: ten future-dated acceptances can qualify a proposal. Exclude events stamped after the audit/extract time (P05 side too: P05 must drop future-dated events).
+2. Scope (~line 49) includes matching subdirectories in linked worktrees without verifying Git ownership for unenrolled peers, so an unrelated nested checkout's acceptances can qualify the enrolled project. Count only cwds whose Git common dir resolves to the enrolled project.
+3. The primary extract directory (~line 51) takes precedence over the legacy directory regardless of recency: an older positive extract can qualify despite a newer denial for the same literal and cwd. Choose by recency (and let any newer denial veto).
+4. Scope discovery (~line 41) inherits Git tracing configuration (`GIT_TRACE*`, `trace2.*`), so a proposal can append to a trace file outside its output. Run Git with a scrubbed environment and `-c trace2.normalTarget= -c trace2.perfTarget= -c trace2.eventTarget=` (or the project's existing safe-Git helper, if one exists; check `scripts/` first).
+5. Default argparse errors (~line 154) echo raw tokens to stderr, exposing private paths or command text in shared logs. Emit a redacted fixed message.
+6. The helper loads before CLI error handling (~line 18): a copy install that selects only `kaizen-allow-rule` crashes even on `--help`. Make `--help` and a missing helper fail cleanly with a short message.
+7. P05 residual: scheduled evidence uses `--days 7`, which exceeds the strict cutoff by proposal time. Use a window that stays within the cutoff at proposal time.
