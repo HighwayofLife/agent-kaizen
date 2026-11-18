@@ -30,3 +30,8 @@ Owned files: `scripts/allow-rule`, `scripts/token-audit`, `tests/test_allow_rule
 - `git diff --check`
 
 Do not commit or push. Do not edit `.claude-plugin/plugin.json` or `CHANGELOG.md`. Do not delete or weaken tests.
+
+## Delta after P24b (second follow-up Sol high review, 0fefbc1..e6fd048; both GATED)
+
+6. `scripts/kaizen_friction_apply.py` (displaced-ledger store, ~line 398 at e6fd048): displaced ledger copies are stored inside the checkout, where scheduled auto reviews keep project-wide write access, so a later review can overwrite the only copy of a displaced editor save. Fix: keep displaced copies outside every path a scheduled model run can write (for example under the private kaizen state directory next to the receipts), recorded by absolute path in the receipt, and test that a scheduled review's write scope cannot reach them.
+7. `scripts/kaizen_friction_apply.py` (~line 451 at e6fd048): a crash after saving `apply-pending` but before starting the native grant leaves a reservation reconciliation cannot clear; once the audit generation changes, the old transaction key is rejected and fresh evidence cannot start a new attempt. Fix: reconciliation cancels a pending reservation whose native effect never started (proved by the native journal having no record of that transaction), without weakening P18d's replay refusal, so fresh signed evidence can start a new attempt. Test both with crash injection.
