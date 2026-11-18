@@ -1,5 +1,5 @@
 #!/usr/bin/env -S python3 -I
-"""Check a scoped LocalSearch output marker."""
+"""Check and recover a scoped host output marker."""
 import os
 import sys
 
@@ -8,6 +8,8 @@ if __name__ == '__main__' and not sys.flags.isolated:
 
 import argparse
 from contextlib import ExitStack, contextmanager
+import ctypes
+import errno
 import fcntl
 from fnmatch import fnmatchcase
 from functools import partial
@@ -30,6 +32,8 @@ PROTECTED_ROOTS = {'.git', '.ssh', '.aws', '.gnupg', '.config', '.kube', '.docke
 DIR_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
 LIMIT = 1024 * 1024
 PLATFORM = sys.platform
+MAX_DEPTH = 64
+UNKNOWN = 'recorded output directory path unknown. A manual check is required'
 
 if __name__ == '__main__':
     sys.dont_write_bytecode = True
@@ -51,6 +55,8 @@ def sibling(*names):
 
 
 def marker_catalog(catalog_id):
+    if catalog_id == 'timemachine-output' and PLATFORM == 'darwin':
+        raise Refused('Time Machine requires a manual catalogue step because same-target exclusion is unverified')
     if catalog_id != CATALOG_ID or PLATFORM != 'linux':
         raise Refused('unknown marker or wrong platform')
     # Resolve the installed probe alongside its catalogue. Probe reports cannot authorize a write.
@@ -69,23 +75,40 @@ def marker_catalog(catalog_id):
     return names, cloud
 
 
+def check_depth(path):
+    if len(path.parts) > MAX_DEPTH + 1:
+        raise Refused('host-fix directory depth exceeds limit')
+
+
 def exact_path(value, base=None):
     path = Path(value)
     if not path.is_absolute():
         path = (base or Path.cwd()) / path
+    check_depth(path)
     if '..' in path.parts or path.resolve(strict=True) != path:
         raise Refused('path has traversal or a symlink component')
     return path
 
 
 @contextmanager
-def checked_directory(path, expected=None):
+def checked_directory(path, expected=None, *, deadline=None, recovery=None):
+    check_depth(path)
+    scope_depth = 0
+    if recovery and 'recovery_root' in recovery:
+        scope = Path(recovery['recovery_root'])
+        if scope not in path.parents:
+            raise Refused('output worktree scope changed')
+        scope_depth = len(scope.parts) - 1
     fd = os.open(path.anchor, DIR_FLAGS)
     try:
-        for part in path.parts[1:]:
+        for depth, part in enumerate(path.parts[1:], 1):
+            if deadline is not None:
+                check_deadline(deadline)
             child = os.open(part, DIR_FLAGS, dir_fd=fd)
             os.close(fd)
             fd = child
+            if depth == scope_depth and list(file_id(os.fstat(fd))) != recovery['recovery_identity']:
+                raise Refused('output worktree identity changed')
         if expected is not None and file_id(os.fstat(fd)) != file_id(expected):
             raise Refused('output directory identity changed')
         yield fd
@@ -93,19 +116,22 @@ def checked_directory(path, expected=None):
         os.close(fd)
 
 
-def read_config(path):
+def read_config(path, deadline):
+    check_deadline(deadline)
     path = path.absolute()
     if '..' in path.parts:
         raise Refused('invalid config path')
     try:
-        with checked_directory(path.parent) as parent:
+        with checked_directory(path.parent, deadline=deadline) as parent:
             fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
             with os.fdopen(fd, 'rb') as stream:
                 if not stat.S_ISREG(os.fstat(fd).st_mode):
                     raise Refused('config is not a regular file')
                 raw = stream.read(LIMIT + 1)
     except FileNotFoundError:
+        check_deadline(deadline)
         return {}
+    check_deadline(deadline)
     if len(raw) > LIMIT:
         raise Refused('config exceeds size limit')
     config = json.loads(raw, object_pairs_hook=_unique)
@@ -131,7 +157,7 @@ def check_policy(global_path, members, name, names, valid_paths, deadline):
     configs.extend((member, member / 'docs/kaizen/config.json') for member in sorted(members))
     output_lists = []
     for member, config_path in configs:
-        config = read_config(config_path)
+        config = read_config(config_path, deadline)
         if config.get('friction', 'on') != 'on' or config.get('hostActions', 'apply') != 'apply':
             raise Refused('project policy does not allow host actions')
         if member is None or 'frictionOutputDirs' not in config:
@@ -149,6 +175,7 @@ def check_policy(global_path, members, name, names, valid_paths, deadline):
                 if sensitive(part) or prefix.is_symlink():
                     raise Refused('invalid project output directories')
         output_lists.append(members[member].as_posix() in outputs)
+    check_deadline(deadline)
     if name not in names and (not output_lists or not all(output_lists)):
         raise Refused('path is not a recognized output directory')
 
@@ -158,8 +185,9 @@ def check_contents(directory, deadline):
 
     def visit(fd, depth):
         nonlocal budget
+        check_deadline(deadline)
         info = os.fstat(fd)
-        if depth > 64 or info.st_dev != device or info.st_uid != os.geteuid():
+        if depth > MAX_DEPTH or info.st_dev != device or info.st_uid != os.geteuid():
             raise Refused('output contains an unsafe directory')
         git_names = set()
         with os.scandir(fd) as entries:
@@ -192,11 +220,15 @@ def git_output(run, directory, *args):
     return result[1]
 
 
-def eligible_path(run, project, path, cloud):
+def eligible_path(run, project, path, cloud, deadline):
+    check_depth(path)
     entries = records(run, project)
     if not entries or any(b'bare' in entry or b'prunable' in entry for entry in entries):
         raise Refused('Git worktree registration is incomplete')
-    roots = {exact_path(os.fsdecode(entry[b'worktree'])) for entry in entries}
+    roots = set()
+    for entry in entries:
+        check_deadline(deadline)
+        roots.add(exact_path(os.fsdecode(entry[b'worktree'])))
     owners = {root for root in roots if root in path.parents}
     active = Path.cwd().resolve()
     if (len(roots) != len(entries) or not owners or path in {active, *roots}
@@ -204,6 +236,8 @@ def eligible_path(run, project, path, cloud):
             or (path / 'docs/kaizen').is_dir()):
         raise Refused('path is a root, contains a worktree or is outside the project')
     root = max(owners, key=lambda item: len(item.parts))
+    with checked_directory(root, deadline=deadline) as root_fd:
+        recovery = dict(recovery_root=str(root), recovery_identity=list(file_id(os.fstat(root_fd))))
     top = Path(os.fsdecode(git_output(run, project, 'rev-parse', '--show-toplevel').removesuffix(b'\n')))
     if top not in roots or (project not in roots and project not in path.parents):
         raise Refused('path is outside the selected project')
@@ -230,16 +264,17 @@ def eligible_path(run, project, path, cloud):
                if parent == outermost or outermost in parent.parents}
     members.setdefault(top, relative)
     members.setdefault(project, path.relative_to(project) if project in path.parents else relative)
-    return members
+    check_deadline(deadline)
+    return members, recovery
 
 
 def marker_identity(info):
     return (*file_id(info), info.st_ctime_ns)
 
 
-def marker_present(directory):
+def marker_present(directory, name=MARKER):
     try:
-        os.stat(MARKER, dir_fd=directory, follow_symlinks=False)
+        os.stat(name, dir_fd=directory, follow_symlinks=False)
     except FileNotFoundError:
         return False
     return True
@@ -277,13 +312,15 @@ def direct_key(directory):
     return key if key.startswith('direct_') else None
 
 
-def marker_version(directory, record):
-    with _private_file(directory, MARKER) as fd, os.fdopen(fd, 'rb', closefd=False) as stream:
+def marker_version(directory, record, name=MARKER):
+    with _private_file(directory, name) as fd, os.fdopen(fd, 'rb', closefd=False) as stream:
         stamp = record['stamp'].encode('ascii')
         contents = stream.read(len(stamp) + 1)
         version = list(marker_identity(os.fstat(fd)))
-    if (contents != stamp or record['marker'] != version[:len(record['marker'])]
-            or version != list(marker_identity(os.stat(MARKER, dir_fd=directory, follow_symlinks=False)))):
+    # Rename changes ctime. The quarantined inode must retain its device, inode and private stamp.
+    expected = record['marker'] if name == MARKER else record['marker'][:2]
+    if (contents != stamp or expected != version[:len(expected)]
+            or version != list(marker_identity(os.stat(name, dir_fd=directory, follow_symlinks=False)))):
         raise Refused('marker was changed or replaced')
     return version
 
@@ -318,6 +355,133 @@ def write_record(state, name, store, record):
     _replace(state, name, json.dumps(signed).encode('ascii') + b'\n')
 
 
+def rename_exclusive(directory, source, target):
+    # Never overwrite another writer's marker, even when restoring a raced rename.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == 'darwin':
+        rename, flags = libc.renameatx_np, 4  # RENAME_EXCL
+    else:
+        rename, flags = libc.renameat2, 1  # RENAME_NOREPLACE
+    if rename(directory, os.fsencode(source), directory, os.fsencode(target), flags):
+        code = ctypes.get_errno()
+        raise OSError(code, os.strerror(code))
+
+
+def retire_marker(directory, record, persist):
+    quarantine = record.get('quarantine')
+    if quarantine and not re.fullmatch(r'\.kaizen-marker-[0-9a-f]{32}', quarantine):
+        raise Refused('invalid marker quarantine name')
+    if not (quarantine and marker_present(directory, quarantine)):
+        if record['phase'] == 'undone' or (quarantine and record['phase'] == 'undo-pending'):
+            return record
+        if not marker_present(directory):
+            return record
+        with _private_file(directory, MARKER):
+            version = marker_version(directory, record)
+            if not quarantine:
+                quarantine = '.kaizen-marker-' + os.urandom(16).hex()
+                record = dict(record, marker=version, quarantine=quarantine, phase='retire-pending')
+                persist(record)
+            rename_exclusive(directory, MARKER, quarantine)
+    try:
+        marker_version(directory, record, quarantine)
+    except (Refused, OSError, ValueError):
+        if record['phase'] == 'undone':
+            raise Refused('quarantined entry changed or replaced. A manual check is required') from None
+        try:
+            rename_exclusive(directory, quarantine, MARKER)
+        except OSError:
+            raise Refused('marker changed or replaced. The quarantined entry needs a manual check') from None
+        os.fsync(directory)
+        raise Refused('marker was changed or replaced') from None
+    if record['phase'] not in ('undo-pending', 'undone'):
+        os.fsync(directory)
+        record = dict(record, phase='undo-pending')
+        persist(record)
+        marker_version(directory, record, quarantine)
+    os.unlink(quarantine, dir_fd=directory)
+    os.fsync(directory)
+    return record
+
+
+def find_output(directory, path, identity, deadline):
+    budget = 20000
+    depth_limited = False
+
+    def visit(fd, candidate):
+        nonlocal budget, depth_limited
+        check_deadline(deadline)
+        info = os.fstat(fd)
+        if list(file_id(info)) == identity:
+            return candidate, info
+        with os.scandir(fd) as entries:
+            for entry in entries:
+                check_deadline(deadline)
+                budget -= 1
+                if budget < 0:
+                    raise Refused('recovery search limit exceeded')
+                if sensitive(entry.name) or not entry.is_dir(follow_symlinks=False):
+                    continue
+                child_path = candidate / entry.name
+                if len(child_path.parts) > MAX_DEPTH + 1:
+                    depth_limited = True
+                    continue
+                try:
+                    child = os.open(entry.name, DIR_FLAGS, dir_fd=fd)
+                except FileNotFoundError:
+                    continue
+                try:
+                    found = visit(child, child_path)
+                    if found is not None:
+                        return found
+                finally:
+                    os.close(child)
+        return None
+
+    found = visit(directory, path)
+    if found is None and depth_limited:
+        raise Refused('recovery directory depth exceeds limit')
+    return found
+
+
+def locate_output(record, deadline):
+    bound = record['binding']
+    path = Path(bound['path'])
+    identity = bound['directory_identity']
+    missing = False
+    try:
+        with checked_directory(path, deadline=deadline) as directory:
+            info = os.fstat(directory)
+            if list(file_id(info)) == identity:
+                return path, info
+    except FileNotFoundError:
+        missing = True
+    except OSError as error:
+        if error.errno in (errno.ELOOP, errno.ENOTDIR):
+            raise Refused('output path has a symlink or non-directory component') from None
+        raise
+    if 'recovery_root' in record:
+        root = Path(record['recovery_root'])
+        try:
+            with checked_directory(root, deadline=deadline) as directory:
+                if list(file_id(os.fstat(directory))) != record['recovery_identity']:
+                    raise Refused(UNKNOWN)
+                found = find_output(directory, root, identity, deadline)
+            if found is not None:
+                return found
+        except Refused as error:
+            if str(error) == UNKNOWN:
+                raise
+            raise Refused(f'{UNKNOWN} ({error})') from None
+        except OSError:
+            raise Refused(UNKNOWN) from None
+    if missing and (record['phase'] == 'undone'
+                    or (record['phase'] == 'undo-pending' and 'quarantine' in record)):
+        # The durable undo-pending phase proves .nomedia was already detached.
+        return None, None
+    raise Refused(UNKNOWN)
+
+
 def runtime():
     executable = next((name for name in GIT_PATHS if os.access(name, os.X_OK)), None)
     deadline = time.monotonic() + 20
@@ -339,9 +503,9 @@ def binding(project, project_info, path, info):
                 path=str(path), directory_identity=list(file_id(info)))
 
 
-def recheck(project, project_info, path, info):
+def recheck(project, project_info, path, info, recovery):
     try:
-        with checked_directory(project, project_info), checked_directory(path, info):
+        with checked_directory(project, project_info), checked_directory(path, info, recovery=recovery):
             if file_id(path.lstat()) != file_id(info) or path.resolve(strict=True) != path:
                 raise Refused('output directory identity changed')
     except OSError:
@@ -364,7 +528,7 @@ def apply(args, *, action_id=None):
     project_info, info = project.lstat(), path.lstat()
 
     def authorize():
-        members = eligible_path(run, project, path, cloud)
+        members, recovery = eligible_path(run, project, path, cloud, deadline)
         canonical, subject = store.canonical_project(project, selector=path)
         members.setdefault(canonical, subject.relative_to(canonical))
         check_policy(runner['global_config_path'](), members, path.name, names,
@@ -377,6 +541,7 @@ def apply(args, *, action_id=None):
                 for row in store.scoped(canonical)):
             raise Refused('no open eligible action for this output and transaction key')
         _check_directory(directory, owner=True, store=True)
+        return recovery
 
     with checked_directory(path, info) as directory, ExitStack() as stack:
         present = marker_present(directory)
@@ -391,9 +556,14 @@ def apply(args, *, action_id=None):
         if create:
             if present:
                 return already_present(action_id)
-            authorize()
-        state = stack.enter_context(_directory(root, create=create, private=True))
-        lock_state(state)
+            recovery = authorize()
+        try:
+            state = stack.enter_context(_directory(root, create=create, private=True))
+            lock_state(state)
+        except (Refused, OSError, ValueError):
+            if present and action_id is None and marker_present(directory):
+                return already_present(action_id)
+            raise
         present = marker_present(directory)
         bound = binding(project, project_info, path, info)
         key = action_id or (direct_key(directory) if present else None)
@@ -411,32 +581,32 @@ def apply(args, *, action_id=None):
                 return already_present(action_id)
             raise
         if present:
-            recheck(project, project_info, path, info)
+            recheck(project, project_info, path, info, record)
         else:
             if record and record['phase'] == 'applied':
                 raise Refused('verified marker is absent')
             if not create:
-                authorize()
+                recovery = authorize()
             check_deadline(deadline)
-            recheck(project, project_info, path, info)
+            recheck(project, project_info, path, info, recovery)
             stamp = f'Agent Kaizen marker v1 {name[:-5]} {os.urandom(32).hex()}\n'
-            record = dict(binding=bound, phase='apply-pending', stamp=stamp)
+            record = dict(recovery, binding=bound, phase='apply-pending', stamp=stamp)
             fd = stage_marker(directory, record['stamp'].encode('ascii'))
             try:
                 record['marker'] = list(file_id(os.fstat(fd)))
                 write_record(state, name, store, record)
                 check_deadline(deadline)
-                recheck(project, project_info, path, info)
+                recheck(project, project_info, path, info, record)
                 try:
                     publish_marker(directory, fd)
                 except FileExistsError:
                     return already_present(action_id)
                 try:
-                    recheck(project, project_info, path, info)
+                    recheck(project, project_info, path, info, record)
                 except Refused:
-                    marker_version(directory, record)
-                    os.unlink(MARKER, dir_fd=directory)
+                    record = retire_marker(directory, record, partial(write_record, state, name, store))
                     os.fsync(directory)
+                    write_record(state, name, store, dict(record, phase='undone'))
                     raise
                 version = marker_version(directory, record)
             finally:
@@ -455,7 +625,7 @@ def undo(args):
     _, cloud = marker_catalog(CATALOG_ID)
     project = exact_path(args.project)
     project_info = project.lstat()
-    _, store, run, _ = runtime()
+    _, store, run, deadline = runtime()
     root = store.friction / 'host-fixes'
     target = Path(args.record).absolute()
     if target.parent != root.absolute() or not re.fullmatch(KEY + r'\.json', target.name):
@@ -463,27 +633,34 @@ def undo(args):
     with _directory(root, private=True) as state:
         lock_state(state)
         record = read_record(state, target.name, store)
-        if record is None or record['binding']['project'] != str(project):
+        if (record is None or record['binding']['project'] != str(project)
+                or record['binding']['project_identity'] != list(file_id(project_info))):
             raise Refused('record does not bind this project')
-        path = exact_path(record['binding']['path'])
-        info = path.lstat()
-        if record['binding'] != binding(project, project_info, path, info):
-            raise Refused('project or output directory identity changed')
-        with checked_directory(path, info) as directory:
-            if marker_present(directory):
-                if record['phase'] == 'undone':
+        if record['phase'] not in ('apply-pending', 'applied', 'retire-pending', 'undo-pending', 'undone'):
+            raise Refused('invalid marker transaction phase')
+        persist = partial(write_record, state, target.name, store)
+        path, info = locate_output(record, deadline)
+        if path is None:
+            if record['phase'] != 'undone':
+                persist(dict(record, phase='undone'))
+                print('host-fix: marker absent. Check for a quarantined marker if the directory moved.')
+            return
+        with checked_directory(path, info, deadline=deadline, recovery=record) as directory:
+            quarantine = record.get('quarantine')
+            quarantined = quarantine and marker_present(directory, quarantine)
+            if marker_present(directory) or quarantined:
+                if record['phase'] == 'undone' and not quarantined:
                     raise Refused('marker appeared after undo')
-                eligible_path(run, project, path, cloud)
+                _, recovery = eligible_path(run, project, path, cloud, deadline)
+                if 'recovery_root' in record and any(record[key] != value for key, value in recovery.items()):
+                    raise Refused(UNKNOWN)
                 _check_directory(directory, owner=True, store=True)
-                version = marker_version(directory, record)
-                record = dict(record, marker=version, phase='undo-pending')
-                write_record(state, target.name, store, record)
-                recheck(project, project_info, path, info)
-                marker_version(directory, record)
-                os.unlink(MARKER, dir_fd=directory)
+                recheck(project, project_info, path, info, record)
+                check_deadline(deadline)
+                record = retire_marker(directory, record, persist)
             if record['phase'] != 'undone':
                 os.fsync(directory)
-                write_record(state, target.name, store, dict(record, phase='undone'))
+                persist(dict(record, phase='undone'))
 
 
 def main(argv=None):
