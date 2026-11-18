@@ -46,3 +46,10 @@ Use the ledger attestation defined in [Approach and contracts](../plan.md#approa
 ## Report
 
 Report changed files and line counts, exact checks and outcomes, known uncertainty and any blocked verification. Label measurements with baseline/conditions. Redact paths and identifiers from shared output. Leave plugin version and release CHANGELOG to P27. Do not commit or push.
+
+## Delta (P16b residuals, 2026-11-18)
+
+P16b landed after three Sol high rounds. Carry into this packet, which extends the same commit/undo code in `scripts/kaizen-backup`:
+1. Ref-backed undo restores require the target's parent directory to exist and can drop filesystem flags or extended attributes. Refuse a restore when the backup recorded xattrs/flags that cannot be reapplied, or reapply them, with a test; a missing parent stays a clear refusal.
+2. Accepted same-UID residuals, do not reopen: a symlink planted under `refs/` that resolves into `refs/kaizen/`, a concurrent move of the undo target's directory during the descriptor-bound copy, and the final POSIX rename race after the fd-bound recheck.
+3. Scheduled commits must reuse P16b's journal, pins and Git re-trust path; do not add a second recovery mechanism.
