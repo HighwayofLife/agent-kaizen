@@ -45,3 +45,7 @@ Read `git show wt/p08b:scripts/kaizen-scheduled` at `review_command` and the ins
 ## Report
 
 Report changed files and line counts, exact checks and outcomes, known uncertainty and any blocked verification. Label measurements with baseline/conditions. Redact paths and identifiers from shared output. Leave plugin version and release CHANGELOG to P27. Do not commit or push.
+
+## Delta (BF13b residual, batch review 6 finding 2)
+
+Before any prepared candidate can drive a scheduled action, bind the report to its extract at initial preparation: `scripts/token-audit` records the SHA-256 of each friction extract it writes (and its size) in the report's friction block; `scripts/kaizen_friction_prepare.py` reads the extract through the existing safe-open path, recomputes the digest and refuses (with a recorded reason) on mismatch or absence. The later receipt check already detects swaps after preparation (`test_swapped_extract_after_receipt_is_refused`). Add a test that swaps the extract between audit and first preparation and asserts refusal. Add `scripts/token-audit` to this packet's owned files for that change only (P18d lands first).
