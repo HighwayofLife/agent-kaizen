@@ -47,6 +47,29 @@ def policy_digest(snapshot):
     return hashlib.sha256(repr(snapshot).encode("utf-8")).hexdigest()
 
 
+def marker_tool():
+    here = Path(__file__).resolve().parent
+    path = next((here / name for name in ("kaizen-host-fix", "host-fix") if (here / name).is_file()), None)
+    require(path is not None and path.resolve() == path)
+    sys.path.insert(0, str(here))
+    try:
+        return runpy.run_path(str(path))
+    finally:
+        del sys.path[0]
+
+
+def marker_writes_enabled(tool):
+    return sys.platform.startswith("linux") and tool["LINUX_WRITES"]
+
+
+def scheduled_marker_refusal():
+    if not VERIFIED_STREAM_VERSIONS:
+        return "scheduled stream gate is closed"
+    if not marker_writes_enabled(marker_tool()):
+        return "native marker gate is closed"
+    return None
+
+
 def reject_constant(_value):
     raise ValueError("non-JSON constant in mutation evidence")
 
@@ -533,6 +556,31 @@ class BrokerLedger:
         self.save(record, "recorded")
         return "recorded"
 
+    def cancel_unstarted_marker(self, record):
+        """Release an old reservation only when its private native journal is absent."""
+        if record["phase"] != "marker-pending" or not record.get("reservation"):
+            return False
+        native = Path(self.tool_record(record["id"], "host-fix"))
+        require(record["operation"] == "host-fix" and record["tool_record"] == str(native))
+        with ExitStack() as stack:
+            try:
+                state = stack.enter_context(self.host["_directory"](native.parent, private=True))
+            except FileNotFoundError:
+                pass
+            else:
+                fcntl = self.host["fcntl"]
+                fcntl.flock(state, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    os.stat(native.name, dir_fd=state, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    return False
+            record["reason"] = "native journal never started"
+            del record["reservation"]
+            self.save(record, "cancelled")
+        return True
+
     def scheduled_marker(self, ident, target, bound, invoke, *, attempt=None):
         """Verify old work first. An absent native journal permits a fresh attempt."""
         record = self.load(ident)
@@ -585,7 +633,7 @@ class BrokerLedger:
 
     def undo(self, ident, inverse):
         record = self.load(ident)
-        if record is None or record["phase"] in ("apply-pending", "marker-pending", "no-effect"):
+        if record is None or record["phase"] in ("apply-pending", "marker-pending", "no-effect", "cancelled"):
             raise ValueError("no verified broker effect in this project")
         self.recover_ledger_backups(ident, record)
         expected = self.row(record, legacy_metric=not record.get("absolute_metric"))
@@ -914,10 +962,7 @@ def marker_main():
     args = parser.parse_args()
     here = Path(__file__).resolve().parent
     sys.dont_write_bytecode = True
-    sys.path.insert(0, str(here))
-    path = next(here / name for name in ("kaizen-host-fix", "host-fix") if (here / name).is_file())
-    require(path.resolve() == path)
-    tool = runpy.run_path(str(path))
+    tool = marker_tool()
     try:
         runner, store, _, deadline = tool["runtime"]()
         host = runpy.run_path(str(here / "kaizen_friction_actions.py"))
@@ -943,7 +988,7 @@ def marker_main():
         require(runner["action_project"](args.project, selector=args.target) == (args.project, args.target))
         project_info, info = args.project.lstat(), args.target.lstat()
         require(list(tool["file_id"](info)) == args.identity)
-        enabled = sys.platform.startswith("linux") and tool["LINUX_WRITES"]
+        enabled = marker_writes_enabled(tool)
         if args.phase == "apply":
             require(enabled)
             backup = runpy.run_path(str(here / "kaizen-backup"))

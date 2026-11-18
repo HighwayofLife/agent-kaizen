@@ -1,6 +1,8 @@
 """Scheduled friction preparation and transactional reconciliation."""
 import json
+import runpy
 from datetime import timedelta
+from unittest.mock import patch
 
 from test_friction_prepare import PreparationTests, prepare
 
@@ -8,7 +10,6 @@ from test_friction_prepare import PreparationTests, prepare
 class ScheduledFrictionTests(PreparationTests):
     def setUp(self):
         super().setUp()
-        from unittest.mock import patch
         clock = patch.dict(self.runner["reconcile_scheduled"].__globals__,
                            {"now": lambda: self.current + timedelta(seconds=3)})
         clock.start()
@@ -27,15 +28,35 @@ class ScheduledFrictionTests(PreparationTests):
         self.assertIsNone(self.scheduled())
         self.assertTrue(inputs.exists())
 
-    def test_apply_stays_pending_and_does_not_acknowledge(self):
-        self.probe["findings"] = [dict(id="low-disk", catalog_id="low-disk", subject="project-volume",
-                                       evidence=dict(free_disk_bytes=1))]
+    def marker_request(self):
+        target = self.project / "build"
+        target.mkdir()
+        self.probe["findings"] = [dict(id="indexed-output", catalog_id="linux-localsearch", subject=str(target),
+                                       evidence=dict(size_bytes=1))]
+        self.probe["regenerable_dirs"] = [dict(path=str(target), size_bytes=1)]
         self.write_evidence()
         inputs, receipt = self.scheduled("auto")
         ident = json.loads(inputs.read_text())["actions"][0]["id"]
         output = self.write(self.obj.folder / "review.md", '<!-- kaizen-host-actions ' + json.dumps(
             dict(v=1, actions=[dict(id=ident, intent="apply")])) + ' -->\n')
-        self.runner["reconcile_scheduled"](self.config / "audits", self.obj, output, receipt)
+        return target, ident, output, receipt
+
+    def test_closed_marker_apply_is_imported_as_suggestion_and_acknowledged(self):
+        target, ident, output, receipt = self.marker_request()
+        self.assertTrue(self.runner["reconcile_scheduled"](
+            self.config / "audits", self.obj, output, receipt, authorize=self.fail))
+        self.assertEqual(output.read_text(), "")
+        store = json.loads((self.config / "audits/host-actions.json").read_text())
+        self.assertEqual(store["receipts"][str(self.project)]["scheduled:" + receipt["generation"]], {ident: "terminal"})
+        self.assertEqual(store["actions"][ident]["status"], "open")
+        self.assertFalse((target / ".nomedia").exists())
+        self.assertIsNone(self.scheduled("auto"))
+
+    def test_apply_stays_pending_and_does_not_acknowledge(self):
+        _, _, output, receipt = self.marker_request()
+        reconcile = self.runner["reconcile_scheduled"]
+        with patch.dict(reconcile.__globals__, scheduled_action_refusal=lambda _: None):
+            self.assertFalse(reconcile(self.config / "audits", self.obj, output, receipt))
         self.assertIsNotNone(self.scheduled("auto"))
         store = json.loads((self.config / "audits/host-actions.json").read_text())
         self.assertIn('pending', json.dumps(store))
@@ -170,6 +191,37 @@ if os.environ.get('REVIEW_SLEEP'): time.sleep(10)
         self.assertEqual(len(self.calls()), calls_before)
         self.assertEqual([p for p in self.obj.folder.glob('cycle-*.md') if not p.name.endswith('.failed.md')], proposals)
         self.assertEqual(self.state()['acknowledged_generation'], '00000000000000000001')
+
+    def test_legacy_pending_receipts_stop_blocking_scheduled_acknowledgement(self):
+        host = runpy.run_path(str(self.runner_path.parent / "kaizen_friction_actions.py"))
+        store = host["HostActions"](self.config / "audits", self.backups,
+                                    self.runner["action_project"], self.runner["key"])
+        target = self.project / "build"
+        target.mkdir()
+        legacy = {}
+        for number, (catalog, selector) in enumerate((("low-disk", "project-volume"),
+                                                      ("linux-localsearch", str(target))), 1):
+            ident = store.action_id(self.project, catalog, selector, allowed=[selector])
+            generation = f"scheduled:{number:020d}"
+            frozen = {ident: dict(canonical_project=str(self.project), catalog_id=catalog, selector_key=selector,
+                                  intents=["suggest", "apply"], evidence="fixture")}
+            block = '<!-- kaizen-host-actions ' + json.dumps(dict(v=1, actions=[dict(id=ident, intent="apply")])) + ' -->'
+            self.assertEqual(store.import_actions(block, frozen, self.project, generation), {ident: "pending"})
+            legacy[generation] = {ident: "terminal"}
+        self.write(self.backups / "friction" / ("prepare-" + self.obj.key + ".json"),
+                   json.dumps(dict(v=1, project=str(self.project), generation=2, acknowledged={}))).chmod(0o600)
+        result = self.review_run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        receipts = json.loads(store.path.read_text())["receipts"][str(self.project)]
+        for generation, expected in legacy.items():
+            self.assertEqual(receipts[generation], expected)
+        self.assertIn("proposal-only", result.stdout)
+        self.assertIn("gate is closed", result.stdout)
+        self.assertEqual(self.state().get("acknowledged_generation"), "00000000000000000003",
+                         result.stdout + result.stderr)
+        self.assertFalse((target / ".nomedia").exists())
+        self.assertFalse(list(store.friction.glob("broker-*.json")))
+        self.assertFalse((store.friction / "host-fixes").exists())
 
     def test_probe_refresh_fresh_stale_and_failure(self):
         import os

@@ -491,12 +491,13 @@ class BrokerLedgerTests(unittest.TestCase):
 from datetime import datetime, timezone
 project = sys.argv[sys.argv.index('--project') + 1]
 out = pathlib.Path(sys.argv[sys.argv.index('--out') + 1])
-target = project + '/build'
+targets = [str(pathlib.Path(project) / name) for name in ('build', 'dist')
+           if (pathlib.Path(project) / name).is_dir()]
 (out / 'host-probe-fixture.json').write_text(json.dumps(dict(v=1, project=project,
     generated_at=datetime.now(timezone.utc).isoformat(),
     findings=[dict(id='indexed-output', catalog_id='linux-localsearch',
-                   subject=target, evidence=dict(size_bytes=1))],
-    regenerable_dirs=[dict(path=target, size_bytes=1)])))
+                   subject=target, evidence=dict(size_bytes=1)) for target in targets],
+    regenerable_dirs=[dict(path=target, size_bytes=1) for target in targets])))
 """)
         claude = installed / "fixture-claude"
         claude.write_text("#!" + sys.executable + "\n" + r"""import json, os, pathlib, sys, time
@@ -505,8 +506,8 @@ if sys.argv[1:] == ['--version']:
     sys.exit()
 prompt = sys.argv[sys.argv.index('-p') + 1]
 inputs = pathlib.Path(json.loads(prompt.split(' friction-inputs=', 1)[1]))
-ident = json.loads(inputs.read_text())['actions'][0]['id']
-line = '<!-- kaizen-host-actions ' + json.dumps(dict(v=1, actions=[dict(id=ident, intent='apply')])) + ' -->'
+actions = [dict(id=row['id'], intent='apply') for row in json.loads(inputs.read_text())['actions']]
+line = '<!-- kaizen-host-actions ' + json.dumps(dict(v=1, actions=actions)) + ' -->'
 session = sys.argv[sys.argv.index('--session-id') + 1]
 fault = os.getenv('FIXTURE_FAULT')
 if fault == 'timeout':
@@ -536,19 +537,25 @@ for index, event in enumerate(events):
         config = installed.parent
         policy = config / "agent-kaizen.json"
         enabled = '{"scheduledAutonomy":"auto","schedule":"always"}'
-        for crash in ("timeout", "invalid", "target", "malformed", "unbacked", "takeover", "effect", "row", "policy"):
-            policy.write_text(enabled)
-            project = installed.parent.parent / crash
+
+        def init_project(name, outputs):
+            project = installed.parent.parent / name
             ledger = project / apply.LEDGER
             ledger.parent.mkdir(parents=True)
             ledger.write_text(self.table)
-            marker = project / "build/.nomedia"
-            marker.parent.mkdir()
-            (project / ".gitignore").write_text("build/\n")
+            for output in outputs:
+                (project / output).mkdir()
+            (project / ".gitignore").write_text("".join(output + "/\n" for output in outputs))
             for args in (("init", "-q"), ("add", "."), ("-c", "user.name=Fixture", "-c",
                          "user.email=fixture@example.invalid", "-c", "core.hooksPath=/dev/null",
                          "commit", "--no-gpg-sign", "-qm", "fixture")):
                 subprocess.run(["git", "-C", str(project), *args], check=True, env=env)
+            return project, ledger
+
+        for crash in ("timeout", "invalid", "target", "malformed", "unbacked", "takeover", "effect", "row", "policy"):
+            policy.write_text(enabled)
+            project, ledger = init_project(crash, ("build",))
+            marker = project / "build/.nomedia"
             source = runner.read_text()
             if crash == "takeover":
                 statement = '                        run_scheduled_broker(audits, project, options, receipt=prepared[1], attempt=attempt)'
@@ -614,6 +621,65 @@ for index, event in enumerate(events):
         command(runner, "review", "--force", "--project-dir", project, "--claude", claude, KAIZEN_SKIP_CHECKS="1")
         self.assertTrue((project / "build/.nomedia").exists())
         self.assertEqual((project / apply.LEDGER).read_text().count("[action:"), 1)
+
+        policy.write_text(json.dumps(dict(scheduledAutonomy="auto", schedule="always", maxChangesPerRun=2)))
+        for fault in ("unstarted", "started", "two-slots", "config-created"):
+            with self.subTest(fault=fault):
+                project, ledger = init_project(fault, ("build", "dist"))
+                review = ("review", "--force", "--project-dir", project, "--claude", claude)
+                if fault in ("unstarted", "started"):
+                    statement = '            self.save(record, "marker-pending")'
+                    runner_source = runner.read_text()
+                    if fault == "unstarted":
+                        runtime.write_text(runtime_source.replace(statement, statement + '\n            os._exit(77)', 1))
+                    else:
+                        native_save = "                write_record(state, name, store, record)"
+                        fix.write_text(fix_source.replace(native_save, native_save + "\n                os._exit(77)", 1))
+                        error = '            raise ValueError("native marker transaction is unavailable or ambiguous")'
+                        runner.write_text(runner_source.replace(error, "            os._exit(77)", 1))
+                    command(runner, *review, code=77, KAIZEN_SKIP_CHECKS="1")
+                    runner.write_text(runner_source)
+                    runtime.write_text(runtime_source)
+                    fix.write_text(fix_source)
+                    records = config / "backups/friction"
+                    journal, = (path for path in records.glob("broker-fa1_*.json")
+                                if json.loads(path.read_text())["scope"][0] == str(project))
+                    reservation = json.loads(journal.read_text())
+                    native = Path(reservation["tool_record"])
+                    self.assertEqual(native.exists(), fault == "started")
+                    target = Path(reservation["target"])
+                    target.rename(project.with_name(project.name + "-replaced-output"))
+                    target.mkdir()
+                    other = project / ("dist" if target.name == "build" else "build")
+                    command(runner, *review, KAIZEN_SKIP_CHECKS="1")
+                    after = json.loads(journal.read_text())
+                    store = json.loads((config / "audits/host-actions.json").read_text())
+                    generation = "scheduled:" + reservation["generation"]
+                    state = store["receipts"][str(project)][generation][reservation["id"]]
+                    if fault == "unstarted":
+                        self.assertNotIn("reservation", after)
+                        self.assertIn("native journal never started", after["reason"])
+                        self.assertEqual(after["phase"], "cancelled")
+                        self.assertEqual(state, "terminal")
+                    else:
+                        self.assertEqual(after, reservation)
+                        self.assertEqual(state, "pending")
+                    self.assertFalse((target / ".nomedia").exists())
+                    self.assertTrue((other / ".nomedia").is_file())
+                    self.assertEqual(ledger.read_text().count("[action:"), 1)
+                    continue
+
+                project_policy = project / "docs/kaizen/config.json"
+                if fault == "config-created":
+                    statement = '        self.save(record, "recorded")'
+                    runtime.write_text(runtime_source.replace(
+                        statement, statement + '\n        (self.project / "docs/kaizen/config.json").write_text("{}")', 1))
+                command(runner, *review, KAIZEN_SKIP_CHECKS="1")
+                runtime.write_text(runtime_source)
+                expected = 1 if fault == "config-created" else 2
+                self.assertEqual(project_policy.exists(), fault == "config-created")
+                self.assertEqual(sum((project / name / ".nomedia").is_file() for name in ("build", "dist")), expected)
+                self.assertEqual(ledger.read_text().count("[action:"), expected)
         (config / "agent-kaizen.json").unlink()
 
     def copied_install_undo_and_bookkeeping_recovery(self, *, relative_state=False):

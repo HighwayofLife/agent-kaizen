@@ -299,16 +299,16 @@ def freeze_mutation_config(project, backup):
                                 parse_constant=reject_constant)
             stamp = (tuple(backup["directory_identity"](parent) for parent in path.parents), stamp)
         except FileNotFoundError:
-            # Pin the closest existing parent of an absent source.
+            # A ledger append can change this directory's timestamps.
             parent = next(parent for parent in path.parents if parent.exists())
-            stamp, raw, config = backup["file_version"](parent.stat()), None, {}
+            stamp, raw, config = ("absent", backup["directory_identity"](parent)), None, {}
         if not isinstance(config, dict):
             raise ValueError("expected a mutation config object")
         for name in config.keys() & SCHEMA.keys():
             if not valid_value(name, config[name]) or SCHEMA[name].get("global_only" if layers else "project_only"):
                 raise ValueError("invalid controlling mutation config")
         layers.append(config)
-        stamps.append((path, stamp, raw))
+        stamps.append((path, stamp, hashlib.sha256(raw).hexdigest() if raw is not None else None))
     global_cfg, project_cfg = layers
     if (not global_cfg.get("enabled", True)
             or project_cfg.get("schedule", global_cfg.get("schedule")) == "off"):
@@ -2199,7 +2199,7 @@ def scheduled_budget(audits, project, options, command, root, prepared, started,
     try:
         backup, config = scheduled_authority(audits, project, options, command, root)
         broker = runpy.run_path(str(HERE / "kaizen_friction_apply.py"))
-        if not broker["VERIFIED_STREAM_VERSIONS"]:
+        if broker["scheduled_marker_refusal"]():
             return None
         version = run_group([command[0], "--version"], cwd="/", timeout=STEP_TIMEOUT,
                             capture_output=True, text=True, stdin=subprocess.DEVNULL)
@@ -2232,6 +2232,13 @@ def scheduled_budget(audits, project, options, command, root, prepared, started,
         return None
 
 
+def scheduled_action_refusal(catalog_id):
+    if catalog_id != "linux-localsearch":
+        return "operation is proposal-only"
+    runtime = runpy.run_path(str(HERE / "kaizen_friction_apply.py"))
+    return runtime["scheduled_marker_refusal"]()
+
+
 def run_scheduled_broker(audits, project, options, *, receipt=None, attempt=None):
     """Reconcile older reservations before allowing any new fixed operation."""
     root = backup_root().resolve()
@@ -2239,16 +2246,29 @@ def run_scheduled_broker(audits, project, options, *, receipt=None, attempt=None
     store = host["HostActions"](audits, root, action_project, key)
     project_path = project.canonical
     command = review_command(options, "auto", "", "", project_path, audits)
-    backup, config = scheduled_authority(audits, project_path, options, command, root)
+    backup, config = None, None
+
+    def authorize():
+        nonlocal backup, config
+        if config is None:
+            backup, config = scheduled_authority(audits, project_path, options, command, root)
+
+    if attempt is not None:
+        authorize()
     broker_path = HERE / "kaizen_friction_apply.py"
     runtime = runpy.run_path(str(broker_path))
     broker = runtime["BrokerLedger"]
     helper_env = dict(HOME=str(canonical_path(Path.home())), CLAUDE_CONFIG_DIR=str(canonical_path(claude_home())),
                       KAIZEN_BACKUP_DIR=str(root), PATH="/usr/bin:/bin")
+    slots = 0
 
     def invoke(phase, ident, target, bound):
-        if phase == "apply" and config != freeze_mutation_config(project_path, backup):
-            raise ValueError("broker policy changed before the effect")
+        nonlocal slots
+        if phase == "apply":
+            if not slots or config != freeze_mutation_config(project_path, backup):
+                raise ValueError("broker policy or budget changed before the effect")
+            # The broker has persisted the reservation by this point.
+            slots -= 1
         arguments = (["--target", target, "--identity", *map(str, bound)] if phase == "verify"
                      else ["--lease-fd", str(ledger.lease)])
         result = run_group([str(Path(options.python).resolve()), "-I", str(broker_path), phase,
@@ -2281,26 +2301,49 @@ def run_scheduled_broker(audits, project, options, *, receipt=None, attempt=None
                 rows[ident].update(status="done", done_by="verify", updated_at=now().isoformat())
             store._save(directory, rows, receipts)
 
+        unresolved = set()
+        action_errors = (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError)
         for ident in pending:
-            record = ledger.load(ident)
-            if record is not None and record["phase"] == "reverted":
-                ledger.reconcile(ident)
+            phase, reason = None, None
+            try:
+                catalog = rows[ident]["catalog_id"]
+                record = ledger.load(ident)
+                if record is None:
+                    reason = scheduled_action_refusal(catalog)
+                elif record["phase"] == "cancelled":
+                    reason = record["reason"]
+                elif record["phase"] == "reverted":
+                    authorize()
+                    phase = ledger.reconcile(ident)
+                elif record.get("reservation"):
+                    authorize()
+                    if ledger.cancel_unstarted_marker(record):
+                        reason = record["reason"]
+                    else:
+                        phase = ledger.scheduled_marker(ident, rows[ident]["selector_key"], record["target_identity"], invoke)
+            except action_errors:
+                unresolved.add(ident)
+                log(f"friction: broker action {ident} remains pending")
+                continue
+            if reason:
                 terminal(ident, applied=False)
-            elif record is not None and record.get("reservation"):
-                phase = ledger.scheduled_marker(ident, rows[ident]["selector_key"], record["target_identity"], invoke)
-                if phase:
-                    terminal(ident, applied=phase == "recorded")
+                log(f"friction: broker action {ident} resolved as a suggestion ({reason})")
+            elif phase:
+                terminal(ident, applied=phase == "recorded")
         if attempt is not None:
             for ident in pending:
-                if not slots or current.get(ident) != "pending" or ident not in targets:
+                if not slots or current.get(ident) != "pending" or ident not in targets or ident in unresolved:
                     continue
-                candidate = receipt["allowed"][ident]
-                if any(rows[ident][key] != candidate[key] for key in ("catalog_id", "selector_key")):
-                    raise ValueError("scheduled action changed after import")
-                slots -= 1
-                phase = ledger.scheduled_marker(ident, candidate["selector_key"], targets[ident], invoke,
-                                                attempt=(run_id, receipt["generation"], receipt["scope"]["cwd"],
-                                                         runtime["policy_digest"](config)))
+                try:
+                    candidate = receipt["allowed"][ident]
+                    if any(rows[ident][key] != candidate[key] for key in ("catalog_id", "selector_key")):
+                        raise ValueError("scheduled action changed after import")
+                    phase = ledger.scheduled_marker(ident, candidate["selector_key"], targets[ident], invoke,
+                                                    attempt=(run_id, receipt["generation"], receipt["scope"]["cwd"],
+                                                             runtime["policy_digest"](config)))
+                except action_errors:
+                    log(f"friction: broker action {ident} remains pending")
+                    continue
                 if phase:
                     terminal(ident, applied=phase == "recorded")
 
@@ -2797,11 +2840,23 @@ def reconcile_scheduled(audits, project, output, receipt, *, acknowledge=True, r
         raise ValueError("expected one action comment")
     block = matches[0].rstrip("\r\n")
     requests = host["_requests"](block)
-    applies = [ident for ident, intent in requests.items() if intent == "apply"]
-    if authorize is not None and applies:
-        if any(receipt["allowed"].get(ident, {}).get("catalog_id") != "linux-localsearch" for ident in applies):
+    downgraded = False
+    for ident, intent in requests.items():
+        if intent != "apply":
+            continue
+        candidate = receipt["allowed"].get(ident, {})
+        if intent not in candidate.get("intents", ()):
+            raise ValueError("unavailable host-action ID or intent for this project")
+        if candidate["catalog_id"] != "linux-localsearch":
             raise ValueError("requested action is proposal-only")
+        if scheduled_action_refusal(candidate["catalog_id"]):
+            requests[ident] = "suggest"
+            downgraded = True
+    if authorize is not None and "apply" in requests.values():
         authorize()
+    if downgraded:
+        block = host["BLOCK_PREFIX"] + json.dumps(
+            dict(v=1, actions=[dict(id=ident, intent=intent) for ident, intent in requests.items()])) + " -->"
     store = host["HostActions"](audits, backup_root(), action_project, key)
     imported = module["import_scheduled"](audits, backup_root(), project, receipt,
                                           effective(project.canonical), now(), action_project, key, block)
