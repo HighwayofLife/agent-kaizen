@@ -1,8 +1,11 @@
 """Runner-owned mutation evidence for the dormant scheduled broker."""
 import argparse
 import base64
-from contextlib import redirect_stdout
+from contextlib import contextmanager, redirect_stdout
+from datetime import date, timedelta
+import errno
 import hashlib
+import hmac
 import io
 import json
 import os
@@ -18,6 +21,16 @@ from threading import Event, Thread
 # Add a version only after S7 verifies the real print-mode lifecycle and permissions.
 VERIFIED_STREAM_VERSIONS = frozenset()
 STREAM_LIMIT = 8 << 20
+LEDGER_LIMIT = 1 << 20
+RECEIPT_LIMIT = 64 << 10
+UNWRITABLE_FLAGS = stat.UF_IMMUTABLE | stat.UF_APPEND | stat.SF_IMMUTABLE | stat.SF_APPEND
+LEDGER = Path("docs/kaizen/LEDGER.md")
+HEADER = "date|change|why (which audit finding)|expected effect|measured effect|keep/revert|metric command|review date".split("|")
+OPERATIONS = {
+    "host-fix": ("Mark regenerable output", "LocalSearch output activity", "Less indexing of generated output"),
+    "allow-rule": ("Add an exact allow rule", "Repeated accepted calls", "Fewer permission prompts"),
+    "worktree-prune": ("Remove a merged worktree", "Clean merged worktree", "Less disk space used"),
+}
 
 
 def require(condition):
@@ -27,6 +40,303 @@ def require(condition):
 
 def reject_constant(_value):
     raise ValueError("non-JSON constant in mutation evidence")
+
+
+def cells(line):
+    if line.startswith(("    ", "\t")):
+        return []
+    line = line.strip()
+    if not line.startswith("|") or not line.endswith("|"):
+        return []
+    return [part.strip() for part in re.split(r"(?<!\\)\|", line[1:-1])]
+
+
+def row_line(row, newline):
+    return "| " + " | ".join(row) + " |" + newline
+
+
+def ledger_headers(lines):
+    fence, comment = "", False
+    for index, line in enumerate(lines):
+        if fence:
+            closing = line.strip()
+            if not line.startswith(("    ", "\t")) and closing.startswith(fence) and not closing.strip(fence[0]):
+                fence = ""
+            continue
+        if not comment:
+            opening = re.match(r" {0,3}(`{3,}|~{3,})", line)
+            if opening:
+                fence = opening[1]
+                continue
+            if cells(line)[:2] == HEADER[:2]:
+                yield index
+        for marker in re.findall(r"<!--|-->", line):
+            comment = marker == "<!--"
+
+
+class BrokerLedger:
+    """Private effect receipts and the editable project ledger, under one scoped writer lock."""
+
+    @classmethod
+    @contextmanager
+    def locked(cls, host, store, project):
+        self = cls()
+        self.host, self.store, self.project = host, store, project
+        if store.friction.resolve().is_relative_to(project):
+            raise ValueError("broker state must be outside the project")
+        self.secret = store._secret()
+        self.path = project / LEDGER
+        lock = "broker-" + hashlib.sha256(os.fsencode(project)).hexdigest() + ".lock"
+        with host["_directory"](store.friction, private=True) as state, \
+                host["_private_file"](state, lock, os.O_RDWR | os.O_CREAT) as lease:
+            host["fcntl"].flock(lease, host["fcntl"].LOCK_EX)
+            if not os.path.samestat(os.fstat(lease), os.stat(lock, dir_fd=state, follow_symlinks=False)):
+                raise ValueError("broker project lock was replaced")
+            with host["_directory"](project) as root:
+                info = os.fstat(root)
+            self.lease, self.state, self.identity = lease, state, [str(project), info.st_dev, info.st_ino]
+            yield self
+
+    def record_name(self, ident):
+        if not self.host["ACTION_ID"].fullmatch(ident):
+            raise ValueError("invalid broker action ID")
+        return "broker-" + ident + ".json"
+
+    def seal(self, record):
+        raw = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("ascii")
+        return hmac.digest(self.secret, b"broker-ledger-v1\0" + raw, "sha256").hex()
+
+    def load(self, ident):
+        try:
+            raw = self.host["_read"](self.state, self.record_name(ident), RECEIPT_LIMIT)
+        except FileNotFoundError:
+            return None
+        record = json.loads(raw, object_pairs_hook=self.host["_unique"], parse_constant=reject_constant)
+        mac = record.pop("mac", None) if isinstance(record, dict) else None
+        if (not isinstance(mac, str) or not mac.isascii() or not hmac.compare_digest(mac, self.seal(record))
+                or record.get("id") != ident or record.get("scope") != self.identity):
+            raise ValueError("broker record does not authenticate this project and action")
+        return record
+
+    def save(self, record, phase):
+        record["phase"] = phase
+        raw = json.dumps(dict(record, mac=self.seal(record))).encode("ascii")
+        if len(raw) > RECEIPT_LIMIT:
+            raise ValueError("private broker record exceeds size limit")
+        self.host["_replace"](self.state, self.record_name(record["id"]), raw)
+
+    def tool_record(self, ident, operation):
+        self.record_name(ident)
+        if operation == "allow-rule":
+            return ident
+        if operation == "host-fix":
+            return str(self.store.friction / "host-fixes" / (ident + ".json"))
+        if operation == "worktree-prune":
+            return str(Path.home().resolve() / ".claude/audits/worktree-prunes" / (ident + ".json"))
+        raise ValueError("unknown broker operation")
+
+    def row(self, record):
+        change, signal, expected = OPERATIONS[record["operation"]]
+        day = date.fromisoformat(record["date"])
+        # Ledger metric commands are run from the enrolled project root.
+        return [day.isoformat(), f"{change} [action:{record['id']}]", f"{signal} ({record['count']})",
+                expected, "pending", "pending", "`kaizen-token-audit --cwd .`", (day + timedelta(days=7)).isoformat()]
+
+    def check_acl(self, fd, kind, linux_attr):
+        self.host["_check_acl"](fd, kind)
+        if hasattr(os, "getxattr"):
+            try:
+                os.getxattr(fd, linux_attr)
+            except OSError as error:
+                if error.errno not in (errno.ENODATA, errno.ENOTSUP):
+                    raise
+            else:
+                raise ValueError("extended ACL on broker ledger " + kind)
+
+    def snapshot(self, directory):
+        with os.fdopen(os.open(self.path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                               dir_fd=directory), "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(info.st_mode) or info.st_size > LEDGER_LIMIT or info.st_nlink != 1
+                    or info.st_uid != os.geteuid() or info.st_mode & 0o7022
+                    or getattr(info, "st_flags", 0) & UNWRITABLE_FLAGS):
+                raise ValueError("unsafe broker ledger file")
+            self.check_acl(stream.fileno(), "file", "system.posix_acl_access")
+            raw = stream.read(LEDGER_LIMIT + 1)
+            live = os.stat(self.path.name, dir_fd=directory, follow_symlinks=False)
+            if len(raw) != info.st_size or not os.path.samestat(info, live) or live.st_ctime_ns != info.st_ctime_ns:
+                raise ValueError("broker ledger changed while being read")
+        return raw, (info.st_dev, info.st_ino, info.st_mode, info.st_gid, info.st_mtime_ns, info.st_ctime_ns)
+
+    @contextmanager
+    def table(self, ident):
+        with self.host["_directory"](self.project) as root, self.host["_directory"](self.path.parent) as directory:
+            info = os.fstat(root)
+            if self.identity[1:] != [info.st_dev, info.st_ino]:
+                raise ValueError("broker project directory was replaced")
+            if (getattr(os.fstat(directory), "st_flags", 0) & UNWRITABLE_FLAGS
+                    or not os.access(self.path.parent, os.W_OK | os.X_OK)):
+                raise ValueError("broker ledger directory is not writable")
+            self.check_acl(directory, "directory", "system.posix_acl_default")
+            before = self.snapshot(directory)
+            raw = before[0]
+            if len(raw) > LEDGER_LIMIT or re.search(rb"[\x00-\x08\x0b-\x0c\x0e-\x1f\x7f]|\r(?!\n)", raw):
+                raise ValueError("invalid broker ledger contents")
+            lines = re.findall(r"[^\n]*\n|[^\n]+$", raw.decode("utf-8"))
+            headers = list(ledger_headers(lines))
+            if len(headers) != 1:
+                raise ValueError("expected one broker ledger table")
+            start = headers[0]
+            header = cells(lines[start])
+            width = len(header)
+            if header[2:3] == ["why"]:
+                header[2] = HEADER[2]
+            separator = cells(lines[start + 1]) if start + 1 < len(lines) else []
+            if (width not in (6, 8) or header != HEADER[:width] or len(separator) != width
+                    or not all(re.fullmatch(r":?-{3,}:?", cell) for cell in separator)):
+                raise ValueError("invalid broker ledger table header")
+            end = start + 2
+            while end < len(lines) and (row := cells(lines[end])):
+                if len(row) not in (6, width):
+                    raise ValueError("invalid broker ledger table row")
+                end += 1
+            matches = [i for i, line in enumerate(lines) if ident in line]
+            if len(matches) > 1 or matches and not (width == 8 and start + 2 <= matches[0] < end):
+                raise ValueError("conflicting broker action ledger rows")
+
+            def write():
+                updated = "".join(lines).encode("utf-8")
+                if len(updated) > LEDGER_LIMIT:
+                    raise ValueError("broker ledger exceeds size limit")
+                temporary = ".kaizen-ledger-" + os.urandom(16).hex()
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                fd = os.open(temporary, flags, 0o600, dir_fd=directory)
+                try:
+                    with os.fdopen(fd, "wb") as stream:
+                        if os.fstat(stream.fileno()).st_gid != before[1][3]:
+                            os.fchown(stream.fileno(), -1, before[1][3])
+                        os.fchmod(stream.fileno(), stat.S_IMODE(before[1][2]))
+                        stream.write(updated)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    with self.host["_directory"](self.path.parent) as live:
+                        if (not os.path.samestat(os.fstat(live), os.fstat(directory))
+                                or self.snapshot(live) != before):
+                            raise ValueError("broker ledger changed during transaction")
+                        os.replace(temporary, self.path.name, src_dir_fd=live, dst_dir_fd=live)
+                        os.fsync(live)
+                        if self.snapshot(live)[0] != updated:
+                            raise ValueError("broker ledger write could not be verified")
+                finally:
+                    try:
+                        os.unlink(temporary, dir_fd=directory)
+                    except FileNotFoundError:
+                        pass
+
+            os.fsync(directory)  # A prior attempt may have stopped after rename.
+            yield lines, start, end, width, matches[0] if matches else None, write
+
+    def preflight(self, ident, operation):
+        """Call before starting a new effect, with the lock held through bookkeeping."""
+        if self.load(ident) is not None:
+            raise ValueError("broker action already has an effect receipt")
+        row = self.row(dict(id=ident, operation=operation, count=10**9, date=date.today().isoformat()))
+        with self.table(ident) as (lines, _, _, _, match, _):
+            growth = len(row_line(row, "\r\n").encode()) + 64  # Include a six-column header upgrade.
+            if match is not None or len("".join(lines).encode("utf-8")) + growth > LEDGER_LIMIT:
+                raise ValueError("broker ledger has a conflicting row or insufficient space")
+
+    def record_verified(self, ident, operation, tool_record, verification, generation, count):
+        """Record a tool-owned effect already verified by the runner, including on recovery."""
+        if (tool_record != self.tool_record(ident, operation) or not re.fullmatch(r"[a-f0-9]{64}", verification)
+                or not self.host["_text"](generation, 128) or type(count) is not int or not 0 <= count <= 10**9):
+            raise ValueError("invalid verified broker effect")
+        binding = dict(id=ident, operation=operation, tool_record=tool_record, verification=verification,
+                       generation=generation, count=count, scope=self.identity)
+        record = self.load(ident)
+        if record is None:
+            record = dict(binding, date=date.today().isoformat())
+            self.save(record, "effect-verified")
+        elif any(record[key] != value for key, value in binding.items()):
+            raise ValueError("conflicting private broker effects")
+        return self.reconcile(ident)
+
+    def reconcile(self, ident):
+        record = self.load(ident)
+        if record is None:
+            raise ValueError("unknown verified broker effect in this project")
+        phase = record["phase"]
+        expected = self.row(record)
+        with self.table(ident) as (lines, start, end, width, match, write):
+            if phase != "effect-verified":
+                row = self.linked_row(lines, match, expected)
+                if phase == "recorded" and row[5].startswith("reverted"):
+                    raise ValueError("broker ledger claims an unverified reversal")
+                if phase == "reverted" and row[5] != f"reverted ({record['undo_date']})":
+                    raise ValueError("broker ledger is missing the verified reversal")
+                return phase
+            if match is None:
+                newline = "\r\n" if lines[start].endswith("\r\n") else "\n"
+                if width == 6:
+                    for index, extra in ((start, HEADER[6:]), (start + 1, ["---", "---"])):
+                        lines[index] = row_line(cells(lines[index]) + extra, newline)
+                if not lines[end - 1].endswith("\n"):
+                    lines[end - 1] += newline
+                lines.insert(end, row_line(expected, newline))
+                write()
+            elif cells(lines[match]) != expected:
+                raise ValueError("broker ledger row conflicts with verified effect")
+        self.save(record, "recorded")
+        return "recorded"
+
+    @staticmethod
+    def linked_row(lines, match, expected):
+        row = cells(lines[match]) if match is not None else []
+        if len(row) != 8 or row[:4] != expected[:4] or row[6:] != expected[6:]:
+            raise ValueError("broker ledger row is missing or conflicts with the private record")
+        return row
+
+    def undo(self, ident, inverse):
+        record = self.load(ident)
+        if record is None:
+            raise ValueError("no verified broker effect in this project")
+        expected = self.row(record)
+        phase = record["phase"]
+        with self.table(ident) as (lines, _, _, _, match, write):
+            row = self.linked_row(lines, match, expected)
+            if phase == "effect-verified":
+                if row != expected:
+                    raise ValueError("broker ledger row conflicts with verified effect")
+                self.save(record, "recorded")
+                phase = "recorded"
+            status = hashlib.sha256(row[5].encode("utf-8")).hexdigest()
+            undo_date = record.get("undo_date") or date.today().isoformat()
+            reverted = f"reverted ({undo_date})"
+            update = row[5] != reverted
+            if update:
+                new_row = row_line([*row[:5], reverted, *row[6:]],
+                                   "\r\n" if lines[match].endswith("\r\n") else "\n")
+                lines[match] = new_row
+                if len("".join(lines).encode("utf-8")) > LEDGER_LIMIT:
+                    raise ValueError("broker ledger has insufficient space for reversal")
+            if phase == "recorded":
+                if row[5].startswith("reverted"):
+                    raise ValueError("broker ledger claims an unverified reversal")
+                record.update(undo_date=undo_date, prior_status=status)
+                self.save(record, "undo-pending")
+                phase = "undo-pending"
+            if phase == "reverted" and not update:
+                return
+            if ((phase == "undo-pending" and status != record["prior_status"])
+                    or (phase == "undo-verified" and status != record["prior_status"] and row[5] != reverted)
+                    or phase not in ("undo-pending", "undo-verified")):
+                raise ValueError("conflicting broker reversal state")
+            if phase == "undo-pending":
+                inverse(record["operation"], record["tool_record"])
+                self.save(record, "undo-verified")
+            if update:
+                write()
+        self.save(record, "reverted")
 
 
 def observe_review(run, command, version, *, backup, scope, project, **kwargs):
@@ -43,16 +353,18 @@ def observe_review(run, command, version, *, backup, scope, project, **kwargs):
 
     def collect():
         try:
-            while len(raw) <= STREAM_LIMIT:
+            while True:
                 if not select.select([reader], [], [], 0.1)[0]:
                     if done.is_set():
                         return
                     continue
-                chunk = os.read(reader, min(65536, STREAM_LIMIT + 1 - len(raw)))
+                chunk = os.read(reader, 65536)
                 if not chunk:
                     complete.set()
                     return
-                raw.extend(chunk)
+                raw.extend(chunk[:max(0, STREAM_LIMIT + 1 - len(raw))])
+                if len(raw) > STREAM_LIMIT and done.is_set():
+                    return
         except OSError:
             return
         finally:
@@ -92,6 +404,14 @@ def runtime_calls(raw, version, scope, project, unique_fields):
         elif index == len(events) - 1:
             require(assistant and kind == "result" and event["subtype"] == "success" and event["is_error"] is False
                     and isinstance(event["result"], str) and calls.keys() == results.keys())
+            denials = event.get("permission_denials", [])
+            require(isinstance(denials, list))
+            denied = set()
+            for denial in denials:
+                ident = denial["tool_use_id"]
+                require(ident in calls and ident not in denied and results[ident][1]
+                        and calls[ident][1:] == (denial["tool_name"], denial["tool_input"]))
+                denied.add(ident)
             return event["result"], [(start, *results[tool_id], name, args)
                                      for tool_id, (start, name, args) in calls.items()]
         else:

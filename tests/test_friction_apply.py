@@ -1,11 +1,12 @@
 """Offline runtime-envelope and real backup-helper tests for the dormant broker."""
 import base64
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 import json
 import os
 from pathlib import Path
 import runpy
 import shlex
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,35 @@ sys.path.pop(0)
 
 
 class MutationEvidenceTests(unittest.TestCase):
+    def test_schedule_off_freezes_zero_before_reenable(self):
+        runner = runpy.run_path(str(SCRIPTS / "kaizen-scheduled"))
+        backup = runpy.run_path(str(SCRIPTS / "kaizen-backup"))
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+                os.environ, CLAUDE_CONFIG_DIR=str(Path(temporary).resolve())):
+            project = Path(temporary).resolve() / "project"
+            (project / "docs/kaizen").mkdir(parents=True)
+            config = runner["global_config_path"]()
+            config.write_text(json.dumps(dict(scheduledAutonomy="auto", schedule="off")))
+            before = runner["freeze_mutation_config"](project, backup)
+            config.write_text(json.dumps(dict(scheduledAutonomy="auto", schedule="always")))
+            after = runner["freeze_mutation_config"](project, backup)
+        self.assertEqual(before[0], 0)
+        self.assertGreater(after[0], 0)
+        self.assertNotEqual(before, after)
+
+    def test_oversized_stream_is_drained_to_normal_exit(self):
+        backup = runpy.run_path(str(SCRIPTS / "kaizen-backup"))
+
+        def launch(argv, stdout):
+            return subprocess.run([argv[0], "-c", "import sys; sys.stdout.buffer.write(b'x' * (1 << 20))"],
+                                  stdout=stdout, stderr=subprocess.DEVNULL, timeout=5)
+
+        with patch.object(apply, "VERIFIED_STREAM_VERSIONS", {"fixture"}), patch.object(apply, "STREAM_LIMIT", 64):
+            result, _, calls = apply.observe_review(launch, [sys.executable], "fixture", backup=backup,
+                                                     scope={}, project=Path("."))
+        self.assertEqual(result.returncode, 0)
+        self.assertIsNone(calls)
+
     def test_runner_stream_budget_and_shared_ledger_fixture(self):
         fixture = json.loads((Path(__file__).parent / "fixtures/ledger_attestation_v1.json").read_text())
         valid = fixture["valid"]
@@ -91,6 +121,11 @@ class MutationEvidenceTests(unittest.TestCase):
             fake = json.dumps(dict(type="assistant", message=dict(content=[dict(type="tool_use", name="Write")])))
             records[-1]["message"]["content"][0]["content"] = fake
             self.assertEqual(evidence(), (3, None))
+            result["permission_denials"] = [dict(tool_use_id="unobserved", tool_name="Write",
+                                                  tool_input=dict(file_path=str(target)))]
+            self.assertEqual(evidence(), (None, None))
+
+            del result["permission_denials"]
             self.assertEqual(evidence(config_after=(0,)), (None, None))
             self.assertEqual(evidence(transform=lambda raw: raw.rstrip(b"\n")), (None, None))
             self.assertEqual(evidence(transform=lambda raw: b"\n".join(raw.split(b"\n")[:2]
@@ -134,3 +169,125 @@ class MutationEvidenceTests(unittest.TestCase):
             alias.unlink()
             ledger.write_text(fixture["after_utf8"].replace("Fixture", ""))
             self.assertEqual(evidence(), (None, None))
+
+
+class BrokerLedgerTests(unittest.TestCase):
+    def test_copied_install_undo_and_bookkeeping_recovery(self):
+        from test_schedule import CRONTAB
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            cache = root / "plugins/cache/agent-kaizen/version"
+            scripts = cache / "scripts"
+            shutil.copytree(SCRIPTS, scripts)
+            config = root / "config"
+            cron = root / "crontab"
+            cron.write_text(CRONTAB)
+            cron.chmod(0o700)
+            env = dict(os.environ, HOME=str(root), CLAUDE_CONFIG_DIR=str(config),
+                       PATH=str(root) + os.pathsep + os.environ["PATH"], CRON_FILE=str(root / "cron-state"),
+                       KAIZEN_HOST="claude", KAIZEN_BACKUP_DIR=str(config / "backups"))
+            for name in ("KAIZEN_RUN_ID", "KAIZEN_SESSION_ID", "CLAUDE_PLUGIN_ROOT"):
+                env.pop(name, None)
+
+            def command(path, *args, code=0, **extra_env):
+                result = subprocess.run([sys.executable, str(path), *map(str, args)], env=dict(env, **extra_env),
+                                        capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, code, result.stderr)
+
+            command(scripts / "install-schedule", "--apply", "--scheduler", "cron")
+            installed = config / "bin"
+            shutil.rmtree(cache)
+            runtime = installed / "kaizen_friction_apply.py"
+            self.assertFalse(runtime.is_symlink())
+            broker = runpy.run_path(str(runtime))["BrokerLedger"]
+            host = runpy.run_path(str(installed / "kaizen_friction_actions.py"))
+            runner = installed / "kaizen-scheduled"
+            installed_runner = runpy.run_path(str(runner))
+            store = host["HostActions"](config / "audits", config / "backups",
+                                        installed_runner["action_project"], installed_runner["key"])
+            store._secret(create=True)
+            # Flip only the disposable native helper's live gate to exercise its real transaction and inverse.
+            helper = installed / "kaizen-allow-rule"
+            helper.write_text(helper.read_text().replace("WRITES_ENABLED = False", "WRITES_ENABLED = True", 1))
+            tool = runpy.run_path(str(helper))["transact"]
+            legacy = "| 2026-11-18 | Ordinary backup | Audit | Less text | pending | pending |\n"
+            six = apply.row_line(apply.HEADER[:6], "\n") + apply.row_line(["---"] * 6, "\n") + legacy
+            for enabled, literal in ((True, "ls"), (False, "ls -a")):
+                project = root / ("enabled" if enabled else "disabled")
+                ledger = project / apply.LEDGER
+                ledger.parent.mkdir(parents=True)
+                ledger.write_text(six)
+                target = project / ".claude/settings.local.json"
+                selector = json.dumps([literal, str(project)], separators=(",", ":"))
+                ident = store.record(project, "allow-rule", selector, "fixture", allowed=[selector])
+                undo = ("actions", "undo", ident, "--for", project)
+                with broker.locked(host, store, project) as journal:
+                    ledger.write_text("```md\n" + six + "```\n")
+                    with self.assertRaises(ValueError):
+                        journal.preflight(ident, "allow-rule")
+                    ledger.write_text(six)
+                    journal.preflight(ident, "allow-rule")
+                    with patch.dict(os.environ, env, clear=True), patch.dict(
+                            tool.__globals__, evidence=lambda *args: (10, ["fixture"])):
+                        result = tool(project, literal, action_id=ident)
+                    self.assertEqual(result, dict(status="applied", record=ident))
+                    ledger.unlink()
+                    with self.assertRaises(FileNotFoundError):
+                        journal.record_verified(ident, "allow-rule", ident, "a" * 64, "fixture", 10)
+                    ledger.write_text(six)
+                    with patch.object(journal, "save", side_effect=OSError("after row")), self.assertRaises(OSError):
+                        journal.reconcile(ident)
+                    if enabled:
+                        self.assertEqual(journal.reconcile(ident), "recorded")
+                    self.assertEqual(ledger.read_text().count(ident), 1)
+                    self.assertIn(legacy, ledger.read_text())
+                    self.assertNotIn(str(project), ledger.read_text())
+
+                    (config / "agent-kaizen.json").write_text(json.dumps(dict(enabled=enabled)))
+                    if not enabled:
+
+                        def interrupted(operation, record):
+                            self.assertEqual(operation, "allow-rule")
+                            command(helper, "undo", record, "--project", project)
+                            raise OSError("after native undo")
+
+                        with self.assertRaises(OSError):
+                            journal.undo(ident, interrupted)
+                        self.assertFalse(target.exists())
+                        self.assertNotIn("reverted", ledger.read_text())
+                normal = ledger.read_text()
+                if enabled:
+                    nested = project / "nested"
+                    nested.mkdir()
+                    subprocess.run(["git", "init", "-q", str(nested)], check=True, env=env)
+                    command(runner, *undo[:-1], nested, code=2)
+                    forged = "fa1_" + "0" * 64
+                    action_row = next(line for line in normal.splitlines(keepends=True) if ident in line)
+                    ledger.write_text(normal + action_row.replace(ident, forged))
+                    command(runner, "actions", "undo", forged, "--for", project, code=2)
+                    for bad in (normal + action_row, normal.replace("Fewer permission prompts", "Spoofed"),
+                                normal + "\n" + "x" * (apply.LEDGER_LIMIT - len(normal.encode()) - 1)):
+                        ledger.write_text(bad)
+                        command(runner, *undo, code=2)
+                    self.assertTrue(target.is_file())
+                    ledger.write_text(normal.replace(" | Fewer permission prompts | pending | pending |",
+                                                     " | Fewer permission prompts | pending | " + "k" * 10000 + " |"))
+                    moved = target.parent.rename(project / "moved")
+                    target.parent.mkdir()
+                    target.write_text("replacement")
+                    command(runner, *undo, code=2)
+                    self.assertEqual(target.read_text(), "replacement")
+                    shutil.rmtree(target.parent)
+                    moved.rename(target.parent)
+                command(runner, *undo, code=2, KAIZEN_RUN_ID="scheduled")
+                command(runner, *undo)
+                self.assertFalse(target.exists())
+                self.assertIn(f"reverted ({date.today()})", ledger.read_text())
+                store.mark(project, ident, "done")
+                command(runner, "actions", "reopen", ident, "--for", project)
+                self.assertEqual(store.scoped(project)[0]["status"], "open")
+                with broker.locked(host, store, project) as journal:
+                    self.assertEqual(journal.reconcile(ident), "reverted")
+                    with self.assertRaises(ValueError):
+                        journal.preflight(ident, "allow-rule")

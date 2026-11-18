@@ -310,8 +310,11 @@ def freeze_mutation_config(project, backup):
         layers.append(config)
         stamps.append((path, stamp, raw))
     global_cfg, project_cfg = layers
+    if (not global_cfg.get("enabled", True)
+            or project_cfg.get("schedule", global_cfg.get("schedule")) == "off"):
+        return 0, tuple(stamps)
     opted_in = [Path(path).expanduser().resolve(strict=False) for path in global_cfg.get("autoProjects", [])]
-    if (len(set(opted_in)) != len(opted_in) or not global_cfg.get("enabled", True)
+    if (len(set(opted_in)) != len(opted_in)
             or project_cfg.get("scheduledAutonomy", global_cfg.get("scheduledAutonomy")) != "auto"
             or project_cfg.get("scheduledAutonomy") == "auto" and project not in opted_in):
         raise ValueError("mutation config does not authorize this auto review")
@@ -2507,10 +2510,36 @@ def actions_command(args):
     if args.action == "import":
         return friction_reconcile_command(args)
     try:
-        host = runpy.run_path(str(HERE / "kaizen_friction_actions.py"))["HostActions"]
-        store = host(audits_dir(), backup_root(), action_project, key)
+        host = runpy.run_path(str(HERE / "kaizen_friction_actions.py"))
+        store = host["HostActions"](audits_dir(), backup_root(), action_project, key)
         project = args.project_dir
-        if args.action == "verify":
+        if args.action == "undo":
+            if "KAIZEN_RUN_ID" in os.environ or "KAIZEN_SESSION_ID" in os.environ:
+                raise ValueError("broker undo requires an interactive invocation")
+            requested = canonical_path(project.expanduser())
+            member = enrolled_project(requested)
+            if (member is None or checkout_root(requested) != checkout_root(member)
+                    or git_common_dir(requested) != git_common_dir(member)):
+                raise ValueError("undo requires a directory in the enrolled checkout")
+            project = action_project(requested)
+            broker = runpy.run_path(str(HERE / "kaizen_friction_apply.py"))["BrokerLedger"]
+
+            def inverse(operation, record):
+                command = broker_command(argparse.Namespace(python=sys.executable), operation)
+                result = run_group([*command, "undo", record, "--project", str(project)], stoppable=True,
+                                   cwd=project, timeout=30, stdin=subprocess.DEVNULL,
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if result.returncode:
+                    raise ValueError("the fixed undo helper could not verify reversal")
+
+            with terminating_on_signals(), broker.locked(host, store, project) as ledger:
+                SIGNALS["lease"] = ledger.lease
+                try:
+                    ledger.undo(args.id, inverse)
+                finally:
+                    SIGNALS.pop("lease", None)
+            print("Broker action reverted.")
+        elif args.action == "verify":
             for ident, result in store.verify(project).items():
                 print(f"{ident} {result}")
         elif args.action != "list":
@@ -2521,7 +2550,9 @@ def actions_command(args):
             for row in store.scoped(project):
                 print(f"{row['id']} {row['status']} {json.dumps(row['subject'])}")
         return 0
-    except (OSError, RuntimeError):
+    except Terminated as error:
+        return 128 + error.number
+    except (OSError, RuntimeError, subprocess.SubprocessError):
         print("actions: project or private host-action files are unavailable", file=sys.stderr)
     except ValueError as error:
         print(f"actions: {error}", file=sys.stderr)
@@ -2623,7 +2654,7 @@ def main(argv=None):
     importer.add_argument("file", type=Path)
     importer.add_argument("--for", dest="project_dir", type=Path, required=True)
     importer.add_argument("--inputs", type=Path, required=True)
-    for action in ("list", "done", "dismiss", "reopen", "verify"):
+    for action in ("list", "done", "dismiss", "reopen", "verify", "undo"):
         subparser = host_commands.add_parser(action)
         subparser.add_argument("--for", dest="project_dir", type=Path, required=True)
         if action == "list":
