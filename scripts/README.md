@@ -161,13 +161,17 @@ review; pass --uncommitted to review them.` The STATUS words are `DONE` and
 `REVIEW FAILED`. When no ignore rule covers `out/`,
 it is added to the repository's `info/exclude` (shared by its worktrees).
 
+## kaizen-doctor
+
+The doctor reports installed Codex and Copilot plugins and host-specific fixes for version differences. For Codex, it also reminds you to trust plugin hooks in `/hooks`.
+
 ## token-audit
 
 Stream Claude transcript JSONL and Codex session JSONL into a compact Markdown
 audit. Install the executable using the shared copy/symlink instructions; it has
 no helper dependency. It reads Claude projects from `$CLAUDE_CONFIG_DIR` (default
 `~/.claude`) and Codex sessions from `$CODEX_HOME` (default `~/.codex`) in a
-rolling three-day window.
+rolling three-day window. It reports on stderr when Copilot sessions exist but are not measured.
 
 ```bash
 token-audit --days 7 > audit.log 2>&1 &

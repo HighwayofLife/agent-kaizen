@@ -1552,6 +1552,8 @@ def main():
     if not args.project_dir and not projects and not next(codex_root.glob("*/*/*/*.jsonl"), None):
         print(f"token-audit: no Claude Code projects under {root} "
               "(set CLAUDE_CONFIG_DIR if they live elsewhere)", file=sys.stderr)
+    if os.path.isdir(Path(os.environ.get("COPILOT_HOME") or Path.home() / ".copilot").expanduser() / "session-state"):
+        print("token-audit: Copilot sessions found but not measured in this version", file=sys.stderr)
     if args.project:
         projects = [p for p in projects if args.project.casefold() in p.name.casefold()]
     directory = (args.out or claude_home() / "audits").expanduser().resolve()

@@ -76,7 +76,7 @@ def main():
         if args.demo:
             with tempfile.TemporaryDirectory(prefix='kaizen-scan-') as tmp:
                 env.update(HOME=tmp, CLAUDE_CONFIG_DIR=str(Path(tmp) / 'claude'),
-                           CODEX_HOME=str(Path(tmp) / 'codex'), XDG_CONFIG_HOME=str(Path(tmp) / 'config'))
+                           CODEX_HOME=str(Path(tmp) / 'codex'), COPILOT_HOME=str(Path(tmp) / 'copilot'), XDG_CONFIG_HOME=str(Path(tmp) / 'config'))
                 subprocess.run([sys.executable, str(HERE / 'kaizen-demo-fixtures'), '--output',
                                 env['CLAUDE_CONFIG_DIR']], env=env, check=True, capture_output=True)
                 data, warning = run_audit(env)
@@ -86,7 +86,9 @@ def main():
         lines = list(score(data))
         lines.sort(key=lambda line: ('FAIL', 'WARN', 'PASS', 'SKIP').index(line.split(' ', 1)[0]))
         print('\n'.join(lines))
-        print('Start: review a warning with its named skill; for missing data, use Claude Code or Codex and scan again.')
+        copilot_note = ' (Copilot sessions are not measured yet)' if 'Copilot sessions found' in warning else ''
+        print('Start: review a warning with its named skill; for missing data, use Claude Code or Codex'
+              + copilot_note + ' and scan again.')
         counts = [sum(line.startswith(status + ' ') for line in lines)
                   for status in ('FAIL', 'WARN', 'PASS', 'SKIP')]
         print(f'{counts[0]} fail, {counts[1]} warn, {counts[2]} pass, {counts[3]} skipped')
