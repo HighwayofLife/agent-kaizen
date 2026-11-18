@@ -49,3 +49,13 @@ P12 fixed the preflight findings (hardened git runner, live-byte cleanliness, id
 1. **Effect-boundary race.** Repeating preflight still leaves a window before deletion in which files, refs, locks and path identity can change, and Git's no-force removal check omits ignored files. Do not rely on `git worktree remove`'s own cleanliness check. Make removal compare-before-remove: move the target directory atomically to a private quarantine sibling (same filesystem, `rename` by dir fd), re-verify identity and live-byte cleanliness of the quarantined tree, and only then delete it or restore it on any difference. Remove the admin dir only after that.
 2. **Journal authentication.** An environment-selected journal location and same-UID permissions do not authenticate a record. Fix the journal location (no env override for apply/undo), bind each record to the target's recorded identity, branch oid and primary oid, and refuse undo when the restore path exists, is outside the recorded project, or the branch tip no longer matches the record. A forged record must never select an unrelated restore path.
 3. **Hooks during undo.** Undo's `worktree add` must run through the P12 hardened runner (`core.hooksPath=/dev/null`, fsmonitor off, fixed env, absolute git) with `--no-checkout` followed by a filter-free restore (write blobs from `cat-file` yourself, or `checkout` only after proving no filter/attribute drivers apply), so no `post-checkout` hook or filter can run.
+
+## Delta 2 from P12 final verification review (2026-11-18), MUST before effects go live
+
+P12 landed with removal and undo still refusing to write, so these preflight gaps were carried here; P12b's security review must confirm each:
+
+1. MUST (`scripts/worktree-prune:431`): `git cat-file --batch-check` accepts a blob whose header is intact but payload is corrupt. For every blob whose only readable copy would be the checkout (live bytes match the blob id), read the object with `git cat-file --batch` through the hardened runner and hash `blob <len>\0<bytes>` in Python with the repo's object format; refuse on mismatch or read error. Stream in bounded chunks.
+2. MUST (`:475`): blob checks accept objects borrowed through alternates inside the linked worktree's admin directory. Refuse when any alternates file reachable from the common dir or the worktree admin dir (including `objects/info/alternates` and `GIT_ALTERNATE_OBJECT_DIRECTORIES`, which the runner already scrubs) resolves inside the admin directory or the checkout being removed.
+3. SHOULD (`:474`): the xattr scan skips the worktree admin directory. Include its files (index, HEAD, logs/HEAD and the rest) in the same no-follow xattr check before deleting it.
+
+Regression test for each in `tests/test_worktree_prune.py`.
