@@ -2138,7 +2138,8 @@ def main(argv=None):
         subparser.add_argument("--for", dest="project_dir", type=Path, required=True)
         if action == "record":
             subparser.add_argument("name", choices=("models", "roster", "whats-new"))
-            subparser.add_argument("--date", default=datetime.now(timezone.utc).date().isoformat())
+            # Local date, matching experiment-check and the dates people write in the ledger.
+            subparser.add_argument("--date", default=datetime.now().date().isoformat())
     cleanup = commands.add_parser("housekeep", help="delete expired generated audit files")
     cleanup.add_argument("--dry-run", action="store_true", help="preview deletions")
     cleanup.add_argument("--audits", type=Path, help="override the audits folder")

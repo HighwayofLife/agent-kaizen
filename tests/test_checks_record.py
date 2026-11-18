@@ -44,6 +44,19 @@ class ChecksRecordTests(unittest.TestCase):
             self.assertEqual(self.run_command('record', '--for', self.project, *arguments).returncode, 2)
         self.assertEqual(self.run_command('record', '--for', self.root, 'models').returncode, 2)
 
+    def test_default_date_is_the_local_date_experiment_check_uses(self):
+        # Between them these zones differ from the UTC date at every hour of the day.
+        checker = SCRIPT.parent / 'experiment-check'
+        for zone in ('Etc/GMT-14', 'Etc/GMT+12'):
+            with self.subTest(zone=zone):
+                self.env['TZ'] = zone
+                self.assertEqual(self.run_command('record', '--for', self.project, 'models').returncode, 0)
+                result = subprocess.run([sys.executable, str(checker), '--project', str(self.project), '--checks',
+                                         '--state-file', str(self.path())],
+                                        capture_output=True, text=True, env=self.env)
+                self.assertNotIn('invalid or future date', result.stdout + result.stderr)
+                self.assertNotIn('models: never run', result.stdout)
+
     def test_concurrent_writers(self):
         path = self.path()
         for _ in range(10):

@@ -132,7 +132,23 @@ Packet 12 runs, on the `release-0.10` integration branch with `tools/ci-local` p
 
 ### Results
 
-Pending packet 12.
+Run on the host on 2026-11-17, after packets 01 to 11 and the review fixes merged into `release-0.10`.
+
+| Gate | Exit |
+|---|---|
+| `bash out/release-smoke.sh` (34 checks PASS, `smoke failures: 0`) | 0 |
+| `tools/ci-local --python 3.9` | 0 |
+| `python3 -m unittest discover -s tests` (817 tests, 2 skipped) | 0 |
+| `shellcheck -S warning hooks/*.sh` | 0 |
+| `claude plugin validate .` (passed with warnings) | 0 |
+| `python3 -m unittest discover -s tests -p 'test_repo.py'` | 0 |
+
+Fixes found by this gate:
+- The smoke check "old keys, groups and proposals unchanged" compared proposals exactly; packet 08 adds `fix_evidence` and `hold_blocked` to proposals by design. The check now compares the old fields of each proposal and the proposal count.
+- `kaizen-scheduled checks record` stamped the UTC date while `experiment-check` compares with the local date, so a check recorded in the evening west of UTC read as "invalid or future date". The recorder now uses the local date; `tests/test_checks_record.py` pins two time zones that between them differ from the UTC date at every hour.
+- `tests/test_schedule_followup.py` (helper timeout after the leader exits) now starts its timeout after helper startup and leader exit; it was a timing flake under load.
+
+Known: `test_codex_run.test_codex_timeout_is_a_failure` and `test_schedule_robustness...test_review_timeout_runs_rollback_and_ledger_check` failed once each in a loaded full-suite run and pass alone (timing flakes, not fixed here).
 
 ## Risks and mitigations
 
