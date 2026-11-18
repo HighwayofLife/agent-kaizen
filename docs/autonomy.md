@@ -64,6 +64,8 @@ rare workflow.
 - Installing, changing or removing scheduled jobs (launchd, cron).
 - Changing the interactive `autonomy` setting itself (only `/agent-kaizen:autonomy`, run by you, does that).
 
+On hosts other than Claude Code (Codex CLI, Copilot runtime), changes to that host's settings, hooks and agent files (in its user config directory or in the project, for example `.codex/agents/` and `.github/hooks/`) are proposals only in every mode, until docs/hosts.md marks the file as verified. Project instruction files tracked in git, such as `AGENTS.md`, follow the normal rules.
+
 ## What every applied change gets, in every mode
 
 No exceptions: this includes the scaffolding `/agent-kaizen:start` creates, one-line edits to files such as `.gitignore`, and new files. A change without a manifest can't be undone, so it isn't made.
