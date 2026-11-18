@@ -148,11 +148,32 @@ class HostFixTests(unittest.TestCase):
                 self.refusal('invalid project output directories')
 
     def test_prefix_walk_checks_deadline(self):
-        self.config.write_text('{"frictionOutputDirs":["one/two/three"]}')
-        with patch.object(FIX['time'], 'monotonic', side_effect=[0, 20]):
+        with patch.dict(FIX, read_config=lambda *_: {'frictionOutputDirs': ['one/two/three']}), \
+                patch.object(FIX['time'], 'monotonic', side_effect=[0, 20]):
             with self.assertRaisesRegex(FIX['Refused'], 'deadline'):
                 FIX['check_policy'](self.root / 'config.json', {self.project: Path('build')},
                                     'build', ['build'], lambda _: True, 20)
+
+    def test_missing_configs_check_deadline(self):
+        with self.assertRaisesRegex(FIX['Refused'], 'deadline'):
+            FIX['check_policy'](self.root / 'missing.json', {self.project: Path('build')},
+                                'build', ['build'], lambda _: True, 0)
+
+    def test_deep_output_is_refused_before_walk(self):
+        target = self.project.joinpath(*(['x'] * 65), 'build')
+        target.mkdir(parents=True)
+        self.refusal('directory depth', target)
+
+    def test_time_machine_refuses_without_runtime_or_effects(self):
+        with patch.dict(FIX, PLATFORM='darwin', runtime=lambda: self.fail('opened runtime')):
+            for _ in range(2):
+                args = SimpleNamespace(project=str(self.project), catalog_id='timemachine-output',
+                                       path=str(self.output))
+                with self.assertRaisesRegex(FIX['Refused'], 'Time Machine.*manual'):
+                    FIX['apply'](args)
+                self.output.rmdir()
+                self.output.mkdir()
+        self.assertEqual(list(self.output.iterdir()), [])
 
     def test_existing_marker_is_noop_before_policy_and_candidate(self):
         marker = self.output / FIX['MARKER']
@@ -178,6 +199,90 @@ class HostFixTests(unittest.TestCase):
                 self.refusal('directory identity changed')
         self.assertFalse((moved / FIX['MARKER']).exists())
         self.assertEqual(marker.read_text(), 'replacement')
+
+    def test_worktree_swap_before_publish_is_refused(self):
+        member = self.project / 'member'
+        self.git('worktree', 'add', '-q', '--detach', str(member))
+        target = member / 'build'
+        target.mkdir()
+        self.store.record(self.project, ID, target, 'fixture evidence', path=True)
+        persist = FIX['write_record']
+
+        def swap(*args):
+            persist(*args)
+            if args[-1]['phase'] == 'apply-pending':
+                moved = self.root / 'member'
+                member.rename(moved)
+                member.mkdir()
+                (moved / 'build').rename(target)
+
+        with self.writes(), patch.dict(FIX, write_record=swap):
+            self.refusal('worktree identity changed', target)
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_interrupted_publish_recovers_directory_by_identity(self):
+        key = self.record()
+        outside = self.root / 'outside'
+        inside = self.project / 'other' / 'build'
+        inside.parent.mkdir()
+        marker = self.output / FIX['MARKER']
+        with self.writes() as link:
+            def publish(directory, fd):
+                self.output.rename(outside)
+                self.output.mkdir()
+                marker.write_text('replacement')
+                link(directory, fd)
+                raise InterruptedError()
+
+            with patch.dict(FIX, publish_marker=publish), self.assertRaises(InterruptedError):
+                self.apply(key=key)
+            record = next((self.store.friction / 'host-fixes').glob('*.json'))
+            with self.assertRaisesRegex(FIX['Refused'], 'path unknown.*manual check'):
+                self.undo(record)
+            self.assertTrue((outside / marker.name).exists())
+            outside.rename(inside)
+            self.undo(record)
+            self.assertFalse((inside / marker.name).exists())
+            self.assertEqual(marker.read_text(), 'replacement')
+
+    def test_undo_preserves_marker_replaced_after_verification(self):
+        self.record()
+        marker = self.output / FIX['MARKER']
+        original = self.output / 'original'
+        with self.writes():
+            record = self.apply()
+            version, recheck = FIX['marker_version'], FIX['recheck']
+            armed = False
+
+            def arm(*args):
+                nonlocal armed
+                recheck(*args)
+                armed = True
+
+            def replace(*args, **kwargs):
+                nonlocal armed
+                result = version(*args, **kwargs)
+                if armed:
+                    armed = False
+                    marker.rename(original)
+                    marker.write_text('replacement')
+                return result
+
+            with patch.dict(FIX, marker_version=replace, recheck=arm):
+                with self.assertRaisesRegex(FIX['Refused'], 'changed or replaced'):
+                    self.undo(record)
+            self.assertEqual(marker.read_text(), 'replacement')
+            self.assertTrue(original.is_file())
+
+    def test_direct_stamped_noop_under_lock(self):
+        self.record()
+        with self.writes():
+            record = self.apply()
+            with FIX['_directory'](record.parent, private=True) as state:
+                FIX['lock_state'](state)
+                with redirect_stdout(io.StringIO()) as out:
+                    self.apply()
+            self.assertIn('already present', out.getvalue())
 
     def test_roots_sensitive_unignored_and_aliases(self):
         for name in ('private', 'out'):
@@ -241,24 +346,28 @@ class HostFixTests(unittest.TestCase):
 
     def test_direct_undo_is_retryable_after_opt_out_and_interruption(self):
         key = self.record()
-        marker = self.output / FIX['MARKER']
         with self.writes():
             record = self.apply()
             self.config.write_text('{"hostActions":"off"}')
             self.store.mark(self.project, key, 'dismiss')
             persist = FIX['write_record']
 
-            def stop_after_unlink(directory, name, store, data):
-                if data['phase'] == 'undone':
-                    raise InterruptedError()
-                persist(directory, name, store, data)
+            for phase in ('undo-pending', 'undone'):
+                def interrupt(*args):
+                    if args[-1]['phase'] == phase:
+                        if phase == 'undone':
+                            self.output.rmdir()
+                        raise InterruptedError()
+                    persist(*args)
 
-            with patch.dict(FIX, write_record=stop_after_unlink):
-                with self.assertRaises(InterruptedError):
+                with patch.dict(FIX, write_record=interrupt), self.assertRaises(InterruptedError):
                     self.undo(record)
-            self.assertFalse(marker.exists())
+                self.assertFalse((self.output / FIX['MARKER']).exists())
+            with redirect_stdout(io.StringIO()) as out:
+                self.undo(record)
+            self.assertIn('marker absent', out.getvalue())
             self.undo(record)
-            self.undo(record)
+            self.assertIn(b'"undone"', record.read_bytes())
 
     def test_foreign_markers_and_forged_records_are_preserved(self):
         self.record()
