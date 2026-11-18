@@ -21,8 +21,7 @@ The part of the loop that repeats. Check whether past changes paid off, keep the
 **Propose-only mode:** if the arguments say `propose-only` (the scheduled headless run uses this), do steps 1–4 but change nothing: write the result to the project report folder as `review-<yyyy-mm-dd>.md` (or print it, if writing isn't allowed) and stop.
 
 
-Review the newest usage audit (`docs/kaizen/` or this project's report folder, printed as `reports` by `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled config show --for .`) against the one
-before it and docs/kaizen/LEDGER.md.
+Use the supplied report when one is given; otherwise use the newest usage audit (`docs/kaizen/` or this project's report folder, printed as `reports` by `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled config show --for .`). Review it against the one before it and docs/kaizen/LEDGER.md.
 
 1. For every ledger row without a measured effect: fill it in from the audits, then say
    keep, tune or revert. Record API-equivalent dollars alongside tokens when available.
@@ -38,7 +37,7 @@ before it and docs/kaizen/LEDGER.md.
 2. Include measured findings from `${CLAUDE_PLUGIN_ROOT}/skills/friction/SKILL.md` in the review and distinguish hypotheses; cycle runs that analysis once. An absent view skips only friction analysis.
    List the 5 largest remaining costs and any new patterns since the last review.
 3. Check that the rules are reaching the agents. In propose-only mode (no shell), use the
-   newest token-audit report only (the per-agent Bash and tool sections; use Grep to count, e.g.
+   selected token-audit report only (the per-agent Bash and tool sections; use Grep to count, e.g.
    codemap vs rg calls); never Read raw transcripts. Interactively, pick 3 recent subagent transcripts and
    check whether they followed the key rules (code map first, ranged reads, tools before
    tokens). If not, find out why: the rule may be missing from their context, or worded

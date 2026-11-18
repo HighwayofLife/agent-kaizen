@@ -41,6 +41,25 @@ class FrictionSkillTests(unittest.TestCase):
         self.assertIn("scoped local commit", read("docs/autonomy.md"))
         self.assertIn("/agent-kaizen:friction", read("README.md"))
 
+    def test_friction_preparation_and_action_policy(self):
+        friction = read("skills/friction/SKILL.md")
+        for phrase in ("scripts/host-probe\" --project <canonical-project> --out <reports>",
+                       "one hour", "view's `actions` (never `flags`)", "hostActions=apply",
+                       "hostActions.value", "config show --for .", "otherwise use `suggest`",
+                       "scripts/friction-catalog.json", "linux-localsearch"):
+            self.assertIn(phrase, friction)
+        self.assertLess(friction.index("scripts/host-probe"), friction.index("friction prepare --for ."))
+
+    def test_scoped_refresh_backup_and_review(self):
+        cycle = read("skills/cycle/SKILL.md")
+        for phrase in ("review --dry-run --project-dir .", "paths:", "--cwd <path>"):
+            self.assertIn(phrase, cycle)
+        autonomy = read("docs/autonomy.md")
+        self.assertIn('begin --skill <skill> --ledger "<ledger text>" --repo <project root>', autonomy)
+        review = read("skills/review/SKILL.md")
+        self.assertIn("supplied report", review)
+        self.assertLess(review.index("supplied report"), review.index("newest usage audit"))
+
 
 if __name__ == "__main__":
     unittest.main()
