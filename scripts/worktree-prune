@@ -10,20 +10,24 @@ if __name__ == '__main__' and not sys.flags.isolated:
               {k: v for k, v in os.environ.items() if not k.startswith('PYTHON')})
 
 import argparse
+import codecs
 import errno
 from functools import partial
 import hashlib
 import json
 from pathlib import Path
 import re
+import select
 import stat
 import struct
+import subprocess
 import time
 
 if __name__ == '__main__':
     sys.dont_write_bytecode = True
     sys.path.insert(0, str(Path(__file__).resolve().parent))
-from kaizen_worktree_facts import file_id, git, records, regular_bytes, resolve_git, within
+from kaizen_worktree_facts import (GIT_CONFIG, GIT_ENV, TIMEOUT, file_id, git, records,
+                                   regular_bytes, resolve_git, within)
 
 
 MIN_IDLE_SECONDS = 86400
@@ -32,12 +36,13 @@ MAX_BYTES = 512 * 1024 * 1024
 MAX_INDEX_BYTES = 16 * 1024 * 1024
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 OID = rb'(?:[0-9a-f]{40}|[0-9a-f]{64})'
+QUOTED_ALTERNATE = re.compile(rb'"((?:[^"\\\0]|\\(?:[abfnrtv"\\]|[0-3][0-7]{2}))*)"')
 INDEX_DEBUG = re.compile(rb'(?:  [^\n]*\n){4}  size: [0-9]+\tflags: ([0-9a-f]+)\n')
 # Git's skip-worktree, intent-to-add and assume-unchanged bits.
 UNSAFE_INDEX_FLAGS = (1 << 30) | (1 << 29) | (1 << 15)
 SAFE_INDEX_EXTENSIONS = {b'TREE', b'UNTR', b'FSMN', b'EOIE', b'IEOT'}
 SAFE_XATTRS = {'com.apple.provenance', 'com.apple.quarantine', 'com.apple.lastuseddate#PS'}
-PENDING = 'worktree changes are disabled pending journal and recovery support (P12b)'
+PENDING = 'worktree changes are disabled pending safe removal and authenticated recovery'
 
 
 class Refused(Exception):
@@ -328,7 +333,43 @@ def xattr_reader():
     return names
 
 
-def check_live(path, info, tree, algorithm, cutoff):
+def xattr_check():
+    list_xattrs = xattr_reader()
+    residuals = {} if list_xattrs else {'xattrs': 'unchecked'}
+
+    def check(path, label):
+        if list_xattrs is None:
+            return
+        try:
+            names = list_xattrs(os.fsencode(path))
+        except OSError as error:
+            if error.errno not in (errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP):
+                raise
+            residuals['xattrs'] = 'unchecked'
+            return
+        if any(os.fsdecode(name) not in SAFE_XATTRS for name in names):
+            raise Refused(f'worktree has extended attributes at {os.fsdecode(label)!r}')
+
+    return check, residuals
+
+
+def check_admin_xattrs(admin, check):
+    count = 0
+
+    def failed(error):
+        raise error
+
+    check(admin, 'admin')
+    for directory, dirs, files, _ in os.fwalk(admin, onerror=failed, follow_symlinks=False):
+        for name in dirs + files:
+            count += 1
+            if count > MAX_WALK_ENTRIES:
+                raise Refused('worktree admin directory is too large to check')
+            entry = Path(directory) / name
+            check(entry, Path('admin') / entry.relative_to(admin))
+
+
+def check_live(path, info, tree, algorithm, cutoff, check_xattrs):
     directories = {b''}
     for name in tree:
         parent = name.rpartition(b'/')[0]
@@ -337,22 +378,7 @@ def check_live(path, info, tree, algorithm, cutoff):
             parent = parent.rpartition(b'/')[0]
     count, total = 0, 0
     blobs = {}
-    list_xattrs = xattr_reader()
-    residuals = {} if list_xattrs else {'xattrs': 'unchecked'}
     root_path = os.fsencode(path)
-
-    def check_xattrs(relative):
-        if list_xattrs is None:
-            return
-        try:
-            names = list_xattrs(os.path.join(root_path, relative))
-        except OSError as error:
-            if error.errno not in (errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP):
-                raise
-            residuals['xattrs'] = 'unchecked'
-            return
-        if any(os.fsdecode(name) not in SAFE_XATTRS for name in names):
-            raise Refused(f'worktree has extended attributes at {os.fsdecode(relative)!r}')
 
     def walk(fd, prefix):
         nonlocal count, total
@@ -369,7 +395,7 @@ def check_live(path, info, tree, algorithm, cutoff):
                     raise Refused('worktree is not idle for 24 hours')
                 name = os.fsencode(entry.name)
                 relative = prefix + name
-                check_xattrs(relative)
+                check_xattrs(os.path.join(root_path, relative), relative)
                 if not prefix and name == b'.git':
                     continue
                 if name.lower() == b'.git':
@@ -415,24 +441,122 @@ def check_live(path, info, tree, algorithm, cutoff):
 
     root = checked_open(path, DIR_FLAGS, info)
     try:
-        check_xattrs(b'.')
+        check_xattrs(path, b'.')
         walk(root, b'')
     finally:
         os.close(root)
     if tree:
         raise Refused('worktree is missing tracked entries')
-    return blobs, residuals
+    return blobs
 
 
-def check_blobs(run, path, blobs):
-    if blobs:
-        request = b''.join(oid + b'\n' for oid in blobs)
-        expected = b''.join(b'%s blob %d\n' % item for item in blobs.items())
-        if run(path, 'cat-file', '--batch-check', input_data=request) != (0, expected):
-            raise Refused('Git blob is missing or has an unexpected type or size')
+def check_alternates(common, admin, path):
+    protected = (inode(admin), inode(path))
+    common_objects = (common / 'objects').resolve(strict=True)
+    if any(within(common_objects, target) for target in protected):
+        raise Refused('common Git object directory is inside the removal scope')
+    pending = [common_objects]
+    seen = set()
+    if os.path.lexists(admin / 'objects'):
+        pending.append(admin / 'objects')
+    while pending:
+        objects = pending.pop().resolve(strict=True)
+        identity = inode(objects)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        filename = objects / 'info/alternates'
+        if len(seen) > 256:
+            raise Refused('too many Git alternate object directories')
+        if not os.path.lexists(filename):
+            continue
+        if (not any(within(objects, target) for target in protected)
+                and any(within(filename.resolve(strict=True), target) for target in protected)):
+            raise Refused('Git alternates file is inside the removal scope')
+        for entry in regular_bytes(filename, 1024 * 1024).split(b'\n'):
+            if not entry or entry.startswith(b'#'):
+                continue
+            if entry.startswith(b'"'):
+                quoted = QUOTED_ALTERNATE.match(entry)
+                if quoted is None:
+                    raise Refused('cannot safely resolve Git alternates')
+                entry = codecs.escape_decode(quoted[1])[0]
+            if not entry or b'\0' in entry:
+                raise Refused('cannot safely resolve Git alternates')
+            alternate = objects / os.fsdecode(entry)
+            resolved = alternate.resolve(strict=True)
+            if any(within(alternate, target) or within(resolved, target)
+                   for target in protected):
+                raise Refused('Git alternate object directory is inside the removal scope')
+            pending.append(resolved)
+            if len(pending) > 256:
+                raise Refused('too many Git alternate object directories')
 
 
-def preflight(run, project, path, cutoff):
+def check_blobs(executable, path, blobs, algorithm):
+    if not blobs:
+        return
+    config = [arg for value in GIT_CONFIG for arg in ('-c', value)]
+    argv = [str(executable), '--no-pager', '--no-optional-locks', '-C', str(path),
+            *config, 'cat-file', '--batch']
+    deadline = time.monotonic() + TIMEOUT
+    invalid = 'Git blob is missing or has an unexpected type or size'
+    with subprocess.Popen(argv, env=GIT_ENV, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.DEVNULL) as process:
+        output = bytearray()
+
+        def receive():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise Refused('Git blob read exceeded its time limit')
+            ready, _, _ = select.select([process.stdout], [], [], remaining)
+            if not ready:
+                raise Refused('Git blob read exceeded its time limit')
+            return os.read(process.stdout.fileno(), 65536)
+
+        try:
+            for oid, size in blobs.items():
+                process.stdin.write(oid + b'\n')
+                process.stdin.flush()
+                header = b'%s blob %d\n' % (oid, size)
+                while len(output) < len(header) and b'\n' not in output:
+                    chunk = receive()
+                    if not chunk:
+                        raise Refused(invalid)
+                    output.extend(chunk)
+                if not output.startswith(header):
+                    raise Refused(invalid)
+                del output[:len(header)]
+                digest = hashlib.new(algorithm, b'blob %d\0' % size)
+                remaining = size
+                while remaining:
+                    if not output:
+                        output.extend(receive())
+                        if not output:
+                            raise Refused(invalid)
+                    take = min(remaining, len(output))
+                    digest.update(output[:take])
+                    del output[:take]
+                    remaining -= take
+                if not output:
+                    output.extend(receive())
+                if not output.startswith(b'\n'):
+                    raise Refused(invalid)
+                del output[:1]
+                if digest.hexdigest().encode('ascii') != oid:
+                    raise Refused('Git blob payload does not match its object ID')
+            process.stdin.close()
+            if output or receive() or process.wait(timeout=max(0.001, deadline - time.monotonic())):
+                raise Refused(invalid)
+        except subprocess.TimeoutExpired:
+            raise Refused('Git blob read exceeded its time limit') from None
+        finally:
+            if process.poll() is None:
+                process.kill()
+
+
+def preflight(executable, project, path, cutoff):
+    run = partial(git, executable)
     path = exact_target(str(path))
     meta = path.lstat()
     target_id = file_id(meta)
@@ -471,8 +595,11 @@ def preflight(run, project, path, cutoff):
     if int(commit) > cutoff or any(p.lstat().st_mtime > cutoff for p in times if os.path.lexists(p)):
         raise Refused('worktree is not idle for 24 hours')
     tree, algorithm = checkout_tree(run, path, tip, admin, common)
-    blobs, residuals = check_live(path, meta, tree, algorithm, cutoff)
-    check_blobs(run, path, blobs)
+    check_xattrs, residuals = xattr_check()
+    check_admin_xattrs(admin, check_xattrs)
+    check_alternates(common, admin, path)
+    blobs = check_live(path, meta, tree, algorithm, cutoff, check_xattrs)
+    check_blobs(executable, path, blobs, algorithm)
     if identity != (inode(path), inode(admin), inode(common), file_id((path / '.git').lstat())):
         raise Refused('worktree identity changed during preflight')
     return branch, tip, primary_branch, primary_tip, identity, history, residuals
@@ -484,24 +611,27 @@ def apply(args):
     executable = resolve_git(project, path)
     if executable is None:
         raise Refused('Git executable is unknown')
-    run = partial(git, executable)
     cutoff = time.time() - MIN_IDLE_SECONDS
-    checked = preflight(run, project, path, cutoff)
-    # Keep the live comparison at the mutation boundary when recovery is added.
-    if preflight(run, project, path, cutoff) != checked:
+    checked = preflight(executable, project, path, cutoff)
+    # An open writer can still change a verified file after a quarantine rename.
+    if preflight(executable, project, path, cutoff) != checked:
         raise Refused('worktree identity or retained history changed during preflight')
     residuals = checked[-1]
     raise Refused('eligible worktree. ' + PENDING + (' ' + json.dumps(residuals) if residuals else ''))
 
 
 def private_record(value):
-    home = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude').resolve()
-    root = home / 'audits/worktree-prunes'
+    home = Path.home().resolve()
+    parts = ('.claude', 'audits', 'worktree-prunes')
     record = Path(value)
-    if record.parent.resolve() != root:
+    if record.parent != home.joinpath(*parts):
         raise Refused('record is outside the private journal')
-    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    directory = os.open(home, DIR_FLAGS)
     try:
+        for part in parts:
+            child = os.open(part, DIR_FLAGS, dir_fd=directory)
+            os.close(directory)
+            directory = child
         meta = os.fstat(directory)
         if meta.st_uid != os.getuid() or meta.st_mode & 0o077:
             raise Refused('journal directory is not private')
@@ -544,6 +674,7 @@ def undo(args):
         raise Refused('branch tip no longer equals the recorded tip')
     if any(e.get(b'branch') == branch for e in trees.values()):
         raise Refused('branch is already checked out')
+    # File ownership and mode do not authenticate recovery data against a same-UID writer.
     raise Refused(PENDING)
 
 
