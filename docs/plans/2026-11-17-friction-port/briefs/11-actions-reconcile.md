@@ -39,3 +39,8 @@ Read `git show wt/p06:scripts/kaizen-scheduled` at `actions_import`, `_action_ve
 ## Report
 
 Report changed files and line counts, exact checks and outcomes, known uncertainty and any blocked verification. Label measurements with baseline/conditions. Redact paths and identifiers from shared output. Leave plugin version and release CHANGELOG to P27. Do not commit or push.
+
+## Delta from P07 fix round 2 (2026-11-18)
+
+- Scope follows plan.md's root-wins rule: an enrolled repository root absorbs nested enrollments and linked worktrees; `action_project` maps targets through per-worktree `anchors` onto the root's canonical project, and refuses when `Project.unknown` is set (failed git probe, incomplete worktree listing).
+- An action ID minted for a subproject before its repository root was enrolled differs from the ID after enrollment (the canonical project changes). Reconcile must treat such rows as stale (no match), never re-key or merge them silently; add a test.
