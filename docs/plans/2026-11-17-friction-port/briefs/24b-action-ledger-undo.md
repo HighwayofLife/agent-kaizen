@@ -44,3 +44,13 @@ Read `git show wt/p08b:scripts/kaizen-scheduled` at `review_command` and the ins
 ## Report
 
 Report changed files and line counts, exact checks and outcomes, known uncertainty and any blocked verification. Label measurements with baseline/conditions. Redact paths and identifiers from shared output. Leave plugin version and release CHANGELOG to P27. Do not commit or push.
+
+## Delta from P24a security review (fix these first; P24a landed dormant)
+
+Each gets a regression test in `tests/test_friction_apply.py` or `tests/test_runner.py`.
+
+1. `scripts/kaizen-scheduled` (~line 313): the frozen config grants a quota while `schedule=off`. Freeze must grant zero quota whenever the schedule is off at freeze time, so a review pending from before the schedule was disabled can never become eligible for broker writes after re-enabling.
+2. `scripts/kaizen_friction_apply.py` (~line 93): the parser accepts a result whose runtime `permission_denials` names a `Write` with no matching counted tool call. Contradictory evidence must fail closed: treat the run's accounting as unverified (zero remaining quota / refusal), never as zero attempts.
+3. `scripts/kaizen_friction_apply.py` (~line 59): the collector closes Claude's stdout at the stream limit, so an oversized review can die on SIGPIPE before returning its result. Keep draining (discarding) past the limit, mark the result oversized and refuse it, and let the process exit normally (bounded by the existing timeout).
+
+Settled stance (do not reopen): same-UID forgery accepted residual; caller env trusted.
