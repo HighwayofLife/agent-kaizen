@@ -227,9 +227,11 @@ def decide(state, key, rule, prompt):
     try:
         with os.fdopen(state_file(counter, os.O_RDONLY), "rb") as stream:
             value = stream.read(33)
+            age = time.time() - os.fstat(stream.fileno()).st_mtime
         if not re.fullmatch(rb"(0|[1-9][0-9]{0,30})\n", value):
             raise ValueError("invalid counter")
-        count = int(value)
+        # A counter older than the prune age is treated as already pruned.
+        count = int(value) if age <= STATE_MAX_AGE else 0
     except FileNotFoundError:
         count = 0
 
@@ -266,16 +268,25 @@ def decide(state, key, rule, prompt):
     return False
 
 
+STATE_MAX_AGE = 30 * 86400
+PRUNE_MAX_ENTRIES = 2000
+PRUNE_MAX_SECONDS = 0.25
+
+
 def expired(path):
     info = path.lstat()
-    return stat.S_ISREG(info.st_mode) and time.time() - info.st_mtime > 30 * 86400
+    return stat.S_ISREG(info.st_mode) and time.time() - info.st_mtime > STATE_MAX_AGE
 
 
 def prune(state, identity):
     with held_lock(state / ".prune.lock", identity) as acquired:
         if not acquired:
             return
-        for path in state.iterdir():
+        # Bounded so the hook stays fast; a huge directory is only partly pruned.
+        deadline = time.monotonic() + PRUNE_MAX_SECONDS
+        for seen, path in enumerate(state.iterdir()):
+            if seen >= PRUNE_MAX_ENTRIES or time.monotonic() >= deadline:
+                break
             match = re.fullmatch(r"(.+)\.(?:count|reasons\.jsonl)", path.name)
             if match is None:
                 continue
@@ -289,7 +300,9 @@ def prune(state, identity):
 
 
 def visible_config(value):
-    return "".join(char if char.isprintable() else repr(char)[1:-1] for char in value)
+    # Printable text is shown as written; anything else as a Python literal,
+    # whose escaping is unambiguous (backslashes are escaped too).
+    return value if value.isprintable() else ascii(value)
 
 
 def guard(event):

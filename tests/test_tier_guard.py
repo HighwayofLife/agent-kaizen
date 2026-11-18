@@ -231,14 +231,29 @@ class TierGuardTests(unittest.TestCase):
         def replace_after_stat(path):
             info = lstat(path)
             if path == counter and time.time() - info.st_mtime > 30 * 86400:
+                # The expired count is ignored, so this request restarts it at 1.
                 self.assertFalse(self.call(other))
-                self.assertEqual(counter.read_text(), "2\n")
+                self.assertEqual(counter.read_text(), "1\n")
             return info
 
         with mock.patch.object(Path, "lstat", replace_after_stat):
             self.run_guard(io.StringIO())
-        self.assertEqual(counter.read_text(), "2\n")
+        # The prune saw the old age but rechecked under the key lock and kept it.
+        self.assertEqual(counter.read_text(), "1\n")
+        self.assertFalse(self.call(other))
         self.assertTrue(self.call(other))
+
+    def test_expired_counter_does_not_deny(self):
+        self.configure({**RULE, "freeSpawns": 1})
+        self.state.mkdir(mode=0o700)
+        counter = self.state / (self.key + ".count")
+        counter.touch(mode=0o600)
+        counter.write_text("5\n")
+        old = time.time() - 31 * 86400
+        os.utime(counter, (old, old))
+        self.assertFalse(self.call())
+        self.assertEqual(counter.read_text(), "1\n")
+        self.assertTrue(self.call())
 
     def test_prune_error_preserves_allow_and_deny(self):
         counter = self.state / (self.key + ".count")
