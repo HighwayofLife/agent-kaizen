@@ -1,7 +1,7 @@
-"""Runner-owned mutation evidence for the dormant scheduled broker."""
+"""Runner-owned mutation evidence and recovery for scheduled friction actions."""
 import argparse
 import base64
-from contextlib import contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from datetime import date, datetime, timedelta, timezone
 import errno
 from functools import cached_property
@@ -16,6 +16,7 @@ import runpy
 import select
 import shlex
 import stat
+import sys
 import tempfile
 from threading import Event, Thread
 from types import SimpleNamespace
@@ -40,6 +41,33 @@ OPERATIONS = {
 def require(condition):
     if not condition:
         raise ValueError("scheduled mutation evidence is incomplete or inconsistent")
+
+
+def policy_digest(snapshot):
+    return hashlib.sha256(repr(snapshot).encode("utf-8")).hexdigest()
+
+
+def marker_tool():
+    here = Path(__file__).resolve().parent
+    path = next((here / name for name in ("kaizen-host-fix", "host-fix") if (here / name).is_file()), None)
+    require(path is not None and path.resolve() == path)
+    sys.path.insert(0, str(here))
+    try:
+        return runpy.run_path(str(path))
+    finally:
+        del sys.path[0]
+
+
+def marker_writes_enabled(tool):
+    return sys.platform.startswith("linux") and tool["LINUX_WRITES"]
+
+
+def scheduled_marker_refusal():
+    if not VERIFIED_STREAM_VERSIONS:
+        return "scheduled stream gate is closed"
+    if not marker_writes_enabled(marker_tool()):
+        return "native marker gate is closed"
+    return None
 
 
 def reject_constant(_value):
@@ -80,16 +108,22 @@ def ledger_headers(lines):
 class BrokerLedger:
     """Private effect receipts and the editable project ledger, under one scoped writer lock."""
 
-    @classmethod
-    @contextmanager
-    def locked(cls, host, store, project):
-        self = cls()
+    def __init__(self, host, store, project):
         self.host, self.store, self.project = host, store, project
         if store.friction.resolve().is_relative_to(project):
             raise ValueError("broker state must be outside the project")
         self.secret = store._secret()
         self.path = project / LEDGER
-        lock = "broker-" + hashlib.sha256(os.fsencode(project)).hexdigest() + ".lock"
+        self.lock_name = "broker-" + hashlib.sha256(os.fsencode(project)).hexdigest() + ".lock"
+        with host["_directory"](project) as root:
+            info = os.fstat(root)
+        self.identity = [str(project), info.st_dev, info.st_ino]
+
+    @classmethod
+    @contextmanager
+    def locked(cls, host, store, project):
+        self = cls(host, store, project)
+        lock = self.lock_name
         with host["_directory"](store.friction, private=True) as state, \
                 host["_private_file"](state, lock, os.O_RDWR | os.O_CREAT) as lease:
             host["fcntl"].flock(lease, host["fcntl"].LOCK_EX)
@@ -97,7 +131,8 @@ class BrokerLedger:
                 raise ValueError("broker project lock was replaced")
             with host["_directory"](project) as root:
                 info = os.fstat(root)
-            self.lease, self.state, self.identity = lease, state, [str(project), info.st_dev, info.st_ino]
+            require(self.identity == [str(project), info.st_dev, info.st_ino])
+            self.lease, self.state = lease, state
             self.reported_backups = set()
             yield self
 
@@ -446,9 +481,12 @@ class BrokerLedger:
         except (OSError, ValueError):
             return False
 
-    def preflight(self, ident, operation, *, evidence_scope):
+    def preflight(self, ident, operation, *, evidence_scope, retry=False):
         """Call before starting a new effect, with the lock held through bookkeeping."""
-        if self.load(ident) is not None:
+        record = self.load(ident)
+        if record is not None and not (retry and record["phase"] == "marker-pending"
+                                       and record["operation"] == operation
+                                       and record["evidence_scope"] == sorted(evidence_scope)):
             raise ValueError("broker action already has an effect receipt")
         _, scope = self.live_scope()
         evidence_scope = self.evidence_scope(evidence_scope, scope)
@@ -518,6 +556,74 @@ class BrokerLedger:
         self.save(record, "recorded")
         return "recorded"
 
+    def cancel_unstarted_marker(self, record):
+        """Release an old reservation only when its private native journal is absent."""
+        if record["phase"] != "marker-pending" or not record.get("reservation"):
+            return False
+        native = Path(self.tool_record(record["id"], "host-fix"))
+        require(record["operation"] == "host-fix" and record["tool_record"] == str(native))
+        with ExitStack() as stack:
+            try:
+                state = stack.enter_context(self.host["_directory"](native.parent, private=True))
+            except FileNotFoundError:
+                pass
+            else:
+                fcntl = self.host["fcntl"]
+                fcntl.flock(state, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                try:
+                    os.stat(native.name, dir_fd=state, follow_symlinks=False)
+                except FileNotFoundError:
+                    pass
+                else:
+                    return False
+            record["reason"] = "native journal never started"
+            del record["reservation"]
+            self.save(record, "cancelled")
+        return True
+
+    def scheduled_marker(self, ident, target, bound, invoke, *, attempt=None):
+        """Verify old work first. An absent native journal permits a fresh attempt."""
+        record = self.load(ident)
+        if record is None and attempt is None:
+            return False
+        native = self.tool_record(ident, "host-fix")
+        binding = dict(id=ident, operation="host-fix", target=target, target_identity=bound,
+                       tool_record=native, scope=self.identity)
+        if record is not None and any(record.get(key) != value for key, value in binding.items()):
+            raise ValueError("scheduled marker target or transaction changed")
+        result = invoke("verify", ident, target, bound)
+        if result == "rolled-back" and record and record["phase"] in ("marker-pending", "no-effect"):
+            if record["phase"] == "marker-pending":
+                record["reason"] = "native marker was rolled back"
+                self.save(record, "no-effect")
+            return "no-effect"
+        if result in ("absent", "gated"):
+            if record is not None and record["phase"] != "marker-pending":
+                raise ValueError("verified marker effect is missing")
+            if attempt is None or result == "gated":
+                return False
+            run_id, generation, roots, policy = attempt
+            self.preflight(ident, "host-fix", evidence_scope=roots, retry=True)
+            if record is None:
+                record = dict(binding, generation=generation, evidence_scope=sorted(roots), count=1,
+                              date=date.today().isoformat(), absolute_metric=True)
+            if record.get("reservation") == run_id:
+                return False
+            info = Path(target).lstat()
+            require([info.st_dev, info.st_ino] == bound)
+            record.update(reservation=run_id, policy=policy, target_ctime_ns=info.st_ctime_ns)
+            self.save(record, "marker-pending")
+            result = invoke("apply", ident, target, bound)
+        if record is None or not re.fullmatch(r"[a-f0-9]{64}", result):
+            raise ValueError("marker effect lacks a matching broker reservation")
+        if record["phase"] == "marker-pending":
+            record["verification"] = result
+            self.save(record, "effect-verified")
+        if record["phase"] not in ("effect-verified", "recorded") or record["verification"] != result:
+            raise ValueError("marker effect changed before bookkeeping")
+        self.reconcile(ident)
+        return self.reconcile(ident)
+
     @staticmethod
     def linked_row(lines, match, expected):
         row = cells(lines[match]) if match is not None else []
@@ -527,7 +633,7 @@ class BrokerLedger:
 
     def undo(self, ident, inverse):
         record = self.load(ident)
-        if record is None or record["phase"] == "apply-pending":
+        if record is None or record["phase"] in ("apply-pending", "marker-pending", "no-effect", "cancelled"):
             raise ValueError("no verified broker effect in this project")
         self.recover_ledger_backups(ident, record)
         expected = self.row(record, legacy_metric=not record.get("absolute_metric"))
@@ -842,3 +948,100 @@ def prove_budget(calls, *, backup, root, scope, project, baseline, ledger_before
         return max(0, config_before[0] - charge), proof
     except (AttributeError, KeyError, OSError, RecursionError, RuntimeError, TypeError, ValueError):
         return None, None
+
+
+def marker_main():
+    """Fixed isolated subprocess entry point. The native helper owns the marker journal."""
+    parser = argparse.ArgumentParser(description=marker_main.__doc__)
+    parser.add_argument("phase", choices=("verify", "apply"))
+    parser.add_argument("project", type=Path)
+    parser.add_argument("id")
+    parser.add_argument("--target", type=Path)
+    parser.add_argument("--identity", type=int, nargs=2)
+    parser.add_argument("--lease-fd", type=int)
+    args = parser.parse_args()
+    here = Path(__file__).resolve().parent
+    sys.dont_write_bytecode = True
+    tool = marker_tool()
+    try:
+        runner, store, _, deadline = tool["runtime"]()
+        host = runpy.run_path(str(here / "kaizen_friction_actions.py"))
+        ledger = BrokerLedger(host, store, args.project)
+        with tool["_directory"](store.friction, private=True) as ledger.state:
+            reservation = ledger.load(args.id)
+            if args.phase == "apply":
+                require(args.target is None and args.identity is None and args.lease_fd is not None and args.lease_fd > 2)
+                with tool["_private_file"](ledger.state, ledger.lock_name) as lease:
+                    require(os.path.samestat(os.fstat(lease), os.fstat(args.lease_fd)))
+                    try:
+                        tool["fcntl"].flock(lease, tool["fcntl"].LOCK_EX | tool["fcntl"].LOCK_NB)
+                    except BlockingIOError:
+                        pass  # The inherited runner lease holds the project lock.
+                    else:
+                        raise ValueError("broker reservation lock is not held")
+                require(reservation and reservation["phase"] == "marker-pending"
+                        and reservation["operation"] == "host-fix" and reservation.get("reservation")
+                        and reservation["tool_record"] == ledger.tool_record(args.id, "host-fix"))
+                args.target, args.identity = Path(reservation["target"]), reservation["target_identity"]
+        require(tool["ACTION_ID"].fullmatch(args.id) and args.target is not None
+                and args.target.is_relative_to(args.project))
+        require(runner["action_project"](args.project, selector=args.target) == (args.project, args.target))
+        project_info, info = args.project.lstat(), args.target.lstat()
+        require(list(tool["file_id"](info)) == args.identity)
+        enabled = marker_writes_enabled(tool)
+        if args.phase == "apply":
+            require(enabled)
+            backup = runpy.run_path(str(here / "kaizen-backup"))
+
+            def recheck(project, project_info, path, info, recovery):
+                try:
+                    policy = policy_digest(runner["freeze_mutation_config"](project, backup))
+                except (OSError, RuntimeError, ValueError) as error:
+                    raise tool["Refused"]("scheduled policy could not be revalidated") from error
+                if ((project, path) != (args.project, args.target)
+                        or list(tool["file_id"](project_info)) != reservation["scope"][1:]
+                        or list(tool["file_id"](info)) != args.identity
+                        or policy != reservation["policy"]):
+                    raise tool["Refused"]("scheduled scope or policy changed")
+                tool["recheck"](project, project_info, path, info, recovery)
+
+            tool["apply"].__globals__["recheck"] = recheck
+            tool["apply"](SimpleNamespace(project=str(args.project), catalog_id=tool["CATALOG_ID"],
+                                          path=str(args.target)), action_id=args.id)
+        name = args.id + ".json"
+        with tool["checked_directory"](args.target, info) as directory, ExitStack() as stack:
+            try:
+                state = stack.enter_context(tool["_directory"](store.friction / "host-fixes", private=True))
+            except FileNotFoundError:
+                record = None
+            else:
+                tool["lock_state"](state)
+                record = tool["read_record"](state, name, store)
+            if record is None:
+                require(args.phase == "verify" and not tool["marker_present"](directory))
+                print("absent" if enabled else "gated")
+                return
+            require(record["binding"] == tool["binding"](args.project, project_info, args.target, info)
+                    and record["phase"] in ("apply-pending", "applied", "undone"))
+            tool["recheck"](args.project, project_info, args.target, info, record)
+            tool["check_deadline"](deadline)
+            if record["phase"] == "undone":
+                names = [tool["MARKER"]]
+                if record.get("quarantine"):
+                    names.append(record["quarantine"])
+                require(args.phase == "verify" and not any(tool["marker_present"](directory, name) for name in names))
+                print("rolled-back")
+                return
+            if args.phase == "verify" and record["phase"] == "apply-pending" and not tool["marker_present"](directory):
+                require(reservation and os.fstat(directory).st_ctime_ns == reservation.get("target_ctime_ns"))
+                print("absent" if enabled else "gated")
+                return
+            version = tool["marker_version"](directory, record)
+            os.fsync(directory)
+            print(hashlib.sha256(json.dumps([record["stamp"], version]).encode("ascii")).hexdigest())
+    except (tool["Refused"], OSError, ValueError, RuntimeError, KeyError, TypeError):
+        parser.exit(2, "scheduled marker transaction could not be verified\n")
+
+
+if __name__ == "__main__":
+    marker_main()

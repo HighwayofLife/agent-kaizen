@@ -13,12 +13,36 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+from test_friction_claude import end, start
 from test_schedule import CRONTAB
+from test_scripts import StubCase, jsonl
 
 PATH = pathlib.Path(__file__).resolve().parents[1] / "scripts/kaizen_friction_prepare.py"
 SPEC = importlib.util.spec_from_file_location("friction_prepare", PATH)
 prepare = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(prepare)
+
+
+class AuditRegressionBindingTests(StubCase):
+    def test_swapped_prior_extract_cannot_add_a_regression_to_new_evidence(self):
+        session = self.home / '.claude/projects/example/fixture.jsonl'
+        rows = []
+        for ident in range(3):
+            rows += [start(str(ident), 1), end(str(ident), 61, toolUseResult=dict(durationMs=60000))]
+        jsonl(session, rows)
+        args = ('--json', '--since', '2025-01-01')
+        prior = json.loads(self.run_script('token-audit', *args).stdout)
+        extract = pathlib.Path(prior['extract_path'])
+        raw = extract.read_bytes()
+        self.assertIn(b'"p50": 60.0', raw)
+        extract.write_bytes(raw.replace(b'"p50": 60.0', b'"p50": 40.0'))
+        self.assertEqual(extract.stat().st_size, len(raw))
+
+        current = json.loads(self.run_script('token-audit', *args).stdout)
+        evidence = json.loads(pathlib.Path(current['extract_path']).read_bytes())['friction']
+        self.assertEqual(evidence['comparisons'][0]['p50'], 60.0)
+        self.assertEqual(evidence['regressions'], [])
+        self.assertNotIn('regression', {flag['id'] for flag in evidence['flags']})
 
 
 class ComparisonTests(unittest.TestCase):
@@ -110,12 +134,18 @@ class PreparationTests(unittest.TestCase):
         return path
 
     def write_evidence(self):
+        data = dict(v=1, report=self.report.name, scope=self.scope,
+                    since=(self.current - timedelta(days=7)).isoformat())
+        if self.block is not None:
+            data["friction"] = self.block
+        raw = json.dumps(data)
+        binding = dict(size=len(raw.encode()), sha256=prepare.hashlib.sha256(raw.encode()).hexdigest())
         self.write(self.report, '# Token audit\nSince: ' + (self.current - timedelta(days=7)).isoformat()
                    + ' (UTC; disposable evidence).\n<!-- token-audit-scope ' + json.dumps(self.scope)
                    + ' -->\n<!-- token-audit-extract ' + json.dumps(dict(v=1, file=self.extract.name))
+                   + ' -->\n<!-- token-audit-friction ' + json.dumps(binding)
                    + ' -->\n<!-- token-audit-complete -->\n')
-        self.write(self.extract, json.dumps(dict(v=1, report=self.report.name, scope=self.scope,
-                   since=(self.current - timedelta(days=7)).isoformat(), friction=self.block)))
+        self.write(self.extract, raw)
         self.probe_path = self.write(self.obj.folder / "host-probe-disposable.json", json.dumps(self.probe))
 
     def run_prepare(self, report=None, interactive=True):
@@ -168,9 +198,8 @@ class PreparationTests(unittest.TestCase):
 
     def test_probe_without_friction_block(self):
         self.candidate()
-        data = json.loads(self.extract.read_text())
-        del data["friction"]
-        self.extract.write_text(json.dumps(data))
+        self.block = None
+        self.write_evidence()
         self.assertTrue(json.loads(self.run_prepare().read_text())["actions"])
 
     def test_linked_worktree_finding_uses_canonical_provenance(self):
@@ -421,6 +450,13 @@ class PreparationTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.reconcile(inputs, self.actions())
 
+    def test_swapped_extract_before_first_preparation_is_refused(self):
+        raw = self.extract.read_bytes()
+        self.extract.write_bytes(raw.replace(b'private subject', b'forged  subject'))
+        with self.assertRaisesRegex(ValueError, "extract digest or size"):
+            self.run_prepare(self.report)
+        self.assertFalse(self.backups.exists())
+
     def test_receipt_redaction_generation_and_read_only_ack(self):
         first = self.run_prepare(self.report)
         second = self.run_prepare()
@@ -513,9 +549,8 @@ class PreparationTests(unittest.TestCase):
         result = subprocess.run([sys.executable, str(PATH.parent / "kaizen-scheduled"), "friction", "prepare", "--for", str(self.project)],
                                 env=self.environment, capture_output=True, text=True)
         self.assertEqual((result.returncode, result.stdout), (0, ""), result.stderr)
-        data = json.loads(self.extract.read_text())
-        del data["friction"]
-        self.extract.write_text(json.dumps(data))
+        self.block = None
+        self.write_evidence()
         self.assertIsNone(self.run_prepare())
 
     def test_installed_runner_prepares_real_disposable_evidence(self):

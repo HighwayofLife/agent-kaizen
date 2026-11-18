@@ -1,6 +1,8 @@
 """Synthetic timeline boundaries, bounded sweeps and private report comparisons."""
 from copy import deepcopy
 import json
+import re
+import hashlib
 import os
 from datetime import timedelta
 from pathlib import Path
@@ -195,8 +197,10 @@ class TimelineTests(unittest.TestCase):
         self.assertEqual(len(calls), 2)
 
     def test_regression_requires_completed_matching_cohort(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+        with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ):
+            root = Path(directory).resolve()
+            os.environ['KAIZEN_BACKUP_DIR'] = str(root / 'backups')
+            secret = AUDIT['audit_machine_key'](create=True)
             old_report = root / 'token-audit-old.md'
             scope = dict(v=1, window='7d', cwd=['synthetic-scope'])
             header = ('<!-- token-audit-headline {} -->\n<!-- token-audit-scope ' + json.dumps(scope)
@@ -209,8 +213,20 @@ class TimelineTests(unittest.TestCase):
             previous = dict(v=1, scope=scope, report=old_report.name, friction=friction)
             extract = root / 'token-audit-old.extract.json'
 
+            def bind(report, value):
+                raw = json.dumps(value).encode()
+                report.with_suffix('.extract.json').write_bytes(raw)
+                binding = dict(size=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+                text = re.sub(r'^<!-- token-audit-friction(?:-mac)? .*? -->\n', '', report.read_text(), flags=re.M)
+                end = '<!-- token-audit-complete -->\n'
+                if text.endswith(end):
+                    mac = AUDIT['regression_binding_mac'](secret, report.name, binding)
+                    text = (text.removesuffix(end) + '<!-- token-audit-friction ' + json.dumps(binding) + ' -->\n'
+                            + '<!-- token-audit-friction-mac ' + mac + ' -->\n' + end)
+                report.write_text(text)
+
             def compare(value, current_count=3):
-                extract.write_text(json.dumps(value))
+                bind(old_report, value)
                 data = dict(friction=deepcopy(friction))
                 data['friction']['comparisons'][0]['p50'] = 90
                 data['friction']['comparisons'][0]['count'] = current_count
@@ -250,7 +266,8 @@ class TimelineTests(unittest.TestCase):
             incomparable = deepcopy(previous)
             incomparable['report'] = newer.name
             incomparable['friction']['comparisons'][0]['signature'] = 'npm test'
-            (root / 'token-audit-newer.extract.json').write_text(json.dumps(incomparable))
+            bind(newer, incomparable)
+            os.utime(newer, (2_000_000_000, 2_000_000_000))
             self.assertEqual(compare(previous)['regressions'][0]['ratio'], 1.5)
             extract.write_text('{broken')
             AUDIT['apply_regression'](dict(friction=deepcopy(friction)), root / 'new.md', scope, root)
@@ -261,6 +278,7 @@ class TimelineCollectionTests(claude.StubCase):
 
     def setUp(self):
         super().setUp()
+        self.env['KAIZEN_BACKUP_DIR'] = str(self.root / 'backups')
         self.project = self.home / '.claude/projects/example'
         self.session = self.project / 'fixture.jsonl'
 
@@ -286,4 +304,24 @@ class TimelineCollectionTests(claude.StubCase):
             if seconds == 60:
                 self.assertFalse(data['friction']['regressions'])
         self.assertEqual(data['friction']['regressions'][0]['ratio'], 1.5)
+
+    def test_cli_regression_rejects_replaced_report_and_extract(self):
+        rows = []
+        for ident in range(3):
+            rows += [start(str(ident), 1), end(str(ident), 91, toolUseResult=dict(durationMs=90000))]
+        jsonl(self.session, rows)
+        args = ('token-audit', '--json', '--since', '2025-01-01')
+        data = json.loads(self.run_script(*args).stdout)
+        report = Path(data['report_path'])
+        extract = Path(data['extract_path'])
+        replaced = json.loads(extract.read_bytes())
+        replaced['friction']['comparisons'][0]['p50'] = 60
+        raw = json.dumps(replaced).encode()
+        extract.write_bytes(raw)
+        binding = json.dumps(dict(size=len(raw), sha256=hashlib.sha256(raw).hexdigest()))
+        report.write_text(re.sub(r'^<!-- token-audit-friction .*? -->$',
+                                 '<!-- token-audit-friction ' + binding + ' -->', report.read_text(), flags=re.M))
+
+        result = json.loads(self.run_script(*args, '--no-write').stdout)
+        self.assertFalse(result['friction']['regressions'])
 

@@ -1,6 +1,9 @@
 """Scheduled friction preparation and transactional reconciliation."""
 import json
+import runpy
 from datetime import timedelta
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from test_friction_prepare import PreparationTests, prepare
 
@@ -8,7 +11,6 @@ from test_friction_prepare import PreparationTests, prepare
 class ScheduledFrictionTests(PreparationTests):
     def setUp(self):
         super().setUp()
-        from unittest.mock import patch
         clock = patch.dict(self.runner["reconcile_scheduled"].__globals__,
                            {"now": lambda: self.current + timedelta(seconds=3)})
         clock.start()
@@ -27,15 +29,63 @@ class ScheduledFrictionTests(PreparationTests):
         self.assertIsNone(self.scheduled())
         self.assertTrue(inputs.exists())
 
-    def test_apply_stays_pending_and_does_not_acknowledge(self):
-        self.probe["findings"] = [dict(id="low-disk", catalog_id="low-disk", subject="project-volume",
-                                       evidence=dict(free_disk_bytes=1))]
+    def marker_request(self):
+        target = self.project / "build"
+        target.mkdir()
+        self.probe["findings"] = [dict(id="indexed-output", catalog_id="linux-localsearch", subject=str(target),
+                                       evidence=dict(size_bytes=1))]
+        self.probe["regenerable_dirs"] = [dict(path=str(target), size_bytes=1)]
         self.write_evidence()
         inputs, receipt = self.scheduled("auto")
         ident = json.loads(inputs.read_text())["actions"][0]["id"]
         output = self.write(self.obj.folder / "review.md", '<!-- kaizen-host-actions ' + json.dumps(
             dict(v=1, actions=[dict(id=ident, intent="apply")])) + ' -->\n')
-        self.runner["reconcile_scheduled"](self.config / "audits", self.obj, output, receipt)
+        return target, ident, output, receipt
+
+    def test_closed_marker_apply_is_imported_as_suggestion_and_acknowledged(self):
+        target, ident, output, receipt = self.marker_request()
+        self.assertTrue(self.runner["reconcile_scheduled"](
+            self.config / "audits", self.obj, output, receipt, authorize=self.fail))
+        self.assertEqual(output.read_text(), "")
+        store = json.loads((self.config / "audits/host-actions.json").read_text())
+        self.assertEqual(store["receipts"][str(self.project)]["scheduled:" + receipt["generation"]], {ident: "terminal"})
+        self.assertEqual(store["actions"][ident]["status"], "open")
+        self.assertFalse((target / ".nomedia").exists())
+        self.assertIsNone(self.scheduled("auto"))
+
+    def test_mixed_batch_downgrades_proposal_only_and_closed_marker_apply(self):
+        target = self.project / "build"
+        target.mkdir()
+        self.probe["findings"] = [
+            dict(id="low-disk", catalog_id="low-disk", subject="project-volume", evidence=dict(free_disk_bytes=1)),
+            dict(id="indexed-output", catalog_id="linux-localsearch", subject=str(target), evidence=dict(size_bytes=1)),
+            dict(id="inotify", catalog_id="inotify-limit", subject="inotify", evidence=dict(watches=1, tracked_files=1)),
+        ]
+        self.probe["regenerable_dirs"] = [dict(path=str(target), size_bytes=1)]
+        self.write_evidence()
+        _, receipt = self.scheduled("auto")
+        ids = {row["catalog_id"]: ident for ident, row in receipt["allowed"].items()}
+        actions = [dict(id=ids[catalog], intent=intent) for catalog, intent in (
+            ("low-disk", "apply"), ("linux-localsearch", "apply"), ("inotify-limit", "suggest"))]
+        output = self.write(self.obj.folder / "review.md", 'Review\n<!-- kaizen-host-actions ' + json.dumps(
+            dict(v=1, actions=actions)) + ' -->\n')
+
+        self.assertTrue(self.runner["reconcile_scheduled"](
+            self.config / "audits", self.obj, output, receipt, authorize=self.fail))
+        self.assertEqual(output.read_text(), 'Review\n')
+        store = json.loads((self.config / "audits/host-actions.json").read_text())
+        self.assertEqual(store["receipts"][str(self.project)]["scheduled:" + receipt["generation"]],
+                         {ident: "terminal" for ident in ids.values()})
+        self.assertEqual({ident: row["status"] for ident, row in store["actions"].items()},
+                         {ident: "open" for ident in ids.values()})
+        self.assertFalse((target / ".nomedia").exists())
+        self.assertIsNone(self.scheduled("auto"))
+
+    def test_apply_stays_pending_and_does_not_acknowledge(self):
+        _, _, output, receipt = self.marker_request()
+        reconcile = self.runner["reconcile_scheduled"]
+        with patch.dict(reconcile.__globals__, scheduled_action_refusal=lambda _: None):
+            self.assertFalse(reconcile(self.config / "audits", self.obj, output, receipt))
         self.assertIsNotNone(self.scheduled("auto"))
         store = json.loads((self.config / "audits/host-actions.json").read_text())
         self.assertIn('pending', json.dumps(store))
@@ -170,6 +220,78 @@ if os.environ.get('REVIEW_SLEEP'): time.sleep(10)
         self.assertEqual(len(self.calls()), calls_before)
         self.assertEqual([p for p in self.obj.folder.glob('cycle-*.md') if not p.name.endswith('.failed.md')], proposals)
         self.assertEqual(self.state()['acknowledged_generation'], '00000000000000000001')
+
+    def test_legacy_pending_receipts_stop_blocking_scheduled_acknowledgement(self):
+        host = runpy.run_path(str(self.runner_path.parent / "kaizen_friction_actions.py"))
+        store = host["HostActions"](self.config / "audits", self.backups,
+                                    self.runner["action_project"], self.runner["key"])
+        target = self.project / "build"
+        target.mkdir()
+        legacy = {}
+        for number, (catalog, selector) in enumerate((("low-disk", "project-volume"),
+                                                      ("linux-localsearch", str(target))), 1):
+            ident = store.action_id(self.project, catalog, selector, allowed=[selector])
+            generation = f"scheduled:{number:020d}"
+            frozen = {ident: dict(canonical_project=str(self.project), catalog_id=catalog, selector_key=selector,
+                                  intents=["suggest", "apply"], evidence="fixture")}
+            block = '<!-- kaizen-host-actions ' + json.dumps(dict(v=1, actions=[dict(id=ident, intent="apply")])) + ' -->'
+            self.assertEqual(store.import_actions(block, frozen, self.project, generation), {ident: "pending"})
+            legacy[generation] = {ident: "terminal"}
+        self.write(self.backups / "friction" / ("prepare-" + self.obj.key + ".json"),
+                   json.dumps(dict(v=1, project=str(self.project), generation=2, acknowledged={}))).chmod(0o600)
+        result = self.review_run()
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        receipts = json.loads(store.path.read_text())["receipts"][str(self.project)]
+        for generation, expected in legacy.items():
+            self.assertEqual(receipts[generation], expected)
+        self.assertIn("proposal-only", result.stdout)
+        self.assertIn("gate is closed", result.stdout)
+        self.assertEqual(self.state().get("acknowledged_generation"), "00000000000000000003",
+                         result.stdout + result.stderr)
+        self.assertFalse((target / ".nomedia").exists())
+        self.assertFalse(list(store.friction.glob("broker-*.json")))
+        self.assertFalse((store.friction / "host-fixes").exists())
+
+    def test_group_writable_checkout_recovers_suggestion_and_refuses_broker_apply(self):
+        audits = self.config / "audits"
+        host = runpy.run_path(str(self.runner_path.parent / "kaizen_friction_actions.py"))
+        store = host["HostActions"](audits, self.backups, self.runner["action_project"], self.runner["key"])
+        self.write(self.config / "agent-kaizen.json", '{"scheduledAutonomy":"auto"}')
+        target = self.project / "build"
+        target.mkdir()
+        generation = "00000000000000000001"
+        frozen = {}
+        for catalog, selector in (("low-disk", "project-volume"), ("linux-localsearch", str(target))):
+            ident = store.action_id(self.project, catalog, selector, allowed=[selector])
+            frozen[ident] = dict(canonical_project=str(self.project), catalog_id=catalog, selector_key=selector,
+                                 intents=["suggest", "apply"], evidence="fixture")
+        suggestion, marker = frozen
+        block = '<!-- kaizen-host-actions ' + json.dumps(dict(
+            v=1, actions=[dict(id=ident, intent="apply") for ident in frozen])) + ' -->'
+        scheduled = "scheduled:" + generation
+        self.assertEqual(store.import_actions(block, frozen, self.project, scheduled), dict.fromkeys(frozen, "pending"))
+        self.write(self.backups / "friction" / ("prepare-" + self.obj.key + ".json"),
+                   json.dumps(dict(v=1, project=str(self.project), generation=1, acknowledged={}))).chmod(0o600)
+
+        options = self.runner["command_options"](SimpleNamespace(claude=str(self.claude)))
+        command = self.runner["review_command"](options, "auto", "", "", self.project, audits)
+        _, config = self.runner["scheduled_authority"](audits, self.project, options, command, self.backups)
+        info = target.stat()
+        self.project.chmod(0o775)
+        with self.assertRaisesRegex(ValueError, "unsafe host-action directory"):
+            self.runner["run_scheduled_broker"](
+                audits, self.obj, options, receipt=dict(generation=generation, allowed=frozen, scope=self.scope),
+                attempt=(1, "fixture", {marker: [info.st_dev, info.st_ino]}, config))
+
+        result = self.review_run("--propose-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        data = json.loads(store.path.read_text())
+        self.assertEqual(data["receipts"][str(self.project)][scheduled][suggestion], "terminal", result.stdout)
+        self.assertEqual(data["receipts"][str(self.project)][scheduled][marker], "terminal", result.stdout)
+        self.assertEqual(data["actions"][suggestion]["status"], "open")
+        self.assertEqual(data["actions"][marker]["status"], "open")
+        self.assertFalse((target / ".nomedia").exists())
+        self.assertFalse(list(store.friction.glob("broker-*.json")))
 
     def test_probe_refresh_fresh_stale_and_failure(self):
         import os

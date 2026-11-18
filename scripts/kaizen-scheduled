@@ -299,16 +299,16 @@ def freeze_mutation_config(project, backup):
                                 parse_constant=reject_constant)
             stamp = (tuple(backup["directory_identity"](parent) for parent in path.parents), stamp)
         except FileNotFoundError:
-            # Pin the closest existing parent of an absent source.
+            # A ledger append can change this directory's timestamps.
             parent = next(parent for parent in path.parents if parent.exists())
-            stamp, raw, config = backup["file_version"](parent.stat()), None, {}
+            stamp, raw, config = ("absent", backup["directory_identity"](parent)), None, {}
         if not isinstance(config, dict):
             raise ValueError("expected a mutation config object")
         for name in config.keys() & SCHEMA.keys():
             if not valid_value(name, config[name]) or SCHEMA[name].get("global_only" if layers else "project_only"):
                 raise ValueError("invalid controlling mutation config")
         layers.append(config)
-        stamps.append((path, stamp, raw))
+        stamps.append((path, stamp, hashlib.sha256(raw).hexdigest() if raw is not None else None))
     global_cfg, project_cfg = layers
     if (not global_cfg.get("enabled", True)
             or project_cfg.get("schedule", global_cfg.get("schedule")) == "off"):
@@ -2155,6 +2155,234 @@ def recover_interrupted_run(audits, options):
     return "; ".join(statuses) or None
 
 
+def scheduled_authority(audits, project, options, command, root):
+    """Accept only the pinned grants and a private namespace outside the checkout."""
+    if (audits != audits_dir().resolve() or backup_root().absolute() != root
+            or root.is_relative_to(project) or project.is_relative_to(root)):
+        raise ValueError("broker state is outside the protected scope")
+    denied = command[command.index("--disallowedTools") + 1].split(",")
+    allowed = command[command.index("--allowedTools") + 1].split(",")
+    if not set(backup_deny()) <= set(denied):
+        raise ValueError("broker state lacks the pinned denies")
+    backup_script, notes_script = HERE / "kaizen-backup", HERE / "notes-ledger"
+    if any(path.resolve(strict=True) != path for path in (backup_script, notes_script)):
+        raise ValueError("broker requires fixed backup and notes helpers")
+    bash = {f"Bash({prefix}{backup_script} {operation}:*)" for operation in ("begin", "finish", "list")
+            for prefix in ("", "python3 ", options.python + " ")}
+    bash.update(f"Bash({python} {notes_script} add:*)" for python in ("python3", options.python))
+    if set(rule for rule in allowed if rule.startswith("Bash")) != bash:
+        raise ValueError("broker cannot trust the effective Bash grants")
+    executables = (Path(options.python).resolve(), Path(command[0]).resolve())
+    for path in (HERE, *executables, Path(options.python), Path(command[0]).absolute()):
+        if path.is_relative_to(project) or any(
+                path.is_relative_to(home) and not any(path.is_relative_to(home / name)
+                                                     for name in ("bin", "plugins"))
+                for home in (claude_home().resolve(), codex_home().resolve())):
+            raise ValueError("broker code is in a model-writable location")
+    for path in ledger_paths().values():
+        for target in (path.resolve(), path.with_name(path.name + ".lock").resolve()):
+            if (target.is_relative_to(root) or target.is_relative_to(HERE) or target in executables
+                    or target.parent == audits and target.name.startswith("host-actions.json")):
+                raise ValueError("notes ledger overlaps the broker state")
+    backup = runpy.run_path(str(backup_script))
+    cfg = effective(project)
+    if (not cfg["enabled"]["value"] or cycle_mode(cfg, options) != "auto"
+            or cfg["schedule"]["value"] == "off" or cfg["friction"]["value"] == "off"
+            or cfg["hostActions"]["value"] != "apply"):
+        raise ValueError("broker policy does not authorize scheduled actions")
+    return backup, freeze_mutation_config(project, backup)
+
+
+def scheduled_budget(audits, project, options, command, root, prepared, started, run_id, session_id, before):
+    if not Path(command[0]).is_absolute():
+        return None
+    try:
+        backup, config = scheduled_authority(audits, project, options, command, root)
+        broker = runpy.run_path(str(HERE / "kaizen_friction_apply.py"))
+        if broker["scheduled_marker_refusal"]():
+            return None
+        version = run_group([command[0], "--version"], cwd="/", timeout=STEP_TIMEOUT,
+                            capture_output=True, text=True, stdin=subprocess.DEVNULL)
+        version = re.fullmatch(r"([0-9]+\.[0-9]+\.[0-9]+) \(Claude Code\)\s*", version.stdout) if not version.returncode else None
+        if not version or version[1] not in broker["VERIFIED_STREAM_VERSIONS"]:
+            return None
+        scope = dict(run_id=run_id, session_id=session_id, started=started, before=before,
+                     root_identity=backup["backup_root_identity"](root))
+        notes = HERE / "notes-ledger"
+        baseline = backup["capture_git_baseline"](project)
+        if baseline is None:
+            return None
+        proof = dict(backup=backup, root=root, scope=scope, project=project, baseline=baseline,
+                     ledger_before=broker["snapshot_ledger"](backup, project), config_before=config,
+                     backup_script=HERE / "kaizen-backup", notes_script=notes, python=options.python,
+                     notes_add=runpy.run_path(str(notes))["add"],
+                     notes_before=broker["snapshot_notes"](backup, ledger_paths()))
+        targets = {}
+        for ident, candidate in prepared["allowed"].items():
+            if candidate["catalog_id"] == "linux-localsearch" and "apply" in candidate["intents"]:
+                path = Path(candidate["selector_key"])
+                provenance = candidate["provenance"]
+                if any(finding["subject"] == str(path) for finding in
+                       (provenance if isinstance(provenance, list) else [provenance])):
+                    info = path.lstat()
+                    if stat.S_ISDIR(info.st_mode) and canonical_path(path) == path:
+                        targets[ident] = [info.st_dev, info.st_ino]
+        return broker, version[1], proof, targets
+    except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
+        return None
+
+
+def scheduled_action_refusal(catalog_id):
+    if catalog_id != "linux-localsearch":
+        return "operation is proposal-only"
+    runtime = runpy.run_path(str(HERE / "kaizen_friction_apply.py"))
+    return runtime["scheduled_marker_refusal"]()
+
+
+def recover_scheduled_suggestions(store, host, project):
+    """Close legacy proposal-only receipts that have no native broker record."""
+    if store.friction.resolve().is_relative_to(project):
+        raise ValueError("broker state must be outside the project")
+    with host["_directory"](store.friction, private=True) as state, host["_locked"](state, "prepare"), \
+            host["_directory"](store.path.parent) as directory, host["_locked"](directory, store.path.name):
+        if store._scope(project) != project:
+            raise ValueError("host-action scope changed; try again")
+        rows, _, receipts = store._load(directory)
+        generations = receipts.get(str(project), {})
+        pending = host["_pending"](generations)
+        suggestions = {}
+        for ident in sorted(pending):
+            if ident not in rows:
+                continue
+            # Scheduled reservations take both locks before creating a record.
+            try:
+                os.stat("broker-" + ident + ".json", dir_fd=state, follow_symlinks=False)
+            except FileNotFoundError:
+                reason = scheduled_action_refusal(rows[ident]["catalog_id"])
+                if reason:
+                    suggestions[ident] = reason
+        if suggestions:
+            for imported in generations.values():
+                for ident in suggestions.keys() & imported.keys():
+                    if imported[ident] == "pending":
+                        imported[ident] = "terminal"
+            store._save(directory, rows, receipts)
+            for ident, reason in suggestions.items():
+                log(f"friction: broker action {ident} resolved as a suggestion ({reason})")
+        return bool(pending - suggestions.keys())
+
+
+def run_scheduled_broker(audits, project, options, *, receipt=None, attempt=None):
+    """Reconcile older reservations before allowing any new fixed operation."""
+    root = backup_root().resolve()
+    host = runpy.run_path(str(HERE / "kaizen_friction_actions.py"))
+    store = host["HostActions"](audits, root, action_project, key)
+    project_path = project.canonical
+    if attempt is None and not recover_scheduled_suggestions(store, host, project_path):
+        return
+    command = review_command(options, "auto", "", "", project_path, audits)
+    backup, config = None, None
+
+    def authorize():
+        nonlocal backup, config
+        if config is None:
+            backup, config = scheduled_authority(audits, project_path, options, command, root)
+
+    if attempt is not None:
+        authorize()
+    broker_path = HERE / "kaizen_friction_apply.py"
+    runtime = runpy.run_path(str(broker_path))
+    broker = runtime["BrokerLedger"]
+    helper_env = dict(HOME=str(canonical_path(Path.home())), CLAUDE_CONFIG_DIR=str(canonical_path(claude_home())),
+                      KAIZEN_BACKUP_DIR=str(root), PATH="/usr/bin:/bin")
+    slots = 0
+
+    def invoke(phase, ident, target, bound):
+        nonlocal slots
+        if phase == "apply":
+            if not slots or config != freeze_mutation_config(project_path, backup):
+                raise ValueError("broker policy or budget changed before the effect")
+            # The broker has persisted the reservation by this point.
+            slots -= 1
+        arguments = (["--target", target, "--identity", *map(str, bound)] if phase == "verify"
+                     else ["--lease-fd", str(ledger.lease)])
+        result = run_group([str(Path(options.python).resolve()), "-I", str(broker_path), phase,
+                            str(project_path), ident, *arguments], cwd="/", env=helper_env,
+                           timeout=30, stoppable=True, stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True, pass_fds=(ledger.lease,))
+        if result.returncode:
+            raise ValueError("native marker transaction is unavailable or ambiguous")
+        return result.stdout.strip()
+
+    with broker.locked(host, store, project_path) as ledger, host["_locked"](ledger.state, "prepare"), \
+            host["_directory"](store.path.parent) as directory, host["_locked"](directory, store.path.name):
+        rows, _, receipts = store._load(directory)
+        generations = receipts.get(str(project_path), {})
+        pending = sorted(host["_pending"](generations))
+        generation = "scheduled:" + receipt["generation"] if receipt else None
+        current = generations.get(generation, {})
+        if attempt is not None:
+            slots, run_id, targets, frozen_config = attempt
+            state = json.loads(host["_read"](ledger.state, "prepare-" + project.key + ".json", 1 << 20))
+            if (state["project"] != str(project_path) or state["generation"] != int(receipt["generation"])
+                    or generation not in generations or config != frozen_config):
+                raise ValueError("scheduled authority changed after import")
+
+        def terminal(ident, *, applied=True):
+            for imported in generations.values():
+                if imported.get(ident) == "pending":
+                    imported[ident] = "terminal"
+            if applied:
+                rows[ident].update(status="done", done_by="verify", updated_at=now().isoformat())
+            store._save(directory, rows, receipts)
+
+        unresolved = set()
+        action_errors = (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError)
+        for ident in pending:
+            phase, reason = None, None
+            try:
+                catalog = rows[ident]["catalog_id"]
+                record = ledger.load(ident)
+                if record is None:
+                    reason = scheduled_action_refusal(catalog)
+                elif record["phase"] == "cancelled":
+                    reason = record["reason"]
+                elif record["phase"] == "reverted":
+                    authorize()
+                    phase = ledger.reconcile(ident)
+                elif record.get("reservation"):
+                    authorize()
+                    if ledger.cancel_unstarted_marker(record):
+                        reason = record["reason"]
+                    else:
+                        phase = ledger.scheduled_marker(ident, rows[ident]["selector_key"], record["target_identity"], invoke)
+            except action_errors:
+                unresolved.add(ident)
+                log(f"friction: broker action {ident} remains pending")
+                continue
+            if reason:
+                terminal(ident, applied=False)
+                log(f"friction: broker action {ident} resolved as a suggestion ({reason})")
+            elif phase:
+                terminal(ident, applied=phase == "recorded")
+        if attempt is not None:
+            for ident in pending:
+                if not slots or current.get(ident) != "pending" or ident not in targets or ident in unresolved:
+                    continue
+                try:
+                    candidate = receipt["allowed"][ident]
+                    if any(rows[ident][key] != candidate[key] for key in ("catalog_id", "selector_key")):
+                        raise ValueError("scheduled action changed after import")
+                    phase = ledger.scheduled_marker(ident, candidate["selector_key"], targets[ident], invoke,
+                                                    attempt=(run_id, receipt["generation"], receipt["scope"]["cwd"],
+                                                             runtime["policy_digest"](config)))
+                except action_errors:
+                    log(f"friction: broker action {ident} remains pending")
+                    continue
+                if phase:
+                    terminal(ident, applied=phase == "recorded")
+
+
 def _run_review(audits, project_dirs, options, clock, safety):
     """Review projects serially; failed/killed runs leave reviewed_at unchanged.
 
@@ -2175,7 +2403,7 @@ def _run_review(audits, project_dirs, options, clock, safety):
         project.folder = audits / "projects" / project.key
         cfg, state = effective(project.canonical), read_state(project)
         try:
-            recovered = recover_scheduled_publication(audits, project)
+            recovered = recover_scheduled_publication(audits, project, options=None if degraded else options)
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
             log(f"friction: publication recovery failed ({failure_text(error)})")
             continue
@@ -2242,6 +2470,7 @@ def _run_review(audits, project_dirs, options, clock, safety):
         rollbacks, rollback_problems = [], []
         guard = None
         active_marker = None
+        observation = calls = rendered = None
         try:
             run_id = started.astimezone().strftime("%Y%m%d-%H%M%S") + "-" + session_id
             root = backup_root().resolve()
@@ -2269,10 +2498,20 @@ def _run_review(audits, project_dirs, options, clock, safety):
                     active_marker = write_active_run(audits, run_id, session_id, mode, guard)
                     with protected():  # from here a signal waits for rollback and the ledger check
                         try:
-                            result = run_group(review_command(options, mode, report, session_id, project.canonical, audits,
-                                                              prepared[0] if prepared else None),
-                                               stoppable=True, cwd=project.canonical, env=env, stdout=output,
-                                               stderr=errors, timeout=limit)
+                            command = review_command(options, mode, report, session_id, project.canonical, audits,
+                                                     prepared[0] if prepared else None)
+                            launch = dict(stoppable=True, cwd=project.canonical, env=env, stderr=errors, timeout=limit)
+                            if mode == "auto" and prepared:
+                                observation = scheduled_budget(audits, project.canonical, options, command, root,
+                                                               prepared[1], started, run_id, session_id, before)
+                            if observation is None:
+                                result = run_group(command, stdout=output, **launch)
+                            else:
+                                broker, version, proof, _ = observation
+                                result, rendered, calls = broker["observe_review"](
+                                    run_group, command, version, backup=proof["backup"], scope=proof["scope"],
+                                    project=project.canonical, **launch)
+                                output.write(rendered)
                         except subprocess.TimeoutExpired:
                             timed_out = limit
                         finally:
@@ -2322,15 +2561,42 @@ def _run_review(audits, project_dirs, options, clock, safety):
                 outcome = f"failed (timed out after {timed_out:g} s)"
             elif result.returncode == 0:
                 terminal = False
+                imported = False
+                attempt = None
                 if prepared:
                     try:
-                        terminal = reconcile_scheduled(audits, project, temporary, prepared[1], acknowledge=False)
+                        if observation is not None:
+                            broker, _, proof, targets = observation
+                            with guard.locked():
+                                config = freeze_mutation_config(project.canonical, proof["backup"])
+                                slots, _ = broker["prove_budget"](calls, **proof, config_after=config)
+                            if slots is None:
+                                raise ValueError("scheduled mutation budget is unknown")
+                            if slots and targets:
+                                attempt = (slots, run_id, targets, config)
+                        terminal = reconcile_scheduled(
+                            audits, project, temporary, prepared[1], acknowledge=False, rendered=rendered,
+                            authorize=lambda: scheduled_authority(audits, project.canonical, options, command, root))
+                        imported = True
                     except (OSError, RuntimeError, ValueError, RecursionError, KeyError, TypeError, AttributeError):
                         log("friction: review output could not be reconciled")
-                if terminal:
+                if imported and (terminal or attempt is not None):
+                    with temporary.open("rb") as publication:
+                        os.fsync(publication.fileno())
                     recover_scheduled_publication(audits, project, prepared[1], proposal, temporary)
                 os.replace(temporary, proposal)
-                if terminal:
+                if imported and (terminal or attempt is not None):
+                    descriptor = os.open(proposal.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    try:
+                        os.fsync(descriptor)
+                    finally:
+                        os.close(descriptor)
+                if imported and attempt is not None and not terminal:
+                    try:
+                        run_scheduled_broker(audits, project, options, receipt=prepared[1], attempt=attempt)
+                    except (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+                        log("friction: broker work remains pending")
+                if imported and (terminal or attempt is not None):
                     recover_scheduled_publication(audits, project)
                 succeeded = True
                 outcome = f"reviewed ({mode})"
@@ -2596,19 +2862,34 @@ def friction_prepare(audits, project, report, options, cfg, mode, clock, *, inte
 
 
 
-def reconcile_scheduled(audits, project, output, receipt, *, acknowledge=True):
+def reconcile_scheduled(audits, project, output, receipt, *, acknowledge=True, rendered=None, authorize=None):
     """Import one validated action line, then acknowledge only terminal requests."""
     module = runpy.run_path(str(HERE / "kaizen_friction_prepare.py"))
     host = runpy.run_path(str(HERE / "kaizen_friction_actions.py"))
-    if output.stat().st_size > 1024 * 1024:
+    if (len(rendered.encode("utf-8")) if rendered is not None else output.stat().st_size) > 1024 * 1024:
         raise ValueError("review output too large")
-    text = output.read_text(encoding="utf-8")
+    text = output.read_text(encoding="utf-8") if rendered is None else rendered
     lines = text.splitlines(keepends=True)
     matches = [line for line in lines if line.startswith(host["BLOCK_PREFIX"])]
     if len(matches) != 1 or text.count(host["BLOCK_PREFIX"]) != 1:
         raise ValueError("expected one action comment")
     block = matches[0].rstrip("\r\n")
-    host["_requests"](block)
+    requests = host["_requests"](block)
+    downgraded = False
+    for ident, intent in requests.items():
+        if intent != "apply":
+            continue
+        candidate = receipt["allowed"].get(ident, {})
+        if intent not in candidate.get("intents", ()):
+            raise ValueError("unavailable host-action ID or intent for this project")
+        if scheduled_action_refusal(candidate["catalog_id"]):
+            requests[ident] = "suggest"
+            downgraded = True
+    if authorize is not None and "apply" in requests.values():
+        authorize()
+    if downgraded:
+        block = host["BLOCK_PREFIX"] + json.dumps(
+            dict(v=1, actions=[dict(id=ident, intent=intent) for ident, intent in requests.items()])) + " -->"
     store = host["HostActions"](audits, backup_root(), action_project, key)
     imported = module["import_scheduled"](audits, backup_root(), project, receipt,
                                           effective(project.canonical), now(), action_project, key, block)
@@ -2619,13 +2900,31 @@ def reconcile_scheduled(audits, project, output, receipt, *, acknowledge=True):
     return terminal
 
 
-def recover_scheduled_publication(audits, project, receipt=None, proposal=None, output=None):
+def recover_scheduled_publication(audits, project, receipt=None, proposal=None, output=None, *, options=None):
     try:
         module = runpy.run_path(str(HERE / "kaizen_friction_prepare.py"))
     except FileNotFoundError:
         return False
     if "scheduled_publication" not in module:
         return False
+    if receipt is None:
+        host = runpy.run_path(str(HERE / "kaizen_friction_actions.py"))
+        store = host["HostActions"](audits, backup_root(), action_project, key)
+        name = "publication-" + project.key + ".json"
+        try:
+            if options is not None and any(row.get("pending") for row in store.scoped(project.canonical)):
+                run_scheduled_broker(audits, project, options)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+            log("friction: broker recovery remains pending")
+        if (store.friction / name).exists():
+            with host["_directory"](store.friction, private=True) as directory:
+                marker = json.loads(host["_read"](directory, name, 1 << 20))
+                state = json.loads(host["_read"](directory, "prepare-" + project.key + ".json", 1 << 20))
+                if str(state["generation"]).zfill(20) > marker["generation"]:
+                    os.unlink(name, dir_fd=directory)
+                    return False
+            if any(row.get("pending") for row in store.scoped(project.canonical)):
+                return False
     return module["scheduled_publication"](audits, backup_root(), project, action_project, key,
                                             receipt, proposal, output)
 
