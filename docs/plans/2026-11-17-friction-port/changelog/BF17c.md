@@ -1,0 +1,2 @@
+- Refresh friction evidence for the full project scope and keep reviews on the selected audit.
+- Avoid rejected host action requests and prepare local commits with a clean-start backup.
