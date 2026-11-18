@@ -273,7 +273,7 @@ class TierGuardTests(unittest.TestCase):
                         self.assertEqual(counter.read_text(), "1\n")
                     raise PermissionError("injected prune error")
 
-                with mock.patch.object(Path, "iterdir", autospec=True, side_effect=fail_scan) as scan:
+                with mock.patch("os.scandir", side_effect=fail_scan) as scan:
                     self.run_guard(output)
                 scan.assert_called_once_with(self.state)
                 self.assertEqual(output.getvalue(), baseline.getvalue())

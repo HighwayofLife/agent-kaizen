@@ -284,25 +284,34 @@ def prune(state, identity):
             return
         # Bounded so the hook stays fast; a huge directory is only partly pruned.
         deadline = time.monotonic() + PRUNE_MAX_SECONDS
-        for seen, path in enumerate(state.iterdir()):
-            if seen >= PRUNE_MAX_ENTRIES or time.monotonic() >= deadline:
-                break
-            match = re.fullmatch(r"(.+)\.(?:count|reasons\.jsonl)", path.name)
-            if match is None:
-                continue
-            with suppress(OSError):
-                if expired(path):
-                    # The scan can see an old file while a writer replaces it.
-                    # Read its age again under the same key lock the writer uses.
-                    with held_lock(state / (match[1] + ".lock"), identity) as acquired:
-                        if acquired and expired(path):
-                            path.unlink()
+        # os.scandir reads entries lazily; Path.iterdir may list them all first.
+        with os.scandir(state) as entries:
+            for seen, entry in enumerate(entries):
+                if seen >= PRUNE_MAX_ENTRIES or time.monotonic() >= deadline:
+                    break
+                prune_entry(state, identity, Path(entry.path))
+
+
+def prune_entry(state, identity, path):
+    match = re.fullmatch(r"(.+)\.(?:count|reasons\.jsonl)", path.name)
+    if match is None:
+        return
+    with suppress(OSError):
+        if expired(path):
+            # The scan can see an old file while a writer replaces it.
+            # Read its age again under the same key lock the writer uses.
+            with held_lock(state / (match[1] + ".lock"), identity) as acquired:
+                if acquired and expired(path):
+                    path.unlink()
 
 
 def visible_config(value):
-    # Printable text is shown as written; anything else as a Python literal,
-    # whose escaping is unambiguous (backslashes are escaped too).
-    return value if value.isprintable() else ascii(value)
+    # Printable text that does not start with a quote is shown as written;
+    # anything else as a quoted Python literal (backslashes escaped too), so
+    # the two forms can never look alike.
+    if value.isprintable() and not value.startswith(("'", '"')):
+        return value
+    return ascii(value)
 
 
 def guard(event):
