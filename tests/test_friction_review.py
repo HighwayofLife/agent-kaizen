@@ -157,6 +157,82 @@ class ScheduledFrictionTests(PreparationTests):
         self.assertEqual(len(list(self.obj.folder.glob("cycle-*.md"))), 1)
         self.assertEqual(json.loads(next((self.backups / "friction").glob("prepare-*.json")).read_text())["acknowledged_generation"], receipt["generation"])
 
+    def test_unpublished_suggestion_survives_new_evidence_generation(self):
+        self.candidate()
+        inputs, receipt = self.scheduled()
+        ident = json.loads(inputs.read_text())["actions"][0]["id"]
+        output = self.write(self.obj.folder / "review.tmp", self.actions([ident]).read_text())
+        self.runner["reconcile_scheduled"](self.config / "audits", self.obj, output, receipt, acknowledge=False)
+        self.probe["generated_at"] = (self.current + timedelta(seconds=1)).isoformat()
+        self.write_evidence()
+        retry, _ = self.scheduled()
+        self.assertIn(ident, [action["id"] for action in json.loads(retry.read_text())["actions"]])
+
+    def test_later_publication_does_not_hide_omitted_unpublished_suggestion(self):
+        self.candidate()
+        inputs, receipt = self.scheduled()
+        ident = json.loads(inputs.read_text())["actions"][0]["id"]
+        output = self.write(self.obj.folder / "review.tmp", self.actions([ident]).read_text())
+        self.runner["reconcile_scheduled"](self.config / "audits", self.obj, output, receipt, acknowledge=False)
+        self.probe["generated_at"] = (self.current + timedelta(seconds=1)).isoformat()
+        self.write_evidence()
+        _, retry = self.scheduled()
+        output.write_text(self.actions().read_text())
+        self.runner["reconcile_scheduled"](self.config / "audits", self.obj, output, retry)
+        next_inputs, _ = self.scheduled()
+        self.assertIn(ident, [action["id"] for action in json.loads(next_inputs.read_text())["actions"]])
+
+    def test_schedule_off_refuses_inflight_import(self):
+        _, receipt = self.scheduled()
+        self.write(self.project / "docs/kaizen/config.json", '{"schedule":"off"}')
+        output = self.write(self.obj.folder / "review.tmp", '<!-- kaizen-host-actions {"v":1,"actions":[]} -->\n')
+        with self.assertRaises(ValueError):
+            self.runner["reconcile_scheduled"](self.config / "audits", self.obj, output, receipt)
+        self.assertFalse((self.config / "audits/host-actions.json").exists())
+
+    def test_edited_publication_recovers_without_overwriting(self):
+        import os
+        _, receipt = self.scheduled()
+        output = self.write(self.obj.folder / "review.tmp", '<!-- kaizen-host-actions {"v":1,"actions":[]} -->\n')
+        proposal = self.obj.folder / "cycle-2026-11-18.md"
+        self.runner["reconcile_scheduled"](self.config / "audits", self.obj, output, receipt, acknowledge=False)
+        recover = self.runner["recover_scheduled_publication"]
+        recover(self.config / "audits", self.obj, receipt, proposal, output)
+        os.replace(output, proposal)
+        proposal.write_text("User edit\n")
+        self.assertEqual(recover(self.config / "audits", self.obj), proposal)
+        self.assertEqual(proposal.read_text(), "User edit\n")
+        self.assertFalse(recover(self.config / "audits", self.obj))
+
+    def test_degraded_recovery_acknowledges_terminal_publication(self):
+        import os
+        _, receipt = self.scheduled()
+        output = self.write(self.obj.folder / "review.tmp", '<!-- kaizen-host-actions {"v":1,"actions":[]} -->\n')
+        proposal = self.obj.folder / "cycle-2026-11-18.md"
+        self.runner["reconcile_scheduled"](self.config / "audits", self.obj, output, receipt, acknowledge=False)
+        recover = self.runner["recover_scheduled_publication"]
+        recover(self.config / "audits", self.obj, receipt, proposal, output)
+        os.replace(output, proposal)
+        self.assertEqual(recover(self.config / "audits", self.obj, degraded=True), proposal)
+        state = json.loads(next((self.backups / "friction").glob("prepare-*.json")).read_text())
+        self.assertEqual(state["acknowledged_generation"], receipt["generation"])
+
+    def test_degraded_recovery_does_not_acknowledge_pending_project_actions(self):
+        import os
+        _, _, output, receipt = self.marker_request()
+        reconcile = self.runner["reconcile_scheduled"]
+        with patch.dict(reconcile.__globals__, scheduled_action_refusal=lambda _: None):
+            terminal, _ = reconcile(self.config / "audits", self.obj, output, receipt, acknowledge=False)
+        self.assertFalse(terminal)
+        proposal = self.obj.folder / "cycle-2026-11-18.md"
+        recover = self.runner["recover_scheduled_publication"]
+        recover(self.config / "audits", self.obj, receipt, proposal, output)
+        os.replace(output, proposal)
+        with patch.dict(recover.__globals__, recover_scheduled_suggestions=lambda *args, **kwargs: True):
+            self.assertFalse(recover(self.config / "audits", self.obj, degraded=True))
+        state = json.loads(next((self.backups / "friction").glob("prepare-*.json")).read_text())
+        self.assertNotIn("acknowledged_generation", state)
+
     def test_audit_policy_global_and_scoped(self):
         options = self.runner["command_options"](type("Args", (), {"dry_run": True})())
         self.write(self.config / "agent-kaizen.json", '{"friction":"off","frictionSlowCallSeconds":123}')

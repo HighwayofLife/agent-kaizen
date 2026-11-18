@@ -224,6 +224,10 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
         if _check is not None:
             raise ValueError("friction is disabled")
         return None
+    if not interactive and cfg["schedule"]["value"] == "off":
+        if _check is not None:
+            raise ValueError("scheduled review is disabled")
+        return None
     if mode not in ("propose-only", "auto"):
         raise ValueError("unsupported preparation mode")
     if (project.unknown or canonical_project(project.canonical) != project.canonical
@@ -296,6 +300,18 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
         rows = {row["id"]: row for row in store.scoped(project.canonical)}
         baseline, imported = state.get("acknowledged"), None
         secret = store._secret(create=_check is None)
+        try:
+            with host["_directory"](store.path.parent) as actions_directory:
+                _, _, receipts = store._load(actions_directory)
+            generations = receipts.get(str(project.canonical), {})
+        except FileNotFoundError:
+            generations = {}
+        unacknowledged = {ident for name, entries in generations.items()
+                          if re.fullmatch(r"scheduled:[0-9]{20}", name)
+                          and name[10:] > state.get("acknowledged_generation", "")
+                          for ident, status in entries.items() if status == "terminal"}
+        unacknowledged.update(ident for entries in state.get("unpublished_suggestions", {}).values()
+                              for ident in entries)
         if _check is not None:
             if (not hmac.compare_digest(_check.get("signature", ""), _signature(_check, secret))
                     or _check.get("channel") != ("interactive" if interactive else "scheduled")
@@ -307,15 +323,9 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
                     state.get("acknowledged_generation") == _check["generation"]
                     and state.get("acknowledged") == _check["comparison"]):
                 raise ValueError("preparation comparison state changed")
-            try:
-                with host["_directory"](store.path.parent) as actions_directory:
-                    _, _, receipts = store._load(actions_directory)
-                generations = receipts.get(str(project.canonical), {})
-                imported = generations.get(("interactive:" if interactive else "scheduled:") + _check["generation"])
-                if interactive and any(value == "pending" for receipt in generations.values() for value in receipt.values()):
-                    raise ValueError("pending host actions require runner reconciliation")
-            except FileNotFoundError:
-                pass
+            imported = generations.get(("interactive:" if interactive else "scheduled:") + _check["generation"])
+            if interactive and any(value == "pending" for receipt in generations.values() for value in receipt.values()):
+                raise ValueError("pending host actions require runner reconciliation")
             if imported is not None and (not set(imported) <= set(_check["allowed"])
                                          or (interactive and any(value != "terminal" for value in imported.values()))):
                 raise ValueError("unmatched interactive import receipt")
@@ -409,8 +419,8 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
         for ident, candidate in list(allowed.items()):
             evidence = candidate["evidence"]
             old = rows.get(ident, {})
-            # Only this generation's terminal suggestion can suppress its own retry.
-            if (imported is not None and ident in imported and not old.get("pending")
+            # An unpublished suggestion must remain visible in a later preparation.
+            if ((ident in unacknowledged or imported is not None and ident in imported) and not old.get("pending")
                     and old.get("status") == "open" and old.get("evidence") == evidence):
                 old = {}
             if old.get("flaps", 0) >= 2 or (not old.get("pending") and (old.get("status") == "dismissed"
@@ -426,7 +436,8 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
         receipt = dict(v=1, generation=generation, created=_check["created"] if _check else current.isoformat(),
                        channel="interactive" if interactive else "scheduled", baseline=baseline,
                        project=str(project.canonical), scope=scope,
-                       identities=identities, policy=dict(mode=mode, window=block["window"] if block else None,
+                       identities=identities, policy=dict(mode=mode, **({} if interactive else {"schedule": cfg["schedule"]["value"]}),
+                       window=block["window"] if block else None,
                        thresholds=block["thresholds"] if block else None, basis=block["basis"] if block else None, hostActions=cfg["hostActions"]["value"]),
                        comparison=snapshot, allowed=allowed, permission_provenance=block.get("permission_acceptance", []) if block else [])
         if retain and _check is None and state.get("acknowledged_generation") != f"{state['generation']:020d}":
@@ -488,6 +499,18 @@ def acknowledge_scheduled(store, project, receipt):
         if ("scheduled:" + receipt["generation"] not in generations
                 or any(value == "pending" for row in generations.values() for value in row.values())):
             raise ValueError("pending or missing scheduled import")
+        unpublished = state.setdefault("unpublished_suggestions", {})
+        previous_ack = state.get("acknowledged_generation", "")
+        for receipt_name, entries in generations.items():
+            if (re.fullmatch(r"scheduled:[0-9]{20}", receipt_name)
+                    and previous_ack < receipt_name[10:] < receipt["generation"]):
+                unpublished.setdefault(receipt_name[10:], [ident for ident, status in entries.items()
+                                                    if status == "terminal"])
+        published = generations["scheduled:" + receipt["generation"]].keys()
+        for generation in list(unpublished):
+            unpublished[generation] = [ident for ident in unpublished[generation] if ident not in published]
+            if not unpublished[generation] or generation == receipt["generation"]:
+                del unpublished[generation]
         state["acknowledged"] = receipt["comparison"]
         state["acknowledged_generation"] = receipt["generation"]
         host["_replace"](directory, name, _encode(state))
@@ -524,6 +547,11 @@ def reconcile(audits, backups, project, inputs, cfg, current, canonical_project,
                                         "interactive:" + checked["generation"])
         if imported is None:
             raise ValueError("acknowledgement requires a successful validated import")
+        unpublished = state.get("unpublished_suggestions", {})
+        for generation in list(unpublished):
+            unpublished[generation] = [ident for ident in unpublished[generation] if ident not in imported]
+            if not unpublished[generation]:
+                del unpublished[generation]
         state["acknowledged"] = checked["comparison"]
         state["acknowledged_generation"] = checked["generation"]
         host["_replace"](directory, state_name, _encode(state))
@@ -536,8 +564,13 @@ def reconcile(audits, backups, project, inputs, cfg, current, canonical_project,
 def import_scheduled(audits, backups, project, receipt, cfg, current, canonical_project, project_key, block):
     """Recheck the retained scheduled authority under the generation lock before import."""
     def complete(store, host, directory, state_name, state, checked, imported):
-        return store.import_actions(block, checked["allowed"], project.canonical,
-                                    "scheduled:" + checked["generation"])
+        result = store.import_actions(block, checked["allowed"], project.canonical,
+                                      "scheduled:" + checked["generation"])
+        if state.get("acknowledged_generation") != checked["generation"]:
+            state.setdefault("unpublished_suggestions", {})[checked["generation"]] = [
+                ident for ident, status in result.items() if status == "terminal"]
+            host["_replace"](directory, state_name, _encode(state))
+        return result
     return prepare(audits, backups, project, Path(receipt["identities"]["report"]["path"]), cfg,
                    receipt["policy"]["mode"], current, canonical_project, project_key,
                    _check=receipt, _complete=complete)
@@ -568,7 +601,7 @@ def scheduled_publication(audits, backups, project, canonical_project, project_k
             return False
         raw, _ = _read(published, host)
         if hashlib.sha256(raw).hexdigest() != marker.get("sha256"):
-            raise ValueError("published review changed before acknowledgement")
+            warnings.warn("published review changed before acknowledgement; preserving the edited report")
         frozen = _json(host["_read"](directory, "receipt-" + project.key + "-" + generation + ".json", LIMIT), host)
         if (frozen.get("channel") != "scheduled" or frozen.get("project") != str(project.canonical)
                 or frozen.get("generation") != generation
