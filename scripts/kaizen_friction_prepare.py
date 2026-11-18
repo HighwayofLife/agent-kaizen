@@ -319,7 +319,7 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
             raise ValueError("unsupported flag")
         flags, snapshot = (compare_flags(cohort, block["window"], block["thresholds"], block["basis"],
                                          block.get("flags"), baseline) if block is not None else ([], baseline))
-        visible_flags, allowed, actions = [], {}, []
+        visible_flags, allowed, action_views = [], {}, {}
         for flag in flags:
             ident = host["_id"](secret, str(project.canonical), flag["id"], flag["subject"])
             visible_flags.append(dict(id=ident, label=LABELS[flag["id"]], value=flag["value"]))
@@ -380,16 +380,6 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
             evidence = json.dumps(finding["evidence"], sort_keys=True, separators=(",", ":"), allow_nan=False)
             if len(evidence) > host["EVIDENCE_LIMIT"]:
                 raise ValueError("oversized candidate evidence")
-            old = rows.get(ident, {})
-            # Only this generation's terminal suggestion can suppress its own retry.
-            if (imported is not None and ident in imported and not old.get("pending")
-                    and old.get("status") == "open" and old.get("evidence") == evidence):
-                old = {}
-            if old.get("flaps", 0) >= 2:
-                continue
-            if not old.get("pending") and (old.get("status") == "dismissed"
-                    or old.get("status") in ("open", "done") and old.get("evidence") == evidence):
-                continue
             if ident in allowed:
                 existing = allowed[ident]
                 provenance = existing["provenance"]
@@ -399,14 +389,27 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
                 existing["provenance"] = provenance
                 if sum(finding["evidence"].values()) > sum(json.loads(existing["evidence"]).values()):
                     existing["evidence"] = evidence
-                    next(action for action in actions if action["id"] == ident)["evidence"] = list(finding["evidence"].values())
+                    action_views[ident]["evidence"] = list(finding["evidence"].values())
                 continue
             allowed[ident] = dict(canonical_project=str(project.canonical), catalog_id=entry["id"],
                                  selector_key=selector, evidence=evidence,
                                  intents=(["suggest", "apply"] if not interactive and mode == "auto"
                                           and cfg["hostActions"]["value"] == "apply" else ["suggest"]),
                                  provenance=finding)
-            actions.append(dict(id=ident, label=entry["problem"], evidence=list(finding["evidence"].values())))
+            action_views[ident] = dict(id=ident, label=entry["problem"], evidence=list(finding["evidence"].values()))
+        # Compare stored evidence only after choosing the strongest finding across worktrees.
+        for ident, candidate in list(allowed.items()):
+            evidence = candidate["evidence"]
+            old = rows.get(ident, {})
+            # Only this generation's terminal suggestion can suppress its own retry.
+            if (imported is not None and ident in imported and not old.get("pending")
+                    and old.get("status") == "open" and old.get("evidence") == evidence):
+                old = {}
+            if old.get("flaps", 0) >= 2 or (not old.get("pending") and (old.get("status") == "dismissed"
+                    or old.get("status") in ("open", "done") and old.get("evidence") == evidence)):
+                del allowed[ident]
+                del action_views[ident]
+        actions = list(action_views.values())
         if not visible_flags and not actions:
             if _check is not None:
                 raise ValueError("empty interactive gate")

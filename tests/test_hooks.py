@@ -75,6 +75,39 @@ class HookTests(unittest.TestCase):
                     self.assertEqual(result.stdout, '{}\n')
                     path.unlink()
 
+    def test_notice_follows_regular_config_symlinks(self):
+        project, audits, _, env = self.notice_setup()
+        audit = audits / 'token-audit-fixture.md'
+        audit.write_text('fixture')
+        target = self.tmp / 'config-target.json'
+        target.write_text('{"schedule":"active"}')
+        for path in (Path(env['CLAUDE_CONFIG_DIR']) / 'agent-kaizen.json',
+                     project / 'docs/kaizen/config.json'):
+            with self.subTest(path=path):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.symlink_to(os.path.relpath(target, path.parent))
+                output = run('audit-notice.sh', {'cwd': str(project)}, env)
+                path.unlink()
+                for marker in audits.glob('*.noticed-*'):
+                    marker.unlink()
+                self.assertIn(audit.name, output['hookSpecificOutput']['additionalContext'] if output else '')
+
+    def test_notice_rejects_symlinks_to_fifo_and_oversized_config(self):
+        project, audits, _, env = self.notice_setup()
+        (audits / 'token-audit-fixture.md').write_text('fixture')
+        fifo, oversized = self.tmp / 'fifo', self.tmp / 'oversized'
+        os.mkfifo(fifo)
+        oversized.write_bytes(b' ' * 65537)
+        config = project / 'docs/kaizen/config.json'
+        for target in (fifo, oversized):
+            with self.subTest(target=target):
+                config.symlink_to(target)
+                result = subprocess.run(['bash', str(HOOKS / 'audit-notice.sh')],
+                                        input=json.dumps({'cwd': str(project)}), text=True,
+                                        capture_output=True, env={**os.environ, **env}, timeout=3, check=True)
+                self.assertEqual(result.stdout, '{}\n')
+                config.unlink()
+
     def test_scoped_actions_notice(self):
         import runpy
         import sys
