@@ -12,6 +12,8 @@ except ModuleNotFoundError:
 # {"stdout": [line or event], "stderr": [line], "final": text or null, "rc": int, "sleep": seconds}
 PLAN_CODEX = '''#!/usr/bin/env python3
 import json, os, pathlib, sys, time
+if os.environ.get('PIDFILE'):
+    pathlib.Path(os.environ['PIDFILE']).write_text(str(os.getpid()))
 args = sys.argv[1:]
 record = pathlib.Path(os.environ['RECORD'])
 n = len(record.read_text().splitlines()) if record.exists() else 0
@@ -19,8 +21,6 @@ with record.open('a') as stream:
     stream.write(json.dumps(dict(args=args, prompt=sys.stdin.read())) + '\\n')
 step = json.loads(os.environ['PLAN'])
 step = step[min(n, len(step) - 1)]
-if os.environ.get('PIDFILE'):
-    pathlib.Path(os.environ['PIDFILE']).write_text(str(os.getpid()))
 print(json.dumps({'type': 'thread.started', 'thread_id': 'plan-thread'}), flush=True)
 for line in step.get('stdout', []):
     print(line if isinstance(line, str) else json.dumps(line), flush=True)
@@ -94,17 +94,17 @@ class DispatchRunTests(PlanCase):
         self.env['PIDFILE'] = str(pidfile)
         self.plan(dict(sleep=30, final='late'))
         started = time.time()
-        result = self.dispatch('--codex-timeout', '1', code=2)
+        result = self.dispatch('--codex-timeout', '5', code=2)
         self.assertLess(time.time() - started, 15)
         lines = self.report(result)
         self.assertEqual(lines[-1], 'STATUS: CODEX FAILED')
-        self.assertTrue(any(line.startswith('Reason:') and 'TIMEOUT after 1s' in line for line in lines), lines)
+        self.assertTrue(any(line.startswith('Reason:') and 'TIMEOUT after 5s' in line for line in lines), lines)
         time.sleep(0.3)
         with self.assertRaises(ProcessLookupError):
             os.kill(int(pidfile.read_text()), 0)
 
     def test_codex_timeout_from_environment_and_bad_value(self):
-        self.env['CODEX_DISPATCH_CODEX_TIMEOUT'] = '1'
+        self.env['CODEX_DISPATCH_CODEX_TIMEOUT'] = '5'
         self.plan(dict(sleep=30, final='late'))
         self.assertEqual(self.report(self.dispatch(code=2))[-1], 'STATUS: CODEX FAILED')
         self.env['CODEX_DISPATCH_CODEX_TIMEOUT'] = 'soon'
