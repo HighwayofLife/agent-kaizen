@@ -6,6 +6,8 @@
         and print the change folder. Credential paths are refused. Run BEFORE editing.
   kaizen-backup finish CHANGE_DIR [--verification passed|failed]
         Record each file's sha256 after the edit. Run AFTER editing and verifying.
+  kaizen-backup commit CHANGE_DIR
+        Verify a prepared local commit. Ref writes require recovery support.
   kaizen-backup action CHANGE_DIR --did CMD --undo CMD
         Record a non-file action (e.g. a package install) and its reverse command.
   kaizen-backup list [--all]
@@ -25,6 +27,7 @@ Backups live in KAIZEN_BACKUP_DIR (default <CLAUDE_CONFIG_DIR or ~/.claude>/kaiz
 in folders only the owner can read.
 """
 import argparse
+import base64
 import datetime
 import hashlib
 import json
@@ -142,9 +145,9 @@ def changes(include_reverted=True):
 
 def change_numbers(run_id):
     for item in ROOT.iterdir():
-        if item.is_dir() and not item.is_symlink() and item.name.startswith(run_id + "-"):
+        if item.name.startswith(run_id + "-"):
             match = re.match(r"(\d+)-", item.name[len(run_id) + 1:])
-            if match:
+            if match and item.is_dir() and not item.is_symlink():
                 yield int(match.group(1))
 
 
@@ -160,20 +163,21 @@ def allocate_change(run_id, skill):
         change = ROOT / f"{run_id}-{number:02d}-{skill}"
         change_dir(change)  # Refuse a path that resolves outside the backup root.
         # Reserve the number across all skills, including callers without a lock.
-        slot = ROOT / f".kaizen-slot.{run_key}.{number}"
-        try:
-            os.mkdir(slot, 0o700)
-        except FileExistsError:
-            continue
-        try:
-            if number in change_numbers(run_id):
-                continue  # Another caller finished allocating after our initial scan.
-            os.mkdir(change, 0o700)
-            return number, change
-        except FileExistsError:
-            continue
-        finally:
-            slot.rmdir()
+        slot = f".kaizen-slot.{run_key}.{number}"
+        with open_directory(ROOT) as fd:
+            try:
+                os.mkdir(slot, 0o700, dir_fd=fd)
+            except FileExistsError:
+                continue
+            try:
+                if number in change_numbers(run_id):
+                    continue  # Another caller finished allocating after our initial scan.
+                os.mkdir(change, 0o700)
+                return number, change
+            except FileExistsError:
+                continue
+            finally:
+                os.rmdir(slot, dir_fd=fd)
     raise ValueError(f"no available backup slot for run {run_id}")
 
 
@@ -353,8 +357,8 @@ def verify_git(record):
     return record["path"]
 
 
-def git(directory, *args, git_exe, git_dir=None):
-    # Only use metadata queries here. No status, diffs or worktree conversion.
+def git(directory, *args, git_exe, git_dir=None, index=None, input=None):
+    # Callers use metadata queries or plumbing with explicit bytes and index.
     info = os.lstat(git_exe["path"])
     if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != tuple(
             git_exe[key] for key in ("dev", "ino", "size", "mtime_ns", "ctime_ns")):
@@ -365,11 +369,14 @@ def git(directory, *args, git_exe, git_dir=None):
                GIT_CONFIG_GLOBAL=os.devnull, GIT_ATTR_NOSYSTEM="1", xcrun_nocache="1",
                GIT_CEILING_DIRECTORIES=str(directory.parent))
     scope = [] if git_dir is None else [f"--git-dir={git_dir}", f"--work-tree={directory}"]
+    if index is not None:
+        env["GIT_INDEX_FILE"] = str(index)
+        scope.extend(("-c", "core.splitIndex=false"))
     return subprocess.run(
         [git_exe["path"], "--no-pager", "--no-optional-locks", "-C", str(directory), *scope,
          "-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}", "-c", "protocol.allow=never",
          "-c", "core.untrackedCache=false", "-c", "core.sparseCheckout=false", *args],
-        env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, timeout=10,
+        env=env, input=input, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, timeout=10,
     ).stdout
 
 
@@ -470,15 +477,64 @@ def still_clean(state, versions, listing):
                     for path, version in versions.items()))
 
 
-def capture_git_tree(directory):
-    git_exe = resolve_git()
+def git_scratch(root):
+    outside = Path(tempfile.gettempdir()).resolve()
+    return tempfile.TemporaryDirectory(dir=root.parent if outside.is_relative_to(root) else outside)
+
+
+def verify_object(root, kind, oid, git_exe):
+    if not re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", oid):
+        raise ValueError("invalid Git object ID")
+    raw = git(root, "cat-file", kind, oid.decode("ascii"), git_exe=git_exe)
+    if object_id(kind, raw, len(oid)) != oid:
+        raise ValueError(f"Git {kind} object does not match its ID")
+    return raw
+
+
+def verified_tree(root, tree, git_exe):
+    entry = re.compile(rb"(40000|100644|100755|120000) ([^/\0]+)\0(.{%d})" % (len(tree) // 2), re.S)
+    leaves, pending = {}, [(b"", tree)]
+    while pending:
+        prefix, oid = pending.pop()
+        raw, offset, names = verify_object(root, "tree", oid, git_exe), 0, set()
+        if prefix and not raw:
+            raise ValueError("Git tree contains an explicit empty subtree")
+        while offset < len(raw):
+            match = entry.match(raw, offset)
+            if not match:
+                raise ValueError("invalid Git tree entry")
+            mode, name, child = match.groups()
+            if name.lower() in (b".", b"..", b".git") or name in names:
+                raise ValueError("invalid or duplicate Git tree path")
+            names.add(name)
+            path = prefix + name
+            child = child.hex().encode("ascii")
+            if mode == b"40000":
+                pending.append((path + b"/", child))
+            else:
+                leaves[path] = mode, child
+            offset = match.end()
+    return leaves
+
+
+def capture_git_tree(directory, *, baseline=None, edits=None):
+    git_exe = resolve_git() if baseline is None else baseline["git_executable"]
+    if baseline is not None:
+        verify_git(git_exe)
     state, raw = git_snapshot(directory, git_exe)
     root = Path(state["root"])
+    if baseline is not None and dict(state, clean_start=True) != baseline:
+        raise ValueError("Git HEAD, root or index differs from the baseline")
     algorithm = "sha256" if len(state["head"]) == 64 else "sha1"
-    tree = git(root, "ls-tree", "-rz", state["head"], git_exe=git_exe).split(b"\0")[:-1]
+    if baseline is None:
+        tree = git(root, "ls-tree", "-rz", state["head"], git_exe=git_exe).split(b"\0")[:-1]
+    else:
+        head = verify_object(root, "commit", state["head"].encode("ascii"), git_exe)
+        leaves = verified_tree(root, head.split(b"\n", 1)[0].removeprefix(b"tree "), git_exe)
+        tree = [mode + b" blob " + oid + b"\t" + name for name, (mode, oid) in sorted(leaves.items())]
     # Before Git scans: a file created after Git passes a directory still changes its stamp.
     listing = worktree_listing(root)
-    with tempfile.TemporaryDirectory() as scratch, open_directory(scratch) as scratch_fd:
+    with git_scratch(root) as scratch, open_directory(scratch) as scratch_fd:
         # Isolate the copied index, including any split-index lookup, from real Git metadata.
         git(scratch, "init", "-q", "--bare", "--template=", f"--object-format={algorithm}", git_exe=git_exe)
         copy = Path(scratch) / "index"
@@ -491,7 +547,7 @@ def capture_git_tree(directory):
         records = git(root, "ls-files", "-v", "--stage", "--debug", "--sparse", "-z",
                       git_exe=git_exe, git_dir=scratch)
         # No exclude options: ignored files count too.
-        if git(root, "ls-files", "--others", "-z", git_exe=git_exe, git_dir=scratch):
+        if edits is None and git(root, "ls-files", "--others", "-z", git_exe=git_exe, git_dir=scratch):
             raise ValueError("worktree contains untracked files")
         entries, versions, offset = {}, {}, 0
         for row in tree:
@@ -500,14 +556,22 @@ def capture_git_tree(directory):
                 raise ValueError("Git index has missing, hidden or nonstandard entries")
             mode, oid, name = match.groups()
             path = root / os.fsdecode(name)
-            versions[path] = file_version(path.lstat())
-            if row != mode + b" blob " + oid + b"\t" + name or not matches_blob(path, mode, oid):
+            if edits is None or path not in edits:
+                versions[path] = file_version(path.lstat())
+                if not matches_blob(path, mode, oid):
+                    raise ValueError("worktree differs from HEAD outside the verified files")
+            if row != mode + b" blob " + oid + b"\t" + name:
                 raise ValueError("index or worktree differs from HEAD")
             entries[path] = (mode, oid)
             offset = match.end()
-        if offset != len(records) or listing[1] != set(entries):
+        expected = set(entries)
+        if edits is not None:
+            for path, (_, _, version) in edits.items():
+                expected.add(path)
+                versions[path] = version
+        if offset != len(records) or listing[1] != expected:
             raise ValueError("worktree entries differ from the index")
-        if git(root, "ls-files", "--others", "-z", git_exe=git_exe, git_dir=scratch):
+        if edits is None and git(root, "ls-files", "--others", "-z", git_exe=git_exe, git_dir=scratch):
             raise ValueError("worktree contains new untracked files")
         # Git read the copy by path; a rewrite or swap of it changes its change time.
         if (scratch_version != file_version(os.lstat(scratch)) or copied != file_version(copy.lstat())):
@@ -593,6 +657,262 @@ def verify_change_handoff(root, change, *, root_identity, identity, manifest_sha
         if digest != manifest_sha256:
             raise ValueError("change manifest hash changed")
     return data
+
+
+LEDGER_PATH = "docs/kaizen/LEDGER.md"
+MAX_LEDGER_BYTES = 1024 * 1024
+MAX_COMMIT_BYTES = 64 * 1024 * 1024
+SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+def unique_fields(pairs):
+    fields = dict(pairs)
+    if len(fields) != len(pairs):
+        raise ValueError("duplicate JSON field")
+    return fields
+
+
+def nonempty(value):
+    return isinstance(value, str) and bool(value)
+
+
+def v1_fields(value, keys):
+    return isinstance(value, dict) and value.keys() == set(keys.split()) and type(value["v"]) is int and value["v"] == 1
+
+
+def id_pair(value):
+    return isinstance(value, list) and len(value) == 2 and all(type(part) is int and part >= 0 for part in value)
+
+
+def checked_bytes(path, limit):
+    refuse_symlinks(path)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(path, flags), "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or info.st_size > limit:
+            raise ValueError("expected a regular file within the size limit")
+        raw = stream.read(info.st_size + 1)
+    refuse_symlinks(path)
+    version = file_version(info)
+    if len(raw) != info.st_size or file_version(path.lstat()) != version:
+        raise ValueError("file changed while being read")
+    return (b"100755" if info.st_mode & stat.S_IXUSR else b"100644"), raw, version
+
+
+def ledger_append(proof, scope, root):
+    if (not v1_fields(proof, "v run_id session_id ledger_relpath before_b64 before_sha256 after_sha256 manifest_ids")
+            or any(proof[key] != scope[key] for key in ("run_id", "session_id"))
+            or proof["ledger_relpath"] != LEDGER_PATH):
+        raise ValueError("invalid ledger attestation scope")
+    encoded, ids = proof["before_b64"], proof["manifest_ids"]
+    if (not isinstance(encoded, str) or len(encoded) > 4 * ((MAX_LEDGER_BYTES + 2) // 3)
+            or not isinstance(ids, list) or not ids or not all(nonempty(i) for i in ids)
+            or len(set(ids)) != len(ids)):
+        raise ValueError("invalid ledger attestation encoding or manifest IDs")
+    before = base64.b64decode(encoded, validate=True)
+    live = checked_bytes(root / LEDGER_PATH, MAX_LEDGER_BYTES)
+    after = live[1]
+    if (len(before) > MAX_LEDGER_BYTES or base64.b64encode(before).decode("ascii") != encoded
+            or any(not isinstance(proof[key], str) or not SHA256.fullmatch(proof[key])
+                   or hashlib.sha256(data).hexdigest() != proof[key]
+                   for key, data in (("before_sha256", before), ("after_sha256", after)))
+            or not after.startswith(before) or (before and not before.endswith(b"\n"))
+            or not after.endswith(b"\n")):
+        raise ValueError("ledger append bytes do not match the attestation")
+    found = []
+    for line in after[len(before):-1].decode("utf-8").split("\n"):
+        if re.search(r"[\x00-\x08\x0a-\x1f\x7f]", line.removesuffix("\r")):
+            raise ValueError("invalid control character in ledger row")
+        row = line.strip().removeprefix("|").removesuffix("|")
+        cells = [cell.strip() for cell in re.split(r"(?<!\\)\|", row)]
+        if (len(cells) != 8 or not all(cells) or not re.fullmatch(r"`[^\x00`]+`", cells[6])
+                or not all(re.fullmatch(r"\d{4}-\d{2}-\d{2}", cells[i]) for i in (0, 7))):
+            raise ValueError("invalid appended ledger row")
+        days = (datetime.date.fromisoformat(cells[7]) - datetime.date.fromisoformat(cells[0])).days
+        tokens = (token.strip("`") for token in re.findall(r"`[^`]+`|[^`\s(),;]+", cells[1]))
+        refs = [token for token in tokens
+                if token in ids or token.startswith(f"{ROOT}/")
+                or re.fullmatch(r"[^/]+-[0-9]{2,}-[A-Za-z][\w-]*", Path(token).name)]
+        if not 0 <= days <= 30 or len(refs) != 1:
+            raise ValueError("ledger row must reference one attested backup")
+        found.append(refs[0].removeprefix(f"{ROOT}/"))
+    if sorted(found) != sorted(ids):
+        raise ValueError("ledger rows do not match the attested backups")
+    return ids, before, live
+
+
+def commit_preflight(change, scheduled=None):
+    root_identity = backup_root_identity(BACKUP_ROOT) if scheduled is None else scheduled["root_identity"]
+    if scheduled is None:
+        with open_handoff(BACKUP_ROOT, change, root_identity) as (fd, identity):
+            manifest, digest = read_manifest_snapshot(fd)
+        baseline = manifest.get("git")
+        if manifest.get("session_id") is not None or manifest.get("git_reason") is not None:
+            raise ValueError("no interactive clean-start baseline")
+    else:
+        if scheduled["change_id"] != change.name:
+            raise ValueError("change folder is not authorized by the runner")
+        baseline, before = scheduled["baseline"], scheduled["before"]
+        if not isinstance(before, list) or len(before) != 2 or not all(isinstance(part, list) for part in before):
+            raise ValueError("invalid runner exclusions")
+        names, identities = before
+        if (not isinstance(root_identity, dict)
+                or not all(nonempty(name) and Path(name).parent == ROOT for name in names)
+                or not all(id_pair(item) for item in identities) or not id_pair(scheduled["change_identity"])
+                or not id_pair([root_identity.get(key) for key in ("dev", "ino")])):
+            raise ValueError("invalid runner folder identities or exclusions")
+        scope = dict(run_id=scheduled["run_id"], session_id=scheduled["session_id"],
+                     started=datetime.datetime.fromisoformat(scheduled["started_at"]),
+                     before=({Path(name) for name in names}, {tuple(item) for item in identities}),
+                     root_identity=root_identity)
+        manifest, identity, digest = validate_change_handoff(BACKUP_ROOT, change, **scope)
+        if list(identity) != scheduled["change_identity"] or digest != scheduled["manifest_sha256"]:
+            raise ValueError("runner-approved change folder or manifest changed")
+    if not isinstance(baseline, dict) or baseline.get("clean_start") is not True:
+        raise ValueError("no clean-start baseline")
+    root = Path(baseline["root"])
+    if not root.is_absolute() or root.resolve(strict=True) != root:
+        raise ValueError("repository root must be canonical")
+
+    manifests = {change: (manifest, identity, digest)}
+    edits, files = {}, {}
+    remaining = MAX_COMMIT_BYTES
+    proof = None if scheduled is None else scheduled["ledger_attestation"]
+    if proof is not None:
+        ids, ledger_before, edits[root / LEDGER_PATH] = ledger_append(proof, scope, root)
+        for folder in ids:
+            sibling = ROOT / valid_id(folder)
+            if sibling not in manifests:
+                manifests[sibling] = validate_change_handoff(BACKUP_ROOT, sibling, **scope)
+    for folder, (data, _, _) in manifests.items():
+        if (data.get("finished") is not True or data.get("verification") != "passed"
+                or data.get("reverted") is not None or "committed" in data or not data["files"]):
+            raise ValueError("expected a verified, finished, unreverted file manifest")
+        for entry in data["files"]:
+            path = validate_entry(folder, entry, plugin_roots())
+            if (not path.is_relative_to(root) or ".git" in path.relative_to(root).parts
+                    or path == root / LEDGER_PATH or is_credential(str(path)) or path in files):
+                raise ValueError("manifest file is outside the permitted scope or is repeated")
+            live = checked_bytes(path, remaining)
+            remaining -= len(live[1])
+            if hashlib.sha256(live[1]).hexdigest() != entry["after_sha256"]:
+                raise ValueError("manifest file changed after finish")
+            if entry["created"] and (entry.get("backup") is not None or live[0] != b"100644"):
+                raise ValueError("new files must be non-executable and have no before backup")
+            files[path] = (None if entry["created"] else folder / entry["backup"]), live
+            if folder == change:
+                edits[path] = live
+    state, entries, check = capture_git_tree(root, baseline=baseline, edits=edits)
+    for path, (backup, live) in files.items():
+        blob = entries.get(path)
+        if (check[1].get(path) != live[2] or (blob is None) != (backup is None)
+                or (blob is not None and (live[0] != blob[0] or not matches_blob(backup, *blob)))):
+            raise ValueError("manifest before bytes or mode differ from HEAD")
+    if proof is not None:
+        ledger = root / LEDGER_PATH
+        mode, oid = entries.get(ledger, (None, b""))
+        if mode != edits[ledger][0] or object_id("blob", ledger_before, len(oid)) != oid:
+            raise ValueError("ledger baseline differs from HEAD")
+
+    def recheck():
+        for folder, (_, identity, digest) in manifests.items():
+            verify_change_handoff(BACKUP_ROOT, folder, root_identity=root_identity,
+                                  identity=identity, manifest_sha256=digest)
+        if not still_clean(*check):
+            raise ValueError("repository changed during commit preflight")
+
+    recheck()
+    return state, entries, {path: live[:2] for path, live in edits.items() if path != root / LEDGER_PATH}, recheck
+
+
+def object_id(kind, raw, oid_length):
+    algorithm = "sha256" if oid_length == 64 else "sha1"
+    digest = hashlib.new(algorithm, kind.encode("ascii") + b" %d\0" % len(raw))
+    digest.update(raw)
+    return digest.hexdigest().encode("ascii")
+
+
+def tree_from_files(state, entries, files, recheck):
+    root, head, git_exe = Path(state["root"]), state["head"], state["git_executable"]
+    recheck()
+    for oid in {oid for path, (_, oid) in entries.items() if path not in files}:
+        verify_object(root, "blob", oid, git_exe)
+    with git_scratch(root) as directory:
+        index = Path(directory) / "index"
+        entries = {os.fsencode(path.relative_to(root)): data for path, data in entries.items()}
+        for path, (mode, raw) in files.items():
+            oid = git(root, "hash-object", "-w", "--no-filters", "--stdin", git_exe=git_exe, input=raw).strip()
+            if oid != object_id("blob", raw, len(head)) or verify_object(root, "blob", oid, git_exe) != raw:
+                raise ValueError("stored Git blob differs from verified bytes")
+            entries[os.fsencode(path.relative_to(root))] = mode, oid
+        updates = b"".join(mode + b" " + oid + b"\t" + name + b"\0" for name, (mode, oid) in entries.items())
+        git(root, "update-index", "-z", "--index-info", git_exe=git_exe, index=index, input=updates)
+        tree = git(root, "write-tree", git_exe=git_exe, index=index).strip()
+        if verified_tree(root, tree, git_exe) != entries:
+            raise ValueError("built tree differs from verified files")
+        return tree.decode("ascii")
+
+
+def checked_ref(state):
+    root, git_exe = Path(state["root"]), state["git_executable"]
+    verify_git(git_exe)
+    if git_identity(root, git_exe) != state:
+        raise ValueError("repository changed before ref validation")
+    ref = f"refs/heads/kaizen/{datetime.date.today().isoformat()}"
+    args = {"git_exe": git_exe}
+    if b"branch " + os.fsencode(ref) in git(root, "worktree", "list", "--porcelain", "-z", **args).split(b"\0"):
+        raise ValueError("kaizen ref is checked out")
+    if git(root, "for-each-ref", "--format=%(refname)", ref, **args):
+        raise ValueError("kaizen ref has no journaled owner")
+    try:
+        git(root, "symbolic-ref", "--no-recurse", "-q", ref, **args)
+    except subprocess.CalledProcessError as error:
+        if error.returncode != 1:
+            raise
+    else:
+        raise ValueError("kaizen ref is symbolic")
+    return ref
+
+
+def write_commit(state, tree, change_id, recheck):
+    # This primitive is dormant until a caller can journal the ref transaction.
+    ref = checked_ref(state)
+    root, head, git_exe = Path(state["root"]), state["head"], state["git_executable"]
+    args = {"git_exe": git_exe}
+    if tree == git(root, "rev-parse", f"{head}^{{tree}}", **args).decode("ascii").strip():
+        raise ValueError("nothing to commit")
+    if not re.fullmatch(r"[^\r\n\0/]+", change_id):
+        raise ValueError("invalid commit trailer ID")
+    message = f"kaizen: verified backup\n\nkaizen-backup change: {change_id}"
+    new = git(root, "-c", "commit.gpgsign=false", "commit-tree", tree, "-p", head, "-m", message, **args).strip()
+    verify_object(root, "commit", new, git_exe)
+    verified_tree(root, tree.encode("ascii"), git_exe)
+    recheck()
+    if checked_ref(state) != ref:
+        raise ValueError("kaizen ref date changed")
+    git(root, "update-ref", "--no-deref", ref, new.decode("ascii"), "0" * len(head), **args)
+    return new.decode("ascii")
+
+
+def commit(args):
+    try:
+        folder = Path(os.path.abspath(Path(args.change).expanduser()))
+        scheduled = None
+        if args.scheduled_baseline_stdin:
+            limit = 2 * MAX_LEDGER_BYTES
+            raw = sys.stdin.buffer.read(limit + 1)
+            if len(raw) > limit:
+                raise ValueError("scheduled baseline exceeds its size limit")
+            scheduled = json.loads(raw, object_pairs_hook=unique_fields)
+            if (not v1_fields(scheduled, "v baseline root_identity run_id session_id started_at before "
+                              "change_id change_identity manifest_sha256 ledger_attestation")
+                    or not all(nonempty(scheduled[key]) for key in ("run_id", "session_id"))):
+                raise ValueError("invalid scheduled baseline")
+        state, _, _, _ = commit_preflight(folder, scheduled)
+        checked_ref(state)
+    except (OSError, ValueError, KeyError, TypeError, IndexError, RecursionError, subprocess.SubprocessError) as error:
+        raise ValueError(f"commit refused: {capture_reason(error)}") from None
+    print("commit preflight passed; ref writes are disabled")
 
 
 def begin(args):
@@ -857,6 +1177,7 @@ def undo(args):
 
 
 def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = parser.add_subparsers(dest="command", required=True)
     p = sub.add_parser("begin")
@@ -871,6 +1192,10 @@ def main(argv=None):
     p.add_argument("change")
     p.add_argument("--verification", choices=("passed", "failed"), default="passed")
     p.set_defaults(func=finish)
+    p = sub.add_parser("commit", allow_abbrev=False)
+    p.add_argument("--scheduled-baseline-stdin", action="store_true", help=argparse.SUPPRESS)
+    p.add_argument("change", metavar="CHANGE_DIR")
+    p.set_defaults(func=commit)
     p = sub.add_parser("action")
     p.add_argument("change")
     p.add_argument("--did", required=True)
@@ -889,6 +1214,10 @@ def main(argv=None):
     p.set_defaults(func=prune)
     args = parser.parse_args(argv)
     try:
+        if args.command == "commit":
+            if args.scheduled_baseline_stdin and argv != ["commit", "--scheduled-baseline-stdin", args.change]:
+                raise ValueError("invalid scheduled commit invocation")
+            return commit(args)
         ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not USER_ROOT:
             try:

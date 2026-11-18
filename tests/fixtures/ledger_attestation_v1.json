@@ -1,0 +1,31 @@
+{
+  "after_utf8": "| date | change | why | expected effect | measured effect | keep/revert | metric command | review date |\n| --- | --- | --- | --- | --- | --- | --- | --- |\n| 2026-11-18 | Trim fixture (scheduled-01-trim) | Fixture | Less text | pending | pending | `wc -c tracked` | 2026-11-25 |\n",
+  "valid": {
+    "v": 1,
+    "run_id": "scheduled",
+    "session_id": "session",
+    "ledger_relpath": "docs/kaizen/LEDGER.md",
+    "before_b64": "fCBkYXRlIHwgY2hhbmdlIHwgd2h5IHwgZXhwZWN0ZWQgZWZmZWN0IHwgbWVhc3VyZWQgZWZmZWN0IHwga2VlcC9yZXZlcnQgfCBtZXRyaWMgY29tbWFuZCB8IHJldmlldyBkYXRlIHwKfCAtLS0gfCAtLS0gfCAtLS0gfCAtLS0gfCAtLS0gfCAtLS0gfCAtLS0gfCAtLS0gfAo=",
+    "before_sha256": "9807fd1d2fe9e6026d71ed338a6d92fa10bb37fd935b7b933e501ee9bed8971a",
+    "after_sha256": "d7d81281b68688eb0344524395b7127b36fb92ce22937279d04915df6a0b419f",
+    "manifest_ids": [
+      "scheduled-01-trim"
+    ]
+  },
+  "invalid_overrides": {
+    "unknown_field": {"extra": null},
+    "bool_version": {"v": true},
+    "wrong_version": {"v": 2},
+    "wrong_run": {"run_id": "other"},
+    "wrong_session": {"session_id": "other"},
+    "wrong_path": {"ledger_relpath": "./docs/kaizen/LEDGER.md"},
+    "bad_base64": {"before_b64": "***"},
+    "wrong_type": {"before_b64": []},
+    "duplicate_ids": {"manifest_ids": ["scheduled-01-trim", "scheduled-01-trim"]},
+    "foreign_manifest": {"manifest_ids": ["foreign-01-trim"]},
+    "empty_id": {"manifest_ids": [""]},
+    "bad_before_hash": {"before_sha256": "0000000000000000000000000000000000000000000000000000000000000000"},
+    "bad_after_hash": {"after_sha256": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"},
+    "forged_prefix": {"before_b64": "IyBVbnJlbGF0ZWQgaGlzdG9yeQo=", "before_sha256": "ccaeb13ed21b8e9da4ef2ce8c908bbc6258cf371878d4fc580dd1885220b1150"}
+  }
+}
