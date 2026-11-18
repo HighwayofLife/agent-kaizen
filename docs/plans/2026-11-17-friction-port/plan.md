@@ -228,6 +228,21 @@ Planning was offline. The October hook notes are leads; verify against current s
 | S6 | Do supported Git versions expose a reliable no-force removal safety boundary for newly changed linked trees and have usable ref compare-and-swap under the planned environment? Probe with temporary repos on supported installs and Git documentation. | P12b/P16b. Keep unknown or unsupported topology read-only. **Answered 2026-11-18 (P12b): no.** Apple Git 2.54 `worktree remove` without `--force` deleted an ignored file, and an open fd could modify the checkout after verification; removal and undo stay proposal-only until a quarantine-retention design lands. |
 | S7 | Verify on the scheduled Claude version that bounded stream-json provides caller-authenticated session start, full Edit/Write and helper dispatch/result coverage and final result, with no event loss under tested interruptions. Exercise real backed and unbacked writes, reflected fake envelopes and truncation, and confirm existing permissions on a fresh run. | P24a/P24/P25/P28. Incomplete evidence keeps broker writes unavailable. |
 
+## Gated carry: must be fixed before S3 or S7 opens
+
+From P24's Sol high security review (2026-11-18). These are fail-closed while S3/S7 stay closed in 0.13.0, so they don't block the release. The packet that opens either gate must fix them first.
+
+- G1 (S7) `scripts/kaizen-scheduled` broker grant check: the broker verifies only its CLI Bash grants. Claude also loads settings-based grants and hooks, so the check can't prove that the model can't write broker state. Prove the effective permission set, including settings files and hooks, before trusting broker allowance.
+- G2 (S3/S7) `scripts/kaizen_friction_apply.py` recovery rejects native `retire-pending` and `undo-pending` journals. A crash during rollback can leave a marker live with no scheduled recovery path. Add recovery for both journal states.
+- G3 (S3/S7) Populated ignored outputs prevent budget proof (fail-closed). This blocks scheduled markers for ordinary build directories. Define a bounded proof for ignored output directories.
+
+- G4 (S3/S7) `scripts/kaizen-scheduled` recovery requires current auto authorization even for a marker applied before a crash. Switching to `--propose-only` or disabling host actions can strand that marker with no ledger row and no broker undo. Recovery of an already-started effect must not depend on current authorization.
+- G5 (S3/S7) `scripts/kaizen_friction_apply.py` writes a `cancelled` record for an unstarted reservation, and that record rejects later attempts for the same stable ID. Fresh evidence with a valid budget can't retry an action that never ran.
+- G6 (S3/S7) `scripts/kaizen-scheduled` lets an older pending action block acknowledgement of every later publication for the project. Scope the acknowledgement block to the pending action's own generation.
+- G7 (S3/S7) `scripts/kaizen-scheduled` import checks only that the version allowlist is nonempty, while launch checks the installed version. An unsupported upgrade can leave marker requests pending forever. Use the same installed-version check at import.
+
+- G8 (S3/S7) `scripts/kaizen-scheduled` import aborts on an unknown mutation budget before intent validation, so valid suggestions and proposal-only downgrades in the batch are lost. Downgrade per action instead of aborting.
+
 ## P27 docs and release
 
 Assemble README, command and scheduling docs, CI checks and the 0.13.0 CHANGELOG/version. Preserve the 0.12.0 host matrix. Keep the release candidate local until the real-input gate accepts all advertised capabilities. P27 owns a follow-up claims pass whenever P28 blocks a conditional capability. Verify refusal and confirm downgraded docs, then rerun P28 for the affected checks. [Release brief](briefs/27-release.md)
