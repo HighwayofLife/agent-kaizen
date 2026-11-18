@@ -19,6 +19,13 @@ from scripts import kaizen_friction_actions as actions
 SCRIPT = Path(__file__).resolve().parents[1] / "scripts/kaizen-scheduled"
 RUNNER = runpy.run_path(str(SCRIPT))
 LITERALS = ("ls", "ls -a")
+
+
+def block(*items):
+    return "<!-- kaizen-host-actions " + json.dumps(
+        {"v": 1, "actions": [dict(id=ident, intent=intent) for ident, intent in items]}) + " -->"
+
+
 WORKER = """
 import json
 from pathlib import Path
@@ -189,7 +196,23 @@ class HostActionsTests(unittest.TestCase):
         self.assertEqual((row["id"], row["canonical_project"], row["selector_key"], row["projects"]),
                          (*root_ids, str(main), str(main / component / "File"), [RUNNER["key"](main)]))
         self.assertEqual([row["id"] for row in self.store.scoped(second / component)], [*root_ids])
+        before = self.store.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "unavailable host-action ID"):
+            self.store.import_actions(block((path_row["id"], "suggest")),
+                                      {path_row["id"]: dict(path_row, intents=["suggest"])}, first, "stale")
+        self.assertEqual(self.store.path.read_bytes(), before)
 
+        self.git(first / component, "init")
+        with self.assertRaisesRegex(ValueError, "outside the canonical project"):
+            self.store.action_id(main, "target", first / component / "File", path=True)
+        shutil.rmtree(first / component / ".git")
+        counterpart = main / component / "File"
+        counterpart.unlink()
+        counterpart.symlink_to(self.root)
+        with self.assertRaisesRegex(ValueError, "scope is unknown"):
+            self.store.action_id(first, "target", first / component / "File", path=True)
+        counterpart.unlink()
+        counterpart.touch()
         (main / component / "docs/kaizen").mkdir(parents=True)
         self.git(main / component, "init")  # An independently enrolled repository at the same prefix.
         self.assertEqual(RUNNER["action_project"](main / component), main / component)
@@ -309,6 +332,79 @@ class HostActionsTests(unittest.TestCase):
                             and len(row["evidence"]) == 500 for row in scoped))
         self.assertEqual(self.secret.stat().st_mode & 0o777, 0o600)
         self.assertEqual([row["id"] for row in self.store.scoped(self.other)], [ids[3]])
+
+    def test_import_validation_receipt_and_interrupted_retry(self):
+        ident = self.store.action_id(self.project, "low-disk", "ls", allowed=LITERALS)
+        frozen = {ident: dict(canonical_project=str(self.project), catalog_id="low-disk", selector_key="ls",
+                              intents=["suggest", "apply"], evidence="observed")}
+        apply, suggest = block((ident, "apply")), block((ident, "suggest"))
+        for fragment, rows in (
+            (suggest.replace('"v": 1', '"v": true'), frozen),
+            (suggest.replace('"v": 1', '"v": 1, "v": 1'), frozen),
+            (suggest.replace('"intent": "suggest"', '"intent": []'), frozen),
+            (block(*[(ident, "suggest")] * 2), frozen), (suggest + "\n", frozen),
+            (block(*[("fa1_" + f"{i:064x}", "suggest") for i in range(17)]), frozen),
+            (suggest.replace('"actions"', " " * 8192 + '"actions"'), frozen),
+            (suggest, {}), (suggest, {ident: dict(frozen[ident], selector_key="wrong")}),
+            (apply, {ident: dict(frozen[ident], intents=["suggest"])}),
+            (suggest, {ident: dict(frozen[ident], canonical_project=str(self.other))}),
+        ):
+            with self.assertRaises(ValueError):
+                self.store.import_actions(fragment, rows, self.project, "bad")
+            self.assertFalse(self.store.path.exists())
+        fsync = os.fsync
+        audit_inode = self.store.path.parent.stat().st_ino
+
+        def interrupt(fd):
+            if os.fstat(fd).st_ino == audit_inode and self.store.path.exists():
+                raise OSError("interrupted directory sync")
+            fsync(fd)
+
+        with patch.object(os, "fsync", side_effect=interrupt):
+            for _ in range(2):
+                with self.assertRaises(OSError):
+                    self.store.import_actions(apply, frozen, self.project, "apply")
+        before = self.store.path.read_bytes()
+        self.assertEqual(self.store.import_actions(apply, frozen, self.project, "apply"), {ident: "pending"})
+        self.assertEqual(self.store.path.read_bytes(), before)
+        self.assertEqual(self.store.import_actions(suggest, frozen, self.project, "suggest"), {ident: "terminal"})
+        self.assertEqual(self.store.import_actions(block(), {}, self.project, "empty"), {})
+        self.assertEqual(self.cli("verify"), f"{ident} pending\n")
+        self.cli("done", ident, code=2)
+        (self.project / ".nomedia").touch()
+        marker = self.store.record(self.project, "linux-localsearch", self.project, "observed", path=True)
+        with patch.object(actions.sys, "platform", "linux"):
+            self.assertEqual(self.store.verify(self.project), {ident: "pending", marker: "done"})
+        done = next(row for row in self.store.scoped(self.project) if row["id"] == marker)
+        self.assertEqual((done["done_by"], done["metric_at_done"]), ("verify", None))
+
+    def test_manual_verification_and_evidence_flaps(self):
+        ident = self.record()
+        row, = self.store.scoped(self.project)
+        frozen = {ident: dict(row, intents=["suggest"], evidence="initial")}
+        suggest = block((ident, "suggest"))
+        self.store.import_actions(suggest, frozen, self.project, "initial")
+        probe = self.store.path.parent / "projects" / row["projects"][0] / "host-probe-fixture.json"
+        probe.parent.mkdir(parents=True)
+        probe.touch(mode=0o600)
+        probe.write_text(json.dumps(dict(v=1, project=str(self.project), generated_at=row["first_seen"],
+                                         facts=dict(free_disk_bytes=42))))
+        for flaps in (1, 2):
+            self.cli("done", ident)
+            done, = self.store.scoped(self.project)
+            self.assertEqual((done["done_by"], done["metric_at_done"]["value"]), ("user", 42))
+            self.store.import_actions(suggest, frozen, self.project, f"same-{flaps}")
+            self.assertEqual(self.store.scoped(self.project), [done])
+            frozen[ident]["evidence"] = f"changed-{flaps}"
+            self.store.import_actions(suggest, frozen, self.project, f"changed-{flaps}")
+            reopened, = self.store.scoped(self.project)
+            self.assertEqual((reopened["status"], reopened["flaps"]), ("open", flaps))
+        with patch.object(self.store, "_probe", side_effect=AssertionError):
+            self.assertEqual(self.store.verify(self.project), {ident: "unavailable"})
+        self.cli("dismiss", ident)
+        before = self.store.scoped(self.project)
+        self.store.import_actions(suggest, frozen, self.project, "changed-2")
+        self.assertEqual(self.store.scoped(self.project), before)
 
     def test_cli_marks_unknown_and_disabled(self):
         ident = self.record(self.project / "docs")
@@ -510,11 +606,11 @@ class HostActionsTests(unittest.TestCase):
         self.assertEqual(len(self.store.scoped(self.project)), 1)
 
     def test_failed_git_probe_leaves_linked_scope_unknown(self):
-        _, (member,) = self.linked("worktree")
+        _, (member, peer) = self.linked("worktree", "peer")
         canonical = RUNNER["action_project"](member)
         namespace = RUNNER["discover"].__globals__
         real = namespace["_git"]
-        for probe in ("--git-common-dir", "list", "--show-prefix"):
+        for probe in ("--git-common-dir", "list", "--show-prefix", "-z"):
             def timed_out(directory, *arguments):
                 return None if probe in arguments else real(directory, *arguments)
 
@@ -536,9 +632,12 @@ class HostActionsTests(unittest.TestCase):
         self.assertIn("scope is unknown", result.stderr)
         self.assertEqual(json.loads(self.cli("list", "--json", project=member))[0]["status"], "open")
         self.assertEqual(self.store.scoped(member)[0]["canonical_project"], str(canonical))
+        member.parent.rename(self.root / "unmounted")
+        with self.assertRaisesRegex(ValueError, "scope is unknown"):
+            self.store.scoped(peer)
 
     def test_special_character_worktree_paths_keep_cli_and_scheduled_ids(self):
-        names = ('a "q\\ wt', "n\nwt", "z-wt")
+        names = ('a "q\\ wt\r', "n\nwt", "z-wt")
         _, members = self.linked(*names)
         expected = members[0]
         for member in members:
