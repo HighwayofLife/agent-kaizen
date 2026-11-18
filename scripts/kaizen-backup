@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Backups, manifests and undo for Agent Kaizen changes (see docs/autonomy.md).
 
-  kaizen-backup begin  --skill NAME --ledger TEXT [--run RUN_ID] FILE...
+  kaizen-backup begin  --skill NAME --ledger TEXT [--run RUN_ID] [--repo DIR] FILE...
         Back up FILEs (existing ones are copied; missing ones are recorded as created)
         and print the change folder. Credential paths are refused. Run BEFORE editing.
   kaizen-backup finish CHANGE_DIR [--verification passed|failed]
@@ -32,9 +32,18 @@ import os
 import re
 import runpy
 import shutil
+import stat
+import subprocess
 import sys
+import tempfile
+import time
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
+try:
+    import fcntl
+except ImportError:
+    fcntl = None
 
 
 def claude_home():
@@ -42,7 +51,8 @@ def claude_home():
 
 
 USER_ROOT = bool(os.environ.get("KAIZEN_BACKUP_DIR"))  # a root the user chose keeps its mode
-ROOT = Path(os.environ.get("KAIZEN_BACKUP_DIR") or claude_home() / "kaizen-backups").expanduser().resolve()
+BACKUP_ROOT = Path(os.environ.get("KAIZEN_BACKUP_DIR") or claude_home() / "kaizen-backups").expanduser()
+ROOT = BACKUP_ROOT.resolve()
 is_credential = runpy.run_path(str(Path(__file__).resolve().with_name("kaizen_credentials.py")))["is_credential"]
 
 
@@ -54,11 +64,19 @@ def sha(path):
 REQUIRED_KEYS = ("run_id", "change", "skill", "ledger", "files", "actions")
 
 
-def read_manifest(path):
-    """Read one manifest; any problem raises ValueError that names the file."""
+def check_manifest_depth(value, depth=1):
+    if isinstance(value, (dict, list)):
+        if depth > 32:
+            raise ValueError("manifest nesting exceeds 32 levels")
+        for child in value.values() if isinstance(value, dict) else value:
+            check_manifest_depth(child, depth + 1)
+
+
+def parse_manifest(path, raw):
     try:
-        data = json.loads(Path(path).read_text())
-    except (OSError, ValueError) as error:
+        data = json.loads(raw)
+        check_manifest_depth(data)
+    except (ValueError, RecursionError) as error:
         raise ValueError(f"cannot read manifest {path}: {error}") from None
     if not isinstance(data, dict):
         raise ValueError(f"manifest {path} is not a JSON object")
@@ -66,6 +84,32 @@ def read_manifest(path):
     if missing or not isinstance(data["files"], list) or not isinstance(data["actions"], list):
         raise ValueError(f"manifest {path} is missing or has bad keys: {', '.join(missing) or 'files/actions'}")
     return data
+
+
+def read_manifest(path):
+    try:
+        raw = Path(path).read_text()
+    except (OSError, ValueError) as error:
+        raise ValueError(f"cannot read manifest {path}: {error}") from None
+    return parse_manifest(path, raw)
+
+
+def read_manifest_snapshot(change_fd):
+    path = "manifest.json"
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    try:
+        with os.fdopen(os.open(path, flags, dir_fd=change_fd), "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= 1024 * 1024:
+                raise ValueError("expected a nonempty regular manifest within 1 MiB")
+            raw = stream.read(info.st_size + 1)
+            data = parse_manifest(path, raw)
+            live = os.stat(path, dir_fd=change_fd, follow_symlinks=False)
+            if len(raw) != info.st_size or file_version(live) != file_version(info):
+                raise ValueError("manifest was replaced or edited during validation")
+    except OSError as error:
+        raise ValueError(f"cannot read manifest {path}: {error}") from None
+    return data, hashlib.sha256(raw).hexdigest()
 
 
 def load(change):
@@ -96,15 +140,41 @@ def changes(include_reverted=True):
                                            str(item[1]["change"]).zfill(8)), reverse=True)
 
 
-def next_number(run_id):
-    """One more than the highest NN in existing folders named <run_id>-NN-<skill>."""
-    numbers = [0]
+def change_numbers(run_id):
     for item in ROOT.iterdir():
         if item.is_dir() and not item.is_symlink() and item.name.startswith(run_id + "-"):
             match = re.match(r"(\d+)-", item.name[len(run_id) + 1:])
             if match:
-                numbers.append(int(match.group(1)))
-    return max(numbers) + 1
+                yield int(match.group(1))
+
+
+def next_number(run_id):
+    """One more than the highest NN in existing folders named <run_id>-NN-<skill>."""
+    return max(change_numbers(run_id), default=0) + 1
+
+
+def allocate_change(run_id, skill):
+    first = next_number(run_id)
+    run_key = hashlib.sha256(os.fsencode(run_id)).hexdigest()
+    for number in range(first, first + 1000):
+        change = ROOT / f"{run_id}-{number:02d}-{skill}"
+        change_dir(change)  # Refuse a path that resolves outside the backup root.
+        # Reserve the number across all skills, including callers without a lock.
+        slot = ROOT / f".kaizen-slot.{run_key}.{number}"
+        try:
+            os.mkdir(slot, 0o700)
+        except FileExistsError:
+            continue
+        try:
+            if number in change_numbers(run_id):
+                continue  # Another caller finished allocating after our initial scan.
+            os.mkdir(change, 0o700)
+            return number, change
+        except FileExistsError:
+            continue
+        finally:
+            slot.rmdir()
+    raise ValueError(f"no available backup slot for run {run_id}")
 
 
 def valid_id(value):
@@ -154,6 +224,377 @@ def validate_entry(change, entry, roots=()):
     return path
 
 
+def file_version(info):
+    return info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
+@contextmanager
+def open_directory(path, *, dir_fd=None):
+    fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dir_fd)
+    try:
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def directory_stamp(path, fd):
+    info = os.fstat(fd)
+    return {"path": str(path), "dev": info.st_dev, "ino": info.st_ino}
+
+
+def directory_identity(path):
+    with open_directory(path) as fd:
+        return directory_stamp(path, fd)
+
+
+def backup_root_path(root):
+    path = Path(root).expanduser()
+    return Path(os.path.abspath(path.parent.resolve(strict=True) / path.name))
+
+
+BACKUP_LOCK = ".kaizen-backup.lock"
+
+
+@contextmanager
+def open_backup_lock(root_fd):
+    flags = os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
+    fd = os.open(BACKUP_LOCK, flags, mode=0o600, dir_fd=root_fd)
+    try:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or stat.S_IMODE(info.st_mode) != 0o600
+                or info.st_uid != os.getuid() or info.st_nlink != 1):
+            raise ValueError("backup lock must be a private regular file")
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def backup_root_stamp(path, fd):
+    info = os.fstat(fd)
+    lock = os.stat(BACKUP_LOCK, dir_fd=fd, follow_symlinks=False)
+    stamp = {"path": str(path), "dev": info.st_dev, "ino": info.st_ino,
+             "ctime_ns": info.st_ctime_ns, "lock": list(file_version(lock))}
+    if sys.platform == "darwin":
+        stamp["birthtime"] = info.st_birthtime
+    return stamp
+
+
+def backup_root_identity(root):
+    """Capture this before launch in the trusted caller, after creating the backup root."""
+    path = backup_root_path(root)
+    with open_directory(path) as fd, open_backup_lock(fd) as lock_fd:
+        stamp = backup_root_stamp(path, fd)
+        if stamp["lock"] != list(file_version(os.fstat(lock_fd))):
+            raise ValueError("backup lock was replaced")
+        return stamp
+
+
+def check_backup_root(root, expected):
+    path = backup_root_path(root)
+    with open_directory(path) as fd:
+        if backup_root_stamp(path, fd) != expected:
+            raise ValueError("backup root was replaced or changed during validation")
+
+
+# Fixed locations in preference order; PATH is never consulted. On macOS the first is
+# the root-owned xcrun shim, run with a fixed environment and no xcrun cache.
+TRUSTED_GIT = ("/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git")
+MAX_GIT_BYTES = 256 * 1024 * 1024
+
+
+def trusted_owner(info):
+    return info.st_uid in (0, os.getuid()) and not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+
+
+def check_trusted_parents(path):
+    parent = os.path.dirname(path)
+    while True:
+        if not trusted_owner(os.lstat(parent)):
+            raise ValueError(f"Git executable is not in a trusted directory: {parent}")
+        if parent == os.path.dirname(parent):
+            return
+        parent = os.path.dirname(parent)
+
+
+def git_executable(path):
+    """Identity of the executable file at a canonical path, including a hash of its bytes."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(path, flags), "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or not info.st_mode & stat.S_IXUSR or not trusted_owner(info)
+                or info.st_size > MAX_GIT_BYTES):
+            raise ValueError("Git executable is not a trusted regular executable")
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+        if file_version(os.lstat(path)) != file_version(info):
+            raise ValueError("Git executable changed while it was hashed")
+    return {"path": path, "dev": info.st_dev, "ino": info.st_ino, "size": info.st_size,
+            "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns, "sha256": digest.hexdigest()}
+
+
+# A user-writable Git executable can still be swapped between check and exec.
+# An entry added after its directory was scanned can still yield a false advisory clean start.
+def resolve_git():
+    """Return the identity of the first Git at a fixed location; re-verify it before each later use."""
+    for candidate in TRUSTED_GIT:
+        if os.path.lexists(candidate):
+            path = os.path.realpath(candidate)
+            check_trusted_parents(candidate)
+            check_trusted_parents(path)
+            return git_executable(path)
+    raise ValueError("no Git executable at a trusted location")
+
+
+def verify_git(record):
+    """Return the executable path only if resolution still yields this exact file and content."""
+    if resolve_git() != record:
+        raise ValueError("Git executable changed since capture")
+    return record["path"]
+
+
+def git(directory, *args, git_exe, git_dir=None):
+    # Only use metadata queries here. No status, diffs or worktree conversion.
+    info = os.lstat(git_exe["path"])
+    if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != tuple(
+            git_exe[key] for key in ("dev", "ino", "size", "mtime_ns", "ctime_ns")):
+        raise ValueError("Git executable changed since capture")
+    directory = Path(directory)
+    env = dict(PATH="/usr/bin:/bin", LC_ALL="C", GIT_TERMINAL_PROMPT="0", GIT_NO_LAZY_FETCH="1",
+               GIT_ALLOW_PROTOCOL="", GIT_NO_REPLACE_OBJECTS="1", GIT_CONFIG_NOSYSTEM="1",
+               GIT_CONFIG_GLOBAL=os.devnull, GIT_ATTR_NOSYSTEM="1", xcrun_nocache="1",
+               GIT_CEILING_DIRECTORIES=str(directory.parent))
+    scope = [] if git_dir is None else [f"--git-dir={git_dir}", f"--work-tree={directory}"]
+    return subprocess.run(
+        [git_exe["path"], "--no-pager", "--no-optional-locks", "-C", str(directory), *scope,
+         "-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}", "-c", "protocol.allow=never",
+         "-c", "core.untrackedCache=false", "-c", "core.sparseCheckout=false", *args],
+        env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, timeout=10,
+    ).stdout
+
+
+MAX_INDEX_BYTES = 64 * 1024 * 1024
+
+
+def read_index(path):
+    refuse_symlinks(path)
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(path, flags), "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or not 0 < info.st_size <= MAX_INDEX_BYTES:
+            raise ValueError("Git index is not a regular file within the size limit")
+        os.set_blocking(stream.fileno(), True)
+        raw = stream.read(info.st_size + 1)
+        if len(raw) != info.st_size or file_version(path.lstat()) != file_version(info):
+            raise ValueError("Git index was edited during capture")
+    return {"path": str(path), "dev": info.st_dev, "ino": info.st_ino,
+            "sha256": hashlib.sha256(raw).hexdigest()}, raw
+
+
+def git_snapshot(directory, git_exe):
+    root = Path(directory).expanduser().resolve(strict=True)
+    if not os.path.lexists(root / ".git"):
+        raise ValueError("repository must be the exact Git worktree top level")
+    worktree = directory_identity(root)
+    top, common, index = (Path(os.fsdecode(git(root, "rev-parse", "--path-format=absolute",
+                                             *args, git_exe=git_exe).removesuffix(b"\n")))
+                          for args in (("--show-toplevel",), ("--git-common-dir",), ("--git-path", "index")))
+    if not all(path.is_absolute() for path in (top, common, index)) or top.resolve(strict=True) != root:
+        raise ValueError("repository must be the exact Git worktree top level")
+    common = common.resolve(strict=True)
+    common_dir = directory_identity(common)
+    if (index.parent / "index.lock").exists():
+        raise ValueError("locked Git index")
+    head = git(root, "rev-parse", "--verify", "HEAD^{commit}", git_exe=git_exe).decode("ascii").strip()
+    index_state, raw = read_index(index)
+    if directory_identity(root) != worktree or directory_identity(common) != common_dir:
+        raise ValueError("Git directories changed during capture")
+    return {"root": str(root), "worktree": worktree, "head": head, "common_dir": common_dir,
+            "index": index_state, "git_executable": git_exe}, raw
+
+
+def git_identity(directory, git_exe):
+    """Read the live identity using the executable from the trusted capture."""
+    return git_snapshot(directory, git_exe)[0]
+
+
+def matches_blob(path, mode, oid):
+    if path.parent.resolve(strict=True) != path.parent:
+        return False
+    digest = hashlib.sha256() if len(oid) == 64 else hashlib.sha1()
+    if mode == b"120000":
+        raw = os.readlink(os.fsencode(path))
+        digest.update(b"blob %d\0" % len(raw) + raw)
+    else:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        with os.fdopen(os.open(path, flags), "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or bool(info.st_mode & stat.S_IXUSR) != (mode == b"100755"):
+                return False
+            digest.update(b"blob %d\0" % info.st_size)
+            for chunk in iter(lambda: stream.read(65536), b""):
+                digest.update(chunk)
+            if file_version(path.lstat()) != file_version(info):
+                return False
+    return digest.hexdigest().encode("ascii") == oid
+
+
+# --debug exposes the intent-to-add bit even when an empty blob matches HEAD.
+INDEX_ENTRY = re.compile(rb"H (100644|100755|120000) ([0-9a-f]+) 0\t([^\0]+)\0"
+                         rb"(?:  [^\n]*\n){4}  size: [0-9]+\tflags: 0\n")
+
+
+def worktree_listing(root):
+    """Stamp each directory before listing it, so any later entry change alters a stamp."""
+    directories, others, pending = {}, set(), [root]
+    while pending:
+        top = pending.pop()
+        info = os.lstat(top)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError("worktree directory was replaced")
+        directories[top] = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+        with os.scandir(top) as listing:
+            for entry in listing:
+                if top == root and entry.name == ".git":
+                    continue
+                (pending.append if entry.is_dir(follow_symlinks=False) else others.add)(top / entry.name)
+    return directories, others
+
+
+def still_clean(state, versions, listing):
+    """Recheck an earlier capture; any change, new directory or new entry means not clean."""
+    root = Path(state["root"])
+    verify_git(state["git_executable"])
+    return (git_identity(root, state["git_executable"]) == state and worktree_listing(root) == listing
+            and all(path.parent.resolve(strict=True) == path.parent and file_version(path.lstat()) == version
+                    for path, version in versions.items()))
+
+
+def capture_git_tree(directory):
+    git_exe = resolve_git()
+    state, raw = git_snapshot(directory, git_exe)
+    root = Path(state["root"])
+    algorithm = "sha256" if len(state["head"]) == 64 else "sha1"
+    tree = git(root, "ls-tree", "-rz", state["head"], git_exe=git_exe).split(b"\0")[:-1]
+    # Before Git scans: a file created after Git passes a directory still changes its stamp.
+    listing = worktree_listing(root)
+    with tempfile.TemporaryDirectory() as scratch, open_directory(scratch) as scratch_fd:
+        # Isolate the copied index, including any split-index lookup, from real Git metadata.
+        git(scratch, "init", "-q", "--bare", "--template=", f"--object-format={algorithm}", git_exe=git_exe)
+        copy = Path(scratch) / "index"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        with os.fdopen(os.open("index", flags, 0o600, dir_fd=scratch_fd), "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            copied = file_version(os.fstat(stream.fileno()))
+        scratch_version = file_version(os.fstat(scratch_fd))
+        records = git(root, "ls-files", "-v", "--stage", "--debug", "--sparse", "-z",
+                      git_exe=git_exe, git_dir=scratch)
+        # No exclude options: ignored files count too.
+        if git(root, "ls-files", "--others", "-z", git_exe=git_exe, git_dir=scratch):
+            raise ValueError("worktree contains untracked files")
+        entries, versions, offset = {}, {}, 0
+        for row in tree:
+            match = INDEX_ENTRY.match(records, offset)
+            if not match:
+                raise ValueError("Git index has missing, hidden or nonstandard entries")
+            mode, oid, name = match.groups()
+            path = root / os.fsdecode(name)
+            versions[path] = file_version(path.lstat())
+            if row != mode + b" blob " + oid + b"\t" + name or not matches_blob(path, mode, oid):
+                raise ValueError("index or worktree differs from HEAD")
+            entries[path] = (mode, oid)
+            offset = match.end()
+        if offset != len(records) or listing[1] != set(entries):
+            raise ValueError("worktree entries differ from the index")
+        if git(root, "ls-files", "--others", "-z", git_exe=git_exe, git_dir=scratch):
+            raise ValueError("worktree contains new untracked files")
+        # Git read the copy by path; a rewrite or swap of it changes its change time.
+        if (scratch_version != file_version(os.lstat(scratch)) or copied != file_version(copy.lstat())):
+            raise ValueError("copied Git index changed during capture")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        with os.fdopen(os.open("index", flags, dir_fd=scratch_fd), "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or copied != file_version(info):
+                raise ValueError("copied Git index changed during capture")
+            digest = hashlib.sha256(stream.read(len(raw) + 1)).hexdigest()
+            if digest != state["index"]["sha256"] or copied != file_version(os.fstat(stream.fileno())):
+                raise ValueError("copied Git index changed during capture")
+    check = state, versions, listing
+    if not still_clean(*check):
+        raise ValueError("repository changed during capture")
+    return state, entries, check
+
+
+def capture_git_baseline(directory):
+    """Capture before launch and retain the result in trusted caller state."""
+    try:
+        return dict(capture_git_tree(directory)[0], clean_start=True)
+    except Exception:  # Advisory: any failure only means "not clean".
+        return None
+
+
+@contextmanager
+def open_handoff(root, change, root_identity):
+    try:
+        root_path = backup_root_path(root)
+        with open_directory(root_path) as root_fd:
+            stamp = backup_root_stamp(root_path, root_fd)
+            # A directory fd cannot stay open across separate invocations. Creating
+            # change folders advances root ctime, so compare it across each read and
+            # use the private lock's version (and Darwin birthtime) across launch.
+            ctime = root_identity.get("ctime_ns")
+            if (type(ctime) is not int or stamp["ctime_ns"] < ctime
+                    or dict(stamp, ctime_ns=ctime) != root_identity):
+                raise ValueError("backup root was replaced")
+            if change.parent != root_path or change.name == "..":
+                raise ValueError("change folder is not a canonical child of the backups root")
+            with open_directory(change.name, dir_fd=root_fd) as change_fd:
+                info = os.fstat(change_fd)
+                identity = (info.st_dev, info.st_ino)
+                yield change_fd, identity
+                check_backup_root(root, stamp)
+                info = os.stat(change.name, dir_fd=root_fd, follow_symlinks=False)
+                if not stat.S_ISDIR(info.st_mode) or (info.st_dev, info.st_ino) != identity:
+                    raise ValueError("change folder was replaced during validation")
+    except OSError as error:
+        raise ValueError(f"cannot open backup root or change folder: {error}") from None
+
+
+def validate_change_handoff(root, change, *, run_id, session_id, started, before, root_identity):
+    """Return the parsed manifest, folder identity and SHA-256 of the validated bytes."""
+    change = Path(change)
+    with open_handoff(root, change, root_identity) as (change_fd, identity):
+        if change in before[0] or identity in before[1]:
+            raise ValueError("change folder is not new to this run")
+        data, digest = read_manifest_snapshot(change_fd)
+        # The manifest's clean_start stamp is advisory and never grants commit authority.
+        if not session_id or data["run_id"] != run_id or data.get("session_id") != session_id:
+            raise ValueError("change manifest does not match the run and session")
+        number, skill = data["change"], data["skill"]
+        if (type(number) is not int or number < 1 or not isinstance(skill, str)
+                or change.name != f"{valid_id(run_id)}-{number:02d}-{valid_id(skill)}"):
+            raise ValueError("change folder name does not match its manifest")
+        created = data.get("created_at")
+        if not isinstance(created, str):
+            raise ValueError("change manifest has no creation timestamp")
+        created = datetime.datetime.fromisoformat(created)
+        if created.tzinfo is None or not started < created <= datetime.datetime.now(datetime.timezone.utc):
+            raise ValueError("change manifest timestamp is outside the run")
+    return data, identity, digest
+
+
+def verify_change_handoff(root, change, *, root_identity, identity, manifest_sha256):
+    """Reopen a handoff and return its manifest only if its folder and bytes match."""
+    with open_handoff(root, Path(change), root_identity) as (change_fd, live_identity):
+        if live_identity != tuple(identity):
+            raise ValueError("change folder identity changed")
+        data, digest = read_manifest_snapshot(change_fd)
+        if digest != manifest_sha256:
+            raise ValueError("change manifest hash changed")
+    return data
+
+
 def begin(args):
     # Preflight every input before copying anything or creating a change folder.
     for name in args.files:
@@ -162,14 +603,65 @@ def begin(args):
         path = Path(name).expanduser().resolve()
         if path.exists() and not path.is_file():
             sys.exit(f"kaizen-backup: {path} is not a regular file")
+    # Serialize numbering and baseline capture across simultaneous begins. Any lock
+    # problem drops only the clean-start stamp; the ordinary backup always proceeds.
+    with ExitStack() as stack:
+        try:
+            if fcntl is None:
+                raise ValueError("file locking is unavailable")
+            root_fd = stack.enter_context(open_directory(ROOT))
+            lock_fd = stack.enter_context(open_backup_lock(root_fd))
+            lock_exclusive(lock_fd)
+        except (OSError, ValueError) as error:
+            stack.close()
+            return write_backup(args, reason=f"backup lock unavailable: {error}")
+        return write_backup(args, root_fd, lock_fd)
+
+
+LOCK_WAIT_SECONDS = 10
+
+
+def lock_exclusive(fd):
+    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    while True:
+        try:
+            return fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
+def capture_reason(error):
+    if isinstance(error, subprocess.SubprocessError):
+        return "a Git query failed"
+    return str(error) or type(error).__name__
+
+
+def write_backup(args, root_fd=None, lock_fd=None, reason=None):
     created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     run_id = args.run or os.environ.get("KAIZEN_RUN_ID") or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    session_id = os.environ.get("KAIZEN_SESSION_ID")
     valid_id(run_id)
     valid_id(args.skill)
-    number = next_number(run_id)
-    change = change_dir(ROOT / f"{run_id}-{number:02d}-{args.skill}")
-    change.mkdir(mode=0o700)
+    number, change = allocate_change(run_id, args.skill)
+    # A previous manifest's advisory Git stamp is never reused.
+    if reason is None and session_id is not None:
+        reason = "scheduled runs record no clean-start stamp"
+    elif reason is None and number != 1:
+        reason = "only the first backup of a run records a clean-start stamp"
+    baseline = None
     try:
+        if args.repo is not None and reason is None:
+            try:
+                root_stamp = backup_root_stamp(ROOT, root_fd)
+                if root_stamp["lock"] != list(file_version(os.fstat(lock_fd))):
+                    raise ValueError("backup lock was replaced")
+                baseline, blobs, check = capture_git_tree(args.repo)
+                repo = Path(baseline["root"])
+                check_backup_root(BACKUP_ROOT, root_stamp)
+            except Exception as error:  # Advisory: never let the capture block the backup.
+                baseline, reason = None, capture_reason(error)
         (change / "files").mkdir(mode=0o700)
         entries = []
         for index, name in enumerate(args.files, 1):
@@ -179,9 +671,30 @@ def begin(args):
             if path.is_file():
                 entry["backup"] = f"files/{index}"
                 shutil.copy2(path, change / entry["backup"])
+            if baseline is not None and path.is_relative_to(repo):
+                try:
+                    blob = blobs.get(path)
+                    backup = entry["backup"]
+                    if not (backup is None if blob is None else (
+                            backup is not None and matches_blob(change / backup, *blob))):
+                        raise ValueError("a backed-up file differs from HEAD")
+                except Exception as error:
+                    baseline, reason = None, capture_reason(error)
             entries.append(entry)
+        if baseline is not None:
+            try:
+                check_backup_root(BACKUP_ROOT, root_stamp)
+                if not still_clean(*check):
+                    raise ValueError("repository changed during backup")
+            except Exception as error:
+                baseline, reason = None, capture_reason(error)
+        stamp = {}
+        if args.repo is not None:
+            stamp["git"] = dict(baseline, clean_start=True) if baseline is not None else None
+            if baseline is None:
+                stamp["git_reason"] = reason
         save(change, {"run_id": run_id, "change": number, "skill": args.skill, "ledger": args.ledger,
-                      "created_at": created_at, "session_id": os.environ.get("KAIZEN_SESSION_ID"),
+                      "created_at": created_at, "session_id": session_id, **stamp,
                       "files": entries, "actions": [], "finished": False, "verification": None,
                       "reverted": None})
     except BaseException:
@@ -350,6 +863,8 @@ def main(argv=None):
     p.add_argument("--skill", required=True)
     p.add_argument("--ledger", required=True)
     p.add_argument("--run")
+    p.add_argument("--repo", metavar="DIR",
+                   help="record an advisory clean-start stamp at the first interactive backup")
     p.add_argument("files", nargs="+")
     p.set_defaults(func=begin)
     p = sub.add_parser("finish")
