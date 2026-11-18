@@ -105,13 +105,16 @@ CODEX_OUTPUT_TYPES = frozenset(kind + b"_output" for kind in CODEX_CALL_TYPES)
 CODEX_FIELD = re.compile(rb'\s*(?:[{,])\s*"([a-z_]+)"\s*:\s*')
 CODEX_STRING = re.compile(rb'"(?:[^"\\]|\\.)*"')
 CODEX_SCALAR = re.compile(CODEX_STRING.pattern + rb'|null|true|false|-?[0-9.]+')
-CODEX_WALL = re.compile(rb'(?:^"|(?<!\\)\\n)Wall time:? ([0-9]+(?:\.[0-9]+)?) seconds\b')
-CODEX_OUTPUT_START = re.compile(rb'(?:^"|(?<!\\)\\n)(?:Original output|Final output|Output):')
+CODEX_OUTPUT_LIMIT = 16 * 1024
+CODEX_EVIDENCE_LIMIT = 400
+CODEX_WALL = re.compile(r"^Wall time:? ([0-9]+(?:\.[0-9]+)?) seconds\b", re.M)
+CODEX_OUTPUT_START = re.compile(r"^(?:Original output|Final output|Output|Stdout):", re.M | re.I)
 CODEX_OUTPUT_END = re.compile(rb'"\s*(?:}\s*\]\s*)?(}\s*}?)\s*$')
-CODEX_TEXT = re.compile(rb'\[\s*\{\s*"type"\s*:\s*"input_text"\s*,\s*"text"\s*:\s*(?=")')
-CODEX_TIMEOUT = re.compile(rb'(?:\b|(?<=\\n))(?:timed out|os error 60|(?:Process exited with code|Exit code:?) (?:124|137|143))\b', re.I)
-CODEX_LOCK = re.compile(rb'(?:\b|(?<=\\n))(?:database is locked|EBUSY|(?:could not|unable to) (?:get|acquire) (?:the )?lock|waiting for .{0,60}?lock)\b', re.I)
-CODEX_INOTIFY = re.compile(rb'upper limit on inotify watches reached|user limit of inotify instances reached', re.I)
+CODEX_EXIT = re.compile(r"^(?:Process exited with code|Exit code:?) (-?\d+)\s*$", re.M | re.I)
+CODEX_ERROR = re.compile(r"^(?:Stderr|Error):[ \t]*(.*)", re.M | re.I | re.S)
+CODEX_TIMEOUT = re.compile(r"\b(?:timed out|os error 60|(?:Process exited with code|Exit code:?) (?:124|137|143))\b", re.I)
+CODEX_LOCK = re.compile(r"\b(?:database is locked|EBUSY|(?:could not|unable to) (?:get|acquire) (?:the )?lock|waiting for .{0,60}?lock)\b", re.I)
+CODEX_INOTIFY = re.compile(r"upper limit on inotify watches reached|user limit of inotify instances reached", re.I)
 CODEX_COMMAND = re.compile(r'^(?:text\(\s*)?(?:await\s+)?(?:tools\.)?exec_command\(\s*\{\s*"?cmd"?\s*:\s*["\x27]([^"\x27\n]{1,200})')
 
 
@@ -138,52 +141,40 @@ def codex_tool_header(line, keep_calls):
     fields = codex_fields(line[:4096])
     outer = fields.get(b"type", b"")[1:-1]
     fields = fields.get(b"payload", {}) if outer == b"response_item" else fields
+    if not isinstance(fields, dict):
+        return None
     kind = fields.get(b"type", b"")[1:-1]
     if kind in CODEX_OUTPUT_TYPES or (keep_calls and kind in CODEX_CALL_TYPES):
         return outer, kind, fields
     return None
 
 
+def invalid_json_constant(value):
+    raise ValueError(value)
+
+
 def codex_call_row(line, kind, fields, wrapped):
     ident = None
     try:
-        raw = fields.get(b"call_id", b"")
-        if raw.startswith(b'"') and 2 < len(raw) <= 258:
-            ident = json.loads(raw)
-        if kind in CODEX_OUTPUT_TYPES:
-            offset = fields.get(b"output")
-            ending = CODEX_OUTPUT_END.search(line[-64:])
-            if ident is None or offset is None or not ending or ending[1].count(b"}") != 1 + wrapped:
-                return ident, None
-            evidence = line[offset:400]
-            if line[offset:offset + 1] not in (b'"', b"["):
-                return ident, None
-            if len(line) <= 400:
-                masked = CODEX_STRING.sub(b'""', evidence).decode("ascii")
-                _, end = JSON_DECODER.raw_decode(masked)
-                if re.fullmatch(r'}\s*}' if wrapped else r'}', masked[end:].strip()) is None:
-                    return ident, None
-            location = {key: json.loads(fields.get(key.encode(), b"null")) for key in ("cwd", "turn_id")}
-            text = CODEX_TEXT.match(evidence)
-            evidence = evidence[text.end():] if text else evidence if evidence.startswith(b'"') else b""
-            marker = CODEX_OUTPUT_START.search(evidence)
-            wall = CODEX_WALL.search(evidence, 0, marker.start() if marker else len(evidence))
-            seconds = float(wall[1]) if wall else None
-            if seconds is not None and not 0 <= seconds <= MAX_TIMING_MS / 1000:
-                seconds = None
-            return ident, dict(location, seconds=seconds, timeout=bool(CODEX_TIMEOUT.search(evidence)),
-                               lock=bool(CODEX_LOCK.search(evidence)), inotify=bool(CODEX_INOTIFY.search(evidence)),
-                               fingerprint=hash(line[:400]))
-        if len(line) > 4096:
+        limit = CODEX_OUTPUT_LIMIT if kind in CODEX_OUTPUT_TYPES else 4096
+        if len(line) <= limit:
+            record = json.loads(line, parse_constant=invalid_json_constant)
+            call = record.get("payload") if wrapped and isinstance(record, dict) else record
+            if not isinstance(call, dict) or call.get("type") != kind.decode("ascii"):
+                return None, None
+            ident = call.get("call_id")
+        else:
+            call = None
+        if call is None:
+            raw = fields.get(b"call_id", b"")
+            if raw.startswith(b'"') and 2 < len(raw) <= 258:
+                ident = json.loads(raw)
             return ident, None
-        call = json.loads(line)
-        call = call.get("payload") if wrapped and isinstance(call, dict) else call
-        if not isinstance(call, dict) or call.get("type") != kind.decode("ascii"):
-            return ident, None
-        ident = call.get("call_id")
         if not isinstance(ident, str) or not 0 < len(ident) <= 256:
             return None, None
-        location = {key: call.get(key) for key in ("cwd", "turn_id")}
+        location = {key: call.get(key, record.get(key)) for key in ("cwd", "turn_id")}
+        if kind in CODEX_OUTPUT_TYPES:
+            return ident, dict(location, **codex_output(call), fingerprint=hash(line))
         args = call.get("arguments")
         args = json.loads(args) if isinstance(args, str) else args
         command = args.get("cmd") if isinstance(args, dict) else None
@@ -197,18 +188,58 @@ def codex_call_row(line, kind, fields, wrapped):
         signature = friction_signature(command) if isinstance(command, str) else "(tool)"
         return ident, dict(location, signature=signature, poll=is_polling(command), fingerprint=hash(line))
     except (ValueError, TypeError, RecursionError):
+        raw = fields.get(b"call_id", b"")
+        if ident is None and raw.startswith(b'"') and 2 < len(raw) <= 258:
+            try:
+                ident = json.loads(raw)
+            except ValueError:
+                pass
         return ident, None
 
 
-def canary_row(line, since, counts, codex, session_version, output_type=None):
+def codex_output(call):
+    output = call.get("output")
+    if isinstance(output, list) and output and isinstance(output[0], dict) and output[0].get("type") == "input_text":
+        output = output[0].get("text")
+    evidence = codex_evidence(output)
+    marker = CODEX_OUTPUT_START.search(evidence)
+    header = evidence[:marker.start()] if marker else evidence
+    error = CODEX_ERROR.search(header)
+    header = header[:error.start()] if error else header
+    wall = CODEX_WALL.search(header)
+    seconds = float(wall[1]) if wall else None
+    if seconds is not None and seconds > MAX_TIMING_MS / 1000:
+        seconds = None
+    code = call.get("exit_code")
+    exit_match = CODEX_EXIT.search(header) if type(code) is not int else None
+    failed = (type(code) is int and code != 0 or exit_match is not None and int(exit_match[1]) != 0
+              or call.get("status") in ("error", "failed") or call.get("is_error") is True)
+    lock = failed and (any(CODEX_LOCK.search(codex_evidence(call.get(field))) for field in ("stderr", "error"))
+                       or bool(error and CODEX_LOCK.search(error[1])))
+    return dict(seconds=seconds, timeout=bool(CODEX_TIMEOUT.search(evidence)),
+                lock=lock, inotify=bool(CODEX_INOTIFY.search(evidence)))
+
+
+def codex_evidence(value):
+    if not isinstance(value, str):
+        return ""
+    prefix = value[:CODEX_EVIDENCE_LIMIT]
+    if prefix.isascii():
+        return prefix
+    return prefix.encode("utf-8", "surrogatepass")[:CODEX_EVIDENCE_LIMIT].decode("utf-8", "ignore")
+
+
+UNPARSED = object()
+
+
+def canary_row(line, since, counts, codex, session_version, output_type=None, row=UNPARSED):
     # Decode candidate records for classification; never retain their content.
-    match = TYPE_FIELD.search(line[:1024])
-    kind = match[1].decode("ascii", "replace") if match else None
     known = CODEX_TYPES if codex else CLAUDE_TYPES
+    prefix = line[:1024] if codex else b""
+    match = TYPE_FIELD.search(prefix) if codex and len(line) > 2048 else None
     # Large ordinary Codex response items are content, not usage records.
     # Their session metadata carries the version; avoid decoding their bodies.
-    if output_type is not None or (codex and kind == "response_item" and len(line) > 2048
-                                   and not VERSION_FIELD.search(line[:1024])):
+    if output_type is not None or (match and match[1] == b"response_item" and not VERSION_FIELD.search(prefix)):
         stamp = TIMESTAMP.search(line[:1024])
         if stamp and (output_type is None or CODEX_OUTPUT_END.search(line[-64:])):
             try:
@@ -222,7 +253,8 @@ def canary_row(line, since, counts, codex, session_version, output_type=None):
                 pass
         return session_version
     try:
-        row = json.loads(line)
+        if row is UNPARSED:
+            row = json.loads(line)
         if not isinstance(row, dict):
             return session_version
         payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
@@ -286,6 +318,7 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                 lines = chain((first_line,), stream)
             for line_number, line in enumerate(lines):
                 prefix = line[:1024]
+                decoded = UNPARSED
                 tool = codex_tool_header(line, keep_codex) if keep_model and b'_call' in prefix else None
                 output_type = tool[0].decode("ascii") if tool and tool[1] in CODEX_OUTPUT_TYPES else None
                 session_meta = keep_codex and b'"session_meta"' in prefix
@@ -297,8 +330,11 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                             recent = (value[:19] >= cutoff if value.endswith(("Z", "+00:00"))
                                       else date_time(value) >= since)
                             if recent or (keep_model and b'"session_meta"' in prefix):
-                                session_version = canary_row(line, since, canary, keep_model, session_version, output_type)
-                        except (ValueError, TypeError, OverflowError):
+                                if not keep_model:
+                                    decoded = json.loads(line)
+                                session_version = canary_row(line, since, canary, keep_model, session_version,
+                                                             output_type, decoded)
+                        except (ValueError, TypeError, OverflowError, RecursionError):
                             pass
                 if (bounds is not None and last_stamp is not None and line.startswith(last_prefix)
                         and keep_model and not keep_tools and not (tool or session_meta or CODEX_ROW.search(prefix))
@@ -390,7 +426,8 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                             yield dict(type="user", message={}, _before_window=True)
                         saved_shape, saved_deltas, before_user = None, [], False
                     row = (metadata_row(line, timestamp) if metadata else
-                           first_row if line_number == 0 and first_row is not None else json.loads(line))
+                           first_row if line_number == 0 and first_row is not None else
+                           decoded if decoded is not UNPARSED else json.loads(line))
                     if isinstance(row, dict):
                         if old:
                             row["_before_window"] = True
@@ -742,41 +779,18 @@ def friction_stamp(stamp):
         return None
 
 
+REPLAY_ENCODER = json.JSONEncoder(separators=(",", ":"))
+
+
 def replay_fingerprint(value):
-    # Traverse only a bounded prefix; include container/string lengths so that
-    # oversized replays cannot consume work proportional to their payload.
-    budget = [4096]
-    digest = hashlib.sha256()
-
-    def feed(item):
-        if budget[0] <= 0:
-            return
-        if isinstance(item, (str, list, dict)):
-            digest.update((type(item).__name__ + str(len(item)) + ":").encode())
-            if isinstance(item, str):
-                part = item[:budget[0]].encode("utf-8", "surrogatepass")[:budget[0]]
-                digest.update(part)
-                budget[0] -= len(part) + 1
-            else:
-                budget[0] -= 1
-                for entry in (item.items() if isinstance(item, dict) else item):
-                    if budget[0] <= 0:
-                        break
-                    if isinstance(item, dict):
-                        feed(entry[0])
-                        feed(entry[1])
-                    else:
-                        feed(entry)
-        else:
-            part = repr(item).encode()[:budget[0]]
-            digest.update(part)
-            budget[0] -= len(part) + 1
-
-    feed(value)
+    # Encode the full value so both element boundaries and trailing changes matter.
+    encoded = REPLAY_ENCODER.encode(value).encode("ascii")
+    digest = hashlib.sha256(len(encoded).to_bytes(8, "big"))
+    digest.update(encoded)
     return digest.digest()
 
 
-def permission_observation(state, key, row, block, start, content):
+def permission_observation(state, key, row, block, start, result_count):
     # Evidence is limited to explicitly selected, canonical cwd members.
     if not state["cwd"]:
         return
@@ -810,7 +824,7 @@ def permission_observation(state, key, row, block, start, content):
         decision = decision if isinstance(decision, dict) else {}
         source, outcome = decision.get("source"), decision.get("decision")
         trusted = source in ("user", "user_permanent")
-        single = sum(item.get("type") == "tool_result" for item in content) == 1
+        single = result_count == 1
         status = ("denied" if trusted and outcome == "reject" and single else
                   "accepted" if trusted and outcome == "accept" and single
                   and isinstance(row.get("toolUseResult"), dict)
@@ -846,7 +860,7 @@ def permission_rows(state):
             for (root, literal), count in sorted(counts.items())]
 
 
-def friction_block(state, row, block, start, content):
+def friction_block(state, row, block, start, result_count=0, row_event=None):
     if row.get("type") != ("assistant" if start else "user"):
         return
     session_id = row.get("sessionId")
@@ -871,7 +885,7 @@ def friction_block(state, row, block, start, content):
             state["warnings"]["malformed rows"] += 1
         pairs[key] = None
         return
-    permission_observation(state, key, row, block, start, content)
+    permission_observation(state, key, row, block, start, result_count)
     row_id = row.get("uuid") or (row["message"].get("id") if start else None)
     identity = row_id if isinstance(row_id, str) and 0 < len(row_id) <= 256 else None
     if start:
@@ -894,7 +908,7 @@ def friction_block(state, row, block, start, content):
         # Row-level duration is attributable only when exactly one result owns it.
         measured = (duration / 1000 if type(duration) in (float, int)
                     and 0 <= duration <= MAX_TIMING_MS
-                    and (len(content) == 1 or sum(item.get("type") == "tool_result" for item in content) == 1)
+                    and result_count == 1
                     else None)
         result = block.get("content")
         result_hash = replay_fingerprint(result)
@@ -905,8 +919,6 @@ def friction_block(state, row, block, start, content):
         exit_match = EXIT_HEADER.match(text.partition("\n")[0].strip())
         hint = hint or bool(exit_match and int(exit_match[1]) in (124, 137, 143))
         lock = bool(re.search(r"\b(?:could not (?:get|acquire) (?:the )?lock|unable to acquire (?:the )?lock|waiting for (?:the )?lock)\b", text, re.I))
-        row_event = (session_id, identity or (stamp, tuple(item.get("tool_use_id") for item in content
-                                                            if item.get("type") == "tool_result")))
         value = (stamp, identity, measured, prompted, bool(details.get("backgroundTaskId")),
                  result_hash, block.get("is_error") is True,
                  timeout, hint, details.get("interrupted") is True, lock, row_event)
@@ -979,32 +991,38 @@ def heavy_timeline(calls, thresholds):
 
 
 def polling_summary(calls, slow_seconds):
-    # Merge waiting intervals: fan-out must not multiply elapsed waiting time.
-    polls, siblings = [], defaultdict(lambda: ([], []))
+    # Merge waiting intervals within each session so fan-out cannot multiply wait.
+    siblings = defaultdict(lambda: ([], []))
     for start, end, seconds, _, _, poll, session in calls:
         if poll:
-            polls.append((start, end))
             siblings[session][0].append((start, end))
         elif seconds >= slow_seconds:
             siblings[session][1].append((start, end))
-    merged = []
-    for start, end in sorted(polls):
-        if merged and start <= merged[-1][1]:
-            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
-        else:
-            merged.append((start, end))
-    overlap = False
+    count = 0
+    seconds = 0
+    overlap = flagged = False
     for waiting, slow in siblings.values():
+        if not waiting:
+            continue
+        count += len(waiting)
+        merged = []
+        for start, end in sorted(waiting):
+            if merged and start <= merged[-1][1]:
+                merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+            else:
+                merged.append((start, end))
+        wait = sum(end - start for start, end in merged)
+        seconds += wait
         slow.sort()
         index = 0
-        for start, end in sorted(waiting):
+        for start, end in merged:
             while index < len(slow) and slow[index][1] <= start:
                 index += 1
             if index < len(slow) and slow[index][0] < end:
                 overlap = True
-    seconds = sum(end - start for start, end in merged)
-    return dict(count=len(polls), seconds=round(seconds, 3), slow_overlap=overlap,
-                flagged=seconds >= 600 and overlap)
+                flagged = flagged or wait >= 600
+                break
+    return dict(count=count, seconds=round(seconds, 3), slow_overlap=overlap, flagged=flagged)
 
 
 def finalize_friction(state, thresholds, window):
@@ -1136,6 +1154,8 @@ def scan_claude(path, agent, since, data, seen_messages, project):
     cache_previous = None
     cache_seen = False
     friction = data.get("_friction")
+    cached_head = lru_cache(maxsize=64)(bash_head)
+    cached_command = lru_cache(maxsize=64)(command_info)
     for row in rows(path, since, data["warnings"], keep_tools=True, canary=data["format_canary"],
                     keep_signals=friction is not None):
         if row.get("type") in ("api-request-shape", "attachment"):
@@ -1230,13 +1250,14 @@ def scan_claude(path, agent, since, data, seen_messages, project):
             if main and pending:
                 add(data["triggers"][pending], usage)
                 pending = None
+        row_event = None
         for block in content:
             if block.get("type") == "tool_use":
                 name, head = block.get("name", "unknown"), None
                 observed["used"].add(name)
                 data["_tool_universe"].add(name)
                 if friction is not None:
-                    friction_block(friction, row, block, True, content)
+                    friction_block(friction, row, block, True)
                 if ("use", block.get("id")) in seen_messages:
                     continue
                 seen_messages.add(("use", block.get("id")))
@@ -1245,24 +1266,37 @@ def scan_claude(path, agent, since, data, seen_messages, project):
                     turn["active"] = True
                     turn["calls"] += 1
                 original_name = name
-                target = str(tool_input.get("file_path") or tool_input.get("path") or tool_input.get("filePath") or "")
-                failure_head = bash_head(tool_input.get("command", "")) if name == "Bash" else redact(target)
                 order = turn["calls"] if turn is not None else 0
                 match_head = None
-                if name == "Bash" and turn is not None:
-                    match_head = command_info(tool_input.get("command", ""))
-                    turn["bash_calls"][order] = (match_head, None)
+                if name == "Bash":
+                    command = tool_input.get("command", "")
+                    cacheable = isinstance(command, str) and len(command) <= 1024
+                    failure_head = (cached_head if cacheable else bash_head)(command)
+                    if turn is not None:
+                        match_head = (cached_command if cacheable else command_info)(command)
+                        turn["bash_calls"][order] = (match_head, None)
+                else:
+                    target = tool_input.get("file_path") or tool_input.get("path") or tool_input.get("filePath") or ""
+                    failure_head = redact(str(target))
                 if name == "Agent":
                     agent_type = str(tool_input.get("subagent_type", "unknown"))
                     data["briefs"][agent_type].append(len(tool_input.get("prompt") or ""))
                     name += ":" + agent_type
                 if name == "Bash" and not main:
-                    head = bash_head(tool_input.get("command", ""))
+                    head = failure_head
                     data["bash"][agent][head] += 1
                 tools[block.get("id")] = (name, head, original_name, failure_head, match_head, order)
             elif block.get("type") == "tool_result":
                 if friction is not None:
-                    friction_block(friction, row, block, False, content)
+                    if row_event is None:
+                        ids = [item.get("tool_use_id") for item in content if item.get("type") == "tool_result"]
+                        result_count = len(ids)
+                        uuid = row.get("uuid")
+                        identity = (uuid if isinstance(uuid, str) and 0 < len(uuid) <= 256
+                                    else (friction_stamp(ts), ids[0] if result_count == 1
+                                          and isinstance(ids[0], str) else replay_fingerprint(ids)))
+                        row_event = (session_id, identity)
+                    friction_block(friction, row, block, False, result_count, row_event)
                 if ("result", block.get("tool_use_id")) in seen_messages:
                     continue
                 seen_messages.add(("result", block.get("tool_use_id")))
@@ -1345,15 +1379,21 @@ def cwd_of_file(path, limit=50):
 
 
 def cwd_matches(raw, targets, realpaths):
-    if not isinstance(raw, str):
+    def canonical(path):
+        if path not in realpaths:
+            try:
+                realpaths[path] = os.path.normpath(os.path.realpath(path))
+            except (OSError, ValueError):
+                realpaths[path] = None
+        return realpaths[path]
+
+    if not isinstance(raw, str) or not os.path.isabs(raw) or "\0" in raw:
         return False
-    if raw not in realpaths:
-        try:
-            realpaths[raw] = os.path.realpath(raw)
-        except (OSError, ValueError):  # e.g. an embedded NUL in a malformed row
-            realpaths[raw] = raw
-    return any(value == target or value.startswith(target.rstrip(os.sep) + os.sep)
-               for target in targets for value in (raw, realpaths[raw]))
+    location = canonical(raw)
+    return location is not None and any(
+        target is not None and os.path.commonpath((location, target)) == target
+        for target in map(canonical, targets)
+    )
 
 
 def scan_codex(root, since, data, cwd=None, realpaths=None):
@@ -1405,13 +1445,15 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                 location = observation["cwd"]
                 if location is None:
                     location = turns.get(turn, current_cwd) if isinstance(turn, str) else current_cwd
-                if (location is not None and not isinstance(location, str)) or (
-                        cwd is not None and not cwd_matches(location, cwd, realpaths)):
+                if location is not None:
+                    in_scope = cwd_matches(location, cwd or (), realpaths)
+                    location = realpaths.get(location) if isinstance(location, str) else None
+                    if location is None or (cwd is not None and not in_scope):
+                        pairs[ident] = None
+                        continue
+                elif cwd is not None:
                     pairs[ident] = None
                     continue
-                if isinstance(location, str):
-                    cwd_matches(location, (), realpaths)
-                    location = realpaths[location]
                 slot = int(kind in CODEX_OUTPUT_TYPES)
                 value = (kind, stamp, location, observation)
                 if pair[slot] is None and (slot or pair[1] is None):
@@ -1483,7 +1525,9 @@ def finish_codex_pairs(pairs, friction, session=None):
         if pair is None or pair[1] is None:
             continue
         start, (kind, end, location, result) = pair
-        if start is not None and (start[0] + b"_output" != kind or start[1] > end or start[2] != location):
+        if start is not None and (start[0] + b"_output" != kind or start[1] > end or start[2] != location
+                                  or (start[3]["turn_id"] is not None and result["turn_id"] is not None
+                                      and start[3]["turn_id"] != result["turn_id"])):
             continue
         signals["inotify"] += result["inotify"]
         if start is None:
@@ -1683,7 +1727,7 @@ def needs_tool_universe(data):
 def tool_use_names(line):
     """Tool names in one transcript line; a pattern reads the usual key order, json.loads the rest."""
     names = TOOL_USE_NAME.findall(line)
-    if len(names) == len(TOOL_USE_TYPE.findall(line)):
+    if len(names) == line.count(b'"tool_use"') or len(names) == len(TOOL_USE_TYPE.findall(line)):
         try:
             return [json.loads(b'"' + name + b'"') if b"\\" in name else name.decode("utf-8")
                     for name in names if name]
@@ -1930,7 +1974,7 @@ def agent_stats(data):
     return sorted(result, reverse=True)
 
 
-def previous_audit(out, scope):
+def previous_audit(out, scope, eligible=None):
     candidates = sorted((p for p in out.parent.glob("token-audit-*.md") if p != out),
                         key=lambda p: (p.stat().st_mtime_ns, p.name), reverse=True)
     match, other = None, None
@@ -1953,7 +1997,7 @@ def previous_audit(out, scope):
                         if not isinstance(metadata, dict) or set(metadata) != set(scope):
                             metadata = None
                         entry = (path, value, metadata)
-                        if match is None and metadata == scope:
+                        if match is None and metadata == scope and (eligible is None or eligible(path)):
                             match = entry
                         elif other is None:
                             other = entry
@@ -1978,15 +2022,8 @@ def describe(scope):
     return "window " + scope["window"] + ", " + projects
 
 
-def apply_regression(data, out, scope, extract_dir):
-    friction = data.get("friction")
-    if friction is None or friction["summary"]["capped"]:
-        return
-    match, _ = previous_audit(out, scope)
-    if match is None:
-        return
+def regression_cohorts(path, scope, extract_dir, friction):
     try:
-        path = match[0]
         if path.stat().st_size > 1024 * 1024:
             return
         report_text = path.read_text()
@@ -2016,19 +2053,39 @@ def apply_regression(data, out, scope, extract_dir):
                     or type(row["p50"]) not in (int, float) or not math.isfinite(row["p50"]) or row["p50"] < 0):
                 return
             indexed[key] = row
-        regressions = []
-        for row in friction["comparisons"]:
-            before = indexed.get((row["signature"], row["basis"]))
-            if before and row["count"] >= 3 and before["p50"] > 0 and row["p50"] >= 1.5 * before["p50"]:
-                regressions.append(dict(signature=row["signature"], basis=row["basis"], count=row["count"],
-                                        previous_count=before["count"], p50=row["p50"], previous_p50=before["p50"],
-                                        ratio=round(row["p50"] / before["p50"], 3)))
-        friction["regressions"] = regressions
-        for row in regressions:
-            friction["flags"].append(dict(id="regression", subject=row["signature"], value=row["p50"],
-                                          detail="Comparable median timing grew by at least 1.5 times."))
+        return indexed
     except (OSError, ValueError, TypeError, KeyError, AttributeError, StopIteration, OverflowError, RecursionError):
+        return None
+
+
+def apply_regression(data, out, scope, extract_dir):
+    friction = data.get("friction")
+    if friction is None or friction["summary"]["capped"]:
         return
+    current = {(row["signature"], row["basis"]): row for row in friction["comparisons"] if row["count"] >= 3}
+    if not current:
+        return
+    indexed = None
+
+    def eligible(path):
+        nonlocal indexed
+        indexed = regression_cohorts(path, scope, extract_dir, friction)
+        return indexed is not None and any(key in current and row["p50"] > 0 for key, row in indexed.items())
+
+    match, _ = previous_audit(out, scope, eligible)
+    if match is None:
+        return
+    regressions = []
+    for key, row in current.items():
+        before = indexed.get(key)
+        if before and before["p50"] > 0 and row["p50"] >= 1.5 * before["p50"]:
+            regressions.append(dict(signature=row["signature"], basis=row["basis"], count=row["count"],
+                                    previous_count=before["count"], p50=row["p50"], previous_p50=before["p50"],
+                                    ratio=round(row["p50"] / before["p50"], 3)))
+    friction["regressions"] = regressions
+    for row in regressions:
+        friction["flags"].append(dict(id="regression", subject=row["signature"], value=row["p50"],
+                                      detail="Comparable median timing grew by at least 1.5 times."))
 
 
 def report(data, out, scope):
