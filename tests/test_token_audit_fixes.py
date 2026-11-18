@@ -42,7 +42,8 @@ class FixCase(StubCase):
         self.codex = self.root / 'codex-config'
         self.config.mkdir()
         self.codex.mkdir()
-        self.env.update(CLAUDE_CONFIG_DIR=str(self.config), CODEX_HOME=str(self.codex))
+        self.env.update(CLAUDE_CONFIG_DIR=str(self.config), CODEX_HOME=str(self.codex),
+                        COPILOT_HOME=str(self.root / 'copilot'))
         self.pricing = write(self.root / 'prices.json', json.dumps(PRICING))
         self.output = self.root / 'series'
 
@@ -75,6 +76,15 @@ class FixCase(StubCase):
 
 
 class PricingBoundaryTests(FixCase):
+    def test_copilot_notice_preserves_json(self):
+        result = self.run_script('token-audit', '--no-write', '--json')
+        json.loads(result.stdout)
+        self.assertNotIn('Copilot sessions found', result.stderr)
+        (Path(self.env['COPILOT_HOME']) / 'session-state').mkdir(parents=True)
+        result = self.run_script('token-audit', '--no-write', '--json')
+        json.loads(result.stdout)
+        self.assertEqual(result.stderr.count('Copilot sessions found but not measured'), 1)
+
     def test_pricing_key_needs_a_boundary_after_the_alias(self):
         key = AUDIT.pricing_key
         self.assertIsNone(key(PRICING, 'claude-fable-5-2'))

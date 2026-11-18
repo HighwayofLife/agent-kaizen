@@ -7,6 +7,9 @@ argument-hint: "[propose|safe|auto|yolo]"
 
 # Packet flow instrumentation
 
+**Plugin root:** `${CLAUDE_PLUGIN_ROOT}`. If that is still a `${...}` placeholder, use the folder that contains `skills/` (this file is `skills/<name>/SKILL.md`), and substitute that path, in quotes, wherever this skill uses `CLAUDE_PLUGIN_ROOT`.
+**Not in Claude Code?** Read `docs/hosts.md` in the plugin root first. Skip steps that only work in Claude Code, and follow its propose-only rule before changing any host configuration.
+
 Show the owner where to record packet state changes in their dispatch, check, review and landing scripts, and how to read the resulting flow report.
 
 **Changes:** proposed calls in the owner's scripts, only after the owner approves.

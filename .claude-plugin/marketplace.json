@@ -3,12 +3,12 @@
   "owner": {
     "name": "HighwayofLife"
   },
-  "description": "Agent Kaizen: a self-improving workflow plugin for Claude Code (and optionally Codex and other agent CLIs).",
+  "description": "Agent Kaizen: a self-improving workflow plugin for Claude Code, with Codex CLI and GitHub Copilot support (experimental on Copilot).",
   "plugins": [
     {
       "name": "agent-kaizen",
       "source": "./",
-      "description": "Skills, an auditor agent, scripts and templates for a self-improving Claude Code workflow."
+      "description": "Skills, scripts and templates for a self-improving workflow on Claude Code and Codex CLI, and experimentally on the Copilot runtime; the auditor agent runs on Claude Code only."
     }
   ]
 }

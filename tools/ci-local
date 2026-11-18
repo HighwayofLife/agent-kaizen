@@ -82,6 +82,10 @@ def main():
             stage('plugin validation', lambda: run(['claude', 'plugin', 'validate', '.']))
         else:
             print('SKIP: plugin validation (claude not found)', flush=True)
+        if shutil.which('codex') or shutil.which('copilot'):
+            stage('host probe', lambda: run([sys.executable, 'tools/host-probe', '--host', 'all', '--worktree']))
+        else:
+            print('SKIP: host probe (neither codex nor copilot found)', flush=True)
     stage('version and changelog', version)
     return 1 if failures else 0
 

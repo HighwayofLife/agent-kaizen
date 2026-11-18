@@ -1,0 +1,6 @@
+{
+  "session_id": "codex-session",
+  "cwd": "/path/to/project",
+  "hook_event_name": "SessionStart",
+  "source": "startup"
+}

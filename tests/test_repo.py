@@ -7,11 +7,20 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SKILLS = sorted(p.parent.name for p in (ROOT / 'skills').glob('*/SKILL.md'))
+PREAMBLE = ('**Plugin root:** `${CLAUDE_PLUGIN_ROOT}`. If that is still a `${...}` placeholder, use the folder '
+            'that contains `skills/` (this file is `skills/<name>/SKILL.md`), and substitute that path, in '
+            'quotes, wherever this skill uses `CLAUDE_PLUGIN_ROOT`.\n'
+            '**Not in Claude Code?** Read `docs/hosts.md` in the plugin root first. Skip steps that only work '
+            'in Claude Code, and follow its propose-only rule before changing any host configuration.\n')
+AGENT_PREAMBLE = PREAMBLE.replace(
+    'the folder that contains `skills/` (this file is `skills/<name>/SKILL.md`)',
+    'the folder that contains `agents/` (this file is `agents/kaizen-auditor.md`)').replace(
+    'wherever this skill uses', 'wherever this agent uses')
 # Tracked and untracked files, minus git-ignored ones (out/, caches, .DS_Store).
 FILES = subprocess.run(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], cwd=ROOT,
                        capture_output=True, text=True, check=True).stdout.split('\0')
 TEXT = [ROOT / f for f in FILES if f and (ROOT / f).is_file() and Path(f).suffix in
-        {'.md', '.json', '.sh', '.py', '.toml', '.conf', '.yml', ''}]
+        {'.md', '.json', '.sh', '.py', '.toml', '.conf', '.yml', '.yaml', ''}]
 
 
 def frontmatter(path):
@@ -26,6 +35,33 @@ def frontmatter(path):
 
 
 class RepoTests(unittest.TestCase):
+    def test_skill_preamble(self):
+        for name in SKILLS:
+            with self.subTest(skill=name):
+                text = (ROOT / 'skills' / name / 'SKILL.md').read_text()
+                self.assertEqual(text.count(PREAMBLE), 1)
+                body = text.split('---\n', 2)[2]
+                heading = re.search(r'^# .*\n\n', body, re.M)
+                self.assertIsNotNone(heading)
+                self.assertTrue(body[heading.end():].startswith(PREAMBLE))
+
+    def test_agent_preamble(self):
+        text = (ROOT / 'agents/kaizen-auditor.md').read_text()
+        self.assertEqual(text.count(AGENT_PREAMBLE), 1)
+        self.assertTrue(text.split('---\n', 2)[2].startswith('\n' + AGENT_PREAMBLE))
+
+    def test_host_map(self):
+        path = ROOT / 'docs/hosts.md'
+        self.assertTrue(path.is_file())
+        text = path.read_text()
+        for heading in ('Claude Code', 'Codex CLI', 'Copilot'):
+            with self.subTest(heading=heading):
+                self.assertRegex(text, rf'(?m)^#+ {re.escape(heading)}(?:[ \t]+[^\n]*)?$')
+
+    def test_codex_dispatch_inside_codex(self):
+        text = (ROOT / 'skills/codex-dispatch/SKILL.md').read_text()
+        self.assertIn(PREAMBLE + 'Inside Codex, this skill does not apply: do the work in the current session.\n', text)
+
     def test_json_files_parse(self):
         for path in [*ROOT.glob('.claude-plugin/*.json'), ROOT / 'hooks/hooks.json',
                      *ROOT.glob('templates/*.json')]:
@@ -48,6 +84,14 @@ class RepoTests(unittest.TestCase):
                 self.assertEqual(fields.get('name'), name)
                 self.assertRegex(fields.get('description', ''), r'^".+"$', 'description must be quoted')
                 self.assertEqual(fields.get('disable-model-invocation'), 'true')
+
+    def test_skills_have_codex_visibility_sidecar(self):
+        for name in SKILLS:
+            with self.subTest(skill=name):
+                path = ROOT / 'skills' / name / 'agents' / 'openai.yaml'
+                self.assertTrue(path.is_file(), str(path))
+                self.assertEqual(path.read_text(encoding='utf-8'),
+                                 'policy:\n  allow_implicit_invocation: false\n')
 
     def test_agent_frontmatter(self):
         for path in [*ROOT.glob('agents/*.md'), *ROOT.glob('templates/agents/*.md')]:

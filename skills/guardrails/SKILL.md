@@ -7,6 +7,9 @@ argument-hint: "[propose|safe|auto|yolo]"
 
 # Guardrail hooks, each with an escape hatch
 
+**Plugin root:** `${CLAUDE_PLUGIN_ROOT}`. If that is still a `${...}` placeholder, use the folder that contains `skills/` (this file is `skills/<name>/SKILL.md`), and substitute that path, in quotes, wherever this skill uses `CLAUDE_PLUGIN_ROOT`.
+**Not in Claude Code?** Read `docs/hosts.md` in the plugin root first. Skip steps that only work in Claude Code, and follow its propose-only rule before changing any host configuration.
+
 Stop the most expensive habits automatically: whole-file reads of big files, images landing in the wrong context, and sessions that grow without limit. Each guardrail has a documented override, so an agent with a real need is never blocked.
 
 **Changes:** adds hook scripts and `settings.json` entries, after you approve. Back up `settings.json` first.

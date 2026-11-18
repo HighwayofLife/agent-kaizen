@@ -7,6 +7,9 @@ argument-hint: "[propose|safe|auto|yolo]"
 
 # Code map: a symbol index for agents
 
+**Plugin root:** `${CLAUDE_PLUGIN_ROOT}`. If that is still a `${...}` placeholder, use the folder that contains `skills/` (this file is `skills/<name>/SKILL.md`), and substitute that path, in quotes, wherever this skill uses `CLAUDE_PLUGIN_ROOT`.
+**Not in Claude Code?** Read `docs/hosts.md` in the plugin root first. Skip steps that only work in Claude Code, and follow its propose-only rule before changing any host configuration.
+
 Agents find code with one indexed query that gives exact line ranges, instead of grep → read → grep loops. This is usually the single biggest saving for planners and engineers in a large codebase.
 
 **Changes:** adds a tool under `tools/` with tests, plus an instruction rule, after you approve.

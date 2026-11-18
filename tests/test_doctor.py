@@ -29,6 +29,7 @@ class DoctorTests(unittest.TestCase):
         self.executable('jq', 'echo jq-1.7')
         self.executable('python3', 'echo Python 3.11.0')
         self.env = dict(os.environ, HOME=str(self.home), CLAUDE_CONFIG_DIR=str(self.home / 'claude'),
+                        CODEX_HOME=str(self.home / 'codex'), COPILOT_HOME=str(self.home / 'copilot'),
                         PATH=str(self.bin), XDG_CONFIG_HOME=str(self.home / 'config'),
                         PYTHONDONTWRITEBYTECODE='1')
         self.env.pop('KAIZEN_USAGE_DB', None)
@@ -82,6 +83,8 @@ class DoctorTests(unittest.TestCase):
 
         before = snapshot()
         out = self.doctor()
+        self.assertNotIn('Codex', out)
+        self.assertNotIn('Copilot', out)
         self.assertIn('PASS installed cache matches', out)
         self.assertIn('PASS plugin hook', out)
         self.assertIn('PASS usage database', out)
@@ -90,6 +93,38 @@ class DoctorTests(unittest.TestCase):
         after = snapshot()
         self.assertEqual(before, after)
         self.assertIn('usage:', self.doctor('--help'))
+
+    def test_other_hosts(self):
+        (self.claude / 'plugins/installed_plugins.json').unlink()
+        version = json.loads((self.root / '.claude-plugin/plugin.json').read_text())['version']
+        cache = Path(self.env['CODEX_HOME']) / 'plugins/cache/agent-kaizen-tools/agent-kaizen'
+        (cache / version).mkdir(parents=True)
+        (self.root / 'hooks/hooks.json').unlink()
+        (self.root / 'scripts/pricing.json').unlink()
+        out = self.doctor()
+        self.assertIn('PASS Codex: plugin version ' + version + ' is in the cache', out)
+        self.assertIn('INFO Codex: run /hooks once', out)
+        self.assertNotIn('claude plugin', out)
+        self.assertNotIn('kaizen-link --apply', out)
+        self.assertIn("update the plugin with your host's plugin command", out)
+        (cache / '0.0.1').mkdir()
+        self.assertIn('PASS Codex: plugin version ' + version + ' is in the cache (also cached: 0.0.1)', self.doctor())
+        (cache / version).rmdir()
+        self.assertIn('WARN Codex:', self.doctor())
+        self.assertIn('fix: codex plugin add agent-kaizen@agent-kaizen-tools', self.doctor())
+        (cache / '0.0.1').rmdir()
+        copilot = Path(self.env['COPILOT_HOME']) / 'installed-plugins/agent-kaizen-tools/agent-kaizen'
+        copilot.mkdir(parents=True)
+        out = self.doctor()
+        self.assertIn('WARN Copilot: plugin folder found but its manifest is missing or unreadable', out)
+        self.assertIn('fix: copilot plugin install agent-kaizen@agent-kaizen-tools', out)
+        self.assertNotIn('claude plugin', out)
+        self.assertNotIn('kaizen-link --apply', out)
+        (copilot / '.claude-plugin').mkdir()
+        (copilot / '.claude-plugin/plugin.json').write_text(json.dumps({'version': version}))
+        self.assertIn('PASS Copilot: plugin installed', self.doctor())
+        (copilot / '.claude-plugin/plugin.json').write_text(json.dumps({'version': '0.0.1'}))
+        self.assertIn('fix: copilot plugin install agent-kaizen@agent-kaizen-tools', self.doctor())
 
     def test_empty_and_live_wal(self):
         wal = Path(str(self.db) + '-wal')

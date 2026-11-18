@@ -7,6 +7,9 @@ argument-hint: "[propose|safe|auto|yolo]"
 
 # Slim the always-loaded instructions
 
+**Plugin root:** `${CLAUDE_PLUGIN_ROOT}`. If that is still a `${...}` placeholder, use the folder that contains `skills/` (this file is `skills/<name>/SKILL.md`), and substitute that path, in quotes, wherever this skill uses `CLAUDE_PLUGIN_ROOT`.
+**Not in Claude Code?** Read `docs/hosts.md` in the plugin root first. Skip steps that only work in Claude Code, and follow its propose-only rule before changing any host configuration.
+
 `CLAUDE.md`, `AGENTS.md` and everything they import are sent with every turn of every session. Shrinking them saves tokens on every turn, so even a small cut adds up across a whole session.
 
 **Changes:** edits instruction files, after you approve.

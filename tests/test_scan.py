@@ -34,7 +34,7 @@ class ScanTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
         self.env = dict(os.environ, HOME=str(self.root), CLAUDE_CONFIG_DIR=str(self.root / 'claude'),
-                        CODEX_HOME=str(self.root / 'codex'), XDG_CONFIG_HOME=str(self.root / 'config'),
+                        CODEX_HOME=str(self.root / 'codex'), COPILOT_HOME=str(self.root / 'copilot'), XDG_CONFIG_HOME=str(self.root / 'config'),
                         TMPDIR=str(self.root), PYTHONDONTWRITEBYTECODE='1')
 
     def run_scan(self, *args):
@@ -64,6 +64,17 @@ class ScanTests(unittest.TestCase):
             if line.startswith(('PASS ', 'WARN ', 'SKIP ')):
                 skill = line.rsplit('/agent-kaizen:', 1)[1]
                 self.assertTrue((ROOT / 'skills' / skill / 'SKILL.md').is_file(), skill)
+
+    def test_copilot_notice_and_demo_isolation(self):
+        normal = self.run_scan()
+        self.assertNotIn('Copilot', normal.stdout + normal.stderr)
+        (Path(self.env['COPILOT_HOME']) / 'session-state').mkdir(parents=True)
+        result = self.run_scan()
+        self.assertIn('Audit note:', result.stderr)
+        self.assertIn('Copilot sessions found but not measured', result.stderr)
+        self.assertIn('Codex (Copilot sessions are not measured yet) and scan again.', result.stdout)
+        demo = self.run_scan('--demo')
+        self.assertNotIn('Copilot', demo.stdout + demo.stderr)
 
     def test_real_fixture_does_not_change_home_or_config(self):
         subprocess.run([str(FIXTURE), '--output', self.env['CLAUDE_CONFIG_DIR']],

@@ -6,6 +6,36 @@ trap '' PIPE
 # Reads global enabled and global or project schedule from agent-kaizen config files.
 emitted=0
 trap '[ "$emitted" = 1 ] || printf "{}\n"' EXIT
+# --- host helper ---
+case ${KAIZEN_HOST:-} in
+    claude|codex|copilot) kaizen_host=$KAIZEN_HOST ;;
+    *)
+        if [[ -n ${COPILOT_PLUGIN_ROOT:-} ]]; then
+            kaizen_host=copilot
+        elif [[ -n ${PLUGIN_ROOT:-} ]]; then
+            kaizen_host=codex
+        else
+            kaizen_host=claude
+        fi
+        ;;
+esac
+kaizen_skill() {
+    if [[ $kaizen_host == codex ]]; then
+        printf '$agent-kaizen:%s' "$1"
+    else
+        printf '/agent-kaizen:%s' "$1"
+    fi
+}
+kaizen_context() {
+    if [[ $kaizen_host == copilot ]]; then
+        jq -n --arg c "$2" '{additionalContext:$c}'
+    elif [[ $1 == SessionStart ]]; then
+        jq -n --arg c "$2" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}'
+    else
+        jq -n --arg event "$1" --arg message "$2" '{hookSpecificOutput:{hookEventName:$event,additionalContext:$message}}'
+    fi
+}
+# --- end host helper ---
 command -v jq >/dev/null 2>&1 || exit 0
 home=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 dir=${AUDIT_DIR:-$home/audits}
@@ -75,7 +105,7 @@ if [ -n "$latest" ] && [ ! -e "${latest%.md}.reviewed" ]; then
         audit_marker=$marker
         extra=""
         [ -n "$proposal" ] && [ "$proposal" -nt "$latest" ] && extra=" A propose-only review is ready too: $proposal."
-        audit_msg="An unreviewed usage audit exists: $latest.$extra When there is a pause, run /agent-kaizen:review (read the headline and flagged sections, not the whole file), propose changes to the user, then touch ${latest%.md}.reviewed."
+        audit_msg="An unreviewed usage audit exists: $latest.$extra When there is a pause, run $(kaizen_skill review) (read the headline and flagged sections, not the whole file), propose changes to the user, then touch ${latest%.md}.reviewed."
     fi
 fi
 
@@ -120,7 +150,7 @@ if { [ -n "$root" ] || [ -n "$key" ]; } && command -v python3 >/dev/null 2>&1 &&
             output=$(printf '%s\n' "$output" | head -n 12)
             experiment_msg="Experiments need attention in this project (docs/kaizen/LEDGER.md):
 $output
-When there is a pause, run /agent-kaizen:review."
+When there is a pause, run $(kaizen_skill review)."
         fi
     fi
 fi
@@ -159,7 +189,7 @@ if [ -n "$regression_msg" ]; then
 }$regression_msg"
 fi
 [ -n "$msg" ] || exit 0
-if ! out=$(jq -n --arg c "$msg" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}') ||
+if ! out=$(kaizen_context SessionStart "$msg") ||
     [ -z "$out" ]; then
     [ -n "$audit_marker" ] && rm -f "$audit_marker"
     [ -n "$experiment_marker" ] && rm -f "$experiment_marker"

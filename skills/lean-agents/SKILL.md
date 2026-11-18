@@ -7,6 +7,9 @@ argument-hint: "[propose|safe|auto|yolo]"
 
 # Lean subagents and model routing
 
+**Plugin root:** `${CLAUDE_PLUGIN_ROOT}`. If that is still a `${...}` placeholder, use the folder that contains `skills/` (this file is `skills/<name>/SKILL.md`), and substitute that path, in quotes, wherever this skill uses `CLAUDE_PLUGIN_ROOT`.
+**Not in Claude Code?** Read `docs/hosts.md` in the plugin root first. Skip steps that only work in Claude Code, and follow its propose-only rule before changing any host configuration.
+
 Each subagent loads only the context its job needs and runs on the cheapest model that does that job well. The main session routes work to it on purpose, not by habit.
 
 **Changes:** edits agent definitions, settings and hooks, after you approve. Back up `<Claude config dir>/agents/` and `<Claude config dir>/settings.json` first.

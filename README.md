@@ -66,6 +66,7 @@ Requires `jq` and Python 3.9+.
 |---|---|---|
 | Claude Code | 2.1.271 (for `omitClaudeMd` subagents) | 2.1.314 |
 | Codex CLI (optional) | — | 0.163.0 |
+| Codex CLI plugin install (optional) | — | 0.167.0 |
 | Python | 3.9 | 3.9 and 3.13 (CI, Linux and macOS) |
 
 Newer versions haven't been tested yet. Setting names and transcript formats change between releases, so if the audit reports zero sessions or a skill's config step fails, check `/agent-kaizen:whats-new` first.
@@ -93,6 +94,43 @@ Or install it straight from GitHub, without a clone:
 ```
 
 To update: `git pull` in the clone (or `/plugin marketplace update` for a GitHub install), then `/reload-plugins` or start a new session. Releases bump `version` in `plugin.json` (see [CHANGELOG.md](CHANGELOG.md)); a GitHub install only picks up a new version. If you installed OS jobs, re-run `install-schedule --apply` after updating to refresh the scheduled scripts. See the [0.4.0 migration note](docs/scheduling.md#03x-migration).
+
+### Other hosts: Codex CLI, Copilot CLI and VS Code
+
+Claude Code is the main target. Codex CLI works today. The Copilot runtime is experimental. This README writes skills as `/agent-kaizen:<name>`; on Codex, type `$` instead of `/`, for example `$agent-kaizen:scan`.
+
+**Codex CLI** (tested on 0.167.0; installing needs no sign-in):
+
+```bash
+codex plugin marketplace add HighwayofLife/agent-kaizen
+codex plugin add agent-kaizen@agent-kaizen-tools
+```
+
+Start a new Codex session, run `/hooks` once and trust the Agent Kaizen hooks. Hooks do nothing until you trust them, and you must trust them again after an update that changes a hook script. Then run `$agent-kaizen:audit` to measure Codex usage.
+
+**GitHub Copilot CLI** (experimental, not yet checked in a live session):
+
+```bash
+copilot plugin marketplace add HighwayofLife/agent-kaizen
+copilot plugin install agent-kaizen@agent-kaizen-tools
+```
+
+Then try `/agent-kaizen:scan` (experimental: not yet checked).
+
+**VS Code with the GitHub Copilot harness** (experimental, not yet checked): set `chat.plugins.enabled`, choose Copilot as the session target, run **Chat: Install Plugin from Source** and enter `https://github.com/HighwayofLife/agent-kaizen`. A plugin you installed with Copilot CLI should also be picked up (not verified).
+
+| Host | Install | Skills | Session notice | Agent | Usage measured |
+|---|---|---|---|---|---|
+| Claude Code | Yes | Yes | Yes | Yes | Yes |
+| Codex CLI | Yes | Yes | Yes, after you trust the hooks in `/hooks` (not yet checked in a live session) | No: the `cycle` skill does the same job | Yes, with `audit` |
+| Copilot CLI | Experimental | Experimental | Experimental | Not verified | Not yet |
+| VS Code, Copilot harness | Experimental | Experimental | Experimental | Not verified | Not yet |
+
+The Codex IDE extension and the GitHub Copilot cloud agent are not supported: they do not run installed plugins. Copilot support is experimental, and Copilot session usage is not measured yet; `scan` and `audit` say so.
+
+Agent Kaizen keeps its files in `~/.claude/` (or `$CLAUDE_CONFIG_DIR`) on every host, so one ledger and one set of audits covers all hosts. If you only use Codex or Copilot, you will get a `~/.claude/` folder that holds only Agent Kaizen files.
+
+On Codex and Copilot, changes to that host's own configuration files are proposals only, in every autonomy mode. Details: [docs/hosts.md](docs/hosts.md).
 
 ### 2. Scan recent usage
 
@@ -150,6 +188,7 @@ Running `install-schedule --apply` again without `--review` removes an installed
 1. `scripts/install-schedule --remove` removes the audit and review jobs.
 2. `scripts/kaizen-link --unlink` removes the linked scripts and hooks from `<Claude config dir>/bin` (add `--restore-replaced` if you used `--replace`).
 3. Remove the plugin: `claude plugin uninstall agent-kaizen@agent-kaizen-tools`.
+4. On Codex CLI: `codex plugin remove agent-kaizen@agent-kaizen-tools`. On Copilot (experimental), use the plugin uninstall command listed by `copilot plugin --help`.
 
 Project files (`docs/kaizen/`), reports in `<Claude config dir>/audits/` and backups (`KAIZEN_BACKUP_DIR`, or `kaizen-backups/` under the Claude config dir) stay until you delete them.
 
