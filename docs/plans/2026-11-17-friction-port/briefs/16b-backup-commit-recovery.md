@@ -43,3 +43,13 @@ Read `git show wt/p15:scripts/kaizen-backup` at `checked_root`, `tree_from_files
 ## Report
 
 Report changed files and line counts, exact checks and outcomes, known uncertainty and any blocked verification. Label measurements with baseline/conditions. Redact paths and identifiers from shared output. Leave plugin version and release CHANGELOG to P27. Do not commit or push.
+
+## Delta from P16 security review (fix these first, in `scripts/kaizen-backup`)
+
+P16 landed with CLI ref writes still unreachable; these findings are P16b's to fix before ref writes are enabled. Each gets a regression test in `tests/test_backup_commit.py`.
+
+1. Bounded object verification (~line 488): Git object verification buffers the whole decompressed object before hashing; an oversized commit or tree can exhaust memory, and the private tree builder has the same exposure for unchanged blobs. Stream and hash in chunks, and refuse objects over a stated size cap (a named constant) with a controlled refusal.
+2. Temp probe inside the checkout (~line 481): `tempfile.gettempdir()` writes and deletes a probe file before the code checks whether the directory is inside the checkout, so a checkout-local `TMPDIR` writes inside the worktree. Check the candidate directory against the checkout (canonical paths) **before** any write, and fall back to the backup store's own private scratch directory instead of `gettempdir()` where possible.
+3. Symlink loop crash (~line 913): `Path.resolve()` raises `RuntimeError` on symlink loops in Python 3.9–3.12, so a backed-up path replaced by a loop after `finish` crashes the CLI. Catch it (and `OSError`) and return a controlled refusal.
+
+Settled stance (do not reopen): clean_start is advisory; same-UID forgery and a user-writable git swapped between check and exec are accepted residuals; caller environment trusted. The security review will confirm these three and P16b's own scope.
