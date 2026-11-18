@@ -2,6 +2,7 @@ import hashlib
 import os
 from pathlib import Path
 import subprocess
+import sys
 import tempfile
 import unittest
 
@@ -11,9 +12,20 @@ FIXTURE = ROOT / 'scripts' / 'kaizen-demo-fixtures'
 
 
 def snapshot(root):
+    library = root / 'Library'
+    caches = library / 'Caches'
+    def included(p):
+        if sys.platform != 'darwin':
+            return True
+        if p == caches or caches in p.parents:
+            return False
+        if p == library and p.is_dir() and set(p.iterdir()) == {caches} and caches.is_dir():
+            return False
+        return True
+
     return {str(p.relative_to(root)): (p.stat().st_mode, p.stat().st_mtime_ns,
             hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else None)
-            for p in root.rglob('*')}
+            for p in root.rglob('*') if included(p)}
 
 
 class ScanTests(unittest.TestCase):
@@ -23,7 +35,7 @@ class ScanTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.env = dict(os.environ, HOME=str(self.root), CLAUDE_CONFIG_DIR=str(self.root / 'claude'),
                         CODEX_HOME=str(self.root / 'codex'), XDG_CONFIG_HOME=str(self.root / 'config'),
-                        TMPDIR=str(self.root))
+                        TMPDIR=str(self.root), PYTHONDONTWRITEBYTECODE='1')
 
     def run_scan(self, *args):
         return subprocess.run([str(SCAN), *args], env=self.env, text=True, capture_output=True, check=True)

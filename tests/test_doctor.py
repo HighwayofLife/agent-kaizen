@@ -29,7 +29,8 @@ class DoctorTests(unittest.TestCase):
         self.executable('jq', 'echo jq-1.7')
         self.executable('python3', 'echo Python 3.11.0')
         self.env = dict(os.environ, HOME=str(self.home), CLAUDE_CONFIG_DIR=str(self.home / 'claude'),
-                        PATH=str(self.bin), XDG_CONFIG_HOME=str(self.home / 'config'))
+                        PATH=str(self.bin), XDG_CONFIG_HOME=str(self.home / 'config'),
+                        PYTHONDONTWRITEBYTECODE='1')
         self.env.pop('KAIZEN_USAGE_DB', None)
         self.claude = Path(self.env['CLAUDE_CONFIG_DIR'])
         self.claude.mkdir()
@@ -74,14 +75,19 @@ class DoctorTests(unittest.TestCase):
         return result.stdout
 
     def test_healthy_and_read_only(self):
-        before = {p: (p.stat().st_mtime_ns, p.stat().st_size) for p in self.home.rglob('*') if p.is_file()}
+        def snapshot():
+            caches = self.home / 'Library' / 'Caches'
+            return {p: (p.stat().st_mtime_ns, p.stat().st_size) for p in self.home.rglob('*')
+                    if p.is_file() and not (sys.platform == 'darwin' and caches in p.parents)}
+
+        before = snapshot()
         out = self.doctor()
         self.assertIn('PASS installed cache matches', out)
         self.assertIn('PASS plugin hook', out)
         self.assertIn('PASS usage database', out)
         self.assertIn('PASS latest audit format canary clean', out)
         self.assertIn('WARN optional scheduler', out)
-        after = {p: (p.stat().st_mtime_ns, p.stat().st_size) for p in self.home.rglob('*') if p.is_file()}
+        after = snapshot()
         self.assertEqual(before, after)
         self.assertIn('usage:', self.doctor('--help'))
 
