@@ -1,3 +1,4 @@
+import hashlib
 import json
 import re
 import unittest
@@ -16,12 +17,44 @@ KEYS = {"free_disk_bytes", "free_disk_pct", "cloud_roots", "prunable_worktrees",
         "stale_worktrees", "inotify_max_user_watches", "wsl_cross_fs"}
 
 
+# SHA-256 of canonical parsed wt/p02 values. The archive's apply and
+# undo_apply operations are deliberately omitted: this catalogue is data-only.
+ARCHIVE_HASHES = {
+    "v": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b",
+    "source": "5966308d4cdeb3d1609dab396bbfe4bf2d09366691c1cc7fbebdda4d77fbc897",
+    "output_dir_names": "ed98eb0cb87fe0605dc5328ce413d74e8dab212e48a3bfe5a39abe6b7e3431ab",
+    "cloud_sync_names": "6841305d27a9c35165f5cad5a07a35c0c1af802f4a89ea382e9123d86960b270",
+    "processes": "1672429302d11bb0fefc1482262ce8f69d6188948acc1699bef616aef26d5099",
+    "actions": "80ccc1581c7a5f7a5e4ac023ae31b8268d61adf9371c3935c12cd7120ca01b94",
+}
+
+
+def unique_object(pairs):
+    result = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate key: " + key)
+        result[key] = value
+    return result
+
+
+def validate_version(value):
+    if type(value) is not int or value != 1:
+        raise ValueError("unknown catalogue version")
+
+
+def validate_template(value):
+    # Angle brackets are reserved for the single supported substitution.
+    if "<" in value.replace("<path>", "") or ">" in value.replace("<path>", ""):
+        raise ValueError("invalid template")
+
+
 class CatalogTest(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.raw = CATALOG.read_text(encoding="utf-8")
         with CATALOG.open(encoding="utf-8") as file:
-            cls.catalog = json.load(file)
+            cls.catalog = json.load(file, object_pairs_hook=unique_object)
 
     def assert_os(self, values):
         self.assertIsInstance(values, list)
@@ -29,13 +62,31 @@ class CatalogTest(unittest.TestCase):
         self.assertTrue(set(values) <= OS)
 
     def assert_placeholders(self, value):
-        for placeholder in re.findall(r"<[^<>]+>", value):
-            self.assertEqual(placeholder, "<path>")
+        validate_template(value)
+
+    def test_archive_values(self):
+        self.assertEqual(set(self.catalog), set(ARCHIVE_HASHES))
+        for key, expected in ARCHIVE_HASHES.items():
+            with self.subTest(field=key):
+                encoded = json.dumps(self.catalog[key], sort_keys=True, ensure_ascii=True,
+                                     separators=(",", ":")).encode("utf-8")
+                self.assertEqual(hashlib.sha256(encoded).hexdigest(), expected)
+
+    def test_invalid_inputs(self):
+        for raw in ('{"v": 1, "v": 1}', '{"nested": {"x": 1, "x": 2}}'):
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                json.loads(raw, object_pairs_hook=unique_object)
+        for version in (0, 2, "1", True, None):
+            with self.subTest(version=version), self.assertRaises(ValueError):
+                validate_version(version)
+        for template in ("<other>", "<path", "path>", "<<path>>", "<>"):
+            with self.subTest(template=template), self.assertRaises(ValueError):
+                validate_template(template)
+        validate_template("<path>/.nomedia")
 
     def test_top_level(self):
         c = self.catalog
-        self.assertEqual(c["v"], 1)
-        self.assertIsInstance(c["v"], int)
+        validate_version(c["v"])
         self.assertIsInstance(c["source"], dict)
         self.assertRegex(c["source"]["checked"], r"^\d{4}-\d{2}-\d{2}$")
         self.assertIsInstance(c["source"]["note"], str)
