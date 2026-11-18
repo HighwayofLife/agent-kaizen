@@ -15,6 +15,16 @@ AUDIT = runpy.run_path(str(SCRIPTS / 'token-audit'))
 
 
 class UsageTests(StubCase):
+    def test_cwd_cache_is_bounded_for_long_and_many_paths(self):
+        cache = {}
+        for i in range(1200):
+            AUDIT['cwd_matches']('/tmp/' + str(i) + 'x' * 5000, ('/tmp',), cache)
+        for i in range(1200):
+            AUDIT['cwd_matches']('/tmp/' + str(i), ('/tmp',), cache)
+        self.assertLessEqual(len(cache), 1024)
+        self.assertTrue(all(len(key) <= 4096 and (value is None or len(value) <= 4096)
+                            for key, value in cache.items()))
+
     def fixture(self):
         now = datetime.now(timezone.utc).isoformat()
         project = self.home / '.claude/projects/example'

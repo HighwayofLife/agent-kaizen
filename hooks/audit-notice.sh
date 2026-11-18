@@ -190,7 +190,8 @@ if [ -n "$root" ] && command -v python3 >/dev/null 2>&1 && [ -f "$plugin_root/sc
     if [ "$value" != off ]; then
         # The store validates ownership, links, size, records and the canonical project.
         result=$(python3 - "$plugin_root/scripts/kaizen-scheduled" "$dir" "$root" <<'PYCODE' 2>/dev/null
-import hashlib, runpy, sys
+import hashlib, json, runpy, sys
+from pathlib import Path
 try:
     runner = runpy.run_path(sys.argv[1])
     host = runpy.run_path(str(runner['HERE'] / 'kaizen_friction_actions.py'))['HostActions']
@@ -198,6 +199,12 @@ try:
     opened = [row for row in rows if row['status'] == 'open']
     if opened:
         project = opened[0]['canonical_project']
+        try:
+            settings = json.loads((Path(project) / 'docs/kaizen/config.json').read_text())
+            if any(settings.get(name) == 'off' for name in ('friction', 'hostActions')):
+                sys.exit(0)
+        except (OSError, ValueError, AttributeError):
+            pass
         print(len(opened), hashlib.sha256(project.encode('utf-8', 'surrogateescape')).hexdigest())
 except (OSError, ValueError, RuntimeError, KeyError, UnicodeError):
     pass
@@ -208,7 +215,13 @@ PYCODE
             marker="$dir/host-actions-$scope_hash.noticed-$today"
             if (umask 077; set -o noclobber; : > "$marker") 2>/dev/null; then
                 actions_marker=$marker
-                actions_msg="$count open host action(s): run kaizen-scheduled actions list --for ."
+                printf -v script_arg '%q' "$plugin_root/scripts/kaizen-scheduled"
+                if [ -n "${AUDIT_DIR:-}" ]; then
+                    printf -v dir_arg '%q' "$dir"
+                    actions_msg="$count open host action(s): run python3 -c 'import runpy,sys;r=runpy.run_path(sys.argv.pop(1));d=sys.argv.pop(1);r[\"main\"].__globals__[\"audits_dir\"]=lambda:r[\"Path\"](d);r[\"main\"]()' $script_arg $dir_arg actions list --for ."
+                else
+                    actions_msg="$count open host action(s): run python3 $script_arg actions list --for ."
+                fi
             fi
         fi
     fi
