@@ -241,6 +241,8 @@ From P24's Sol high security review (2026-11-18). These are fail-closed while S3
 - G6 (S3/S7) `scripts/kaizen-scheduled` lets an older pending action block acknowledgement of every later publication for the project. Scope the acknowledgement block to the pending action's own generation.
 - G7 (S3/S7) `scripts/kaizen-scheduled` import checks only that the version allowlist is nonempty, while launch checks the installed version. An unsupported upgrade can leave marker requests pending forever. Use the same installed-version check at import.
 
+- G8 (S3/S7) `scripts/kaizen-scheduled` import aborts on an unknown mutation budget before intent validation, so valid suggestions and proposal-only downgrades in the batch are lost. Downgrade per action instead of aborting.
+
 ## P27 docs and release
 
 Assemble README, command and scheduling docs, CI checks and the 0.13.0 CHANGELOG/version. Preserve the 0.12.0 host matrix. Keep the release candidate local until the real-input gate accepts all advertised capabilities. P27 owns a follow-up claims pass whenever P28 blocks a conditional capability. Verify refusal and confirm downgraded docs, then rerun P28 for the affected checks. [Release brief](briefs/27-release.md)
