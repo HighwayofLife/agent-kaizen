@@ -293,6 +293,26 @@ class WorktreePruneTests(unittest.TestCase):
         self.age()
         self.refused('alternate object directory is inside the removal scope')
 
+    def test_alternates_entries_fail_closed(self):
+        alternate_file = self.common / 'objects/info/alternates'
+        external = self.root / 'external-objects'
+        external.mkdir()
+        checkout_objects = self.target
+
+        for suffix in (b':' + os.fsencode(self.admin / 'objects'), b'garbage'):
+            with self.subTest(suffix=suffix):
+                alternate_file.write_bytes(b'"' + os.fsencode(external) + b'"' + suffix + b'\n')
+                self.refused('cannot safely resolve Git alternates')
+        for entry in (b'"unterminated', b'"bad\\q"', b'"bad\\000"', b'bad\0path'):
+            with self.subTest(entry=entry):
+                alternate_file.write_bytes(entry + b'\n')
+                self.refused('cannot safely resolve Git alternates')
+
+        alternate_file.write_bytes(os.fsencode(external) + b':' + os.fsencode(checkout_objects) + b'\n')
+        self.refused('alternate object directory is inside the removal scope')
+        alternate_file.write_bytes(os.fsencode(external) + b'\n')
+        self.refused('eligible worktree')
+
     def test_index_extensions_refuse_private_or_unknown_data(self):
         index = self.admin / 'index'
         for version in (2, 4):
