@@ -116,10 +116,13 @@ class DoctorTests(unittest.TestCase):
         copilot = Path(self.env['COPILOT_HOME']) / 'installed-plugins/agent-kaizen-tools/agent-kaizen'
         copilot.mkdir(parents=True)
         out = self.doctor()
-        self.assertIn('PASS Copilot: plugin installed', out)
+        self.assertIn('WARN Copilot: plugin folder found but its manifest is missing or unreadable', out)
+        self.assertIn('fix: copilot plugin install agent-kaizen@agent-kaizen-tools', out)
         self.assertNotIn('claude plugin', out)
         self.assertNotIn('kaizen-link --apply', out)
         (copilot / '.claude-plugin').mkdir()
+        (copilot / '.claude-plugin/plugin.json').write_text(json.dumps({'version': version}))
+        self.assertIn('PASS Copilot: plugin installed', self.doctor())
         (copilot / '.claude-plugin/plugin.json').write_text(json.dumps({'version': '0.0.1'}))
         self.assertIn('fix: copilot plugin install agent-kaizen@agent-kaizen-tools', self.doctor())
 

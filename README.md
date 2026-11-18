@@ -106,7 +106,7 @@ codex plugin marketplace add HighwayofLife/agent-kaizen
 codex plugin add agent-kaizen@agent-kaizen-tools
 ```
 
-Start a new Codex session, run `/hooks` once and trust the Agent Kaizen hooks. Hooks do nothing until you trust them, and you must trust them again after an update that changes a hook script. Then run `$agent-kaizen:scan`.
+Start a new Codex session, run `/hooks` once and trust the Agent Kaizen hooks. Hooks do nothing until you trust them, and you must trust them again after an update that changes a hook script. Then run `$agent-kaizen:audit` to measure Codex usage.
 
 **GitHub Copilot CLI** (experimental, not yet checked in a live session):
 
@@ -122,7 +122,7 @@ Then try `/agent-kaizen:scan` (experimental: not yet checked).
 | Host | Install | Skills | Session notice | Agent | Usage measured |
 |---|---|---|---|---|---|
 | Claude Code | Yes | Yes | Yes | Yes | Yes |
-| Codex CLI | Yes | Yes | Yes, after you trust the hooks in `/hooks` (not yet checked in a live session) | No: the `cycle` skill does the same job | Yes |
+| Codex CLI | Yes | Yes | Yes, after you trust the hooks in `/hooks` (not yet checked in a live session) | No: the `cycle` skill does the same job | Yes, with `audit` |
 | Copilot CLI | Experimental | Experimental | Experimental | Not verified | Not yet |
 | VS Code, Copilot harness | Experimental | Experimental | Experimental | Not verified | Not yet |
 

@@ -14,7 +14,7 @@ CODEX = r'''#!/usr/bin/env python3
 import json, os, pathlib, sys
 args = sys.argv[1:]
 with open(os.environ['RECORD'], 'a') as f:
-    f.write(json.dumps({'args': args, 'cwd': os.getcwd(), 'env': dict(os.environ)}) + '\n')
+    f.write(json.dumps({'args': args, 'cwd': os.getcwd(), 'env': {k: os.environ[k] for k in ('HOME', 'CODEX_HOME', 'COPILOT_HOME', 'TMPDIR', 'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME') if k in os.environ}}) + '\n')
 if args == ['--version']:
     print('codex-cli 0.0.0-stub')
 elif args[:3] == ['plugin', 'marketplace', 'add']:
@@ -48,6 +48,8 @@ COPILOT = r'''#!/usr/bin/env python3
 import json, os, pathlib, sys
 with open(os.environ['RECORD'], 'a') as f:
     f.write(json.dumps(sys.argv[1:]) + '\n')
+if os.environ.get('LOGIN_PATH'):
+    print('/tmp/login/plugin')
 if os.environ.get('SIGNIN'):
     print('Please sign in'); sys.exit(1)
 if os.environ.get('MARKET_FAIL'):
@@ -133,6 +135,10 @@ class HostProbeTest(unittest.TestCase):
         run = self.run_probe('--host', 'copilot')
         self.assertEqual(run.returncode, 0, run.stdout)
         self.assertEqual(run.stdout.count('PASS'), 3)
+        run = self.run_probe('--host', 'copilot', LOGIN_PATH='1')
+        self.assertEqual(run.returncode, 0, run.stdout)
+        self.assertNotIn('needs sign-in', run.stdout)
+        self.assertEqual(run.stdout.count('PASS'), 3)
 
     def test_failures_and_worktree(self):
         self.stub('codex', CODEX)
@@ -152,6 +158,15 @@ class HostProbeTest(unittest.TestCase):
         run = self.run_probe('--host', 'codex', HOOK_MODE='one')
         self.assertEqual(run.returncode, 1)
         self.assertIn('FAIL codex hooks discovered:', run.stdout)
+        tracked = self.source / 'd'
+        tracked.mkdir()
+        (tracked / 'f.txt').write_text('tracked')
+        subprocess.run(['git', '-C', str(self.source), 'add', 'd/f.txt'], check=True)
+        shutil.rmtree(tracked)
+        outside_dir = self.scratch / 'outside-dir'
+        outside_dir.mkdir()
+        (outside_dir / 'f.txt').write_text('private')
+        tracked.symlink_to(outside_dir, target_is_directory=True)
         (self.source / 'new-file').write_text('new')
         outside = self.scratch / 'outside'
         outside.write_text('private')
@@ -160,6 +175,7 @@ class HostProbeTest(unittest.TestCase):
         exported = json.loads(self.export_record.read_text())
         self.assertIn('new-file', exported)
         self.assertNotIn('external-link', exported)
+        self.assertNotIn('d/f.txt', exported)
 
 
 if __name__ == '__main__':
