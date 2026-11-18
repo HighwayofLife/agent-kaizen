@@ -105,7 +105,6 @@ CODEX_OUTPUT_TYPES = frozenset(kind + b"_output" for kind in CODEX_CALL_TYPES)
 CODEX_FIELD = re.compile(rb'\s*(?:[{,])\s*"([a-z_]+)"\s*:\s*')
 CODEX_STRING = re.compile(rb'"(?:[^"\\]|\\.)*"')
 CODEX_SCALAR = re.compile(CODEX_STRING.pattern + rb'|null|true|false|-?[0-9.]+')
-CODEX_OUTPUT_LIMIT = 16 * 1024
 CODEX_EVIDENCE_LIMIT = 400
 CODEX_WALL = re.compile(r"^Wall time:? ([0-9]+(?:\.[0-9]+)?) seconds\b", re.M)
 CODEX_OUTPUT_START = re.compile(r"^(?:Original output|Final output|Output|Stdout):", re.M | re.I)
@@ -156,7 +155,7 @@ def invalid_json_constant(value):
 def codex_call_row(line, kind, fields, wrapped):
     ident = None
     try:
-        limit = CODEX_OUTPUT_LIMIT if kind in CODEX_OUTPUT_TYPES else 4096
+        limit = LINE_LIMIT if kind in CODEX_OUTPUT_TYPES else 4096
         if len(line) <= limit:
             record = json.loads(line, parse_constant=invalid_json_constant)
             call = record.get("payload") if wrapped and isinstance(record, dict) else record
@@ -215,7 +214,8 @@ def codex_output(call):
     failed = (type(code) is int and code != 0 or exit_match is not None and int(exit_match[1]) != 0
               or call.get("status") in ("error", "failed") or call.get("is_error") is True)
     lock = failed and (any(CODEX_LOCK.search(codex_evidence(call.get(field))) for field in ("stderr", "error"))
-                       or bool(error and CODEX_LOCK.search(error[1])))
+                       or bool(error and CODEX_LOCK.search(error[1]))
+                       or bool(marker and CODEX_LOCK.search(evidence[marker.end():])))
     return dict(seconds=seconds, timeout=bool(CODEX_TIMEOUT.search(evidence)),
                 lock=lock, inotify=bool(CODEX_INOTIFY.search(evidence)))
 

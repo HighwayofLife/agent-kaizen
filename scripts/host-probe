@@ -227,7 +227,15 @@ class Probe:
         for tree in trees[1:]:
             root = tree['path']
             status = self.git(root, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching')
-            if status is not None:
+            index = self.git(root, 'ls-files', '-v', '-z')
+            config = self.git(root, 'config', '--null', '--list')
+            modules = self.git(root, 'config', '--null', '--file', '.gitmodules', '--list') if (Path(root) / '.gitmodules').exists() else ''
+            settings = (config or '') + (modules or '')
+            hidden = index is not None and any(entry and (entry[0].islower() or entry[0] == 'S')
+                                               for entry in index.split('\0'))
+            ignored = any(re.match(r'^(?:diff\.ignoresubmodules|submodule\..*\.ignore)\n', entry, re.I)
+                          for entry in settings.split('\0'))
+            if status is not None and index is not None and config is not None and modules is not None and not hidden and not ignored:
                 tree['clean'] = not bool(status)
             head, primary = tree['head'], trees[0]['head']
             if (head and primary and re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', head)
