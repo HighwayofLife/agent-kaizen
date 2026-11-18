@@ -2847,8 +2847,6 @@ def reconcile_scheduled(audits, project, output, receipt, *, acknowledge=True, r
         candidate = receipt["allowed"].get(ident, {})
         if intent not in candidate.get("intents", ()):
             raise ValueError("unavailable host-action ID or intent for this project")
-        if candidate["catalog_id"] != "linux-localsearch":
-            raise ValueError("requested action is proposal-only")
         if scheduled_action_refusal(candidate["catalog_id"]):
             requests[ident] = "suggest"
             downgraded = True

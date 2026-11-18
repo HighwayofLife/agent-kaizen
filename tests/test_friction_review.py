@@ -52,6 +52,34 @@ class ScheduledFrictionTests(PreparationTests):
         self.assertFalse((target / ".nomedia").exists())
         self.assertIsNone(self.scheduled("auto"))
 
+    def test_mixed_batch_downgrades_proposal_only_and_closed_marker_apply(self):
+        target = self.project / "build"
+        target.mkdir()
+        self.probe["findings"] = [
+            dict(id="low-disk", catalog_id="low-disk", subject="project-volume", evidence=dict(free_disk_bytes=1)),
+            dict(id="indexed-output", catalog_id="linux-localsearch", subject=str(target), evidence=dict(size_bytes=1)),
+            dict(id="inotify", catalog_id="inotify-limit", subject="inotify", evidence=dict(watches=1, tracked_files=1)),
+        ]
+        self.probe["regenerable_dirs"] = [dict(path=str(target), size_bytes=1)]
+        self.write_evidence()
+        _, receipt = self.scheduled("auto")
+        ids = {row["catalog_id"]: ident for ident, row in receipt["allowed"].items()}
+        actions = [dict(id=ids[catalog], intent=intent) for catalog, intent in (
+            ("low-disk", "apply"), ("linux-localsearch", "apply"), ("inotify-limit", "suggest"))]
+        output = self.write(self.obj.folder / "review.md", 'Review\n<!-- kaizen-host-actions ' + json.dumps(
+            dict(v=1, actions=actions)) + ' -->\n')
+
+        self.assertTrue(self.runner["reconcile_scheduled"](
+            self.config / "audits", self.obj, output, receipt, authorize=self.fail))
+        self.assertEqual(output.read_text(), 'Review\n')
+        store = json.loads((self.config / "audits/host-actions.json").read_text())
+        self.assertEqual(store["receipts"][str(self.project)]["scheduled:" + receipt["generation"]],
+                         {ident: "terminal" for ident in ids.values()})
+        self.assertEqual({ident: row["status"] for ident, row in store["actions"].items()},
+                         {ident: "open" for ident in ids.values()})
+        self.assertFalse((target / ".nomedia").exists())
+        self.assertIsNone(self.scheduled("auto"))
+
     def test_apply_stays_pending_and_does_not_acknowledge(self):
         _, _, output, receipt = self.marker_request()
         reconcile = self.runner["reconcile_scheduled"]
