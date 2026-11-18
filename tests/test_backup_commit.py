@@ -1,11 +1,13 @@
 """Clean Git capture and ordinary manifest handoff for local backup commits."""
 import datetime
+import errno
 import hashlib
 import json
 import os
 import runpy
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -77,6 +79,39 @@ class BackupCommitTests(unittest.TestCase):
         (first / "manifest.json").write_text(json.dumps(dict(data, git=stamp)))
         self.assertIsNone(self.manifest(self.begin("--run", "dirty", "--repo", "."))["git"])
 
+    def test_git_identity_uses_captured_executable_and_fixed_environment(self):
+        snapshot = self.helpers["git_snapshot"]
+        fake_dir = self.tmp / "bin"
+        fake_dir.mkdir()
+        fake_git = fake_dir / "git"
+        marker = self.tmp / "fake-git-ran"
+        fake_git.write_text(f"#!/bin/sh\n: > {shlex.quote(str(marker))}\nexit 1\n")
+        fake_git.chmod(0o755)
+
+        def change_path_after_snapshot(*args, **kwargs):
+            result = snapshot(*args, **kwargs)
+            os.environ.update(PATH=str(fake_dir), LD_PRELOAD="inherited", BASH_ENV="inherited")
+            return result
+
+        with patch.dict(os.environ, self.env, clear=True), patch.dict(
+                self.helpers, git_snapshot=change_path_after_snapshot), patch.object(
+                subprocess, "run", wraps=subprocess.run) as run:
+            stamp = self.capture(self.repo)
+        self.assertFalse(marker.exists())
+        self.assertIsNotNone(stamp)
+        git_path = str(Path(shutil.which("git", path=self.env["PATH"])).resolve())
+        self.assertEqual(stamp["git_path"], git_path)
+        for call in run.call_args_list:
+            self.assertEqual(call.args[0][0], git_path)
+            self.assertEqual(call.kwargs["env"]["PATH"], "/usr/bin:/bin")
+            self.assertNotIn("LD_PRELOAD", call.kwargs["env"])
+            self.assertNotIn("BASH_ENV", call.kwargs["env"])
+
+        fake_git.chmod(0o777)
+        with patch.dict(os.environ, dict(self.env, PATH=str(fake_dir)), clear=True):
+            self.assertIsNone(self.capture(self.repo))
+        self.assertFalse(marker.exists())
+
     def test_filter_added_during_capture_never_executes(self):
         marker = self.tmp / "filter-ran"
         (self.repo / ".git" / "info" / "attributes").write_text("tracked filter=late\n")
@@ -86,7 +121,7 @@ class BackupCommitTests(unittest.TestCase):
         def configure_late(directory, *args, **kwargs):
             nonlocal injected
             result = git(directory, *args, **kwargs)
-            if "--name-only" in args or "--others" in args:
+            if not injected and "--others" in args:
                 self.git("config", "filter.late.clean", f"touch {shlex.quote(str(marker))}; cat")
                 later = self.target.stat().st_mtime + 2
                 os.utime(self.target, (later, later))
@@ -98,6 +133,35 @@ class BackupCommitTests(unittest.TestCase):
         self.assertTrue(injected)
         self.assertFalse(marker.exists())
         self.assertIsNotNone(stamp)
+
+    def test_tracked_edit_after_hash_revokes_clean_start(self):
+        matches_blob = self.helpers["matches_blob"]
+
+        def edit_after_hash(path, *args):
+            matches = matches_blob(path, *args)
+            if path == self.target:
+                self.target.write_text("edited after hashing")
+            return matches
+
+        with patch.dict(self.helpers, matches_blob=edit_after_hash):
+            self.assertIsNone(self.capture(self.repo))
+
+    def test_untracked_creation_after_enumeration_revokes_clean_start(self):
+        git = self.helpers["git"]
+        (self.repo / ".git" / "info" / "exclude").write_text("ignored\n")
+
+        def create_after_enumeration(directory, *args, **kwargs):
+            result = git(directory, *args, **kwargs)
+            if "--others" in args:
+                untracked.touch()
+            return result
+
+        for name in ("untracked", "ignored"):
+            untracked = self.repo / name
+            with self.subTest(name=name), patch.dict(self.helpers, git=create_after_enumeration):
+                self.assertIsNone(self.capture(self.repo))
+                self.assertTrue(untracked.exists())
+            untracked.unlink()
 
     def test_forged_index_stat_cannot_hide_dirty_content(self):
         before = bytes.fromhex(self.git("rev-parse", "HEAD:tracked"))
@@ -198,13 +262,13 @@ class BackupCommitTests(unittest.TestCase):
         self.script("finish", change)
         expected = dict(run_id="scheduled", session_id="session", started=started, before=before,
                         root_identity=self.helpers["backup_root_identity"](self.backups))
-        data, identity = self.handoff(self.backups, change, **expected)
+        data, identity, digest = self.handoff(self.backups, change, **expected)
         self.assertTrue(data["finished"])
         self.assertEqual(identity, (change.stat().st_dev, change.stat().st_ino))
+        self.assertEqual(digest, hashlib.sha256((change / "manifest.json").read_bytes()).hexdigest())
         self.assertNotIn("git", data)
         for path, overrides in ((old, {}), (change, {"session_id": "foreign"}),
                                 (self.begin("--run", "foreign"), {}),
-                                (self.begin("--repo", "."), {}),
                                 (change, {"started": datetime.datetime.now(datetime.timezone.utc)})):
             with self.assertRaises(ValueError):
                 self.handoff(self.backups, path, **dict(expected, **overrides))
@@ -214,6 +278,118 @@ class BackupCommitTests(unittest.TestCase):
         moved = old.rename(old.with_name("scheduled-01-other"))
         with self.assertRaisesRegex(ValueError, "not new"):
             self.handoff(self.backups, moved, **expected)
+
+    def test_forged_clean_start_is_advisory_on_all_manifest_paths(self):
+        self.env.update(KAIZEN_RUN_ID="scheduled", KAIZEN_SESSION_ID="session")
+        self.backups.mkdir()
+        started = datetime.datetime.now(datetime.timezone.utc)
+        root_identity = self.helpers["backup_root_identity"](self.backups)
+        change = self.begin()
+        manifest = change / "manifest.json"
+        original = self.manifest(change)
+        outcomes = []
+        forged = self.capture(self.repo)
+        self.assertTrue(forged["clean_start"])
+        for fields in ({}, {"clean_start": True, "git": forged}):
+            with self.subTest(stamped=bool(fields)):
+                self.target.write_text("after")
+                manifest.write_text(json.dumps(dict(original, **fields)))
+                self.script("action", change, "--did", "edit", "--undo", "restore")
+                self.script("finish", change)
+                result = [self.script("list"), self.script("prune", "--older-than", "1")]
+                data, *_ = self.handoff(self.backups, change, run_id="scheduled", session_id="session",
+                                        started=started, before=(set(), set()), root_identity=root_identity)
+                result.append({key: value for key, value in data.items() if key not in fields})
+                result.extend((self.script("undo", change), self.target.read_text()))
+                outcomes.append(result)
+                followup = self.begin("--repo", ".")
+                self.assertIsNone(self.manifest(followup)["git"])
+                shutil.rmtree(followup)
+        self.assertEqual(outcomes[0], outcomes[1])
+        self.assertIn("advisory", self.script("begin", "--help"))
+
+    def test_handoff_hash_detects_manifest_replacement(self):
+        self.env.update(KAIZEN_RUN_ID="scheduled", KAIZEN_SESSION_ID="session")
+        started = datetime.datetime.now(datetime.timezone.utc)
+        change = self.begin()
+        root_identity = self.helpers["backup_root_identity"](self.backups)
+        expected = dict(run_id="scheduled", session_id="session", started=started, before=(set(), set()),
+                        root_identity=root_identity)
+        _, identity, digest = self.handoff(self.backups, change, **expected)
+        verify = self.helpers["verify_change_handoff"]
+        verify(self.backups, change, root_identity=root_identity, identity=identity, manifest_sha256=digest)
+        manifest = change / "manifest.json"
+        replacement = manifest.with_suffix(".replacement")
+        replacement.write_bytes(manifest.read_bytes() + b" ")
+        replacement.replace(manifest)
+        _, same_identity, new_digest = self.handoff(self.backups, change, **expected)
+        self.assertEqual(same_identity, identity)
+        self.assertNotEqual(new_digest, digest)
+        with self.assertRaisesRegex(ValueError, "manifest hash changed"):
+            verify(self.backups, change, root_identity=root_identity, identity=identity, manifest_sha256=digest)
+
+    def test_backup_root_stamp_checks_timestamps(self):
+        self.backups.mkdir()
+        identity = self.helpers["backup_root_identity"](self.backups)
+        info = self.backups.stat()
+        self.assertEqual(identity["ctime_ns"], info.st_ctime_ns)
+        if sys.platform == "darwin":
+            self.assertEqual(identity["birthtime"], info.st_birthtime)
+        self.env.update(KAIZEN_RUN_ID="scheduled", KAIZEN_SESSION_ID="session")
+        started = datetime.datetime.now(datetime.timezone.utc)
+        change = self.begin()
+        expected = dict(run_id="scheduled", session_id="session", started=started, before=(set(), set()))
+        self.handoff(self.backups, change, root_identity=identity, **expected)
+        for key in ("ctime_ns", "birthtime") if sys.platform == "darwin" else ("ctime_ns",):
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, "backup root was replaced"):
+                self.handoff(self.backups, change, root_identity=dict(identity, **{key: identity[key] * 2}),
+                             **expected)
+
+        snapshot = self.helpers["read_manifest_snapshot"]
+
+        def touch_root_after_read(fd):
+            result = snapshot(fd)
+            (self.backups / "concurrent").mkdir()
+            return result
+
+        with patch.dict(self.helpers, read_manifest_snapshot=touch_root_after_read):
+            with self.assertRaisesRegex(ValueError, "backup root was replaced or changed"):
+                self.handoff(self.backups, change, root_identity=identity, **expected)
+
+    def test_enolck_still_backs_up_without_clean_start(self):
+        fcntl = self.helpers["fcntl"]
+
+        def unavailable(fd, operation):
+            self.assertTrue(stat.S_ISREG(os.fstat(fd).st_mode))
+            self.assertEqual(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE, os.O_RDWR)
+            self.assertEqual(operation, fcntl.LOCK_EX)
+            raise OSError(errno.ENOLCK, "lock unavailable")
+
+        with patch.dict(os.environ, self.env, clear=True), patch.object(
+                fcntl, "flock", side_effect=unavailable
+        ) as lock, patch("sys.stdout"):
+            self.assertEqual(self.helpers["main"](
+                ["begin", "--run", "unlocked", "--repo", str(self.repo), "--skill", "trim",
+                 "--ledger", "fixture", str(self.target)]), 0)
+        lock.assert_called_once()
+        lock_file = self.backups / ".kaizen-backup.lock"
+        self.assertEqual(lock_file.stat().st_mode & 0o777, 0o600)
+        change = self.backups / "unlocked-01-trim"
+        self.assertIsNone(self.manifest(change)["git"])
+        self.assertEqual((change / "files" / "1").read_text(), "before")
+
+    def test_deep_manifest_uses_normal_rejection_path(self):
+        change = self.begin()
+        manifest = change / "manifest.json"
+        original = manifest.read_text().rstrip()[:-1]
+        for depth in (40, 2000):
+            with self.subTest(depth=depth):
+                manifest.write_text(original + ',"nested":' + "[" * depth + "0" + "]" * depth + "}")
+                result = subprocess.run([sys.executable, str(SCRIPT), "undo", str(change)],
+                                        env=self.env, cwd=self.repo, text=True, capture_output=True, timeout=10)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("cannot read manifest", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
 
     def test_handoff_refuses_backup_root_and_manifest_swaps(self):
         self.env.update(KAIZEN_RUN_ID="scheduled", KAIZEN_SESSION_ID="session")
