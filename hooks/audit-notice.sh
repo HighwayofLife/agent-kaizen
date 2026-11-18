@@ -165,6 +165,7 @@ if ! out=$(jq -n --arg c "$msg" '{hookSpecificOutput:{hookEventName:"SessionStar
     [ -n "$regression_marker" ] && rm -f "$regression_marker"
     exit 0
 fi
+trap '' PIPE
 if printf '%s\n' "$out"; then
     emitted=1
 else

@@ -606,6 +606,7 @@ def run_sql(args):
 
 # --- regression guard ---
 
+GUARD_LOOKBACK_DAYS = 120
 GUARD_MINIMUMS = dict(main_avg_context=1000, expensive_agent_calls=2, agent_cost_share=0.05,
                       output_per_call=100, full_rewrite_share=0.05)
 
@@ -648,11 +649,14 @@ def guard_rewrites(conn, origin, bound=None):
     if pending:
         # Only first-in-window writes need an earlier predecessor. The call id
         # breaks timestamp ties, which cannot change the predecessor's time.
-        for session, previous in conn.execute(f"""
-            SELECT session, MAX(rtrim(ts, 'Z')) FROM calls
-            WHERE day < ? AND {where} GROUP BY session
-        """, (bound,)):
-            if session in pending:
+        sessions = list(pending)
+        for offset in range(0, len(sessions), 500):
+            chunk = sessions[offset:offset + 500]
+            placeholders = ','.join('?' for _ in chunk)
+            for session, previous in conn.execute(f"""
+                SELECT session, MAX(rtrim(ts, 'Z')) FROM calls
+                WHERE day < ? AND session IN ({placeholders}) AND {where} GROUP BY session
+            """, (bound, *chunk)):
                 date, current, write, context = pending[session]
                 add(date, current, previous, write, context)
     return {date: row['full_rewrites'] / row['writes'] for date, row in daily.items()}
@@ -675,8 +679,9 @@ def guard_days(conn, args, bound=None):
             row.update(main=calls, context=sum(tokens[:4]))
         elif subagent == 1:
             row['claude_agent_calls'] += calls
-            if re.fullmatch(r'claude-(?:opus|fable)(?:[-\[].*)?',
-                            AUDIT.pricing_key(state['_pricing'], model) or model, re.IGNORECASE):
+            family = re.match(r'claude-(opus|fable|sonnet|haiku)(?:[-\[].*)?$', model, re.IGNORECASE)
+            tier_model = model if family else (AUDIT.pricing_key(state['_pricing'], model) or model)
+            if re.fullmatch(r'claude-(?:opus|fable)(?:[-\[].*)?', tier_model, re.IGNORECASE):
                 row['expensive'] += calls
             if agent and agent != 'unknown' and re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_-]{0,63}', agent):
                 agents[agent][date].append(cost)
@@ -694,7 +699,7 @@ def guard_days(conn, args, bound=None):
             days['expensive_agent_calls'][date] = row['expensive']
     for agent, costs in agents.items():
         days['agent_cost_share.' + agent] = {
-            date: round(math.fsum(cost) / totals[date]['cost'], 6) for date, cost in costs.items()
+            date: math.fsum(cost) / totals[date]['cost'] for date, cost in costs.items()
             if not (totals[date]['unpriced'] or totals[date]['unknown_origin']) and totals[date]['cost'] > 0
         }
     if agents:
@@ -705,23 +710,15 @@ def guard_days(conn, args, bound=None):
 
 def guard(args):
     with closing(open_read(db_path(args))) as conn:
+        # Avoid repeatedly reloading call rows through calls_day while grouping.
+        # These connection-local settings leave the read-only database unchanged.
+        conn.execute('PRAGMA mmap_size = 268435456')
+        conn.execute('PRAGMA cache_size = -65536')
+        conn.execute('PRAGMA temp_store = MEMORY')
         conn.execute('BEGIN')
-        dates = [row[0] for row in conn.execute('SELECT DISTINCT day FROM calls ORDER BY day DESC')]
-        # Old-only agents still need their own history (including zero eligible days).
-        origin_exists = 'is_subagent' in {row[1] for row in conn.execute('PRAGMA table_info(calls)')}
-        agent_names = set()
-        if origin_exists:
-            agent_names = {row[0] for row in conn.execute(
-                "SELECT DISTINCT agent FROM calls WHERE source = 'claude' AND is_subagent = 1")
-                if row[0] and row[0] != 'unknown' and re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_-]{0,63}', row[0])}
-        size = min(17, len(dates))
-        while True:
-            bound = dates[size - 1] if size and size < len(dates) else None
-            days = guard_days(conn, args, bound)
-            missing_agent = any('agent_cost_share.' + agent not in days for agent in agent_names)
-            if bound is None or (not missing_agent and all(len(values) >= 17 for values in days.values())):
-                break
-            size = min(len(dates), size * 2)
+        newest = conn.execute('SELECT MAX(day) FROM calls').fetchone()[0]
+        bound = (datetime.strptime(newest, '%Y-%m-%d') - timedelta(days=GUARD_LOOKBACK_DAYS - 1)).date().isoformat() if newest else None
+        days = guard_days(conn, args, bound)
     minimums = dict(GUARD_MINIMUMS, **dict(args.minimum))
     regressions, insufficient = [], []
     for metric, values in sorted(days.items()):
@@ -807,6 +804,7 @@ def build_parser():
         description='Read-only. For each metric, compare the mean of the last 3 active UTC days with the median '
         'of the preceding 14. Flag increases above max(3 * unscaled MAD, 20% of |median|, metric minimum). '
         'Rank by increase divided by that threshold (default metric minimum if zero), then by name. '
+        f'Use the {GUARD_LOOKBACK_DAYS} UTC days ending on the newest database day. '
         'Reports and insufficient data exit 0.',
         epilog='Context is per Claude main call. Expensive calls count Claude Opus and Fable subagent calls '
         'on days with known Claude origin and subagent tier. Output is per stored call across sources. '

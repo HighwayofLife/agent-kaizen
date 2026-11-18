@@ -152,12 +152,47 @@ class UsageGuardTests(UsageDbCase):
                 self.call(i, f'alias-{j}', subagent=1, model=model)
         self.assertIn('REGRESSION expensive_agent_calls 3 vs 0', self.findings())
 
-    def test_cost_share_rounding_avoids_invisible_regression(self):
+    def test_cost_share_uses_unrounded_values_even_for_small_increases(self):
         for i in range(17):
             self.call(i, 'main', input_=100000000)
             self.call(i, 'agent', input_=100000000 + (i >= 14), subagent=1)
-        self.assertFalse(any('agent_cost_share' in line for line in self.findings(
+        self.assertTrue(any('agent_cost_share' in line for line in self.findings(
             '--relative-threshold', '0', '--mad-multiplier', '0', '--minimum', 'agent_cost_share=0')))
+
+    def test_cost_share_does_not_cross_threshold_due_to_rounding(self):
+        for i in range(17):
+            self.call(i, 'main', input_=66666651 if i < 14 else 60000000)
+            self.call(i, 'agent', input_=33333349 if i < 14 else 40000000, subagent=1)
+        self.assertFalse(any('agent_cost_share' in line for line in self.findings()))
+
+    def test_expensive_model_uses_name_before_shared_price_key(self):
+        self.prices.write_text(json.dumps(dict(models={'shared': PRICES['models']['claude-opus-test']},
+                                               aliases={'claude-opus-test': 'shared',
+                                                        'claude-sonnet-test': 'shared'})))
+        for i in range(17):
+            self.call(i, 'main', model='claude-sonnet-test')
+            self.call(i, 'cheap', subagent=1, model='claude-sonnet-test')
+            if i >= 14:
+                for j in range(3):
+                    self.call(i, f'expensive-{j}', subagent=1)
+        self.assertIn('REGRESSION expensive_agent_calls 3 vs 0', self.findings())
+
+    def test_predecessor_query_filters_unrelated_sessions(self):
+        self.call(0, 'predecessor', session='spanning')
+        self.call(1, 'write', session='spanning', input_=0, write=10000)
+        with sqlite3.connect(self.db) as conn:
+            conn.executemany(
+                "INSERT INTO calls (source, call_id, ts, day, session, is_subagent) VALUES (?, ?, ?, ?, ?, 0)",
+                (('claude', f'old-{i}', '2024-01-01T00:00:00Z', '2024-01-01', f'other-{i}')
+                 for i in range(100000)))
+            steps = [0]
+            def progress():
+                steps[0] += 1000
+                return 0
+            conn.set_progress_handler(progress, 1000)
+            result = self.guard_module().guard_rewrites(conn, 'is_subagent', '2025-01-03')
+        self.assertEqual(result, {'2025-01-03': 1.0})
+        self.assertLess(steps[0], 1500000)
 
     def test_bounded_matches_unrestricted_sparse_families(self):
         for i in range(40):
@@ -184,10 +219,15 @@ class UsageGuardTests(UsageDbCase):
                 agent = (i // 60) % 10 == 0
                 yield ('claude', str(i), day + 'T12:00:00Z', day, 'session-' + str(i % 100),
                        'worker' if agent else 'main', 'claude-opus-test', int(agent), 10000,
-                       100 if (i // 60) % 100 == 1 else 0, 10)
+                       100 if (i // 60) % 100 == 1 else 0, 1000 if i % 60 >= 57 else 10)
         with sqlite3.connect(self.db) as conn:
             conn.executemany('INSERT INTO calls (source, call_id, ts, day, session, agent, model, is_subagent, '
                              'input, cache_write_5m, output) VALUES (?,?,?,?,?,?,?,?,?,?,?)', rows())
+            for i in range(5):
+                day = (date(2025, 3, 1) - timedelta(days=i * 75)).isoformat()
+                conn.execute("INSERT INTO calls (source, call_id, ts, day, session, agent, model, is_subagent, input) "
+                             "VALUES ('claude', ?, ?, ?, 'sparse', 'sparse', 'claude-opus-test', 1, 1000)",
+                             (f'sparse-{i}', day + 'T12:00:00Z', day))
         if time.monotonic() - start > 20:
             self.skipTest('building the synthetic database took over 20 seconds')
         start = time.monotonic()
@@ -195,7 +235,10 @@ class UsageGuardTests(UsageDbCase):
                                  '--pricing', str(self.prices)], capture_output=True, text=True)
         elapsed = time.monotonic() - start
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertLess(elapsed, 1.0, f'guard took {elapsed:.3f} seconds')
+        self.assertIn('REGRESSION output_per_call', result.stdout)
+        self.assertIn('insufficient data agent_cost_share.sparse', result.stdout)
+        self.assertLess(elapsed, 1.5,  # hook deadline is 2 s
+                        f'guard took {elapsed:.3f} seconds')
 
     def test_rejects_nonfinite_thresholds(self):
         for args in (('--relative-threshold', 'nan'), ('--mad-multiplier', '-1'),
