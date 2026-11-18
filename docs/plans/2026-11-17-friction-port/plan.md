@@ -228,6 +228,14 @@ Planning was offline. The October hook notes are leads; verify against current s
 | S6 | Do supported Git versions expose a reliable no-force removal safety boundary for newly changed linked trees and have usable ref compare-and-swap under the planned environment? Probe with temporary repos on supported installs and Git documentation. | P12b/P16b. Keep unknown or unsupported topology read-only. **Answered 2026-11-18 (P12b): no.** Apple Git 2.54 `worktree remove` without `--force` deleted an ignored file, and an open fd could modify the checkout after verification; removal and undo stay proposal-only until a quarantine-retention design lands. |
 | S7 | Verify on the scheduled Claude version that bounded stream-json provides caller-authenticated session start, full Edit/Write and helper dispatch/result coverage and final result, with no event loss under tested interruptions. Exercise real backed and unbacked writes, reflected fake envelopes and truncation, and confirm existing permissions on a fresh run. | P24a/P24/P25/P28. Incomplete evidence keeps broker writes unavailable. |
 
+## Gated carry: must be fixed before S3 or S7 opens
+
+From P24's Sol high security review (2026-11-18). These are fail-closed while S3/S7 stay closed in 0.13.0, so they don't block the release. The packet that opens either gate must fix them first.
+
+- G1 (S7) `scripts/kaizen-scheduled` broker grant check: the broker verifies only its CLI Bash grants. Claude also loads settings-based grants and hooks, so the check can't prove that the model can't write broker state. Prove the effective permission set, including settings files and hooks, before trusting broker allowance.
+- G2 (S3/S7) `scripts/kaizen_friction_apply.py` recovery rejects native `retire-pending` and `undo-pending` journals. A crash during rollback can leave a marker live with no scheduled recovery path. Add recovery for both journal states.
+- G3 (S3/S7) Populated ignored outputs prevent budget proof (fail-closed). This blocks scheduled markers for ordinary build directories. Define a bounded proof for ignored output directories.
+
 ## P27 docs and release
 
 Assemble README, command and scheduling docs, CI checks and the 0.13.0 CHANGELOG/version. Preserve the 0.12.0 host matrix. Keep the release candidate local until the real-input gate accepts all advertised capabilities. P27 owns a follow-up claims pass whenever P28 blocks a conditional capability. Verify refusal and confirm downgraded docs, then rerun P28 for the affected checks. [Release brief](briefs/27-release.md)
