@@ -305,6 +305,8 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                         and b'"model"' not in line):
                     continue
                 if bounds is None and b'"timestamp"' not in prefix and not any(marker in line for marker in MARKERS):
+                    if keep_signals and b'"tool_use"' in line:
+                        warnings["malformed rows"] += 1
                     continue
                 if bounds is not None:
                     if last_prefix is None or not line.startswith(last_prefix):
@@ -342,6 +344,8 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                 else:
                     match = TIMESTAMP.search(line)
                     if not match:
+                        if keep_signals and (b'"tool_use"' in line or b'"tool_result"' in line):
+                            warnings["malformed rows"] += 1
                         continue
                     timestamp = match[1].decode("ascii", "replace")
                 try:
@@ -738,6 +742,40 @@ def friction_stamp(stamp):
         return None
 
 
+def replay_fingerprint(value):
+    # Traverse only a bounded prefix; include container/string lengths so that
+    # oversized replays cannot consume work proportional to their payload.
+    budget = [4096]
+    digest = hashlib.sha256()
+
+    def feed(item):
+        if budget[0] <= 0:
+            return
+        if isinstance(item, (str, list, dict)):
+            digest.update((type(item).__name__ + str(len(item)) + ":").encode())
+            if isinstance(item, str):
+                part = item[:budget[0]].encode("utf-8", "surrogatepass")[:budget[0]]
+                digest.update(part)
+                budget[0] -= len(part) + 1
+            else:
+                budget[0] -= 1
+                for entry in (item.items() if isinstance(item, dict) else item):
+                    if budget[0] <= 0:
+                        break
+                    if isinstance(item, dict):
+                        feed(entry[0])
+                        feed(entry[1])
+                    else:
+                        feed(entry)
+        else:
+            part = repr(item).encode()[:budget[0]]
+            digest.update(part)
+            budget[0] -= len(part) + 1
+
+    feed(value)
+    return digest.digest()
+
+
 def permission_observation(state, key, row, block, start, content):
     # Evidence is limited to explicitly selected, canonical cwd members.
     if not state["cwd"]:
@@ -751,6 +789,11 @@ def permission_observation(state, key, row, block, start, content):
                 root = candidate
         except (OSError, ValueError, RuntimeError):
             pass
+    if start:
+        tool_input = block.get("input")
+        command = tool_input.get("command") if isinstance(tool_input, dict) else None
+        if block.get("name") != "Bash" or command not in ("ls", "ls -a", "ls -l"):
+            return
     observations = state["permissions"]
     if key not in observations:
         if len(observations) >= FRICTION_PAIR_LIMIT:
@@ -761,7 +804,7 @@ def permission_observation(state, key, row, block, start, content):
         tool_input = block.get("input")
         command = tool_input.get("command") if isinstance(tool_input, dict) else None
         literal = command if block.get("name") == "Bash" and command in ("ls", "ls -a", "ls -l") else None
-        value = (root, literal, hash(json.dumps(block, sort_keys=True)))
+        value = (root, literal, replay_fingerprint(block))
     else:
         decision = row.get("permissionDecision")
         decision = decision if isinstance(decision, dict) else {}
@@ -776,8 +819,8 @@ def permission_observation(state, key, row, block, start, content):
                        or any(isinstance(row["toolUseResult"].get(k), str) for k in ("stdout", "stderr")))
                   and row["toolUseResult"].get("interrupted") is not True
                   and block.get("is_error") is not True else "ambiguous")
-        fingerprint = hash(json.dumps([block, row.get("permissionDecision"),
-                                       row.get("toolUseResult"), row.get("uuid")], sort_keys=True))
+        fingerprint = replay_fingerprint([block, row.get("permissionDecision"),
+                                          row.get("toolUseResult"), row.get("uuid")])
         value = (root, status, fingerprint)
     # A conflicting replay remains ambiguous without retaining private text.
     slot = observations[key][0 if start else 1]
@@ -789,11 +832,13 @@ def permission_observation(state, key, row, block, start, content):
 
 def permission_rows(state):
     counts = defaultdict(Counter)
-    for starts, results in state["permissions"].values():
+    for key, (starts, results) in state["permissions"].items():
         attributed = {(root, literal) for root, literal, _ in starts if root and literal}
         for root, literal in attributed:
             matching = {status for result_root, status, _ in results if result_root == root}
-            status = (next(iter(matching)) if len(starts) == 1 and len(results) == 1
+            pair = state["pairs"].get(key)
+            valid = pair is not None and None not in pair and pair[1][0] >= pair[0][0]
+            status = (next(iter(matching)) if valid and len(starts) == 1 and len(results) == 1
                       and len(matching) == 1 else "ambiguous")
             counts[(root, literal)][status] += 1
     return [dict(cwd_id=hashlib.sha256(root.encode()).hexdigest(), literal=literal,
@@ -822,6 +867,8 @@ def friction_block(state, row, block, start, content):
     ts = row.get("timestamp")
     stamp = friction_stamp(ts) if isinstance(ts, str) and len(ts) <= 40 else None
     if stamp is None or stamp < state["since"]:
+        if stamp is None:
+            state["warnings"]["malformed rows"] += 1
         pairs[key] = None
         return
     permission_observation(state, key, row, block, start, content)
@@ -835,8 +882,7 @@ def friction_block(state, row, block, start, content):
         skipped = name in UNTIMED_TOOLS or tool_input.get("run_in_background") is True
         # Keep only a fingerprint for conflict detection, including starts whose
         # private arguments collapse to the same public signature.
-        private_input = command if name == "Bash" else json.dumps(tool_input, sort_keys=True)
-        fingerprint = hash((name, private_input)) if isinstance(private_input, str) else None
+        fingerprint = replay_fingerprint([name, tool_input])
         value = (stamp, identity, signature, skipped, fingerprint, name, is_polling(command))
     else:
         details = row.get("toolUseResult")
@@ -851,7 +897,7 @@ def friction_block(state, row, block, start, content):
                     and (len(content) == 1 or sum(item.get("type") == "tool_result" for item in content) == 1)
                     else None)
         result = block.get("content")
-        result_hash = hash(result if isinstance(result, str) else json.dumps(result, sort_keys=True))
+        result_hash = replay_fingerprint(result)
         text = result_text(result)[:2000] if block.get("is_error") is True else ""
         timeout = details.get("timedOutAfterMs")
         timeout = type(timeout) is int and timeout >= 0
@@ -859,9 +905,11 @@ def friction_block(state, row, block, start, content):
         exit_match = EXIT_HEADER.match(text.partition("\n")[0].strip())
         hint = hint or bool(exit_match and int(exit_match[1]) in (124, 137, 143))
         lock = bool(re.search(r"\b(?:could not (?:get|acquire) (?:the )?lock|unable to acquire (?:the )?lock|waiting for (?:the )?lock)\b", text, re.I))
+        row_event = (session_id, identity or (stamp, tuple(item.get("tool_use_id") for item in content
+                                                            if item.get("type") == "tool_result")))
         value = (stamp, identity, measured, prompted, bool(details.get("backgroundTaskId")),
                  result_hash, block.get("is_error") is True,
-                 timeout, hint, details.get("interrupted") is True, lock)
+                 timeout, hint, details.get("interrupted") is True, lock, row_event)
     slot = 0 if start else 1
     # Retain both observations until the scan ends, so later replayed rows can
     # invalidate an otherwise plausible but conflicting pair.
@@ -964,14 +1012,20 @@ def finalize_friction(state, thresholds, window):
     signals = state["codex_signals"]
     calls = state.get("timeline", [])
     question_wait = []
+    timeout_events, interrupt_events = set(), set()
     for key, pair in state["pairs"].items():
         if pair is None or None in pair:
             continue
         (start, _, signature, skipped, _, name, poll), (end, _, measured, prompted, background, _, _,
-                                                  timeout, hint, interrupted, lock) = pair
-        signals["timeouts"] += int(timeout)
+                                                  timeout, hint, interrupted, lock, row_event) = pair
+        if end < start:
+            state["warnings"]["malformed rows"] += 1
+            continue
+        if timeout:
+            timeout_events.add(row_event)
+        if interrupted:
+            interrupt_events.add(row_event)
         signals["timeout_hints"] += int(hint and not timeout)
-        signals["interrupts"] += int(interrupted)
         signals["lock_phrases"] += int(lock)
         if name == "AskUserQuestion" and end >= start and not background:
             question_wait.append((end - start).total_seconds())
@@ -982,7 +1036,15 @@ def finalize_friction(state, thresholds, window):
         if len(calls) >= FRICTION_PAIR_LIMIT:
             state["capped"] = True
         timeline_call(calls, start, end, seconds, signature, measured is not None, poll, ("claude", key[0]))
+    signals["timeouts"] += len(timeout_events)
+    signals["interrupts"] += len(interrupt_events)
     rows, flags = [], []
+    for ident, count in (("usage-limits", len(state["usage_limits"])),
+                         ("timeouts", signals["timeouts"]), ("interrupts", signals["interrupts"]),
+                         ("lock-contention", signals["lock_phrases"])):
+        if count:
+            flags.append(dict(id=ident, subject="", value=count,
+                              detail=f"{count} confirmed {ident.replace('-', ' ')} events in the window (threshold: 1)."))
     measured = samples = 0
     for signature, group in grouped.items():
         values = sorted(seconds for seconds, _ in group)
@@ -1449,7 +1511,7 @@ def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=No
     data["format_canary"] = defaultdict(Counter)
     if friction:
         data["_friction"] = dict(pairs={}, capped=False, since=since, usage_limits=set(),
-                                 cwd=set(cwd or ()), permissions={}, codex_calls=defaultdict(list),
+                                 cwd=set(cwd or ()), permissions={}, warnings=data["warnings"], codex_calls=defaultdict(list),
                                  codex_signals=Counter(), codex_samples=0, timeline=[])
     data["cache_writes"] = {kind: {bucket: Counter(writes=0, write_tokens=0, full_rewrites=0) for bucket in CACHE_BUCKETS}
                             for kind in ("main", "subagent")}

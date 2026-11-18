@@ -80,7 +80,9 @@ class FrictionClaudeTests(StubCase):
                          {'slow-calls': 1, 'heavy-calls': 90.0})
         self.assertTrue(all(set(flag) == {'id', 'subject', 'detail', 'value'} for flag in f['flags']))
         self.assertNotIn('_friction', data)
-        self.assertEqual(self.collect(friction=False), {k: v for k, v in data.items() if k != 'friction'})
+        self.assertEqual(data['warnings']['malformed rows'], 1)
+        without_friction = {k: v for k, v in data.items() if k not in ('friction', 'warnings')}
+        self.assertEqual({k: v for k, v in self.collect(friction=False).items() if k != 'warnings'}, without_friction)
 
     def test_multi_result_metadata_is_not_measured_and_background_is_excluded(self):
         result = end('first', 200, toolUseResult=dict(durationMs=1234))
