@@ -1,8 +1,10 @@
 """Offline runtime-envelope and real backup-helper tests for the dormant broker."""
 import base64
+from contextlib import redirect_stdout
 from datetime import date, datetime, timedelta, timezone
 import hashlib
 import hmac
+import io
 import json
 import os
 from pathlib import Path
@@ -293,6 +295,63 @@ class BrokerLedgerTests(unittest.TestCase):
                     write()
             self.assertEqual(self.ledger.read_text(), updated)
 
+    def ledger_effect(self, journal):
+        self.signed_extract([self.project])
+        ident = self.action("ls", [self.project])
+        native_id = journal.begin_allow_rule(ident)
+        self.tool["transact"](self.project, "ls", action_id=native_id)
+        return ident
+
+    def assert_ledger_backup(self, journal, ident, edited, report):
+        paths = [Path(path) for path in journal.load(ident).get("ledger_backups", [])]
+        self.assertEqual(len(paths), 1)
+        path = paths[0]
+        self.assertEqual(path.read_text(), edited)
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(path.parent.stat().st_mode & 0o777, 0o700)
+        self.assertIn(str(path), report.getvalue())
+
+    def test_editor_descriptor_survives_write_after_verification(self):
+        edited = self.table + "\nEditor saved after verification.\n"
+        report = io.StringIO()
+        with self.locked() as journal, self.ledger.open("r+") as editor:
+            ident = self.ledger_effect(journal)
+            exchange = journal.exchange_ledger
+
+            def save_after_verification(*args, **kwargs):
+                result = exchange(*args, **kwargs)
+                editor.seek(0, os.SEEK_END)
+                editor.write(edited[len(self.table):])
+                editor.close()
+                return result
+
+            with patch.object(journal, "exchange_ledger", side_effect=save_after_verification), redirect_stdout(report):
+                self.assertEqual(journal.reconcile(ident), "recorded")
+            self.assert_ledger_backup(journal, ident, edited, report)
+            self.assertEqual(self.ledger.read_text().count(ident), 1)
+
+    def test_crash_after_exchange_recovers_concurrent_save(self):
+        edited = self.table + "\nEditor saved before the swap.\n"
+        with self.locked() as journal:
+            ident = self.ledger_effect(journal)
+            exchange = journal.allow_rule["rename_effect"]
+
+            def crash_after_exchange(*args, **kwargs):
+                self.ledger.write_text(edited)
+                exchange(*args, **kwargs)
+                raise OSError("after ledger exchange")
+
+            with patch.dict(journal.allow_rule, rename_effect=crash_after_exchange):
+                with self.assertRaisesRegex(OSError, "after ledger exchange"):
+                    journal.reconcile(ident)
+            self.assertEqual(journal.load(ident)["phase"], "effect-verified")
+            self.assertEqual(self.ledger.read_text().count(ident), 1)
+        report = io.StringIO()
+        with self.locked() as journal, redirect_stdout(report):
+            self.assertEqual(journal.reconcile(ident), "recorded")
+            self.assert_ledger_backup(journal, ident, edited, report)
+            self.assertEqual(self.ledger.read_text().count(ident), 1)
+
     def test_legacy_table_without_outer_pipes_and_malformed_row(self):
         ident = "fa1_" + "1" * 64
         legacy = "\n".join(" | ".join(apply.cells(line)) for line in self.table.splitlines()) + "\n"
@@ -314,14 +373,17 @@ class BrokerLedgerTests(unittest.TestCase):
             self.assertIn(row + "\n", self.ledger.read_text())
             self.assertIn("reverted", self.ledger.read_text())
 
-    def test_metric_keeps_both_canonical_worktrees(self):
-        worktree = self.root / "worktree with spaces"
+    def add_worktree(self, worktree):
         for arguments in (["init", "-q"], ["-c", "user.name=Test", "-c", "user.email=test@example.invalid",
                            "commit", "--allow-empty", "-qm", "initial"],
                           ["worktree", "add", "-q", "--detach", str(worktree)]):
             result = subprocess.run(["git", "-C", str(self.project), *arguments], capture_output=True, text=True,
                                     env=dict(os.environ, GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull))
             self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_metric_keeps_both_canonical_worktrees(self):
+        worktree = self.root / "worktree with spaces"
+        self.add_worktree(worktree)
         roots = sorted([self.project, worktree])
         self.signed_extract(roots)
         ident = self.action("ls", roots)
@@ -339,6 +401,36 @@ class BrokerLedgerTests(unittest.TestCase):
             self.tool["transact"](self.project, "ls", action_id=native_id)
             journal.reconcile(ident)
             self.assertIn(metric, self.ledger.read_text())
+
+    def test_metric_audits_worktree_named_with_literal_tilde(self):
+        worktree = self.project / "~x"
+        self.add_worktree(worktree)
+        with self.locked() as journal:
+            record = dict(id="fa1_" + "1" * 64, operation="allow-rule", count=10,
+                          date=date.today().isoformat(), evidence_scope=[str(worktree)])
+            argv = shlex.split(journal.row(record)[6].strip("`"))
+        result = subprocess.run([sys.executable, str(SCRIPTS / "token-audit"), *argv[1:], "--no-write", "--json"],
+                                cwd=self.project, env=dict(os.environ, CODEX_HOME=str(self.root / "codex"),
+                                                           COPILOT_HOME=str(self.root / "copilot")),
+                                capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["scope"]["cwd"], [str(worktree)])
+        self.assertEqual(argv[2], str(worktree))
+
+    def test_preexisting_relative_metric_row_stays_linked(self):
+        with self.locked() as journal, redirect_stdout(io.StringIO()):
+            ident = self.ledger_effect(journal)
+            journal.reconcile(ident)
+            record = journal.load(ident)
+            del record["absolute_metric"]
+            metric = journal.row(record)[6]
+            historical = "`kaizen-token-audit --cwd .`"
+            self.ledger.write_text(self.ledger.read_text().replace(metric, historical))
+            journal.save(record, "recorded")
+            self.assertEqual(journal.reconcile(ident), "recorded")
+            journal.undo(ident, lambda _, native: self.tool["transact"](self.project, record=native))
+            self.assertEqual(journal.reconcile(ident), "reverted")
+            self.assertIn(historical, self.ledger.read_text())
 
     def test_recovery_after_native_publication_without_extract(self):
         extract = self.signed_extract([self.project])
@@ -374,6 +466,12 @@ class BrokerLedgerTests(unittest.TestCase):
         self.assertIn("reverted", self.ledger.read_text())
 
     def test_copied_install_undo_and_bookkeeping_recovery(self):
+        self.copied_install_undo_and_bookkeeping_recovery()
+
+    def test_undo_resolves_relative_state_paths(self):
+        self.copied_install_undo_and_bookkeeping_recovery(relative_state=True)
+
+    def copied_install_undo_and_bookkeeping_recovery(self, *, relative_state=False):
         from test_schedule import CRONTAB
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -393,7 +491,7 @@ class BrokerLedgerTests(unittest.TestCase):
 
             def command(path, *args, code=0, **extra_env):
                 result = subprocess.run([sys.executable, "-I", str(path), *map(str, args)], env=dict(env, **extra_env),
-                                        capture_output=True, text=True, timeout=30)
+                                        cwd=root, capture_output=True, text=True, timeout=30)
                 self.assertEqual(result.returncode, code, result.stderr)
 
             command(scripts / "install-schedule", "--apply", "--scheduler", "cron")
@@ -466,7 +564,10 @@ class BrokerLedgerTests(unittest.TestCase):
                         self.assertEqual(journal.reconcile(ident), "recorded")
                     self.assertEqual(ledger.read_text().count(ident), 1)
                     self.assertIn(legacy, ledger.read_text())
-                    self.assertNotIn(str(project), ledger.read_text())
+                    action_row = next(line for line in ledger.read_text().splitlines() if ident in line)
+                    metric = apply.cells(action_row)[6]
+                    self.assertEqual(shlex.split(metric.strip("`")), ["kaizen-token-audit", "--cwd", str(project)])
+                    self.assertNotIn(str(project), ledger.read_text().replace(metric, ""))
 
                     (config / "agent-kaizen.json").write_text(json.dumps(dict(enabled=enabled)))
                     if not enabled:
@@ -510,7 +611,14 @@ class BrokerLedgerTests(unittest.TestCase):
                 for module in ("signal", "select"):
                     (project / (module + ".py")).write_text(
                         f"open({str(poison)!r}, 'a').write({module!r})\nraise SystemExit(0)\n")
-                command(runner, *undo, PYTHONPATH=str(project))
+                state_paths = {"CLAUDE_CONFIG_DIR": "config", "KAIZEN_BACKUP_DIR": "config/backups"} if relative_state else {}
+                if relative_state and enabled:
+                    # Check the actual child environment before executing the native inverse.
+                    entry = '    sys.exit(main())\n'
+                    checks = (f'    assert os.environ["CLAUDE_CONFIG_DIR"] == {str(config)!r}\n'
+                              f'    assert os.environ["KAIZEN_BACKUP_DIR"] == {str(config / "backups")!r}\n')
+                    helper.write_text(helper.read_text().replace(entry, checks + entry, 1))
+                command(runner, *undo, PYTHONPATH=str(project), **state_paths)
                 self.assertFalse(poison.exists())
                 self.assertFalse(target.exists())
                 self.assertIn(f"reverted ({date.today()})", ledger.read_text())

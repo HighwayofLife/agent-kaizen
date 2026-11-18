@@ -2511,11 +2511,18 @@ def actions_command(args):
         return friction_reconcile_command(args)
     try:
         host = runpy.run_path(str(HERE / "kaizen_friction_actions.py"))
-        store = host["HostActions"](audits_dir(), backup_root(), action_project, key)
-        project = args.project_dir
+        audits, backups = audits_dir(), backup_root()
         if args.action == "undo":
             if "KAIZEN_RUN_ID" in os.environ or "KAIZEN_SESSION_ID" in os.environ:
                 raise ValueError("broker undo requires an interactive invocation")
+            home, config, backups = map(canonical_path, (Path.home(), claude_home(), backups))
+            if not all(path.is_dir() for path in (home, config, backups)):
+                raise ValueError("broker undo requires valid state directories")
+            audits = config / "audits"
+            helper_env = dict(os.environ, HOME=str(home), CLAUDE_CONFIG_DIR=str(config), KAIZEN_BACKUP_DIR=str(backups))
+        store = host["HostActions"](audits, backups, action_project, key)
+        project = args.project_dir
+        if args.action == "undo":
             requested = canonical_path(project.expanduser())
             member = enrolled_project(requested)
             if (member is None or checkout_root(requested) != checkout_root(member)
@@ -2526,8 +2533,11 @@ def actions_command(args):
 
             def inverse(operation, record):
                 python, helper = broker_command(argparse.Namespace(python=sys.executable), operation)
+                if operation != "allow-rule":
+                    path = Path(record)
+                    record = str(canonical_path(path.parent) / path.name)
                 result = run_group([python, "-I", helper, "undo", record, "--project", str(project)], stoppable=True,
-                                   cwd="/", timeout=30, stdin=subprocess.DEVNULL,
+                                   cwd="/", env=helper_env, timeout=30, stdin=subprocess.DEVNULL,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if result.returncode:
                     raise ValueError("the fixed undo helper could not verify reversal")
