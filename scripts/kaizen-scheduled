@@ -2239,12 +2239,45 @@ def scheduled_action_refusal(catalog_id):
     return runtime["scheduled_marker_refusal"]()
 
 
+def recover_scheduled_suggestions(store, host, project):
+    """Close legacy proposal-only receipts that have no native broker record."""
+    if store.friction.resolve().is_relative_to(project):
+        raise ValueError("broker state must be outside the project")
+    with host["_directory"](store.friction, private=True) as state, host["_locked"](state, "prepare"), \
+            host["_directory"](store.path.parent) as directory, host["_locked"](directory, store.path.name):
+        if store._scope(project) != project:
+            raise ValueError("host-action scope changed; try again")
+        rows, _, receipts = store._load(directory)
+        generations = receipts.get(str(project), {})
+        pending = host["_pending"](generations)
+        suggestions = set()
+        for ident in sorted(pending):
+            if ident not in rows or rows[ident]["catalog_id"] == "linux-localsearch":
+                continue
+            # Scheduled reservations take both locks before creating a record.
+            try:
+                os.stat("broker-" + ident + ".json", dir_fd=state, follow_symlinks=False)
+            except FileNotFoundError:
+                suggestions.add(ident)
+        if suggestions:
+            for imported in generations.values():
+                for ident in suggestions.intersection(imported):
+                    if imported[ident] == "pending":
+                        imported[ident] = "terminal"
+            store._save(directory, rows, receipts)
+            for ident in sorted(suggestions):
+                log(f"friction: broker action {ident} resolved as a suggestion (operation is proposal-only)")
+        return bool(pending - suggestions)
+
+
 def run_scheduled_broker(audits, project, options, *, receipt=None, attempt=None):
     """Reconcile older reservations before allowing any new fixed operation."""
     root = backup_root().resolve()
     host = runpy.run_path(str(HERE / "kaizen_friction_actions.py"))
     store = host["HostActions"](audits, root, action_project, key)
     project_path = project.canonical
+    if attempt is None and not recover_scheduled_suggestions(store, host, project_path):
+        return
     command = review_command(options, "auto", "", "", project_path, audits)
     backup, config = None, None
 

@@ -1,6 +1,8 @@
 """Synthetic timeline boundaries, bounded sweeps and private report comparisons."""
 from copy import deepcopy
 import json
+import re
+import hashlib
 import os
 from datetime import timedelta
 from pathlib import Path
@@ -210,7 +212,13 @@ class TimelineTests(unittest.TestCase):
             extract = root / 'token-audit-old.extract.json'
 
             def compare(value, current_count=3):
-                extract.write_text(json.dumps(value))
+                raw = json.dumps(value).encode()
+                extract.write_bytes(raw)
+                binding = json.dumps(dict(size=len(raw), sha256=hashlib.sha256(raw).hexdigest()))
+                text = re.sub(r'^<!-- token-audit-friction .*? -->\n', '', old_report.read_text(), flags=re.M)
+                if text.endswith('<!-- token-audit-complete -->\n'):
+                    text = text[:-len('<!-- token-audit-complete -->\n')] + '<!-- token-audit-friction ' + binding + ' -->\n<!-- token-audit-complete -->\n'
+                old_report.write_text(text)
                 data = dict(friction=deepcopy(friction))
                 data['friction']['comparisons'][0]['p50'] = 90
                 data['friction']['comparisons'][0]['count'] = current_count

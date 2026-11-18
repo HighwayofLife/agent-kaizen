@@ -2411,10 +2411,21 @@ def regression_cohorts(path, scope, extract_dir, friction):
         name = path.stem + ".extract.json"
         if ref != dict(v=1, file=name):
             return
-        extract = extract_dir.expanduser() / name
-        if extract.stat().st_size > 8 * 1024 * 1024:
+        bindings = re.findall(r"^<!-- token-audit-friction (.*?) -->$", report_text, re.M)
+        if len(bindings) != 1:
             return
-        previous = json.loads(extract.read_text())
+        binding = json.loads(bindings[0])
+        size = binding.get("size")
+        if type(size) is not int or not 0 < size <= 8 * 1024 * 1024:
+            return
+        extract = extract_dir.expanduser() / name
+        if extract.stat().st_size != size:
+            return
+        with extract.open("rb") as stream:
+            raw = stream.read(size + 1)
+        if len(raw) != size or binding != dict(size=size, sha256=hashlib.sha256(raw).hexdigest()):
+            return
+        previous = json.loads(raw)
         old = previous["friction"]
         if (type(previous["v"]) is not int or previous["v"] != 1
                 or previous["scope"] != scope or previous["report"] != path.name

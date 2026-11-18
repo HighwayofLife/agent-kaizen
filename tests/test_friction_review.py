@@ -2,6 +2,7 @@
 import json
 import runpy
 from datetime import timedelta
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from test_friction_prepare import PreparationTests, prepare
@@ -250,6 +251,45 @@ if os.environ.get('REVIEW_SLEEP'): time.sleep(10)
         self.assertFalse((target / ".nomedia").exists())
         self.assertFalse(list(store.friction.glob("broker-*.json")))
         self.assertFalse((store.friction / "host-fixes").exists())
+
+    def test_group_writable_checkout_recovers_suggestion_and_refuses_broker_apply(self):
+        audits = self.config / "audits"
+        host = runpy.run_path(str(self.runner_path.parent / "kaizen_friction_actions.py"))
+        store = host["HostActions"](audits, self.backups, self.runner["action_project"], self.runner["key"])
+        self.write(self.config / "agent-kaizen.json", '{"scheduledAutonomy":"auto"}')
+        target = self.project / "build"
+        target.mkdir()
+        generation = "00000000000000000001"
+        frozen = {}
+        for catalog, selector in (("low-disk", "project-volume"), ("linux-localsearch", str(target))):
+            ident = store.action_id(self.project, catalog, selector, allowed=[selector])
+            frozen[ident] = dict(canonical_project=str(self.project), catalog_id=catalog, selector_key=selector,
+                                 intents=["suggest", "apply"], evidence="fixture")
+        suggestion, marker = frozen
+        block = '<!-- kaizen-host-actions ' + json.dumps(dict(
+            v=1, actions=[dict(id=ident, intent="apply") for ident in frozen])) + ' -->'
+        scheduled = "scheduled:" + generation
+        self.assertEqual(store.import_actions(block, frozen, self.project, scheduled), dict.fromkeys(frozen, "pending"))
+        self.write(self.backups / "friction" / ("prepare-" + self.obj.key + ".json"),
+                   json.dumps(dict(v=1, project=str(self.project), generation=1, acknowledged={}))).chmod(0o600)
+
+        options = self.runner["command_options"](SimpleNamespace(claude=str(self.claude)))
+        command = self.runner["review_command"](options, "auto", "", "", self.project, audits)
+        _, config = self.runner["scheduled_authority"](audits, self.project, options, command, self.backups)
+        info = target.stat()
+        self.project.chmod(0o775)
+        with self.assertRaisesRegex(ValueError, "unsafe host-action directory"):
+            self.runner["run_scheduled_broker"](
+                audits, self.obj, options, receipt=dict(generation=generation, allowed=frozen, scope=self.scope),
+                attempt=(1, "fixture", {marker: [info.st_dev, info.st_ino]}, config))
+
+        result = self.review_run("--propose-only")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        data = json.loads(store.path.read_text())
+        self.assertEqual(data["receipts"][str(self.project)][scheduled][suggestion], "terminal", result.stdout)
+        self.assertEqual(data["actions"][suggestion]["status"], "open")
+        self.assertFalse((target / ".nomedia").exists())
+        self.assertFalse(list(store.friction.glob("broker-*.json")))
 
     def test_probe_refresh_fresh_stale_and_failure(self):
         import os

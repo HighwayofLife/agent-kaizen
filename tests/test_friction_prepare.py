@@ -13,12 +13,36 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
+from test_friction_claude import end, start
 from test_schedule import CRONTAB
+from test_scripts import StubCase, jsonl
 
 PATH = pathlib.Path(__file__).resolve().parents[1] / "scripts/kaizen_friction_prepare.py"
 SPEC = importlib.util.spec_from_file_location("friction_prepare", PATH)
 prepare = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(prepare)
+
+
+class AuditRegressionBindingTests(StubCase):
+    def test_swapped_prior_extract_cannot_add_a_regression_to_new_evidence(self):
+        session = self.home / '.claude/projects/example/fixture.jsonl'
+        rows = []
+        for ident in range(3):
+            rows += [start(str(ident), 1), end(str(ident), 61, toolUseResult=dict(durationMs=60000))]
+        jsonl(session, rows)
+        args = ('--json', '--since', '2025-01-01')
+        prior = json.loads(self.run_script('token-audit', *args).stdout)
+        extract = pathlib.Path(prior['extract_path'])
+        raw = extract.read_bytes()
+        self.assertIn(b'"p50": 60.0', raw)
+        extract.write_bytes(raw.replace(b'"p50": 60.0', b'"p50": 40.0'))
+        self.assertEqual(extract.stat().st_size, len(raw))
+
+        current = json.loads(self.run_script('token-audit', *args).stdout)
+        evidence = json.loads(pathlib.Path(current['extract_path']).read_bytes())['friction']
+        self.assertEqual(evidence['comparisons'][0]['p50'], 60.0)
+        self.assertEqual(evidence['regressions'], [])
+        self.assertNotIn('regression', {flag['id'] for flag in evidence['flags']})
 
 
 class ComparisonTests(unittest.TestCase):
