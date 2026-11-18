@@ -1,0 +1,191 @@
+#!/usr/bin/env python3
+"""Check plugin installation and discovery in isolated host homes."""
+import argparse
+import collections
+import json
+import os
+from pathlib import Path
+import queue
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+PLUGIN = 'agent-kaizen@agent-kaizen-tools'
+EXPECTED = collections.Counter({'postToolUse': 1, 'sessionStart': 2, 'userPromptSubmit': 1})
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--host', choices=['codex', 'copilot', 'all'], default='all')
+    parser.add_argument('--source', type=Path, default=ROOT)
+    parser.add_argument('--worktree', action='store_true')
+    parser.add_argument('--expect-hidden-skills', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--timeout', type=float, default=120)
+    parser.add_argument('--json', action='store_true')
+    args = parser.parse_args()
+    if args.timeout <= 0:
+        parser.error('--timeout must be positive')
+    source = args.source.resolve()
+    results = []
+    temp_parent = Path(tempfile.gettempdir()).resolve()
+    if temp_parent == source or source in temp_parent.parents:
+        result = dict(status='FAIL', host='probe', check='sandbox', detail='temporary directory is inside source')
+        print(json.dumps([result]) if args.json else 'FAIL probe sandbox: temporary directory is inside source')
+        return 1
+    tmp = Path(tempfile.mkdtemp()).resolve()
+
+    def add(status, host, check, detail):
+        detail = str(detail).replace(str(tmp), '<tmp>').replace('\n', ' ').strip()
+        results.append(dict(status=status, host=host, check=check, detail=detail))
+
+    try:
+        if tmp == source or source in tmp.parents:
+            add('FAIL', 'probe', 'sandbox', 'temporary directory is inside source')
+        else:
+            export, home = tmp / 'export', tmp / 'home'
+            for path in (export, home, tmp / 'codex', tmp / 'copilot'):
+                path.mkdir()
+            env = {k: v for k, v in os.environ.items() if not k.startswith(
+                ('KAIZEN_', 'CLAUDE_', 'CODEX_', 'COPILOT_', 'XDG_'))}
+            env.update(HOME=str(home), CODEX_HOME=str(tmp / 'codex'), COPILOT_HOME=str(tmp / 'copilot'),
+                       XDG_CONFIG_HOME=str(tmp / 'xdg/config'), XDG_CACHE_HOME=str(tmp / 'xdg/cache'),
+                       XDG_DATA_HOME=str(tmp / 'xdg/data'), XDG_STATE_HOME=str(tmp / 'xdg/state'),
+                       GIT_CONFIG_GLOBAL=os.devnull)
+
+            def run(command, **kwargs):
+                return subprocess.run(command, cwd=str(home), env=env, timeout=args.timeout,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kwargs)
+
+            try:
+                if args.worktree:
+                    listing = run(['git', '-C', str(source), 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], check=True).stdout
+                    for name in set(os.fsdecode(listing).split('\0')) - {''}:
+                        src, dst = source / name, export / name
+                        if src.is_file():
+                            dst.parent.mkdir(parents=True, exist_ok=True)
+                            shutil.copy2(src, dst)
+                else:
+                    archive = run(['git', '-C', str(source), 'archive', 'HEAD'], check=True).stdout
+                    run(['tar', '-x', '-C', str(export)], input=archive, check=True)
+                version = json.loads((export / '.claude-plugin/plugin.json').read_text())['version']
+            except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
+                add('FAIL', 'probe', 'export', str(exc))
+            else:
+                def command(host, check, argv):
+                    try:
+                        result = run(argv)
+                        output = (result.stdout + result.stderr).decode('utf-8', 'replace').strip()
+                        if host == 'copilot' and re.search(r'sign in|login|log in|authenticate', output, re.I):
+                            add('SKIP', host, check, 'needs sign-in')
+                            return False
+                        add('PASS' if result.returncode == 0 else 'FAIL', host, check,
+                            output or ('exit {}'.format(result.returncode) if result.returncode else 'ok'))
+                        return result.returncode == 0
+                    except (OSError, subprocess.TimeoutExpired) as exc:
+                        add('FAIL', host, check, '{}: {}'.format(argv[0], exc))
+                        return False
+
+                def hooks():
+                    process = None
+                    try:
+                        process = subprocess.Popen(['codex', 'app-server'], cwd=str(home), env=env,
+                                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                        messages = queue.Queue()
+                        def reader():
+                            for line in process.stdout:
+                                messages.put(line)
+                            messages.put(None)
+                        threading.Thread(target=reader, daemon=True).start()
+                        deadline = time.monotonic() + args.timeout
+                        def send(message):
+                            process.stdin.write((json.dumps(message) + '\n').encode())
+                            process.stdin.flush()
+                        def receive(identifier):
+                            while True:
+                                line = messages.get(timeout=max(0, deadline - time.monotonic()))
+                                if line is None:
+                                    raise ValueError('app-server exited')
+                                data = json.loads(line)
+                                if data.get('id') == identifier:
+                                    if 'error' in data:
+                                        raise ValueError('JSON-RPC error: {}'.format(data['error']))
+                                    return data
+                        send({'jsonrpc': '2.0', 'id': 1, 'method': 'initialize', 'params': {'clientInfo': {'name': 'host-probe', 'version': '0'}}})
+                        receive(1)
+                        send({'jsonrpc': '2.0', 'method': 'initialized'})
+                        send({'jsonrpc': '2.0', 'id': 2, 'method': 'hooks/list', 'params': {'cwds': [str(home)]}})
+                        hooks_list = receive(2)['result']['data'][0]['hooks']
+                        found = collections.Counter(h['eventName'] for h in hooks_list if h.get('pluginId') == PLUGIN and h.get('source') == 'plugin')
+                        missing = EXPECTED - found
+                        extra = found - EXPECTED
+                        detail = '{} hooks: {}'.format(sum(found.values()), ', '.join(sorted(found.elements())) or 'none')
+                        if missing:
+                            detail += '; missing: ' + ', '.join(sorted(missing.elements()))
+                        if extra:
+                            detail += '; unexpected: ' + ', '.join(sorted(extra.elements()))
+                        add('FAIL' if missing or extra else 'PASS', 'codex', 'hooks discovered', detail)
+                    except (OSError, ValueError, KeyError, IndexError, TypeError, queue.Empty) as exc:
+                        add('SKIP', 'codex', 'hooks discovered', 'JSON-RPC exchange failed: {}'.format(str(exc) or 'timeout'))
+                    finally:
+                        if process is not None:
+                            process.kill()
+                            process.wait()
+                            process.stdin.close()
+                            process.stdout.close()
+
+                if args.host in ('codex', 'all'):
+                    if not shutil.which('codex', path=env.get('PATH')):
+                        add('SKIP', 'codex', 'cli', 'codex not found on PATH')
+                    else:
+                        command('codex', 'cli version', ['codex', '--version'])
+                        command('codex', 'marketplace add', ['codex', 'plugin', 'marketplace', 'add', str(export)])
+                        installed = command('codex', 'plugin add', ['codex', 'plugin', 'add', PLUGIN])
+                        if not installed:
+                            for check in ('installed version', 'skills hidden', 'hooks discovered'):
+                                add('SKIP', 'codex', check, 'plugin add failed')
+                        else:
+                            path = tmp / 'codex/plugins/cache/agent-kaizen-tools/agent-kaizen' / version
+                            add('PASS' if path.is_dir() else 'FAIL', 'codex', 'installed version', version if path.is_dir() else '{} missing'.format(version))
+                            try:
+                                result = run(['codex', 'debug', 'prompt-input'])
+                                output = result.stdout.decode('utf-8', 'replace')
+                                if result.returncode:
+                                    raise ValueError('prompt-input exited {}'.format(result.returncode))
+                                if not isinstance(json.loads(output), list):
+                                    raise ValueError('prompt output is not a JSON array')
+                                if not re.search(r'- [^\s:]+(?:\:[^\s:]+)?: .+? \(file: .*?\)', output):
+                                    add('SKIP', 'codex', 'skills hidden', 'prompt output has no skills section')
+                                else:
+                                    count = len(set(re.findall(r'agent-kaizen:([a-z0-9-]+): ', output)))
+                                    add('FAIL' if args.expect_hidden_skills and count else 'PASS', 'codex', 'skills hidden', '{} listed'.format(count))
+                            except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
+                                add('FAIL', 'codex', 'skills hidden', 'codex debug prompt-input: {}'.format(exc))
+                            hooks()
+                if args.host in ('copilot', 'all'):
+                    if not shutil.which('copilot', path=env.get('PATH')):
+                        add('SKIP', 'copilot', 'cli', 'copilot not found on PATH')
+                    else:
+                        command('copilot', 'marketplace add', ['copilot', 'plugin', 'marketplace', 'add', str(export)])
+                        installed = command('copilot', 'plugin install', ['copilot', 'plugin', 'install', PLUGIN])
+                        if installed:
+                            path = tmp / 'copilot/installed-plugins/agent-kaizen-tools/agent-kaizen'
+                            add('PASS' if path.is_dir() else 'FAIL', 'copilot', 'installed', 'installation found' if path.is_dir() else 'installation missing')
+                        else:
+                            add('SKIP', 'copilot', 'installed', 'plugin install did not succeed')
+    finally:
+        shutil.rmtree(tmp)
+    if args.json:
+        print(json.dumps(results))
+    else:
+        for result in results:
+            print('{status} {host} {check}: {detail}'.format(**result))
+    return int(any(result['status'] == 'FAIL' for result in results))
+
+
+if __name__ == '__main__':
+    sys.exit(main())
