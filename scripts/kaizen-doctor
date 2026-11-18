@@ -45,32 +45,71 @@ def main():
     parser.add_argument('--project', type=Path, default=Path.cwd(), help='project whose config to check')
     args = parser.parse_args()
     root = args.plugin_root.expanduser().resolve()
-    link = root / 'scripts/kaizen-link'
-    fix_link = 'kaizen-link --check --plugin-root DIR'
-    result = command([sys.executable, str(link), '--check', '--json', '--plugin-root', str(root)])
     try:
-        entries = json.loads(result.stdout)['entries'] if result else None
-        if not isinstance(entries, list):
-            raise ValueError()
-        bad = [e for e in entries if e['status'] in ('DRIFT', 'BROKEN', 'ABSENT')]
-        stale = [e for e in entries if e['status'] == 'STALE-CACHE']
-        emit('WARN' if bad else 'PASS', 'managed links: {} need attention'.format(len(bad)),
-             'kaizen-link --apply' if bad else '')
-        registry = HOME / 'plugins/installed_plugins.json'
-        data = read_json(registry)
-        name = read_json(root / '.claude-plugin/plugin.json')['name']
-        plugins = data['plugins']
-        installed = any(k.split('@', 1)[0] == name and isinstance(v, list) and
-                        any(isinstance(item, dict) and item.get('installPath') for item in v)
-                        for k, v in plugins.items())
-        if stale:
-            emit('WARN', 'installed cache differs from plugin root', 'claude plugin update agent-kaizen')
-        elif installed:
-            emit('PASS', 'installed cache matches plugin root')
+        plugin = read_json(root / '.claude-plugin/plugin.json')
+        plugin_name = plugin.get('name', 'agent-kaizen')
+        version = plugin.get('version', 'unknown')
+    except (OSError, ValueError, TypeError, AttributeError):
+        plugin_name, version = 'agent-kaizen', 'unknown'
+    try:
+        marketplace = read_json(root / '.claude-plugin/marketplace.json').get('name', 'agent-kaizen-tools')
+    except (OSError, ValueError, TypeError, AttributeError):
+        marketplace = 'agent-kaizen-tools'
+    codex = Path(os.environ.get('CODEX_HOME') or Path.home() / '.codex').expanduser()
+    cache = codex / 'plugins/cache' / marketplace / plugin_name
+    try:
+        versions = sorted(p.name for p in cache.iterdir() if p.is_dir())
+    except OSError:
+        versions = []
+    copilot = Path(os.environ.get('COPILOT_HOME') or Path.home() / '.copilot').expanduser()
+    installed_copilot = copilot / 'installed-plugins' / marketplace / plugin_name
+    copilot_present = installed_copilot.is_dir()
+    neutral = not (HOME / 'plugins/installed_plugins.json').exists() and (bool(versions) or copilot_present)
+    neutral_fix = "update the plugin with your host's plugin command (see docs/hosts.md)"
+    if versions:
+        if versions == [version]:
+            emit('PASS', 'Codex: plugin installed (version {})'.format(version))
         else:
-            emit('WARN', 'installed cache not found', 'claude plugin list')
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        emit('WARN', 'link or installed cache status unknown', fix_link)
+            emit('WARN', 'Codex: installed version(s) {} differ from plugin root {}'.format(', '.join(versions), version),
+                 'codex plugin add {}@{}'.format(plugin_name, marketplace))
+        emit('INFO', 'Codex: run /hooks once to trust the plugin hooks')
+    if copilot_present:
+        try:
+            copilot_version = read_json(installed_copilot / '.claude-plugin/plugin.json')['version']
+        except (OSError, ValueError, KeyError, TypeError):
+            copilot_version = None
+        if copilot_version is not None and copilot_version != version:
+            emit('WARN', 'Copilot: installed version(s) {} differ from plugin root {}'.format(copilot_version, version),
+                 'copilot plugin install {}@{}'.format(plugin_name, marketplace))
+        else:
+            emit('PASS', 'Copilot: plugin installed')
+    if not neutral:
+        link = root / 'scripts/kaizen-link'
+        fix_link = 'kaizen-link --check --plugin-root DIR'
+        result = command([sys.executable, str(link), '--check', '--json', '--plugin-root', str(root)])
+        try:
+            entries = json.loads(result.stdout)['entries'] if result else None
+            if not isinstance(entries, list):
+                raise ValueError()
+            bad = [e for e in entries if e['status'] in ('DRIFT', 'BROKEN', 'ABSENT')]
+            stale = [e for e in entries if e['status'] == 'STALE-CACHE']
+            emit('WARN' if bad else 'PASS', 'managed links: {} need attention'.format(len(bad)),
+                 'kaizen-link --apply' if bad else '')
+            registry = HOME / 'plugins/installed_plugins.json'
+            data = read_json(registry)
+            name = read_json(root / '.claude-plugin/plugin.json')['name']
+            plugins = data['plugins']
+            installed = any(k.split('@', 1)[0] == name and isinstance(v, list) and
+                            any(isinstance(item, dict) and item.get('installPath') for item in v)
+                            for k, v in plugins.items())
+            if stale:
+                emit('WARN', 'installed cache differs from plugin root', 'claude plugin update agent-kaizen')
+            elif installed:
+                emit('PASS', 'installed cache matches plugin root')
+            else:
+                emit('WARN', 'installed cache not found', 'claude plugin list')
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            emit('WARN', 'link or installed cache status unknown', fix_link)
 
     expected = [('SessionStart', 'startup|resume', 'audit-notice.sh'),
                 ('SessionStart', 'startup|resume', 'session-audit.sh'),
@@ -91,7 +130,7 @@ def main():
                 raise ValueError()
         emit('PASS', 'plugin hook registration and scripts')
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        emit('FAIL', 'plugin hook registration or script missing or malformed', 'claude plugin install agent-kaizen')
+        emit('FAIL', 'plugin hook registration or script missing or malformed', neutral_fix if neutral else 'claude plugin install agent-kaizen')
 
     for name, minimum in [('jq', None), ('python3', (3, 9))]:
         path = shutil.which(name)
@@ -142,7 +181,7 @@ def main():
             raise ValueError()
         emit('PASS', 'pricing checked {} days ago'.format(age))
     except (OSError, ValueError, TypeError, KeyError):
-        emit('WARN', 'pricing date missing, invalid, or over 60 days old', 'kaizen-link --apply --replace-prefixed after updating pricing.json')
+        emit('WARN', 'pricing date missing, invalid, or over 60 days old', neutral_fix if neutral else 'kaizen-link --apply --replace-prefixed after updating pricing.json')
 
     try:
         db = Path(os.environ.get('KAIZEN_USAGE_DB') or HOME / 'kaizen-usage.db').expanduser().resolve()
