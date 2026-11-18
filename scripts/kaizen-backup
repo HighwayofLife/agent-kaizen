@@ -140,15 +140,41 @@ def changes(include_reverted=True):
                                            str(item[1]["change"]).zfill(8)), reverse=True)
 
 
-def next_number(run_id):
-    """One more than the highest NN in existing folders named <run_id>-NN-<skill>."""
-    numbers = [0]
+def change_numbers(run_id):
     for item in ROOT.iterdir():
         if item.is_dir() and not item.is_symlink() and item.name.startswith(run_id + "-"):
             match = re.match(r"(\d+)-", item.name[len(run_id) + 1:])
             if match:
-                numbers.append(int(match.group(1)))
-    return max(numbers) + 1
+                yield int(match.group(1))
+
+
+def next_number(run_id):
+    """One more than the highest NN in existing folders named <run_id>-NN-<skill>."""
+    return max(change_numbers(run_id), default=0) + 1
+
+
+def allocate_change(run_id, skill):
+    first = next_number(run_id)
+    run_key = hashlib.sha256(os.fsencode(run_id)).hexdigest()
+    for number in range(first, first + 1000):
+        change = ROOT / f"{run_id}-{number:02d}-{skill}"
+        change_dir(change)  # Refuse a path that resolves outside the backup root.
+        # Reserve the number across all skills, including callers without a lock.
+        slot = ROOT / f".kaizen-slot.{run_key}.{number}"
+        try:
+            os.mkdir(slot, 0o700)
+        except FileExistsError:
+            continue
+        try:
+            if number in change_numbers(run_id):
+                continue  # Another caller finished allocating after our initial scan.
+            os.mkdir(change, 0o700)
+            return number, change
+        except FileExistsError:
+            continue
+        finally:
+            slot.rmdir()
+    raise ValueError(f"no available backup slot for run {run_id}")
 
 
 def valid_id(value):
@@ -307,6 +333,8 @@ def git_executable(path):
             "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns, "sha256": digest.hexdigest()}
 
 
+# A user-writable Git executable can still be swapped between check and exec.
+# An entry added after its directory was scanned can still yield a false advisory clean start.
 def resolve_git():
     """Return the identity of the first Git at a fixed location; re-verify it before each later use."""
     for candidate in TRUSTED_GIT:
@@ -450,12 +478,16 @@ def capture_git_tree(directory):
     tree = git(root, "ls-tree", "-rz", state["head"], git_exe=git_exe).split(b"\0")[:-1]
     # Before Git scans: a file created after Git passes a directory still changes its stamp.
     listing = worktree_listing(root)
-    with tempfile.TemporaryDirectory() as scratch:
+    with tempfile.TemporaryDirectory() as scratch, open_directory(scratch) as scratch_fd:
         # Isolate the copied index, including any split-index lookup, from real Git metadata.
         git(scratch, "init", "-q", "--bare", "--template=", f"--object-format={algorithm}", git_exe=git_exe)
         copy = Path(scratch) / "index"
-        copy.write_bytes(raw)
-        copied = file_version(os.lstat(scratch)), file_version(copy.lstat())
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        with os.fdopen(os.open("index", flags, 0o600, dir_fd=scratch_fd), "wb") as stream:
+            stream.write(raw)
+            stream.flush()
+            copied = file_version(os.fstat(stream.fileno()))
+        scratch_version = file_version(os.fstat(scratch_fd))
         records = git(root, "ls-files", "-v", "--stage", "--debug", "--sparse", "-z",
                       git_exe=git_exe, git_dir=scratch)
         # No exclude options: ignored files count too.
@@ -478,9 +510,16 @@ def capture_git_tree(directory):
         if git(root, "ls-files", "--others", "-z", git_exe=git_exe, git_dir=scratch):
             raise ValueError("worktree contains new untracked files")
         # Git read the copy by path; a rewrite or swap of it changes its change time.
-        if (copied != (file_version(os.lstat(scratch)), file_version(copy.lstat()))
-                or hashlib.sha256(copy.read_bytes()).hexdigest() != state["index"]["sha256"]):
+        if (scratch_version != file_version(os.lstat(scratch)) or copied != file_version(copy.lstat())):
             raise ValueError("copied Git index changed during capture")
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        with os.fdopen(os.open("index", flags, dir_fd=scratch_fd), "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or copied != file_version(info):
+                raise ValueError("copied Git index changed during capture")
+            digest = hashlib.sha256(stream.read(len(raw) + 1)).hexdigest()
+            if digest != state["index"]["sha256"] or copied != file_version(os.fstat(stream.fileno())):
+                raise ValueError("copied Git index changed during capture")
     check = state, versions, listing
     if not still_clean(*check):
         raise ValueError("repository changed during capture")
@@ -605,15 +644,13 @@ def write_backup(args, root_fd=None, lock_fd=None, reason=None):
     session_id = os.environ.get("KAIZEN_SESSION_ID")
     valid_id(run_id)
     valid_id(args.skill)
-    number = next_number(run_id)
+    number, change = allocate_change(run_id, args.skill)
     # A previous manifest's advisory Git stamp is never reused.
     if reason is None and session_id is not None:
         reason = "scheduled runs record no clean-start stamp"
     elif reason is None and number != 1:
         reason = "only the first backup of a run records a clean-start stamp"
     baseline = None
-    change = change_dir(ROOT / f"{run_id}-{number:02d}-{args.skill}")
-    change.mkdir(mode=0o700)
     try:
         if args.repo is not None and reason is None:
             try:

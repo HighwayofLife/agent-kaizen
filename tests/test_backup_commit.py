@@ -11,7 +11,9 @@ import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
 
@@ -51,6 +53,13 @@ class BackupCommitTests(unittest.TestCase):
 
     def manifest(self, change):
         return json.loads((change / "manifest.json").read_text())
+
+    def begin_in_process(self, run):
+        with patch.dict(os.environ, self.env, clear=True), patch("sys.stdout"):
+            self.assertEqual(self.helpers["main"](
+                ["begin", "--run", run, "--repo", str(self.repo), "--skill", "trim",
+                 "--ledger", "fixture", str(self.target)]), 0)
+        return self.backups / f"{run}-01-trim"
 
     def test_capture_and_first_interactive_begin(self):
         tree = self.tmp / "linked"
@@ -228,6 +237,46 @@ class BackupCommitTests(unittest.TestCase):
 
         with patch.dict(self.helpers, git=swap_copied_index):
             self.assertIsNone(self.capture(self.repo))
+
+    def test_existing_scratch_index_is_refused(self):
+        git = self.helpers["git"]
+
+        def occupy_index(directory, *args, **kwargs):
+            result = git(directory, *args, **kwargs)
+            if args[0] == "init":
+                (Path(directory) / "index").write_text("already occupied")
+            return result
+
+        with patch.dict(self.helpers, git=occupy_index):
+            change = self.begin_in_process("occupied")
+        self.assertIsNone(self.manifest(change)["git"])
+        self.assertEqual((change / "files" / "1").read_text(), "before")
+
+    def test_scratch_index_replaced_after_stat_revokes_clean_start(self):
+        git, lstat = self.helpers["git"], Path.lstat
+        copy = None
+
+        def remember_index(directory, *args, **kwargs):
+            nonlocal copy
+            result = git(directory, *args, **kwargs)
+            if "--others" in args:
+                copy = Path(kwargs["git_dir"]) / "index"
+            return result
+
+        def replace_after_stat(path):
+            info = lstat(path)
+            if path == copy:
+                replacement = path.with_name("replacement")
+                replacement.write_bytes(path.read_bytes())
+                replacement.replace(path)
+            return info
+
+        with patch.dict(self.helpers, git=remember_index), patch.object(Path, "lstat", replace_after_stat):
+            change = self.begin_in_process("swapped")
+        data = self.manifest(change)
+        self.assertIsNone(data["git"])
+        self.assertEqual(data["git_reason"], "copied Git index changed during capture")
+        self.assertEqual((change / "files" / "1").read_text(), "before")
 
     def test_forged_index_stat_cannot_hide_dirty_content(self):
         before = bytes.fromhex(self.git("rev-parse", "HEAD:tracked"))
@@ -479,6 +528,30 @@ class BackupCommitTests(unittest.TestCase):
                 self.assertIn("lock", data["git_reason"])
                 self.assertEqual((self.backups / f"lock{run}-01-trim" / "files" / "1").read_text(), "before")
                 lock_file.rmdir() if lock_file.is_dir() else lock_file.unlink(missing_ok=True)
+
+    def test_concurrent_lock_fallbacks_allocate_distinct_change_numbers(self):
+        next_number = self.helpers["next_number"]
+        barrier = threading.Barrier(2)
+
+        def simultaneous_number(run):
+            number = next_number(run)
+            barrier.wait(timeout=5)
+            return number
+
+        def begin(skill):
+            return self.helpers["main"](
+                ["begin", "--run", "unlocked", "--repo", str(self.repo), "--skill", skill,
+                 "--ledger", "fixture", str(self.target)])
+
+        with patch.dict(os.environ, self.env, clear=True), patch.dict(
+                self.helpers, fcntl=None, next_number=simultaneous_number), patch("sys.stdout"):
+            with ThreadPoolExecutor(max_workers=2) as workers:
+                self.assertEqual(list(workers.map(begin, ("trim", "review"))), [0, 0])
+        changes = list(self.backups.glob("unlocked-*"))
+        self.assertEqual(sorted(self.manifest(change)["change"] for change in changes), [1, 2])
+        for change in changes:
+            self.assertIsNone(self.manifest(change)["git"])
+            self.assertEqual((change / "files" / "1").read_text(), "before")
 
     def test_deep_manifest_uses_normal_rejection_path(self):
         change = self.begin()
