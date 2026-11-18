@@ -52,7 +52,7 @@ MANAGED_NAMES = (
     "kaizen_credentials.py",
     "kaizen-pricing.json", "pricing.json", "kaizen-link", "rules-lint",
     "rules-lint.patterns", "packet-report", "kaizen-project-report", "notes-ledger",
-    "usage-series", "usage-compare", "usage-db",
+    "usage-series", "usage-compare", "usage-db", "kaizen-demo-fixtures",
     "packet-event", "flow-report", "experiment-check", "brief-lint",
 )
 LABEL = "com.agent-kaizen"

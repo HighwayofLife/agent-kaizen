@@ -1,0 +1,69 @@
+#!/usr/bin/env python3
+"""Create synthetic Claude transcripts for offline audit demonstrations."""
+import argparse
+from datetime import datetime, timedelta, timezone
+import json
+from pathlib import Path
+
+
+def generate(output):
+    project = output / 'projects' / 'synthetic-demo'
+    now = datetime.now(timezone.utc).replace(microsecond=0)
+
+    def stamp(minutes):
+        return (now + timedelta(minutes=minutes)).isoformat()
+
+    def row(kind, minute, content, **message):
+        return dict(type=kind, timestamp=stamp(minute), sessionId='synthetic-main',
+                    message=dict(content=content, **message))
+
+    def call(minute, ident, usage, content):
+        return row('assistant', minute, content, id=ident, model='claude-sonnet-4-5', usage=usage)
+
+    def tool(ident, name, **inputs):
+        return dict(type='tool_use', id=ident, name=name, input=inputs)
+
+    def result(ident, content):
+        return dict(type='tool_result', tool_use_id=ident, content=content)
+
+    main = [
+        row('user', -120, 'Inspect the synthetic project.'),
+        call(-119, 'demo-main-call-1', dict(input_tokens=1000, cache_read_input_tokens=180000,
+             cache_creation_input_tokens=10000, output_tokens=400),
+             [tool('demo-spawn', 'Agent', subagent_type='relay', prompt='Inspect files and report briefly.'),
+              tool('demo-image', 'Read', file_path='example.png')]),
+        row('user', -118, [result('demo-spawn', 'Done.'),
+                           result('demo-image', [dict(type='image', source=dict(type='base64',
+                                  media_type='image/png', data='c3ludGhldGlj'))])]),
+        call(-58, 'demo-main-call-2', dict(input_tokens=2000, cache_read_input_tokens=10000,
+             cache_creation_input_tokens=180000, output_tokens=300), []),
+    ]
+    relay = [
+        row('user', -119, 'Inspect files and report briefly.'),
+        call(-118, 'demo-relay-call-1', dict(input_tokens=100, cache_read_input_tokens=1000,
+             cache_creation_input_tokens=200, output_tokens=30),
+             [tool('demo-bash-1', 'Bash', command='rg TODO src'),
+              tool('demo-bash-2', 'Bash', command='git status --short'),
+              tool('demo-bash-3', 'Bash', command='ls src')]),
+        row('user', -117, [result('demo-bash-1', 'none'), result('demo-bash-2', 'clean'),
+                           result('demo-bash-3', 'ok')]),
+    ]
+    project.mkdir(parents=True, exist_ok=True)
+    subagents = project / 'synthetic-main' / 'subagents'
+    subagents.mkdir(parents=True, exist_ok=True)
+    for path, rows in ((project / 'synthetic-main.jsonl', main),
+                       (subagents / 'synthetic-relay.jsonl', relay)):
+        path.write_text(''.join(json.dumps(item) + '\n' for item in rows), encoding='utf-8')
+    (subagents / 'synthetic-relay.meta.json').write_text(
+        json.dumps(dict(agentType='relay')) + '\n', encoding='utf-8')
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', required=True, type=Path, help='directory for synthetic projects')
+    args = parser.parse_args()
+    generate(args.output)
+
+
+if __name__ == '__main__':
+    main()
