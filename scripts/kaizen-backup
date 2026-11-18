@@ -26,7 +26,6 @@ in folders only the owner can read.
 """
 import argparse
 import datetime
-import errno
 import hashlib
 import json
 import os
@@ -37,7 +36,8 @@ import stat
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager
+import time
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 try:
@@ -270,38 +270,82 @@ def check_backup_root(root, expected):
             raise ValueError("backup root was replaced or changed during validation")
 
 
+# Fixed locations in preference order; PATH is never consulted. On macOS the first is
+# the root-owned xcrun shim, run with a fixed environment and no xcrun cache.
+TRUSTED_GIT = ("/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git")
+MAX_GIT_BYTES = 256 * 1024 * 1024
+
+
+def trusted_owner(info):
+    return info.st_uid in (0, os.getuid()) and not info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+
+
+def check_trusted_parents(path):
+    parent = os.path.dirname(path)
+    while True:
+        if not trusted_owner(os.lstat(parent)):
+            raise ValueError(f"Git executable is not in a trusted directory: {parent}")
+        if parent == os.path.dirname(parent):
+            return
+        parent = os.path.dirname(parent)
+
+
+def git_executable(path):
+    """Identity of the executable file at a canonical path, including a hash of its bytes."""
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(path, flags), "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or not info.st_mode & stat.S_IXUSR or not trusted_owner(info)
+                or info.st_size > MAX_GIT_BYTES):
+            raise ValueError("Git executable is not a trusted regular executable")
+        digest = hashlib.sha256()
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+        if file_version(os.lstat(path)) != file_version(info):
+            raise ValueError("Git executable changed while it was hashed")
+    return {"path": path, "dev": info.st_dev, "ino": info.st_ino, "size": info.st_size,
+            "mtime_ns": info.st_mtime_ns, "ctime_ns": info.st_ctime_ns, "sha256": digest.hexdigest()}
+
+
 def resolve_git():
-    executable = shutil.which("git")
-    if executable is None:
-        raise ValueError("Git executable was not found")
-    path = Path(executable).resolve(strict=True)
-    info = path.stat()
-    if (not stat.S_ISREG(info.st_mode) or not os.access(path, os.X_OK)
-            or info.st_mode & (stat.S_IWGRP | stat.S_IWOTH) or info.st_uid not in (0, os.getuid())):
-        raise ValueError("Git executable is not a trusted regular executable")
-    return str(path)
+    """Return the identity of the first Git at a fixed location; re-verify it before each later use."""
+    for candidate in TRUSTED_GIT:
+        if os.path.lexists(candidate):
+            path = os.path.realpath(candidate)
+            check_trusted_parents(candidate)
+            check_trusted_parents(path)
+            return git_executable(path)
+    raise ValueError("no Git executable at a trusted location")
 
 
-def git(directory, *args, git_path, git_dir=None):
+def verify_git(record):
+    """Return the executable path only if resolution still yields this exact file and content."""
+    if resolve_git() != record:
+        raise ValueError("Git executable changed since capture")
+    return record["path"]
+
+
+def git(directory, *args, git_exe, git_dir=None):
     # Only use metadata queries here. No status, diffs or worktree conversion.
-    if not os.path.isabs(git_path):
-        raise ValueError("Git executable path must be absolute")
+    info = os.lstat(git_exe["path"])
+    if (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns) != tuple(
+            git_exe[key] for key in ("dev", "ino", "size", "mtime_ns", "ctime_ns")):
+        raise ValueError("Git executable changed since capture")
     directory = Path(directory)
     env = dict(PATH="/usr/bin:/bin", LC_ALL="C", GIT_TERMINAL_PROMPT="0", GIT_NO_LAZY_FETCH="1",
                GIT_ALLOW_PROTOCOL="", GIT_NO_REPLACE_OBJECTS="1", GIT_CONFIG_NOSYSTEM="1",
-               GIT_CONFIG_GLOBAL=os.devnull, GIT_ATTR_NOSYSTEM="1",
+               GIT_CONFIG_GLOBAL=os.devnull, GIT_ATTR_NOSYSTEM="1", xcrun_nocache="1",
                GIT_CEILING_DIRECTORIES=str(directory.parent))
     scope = [] if git_dir is None else [f"--git-dir={git_dir}", f"--work-tree={directory}"]
     return subprocess.run(
-        [git_path, "--no-pager", "--no-optional-locks", "-C", str(directory), *scope,
-         "-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}",
+        [git_exe["path"], "--no-pager", "--no-optional-locks", "-C", str(directory), *scope,
+         "-c", "core.fsmonitor=false", "-c", f"core.hooksPath={os.devnull}", "-c", "protocol.allow=never",
          "-c", "core.untrackedCache=false", "-c", "core.sparseCheckout=false", *args],
         env=env, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=True, timeout=10,
     ).stdout
 
 
 MAX_INDEX_BYTES = 64 * 1024 * 1024
-GIT_ERRORS = (OSError, ValueError, RuntimeError, subprocess.SubprocessError)
 
 
 def read_index(path):
@@ -319,13 +363,13 @@ def read_index(path):
             "sha256": hashlib.sha256(raw).hexdigest()}, raw
 
 
-def git_snapshot(directory, git_path):
+def git_snapshot(directory, git_exe):
     root = Path(directory).expanduser().resolve(strict=True)
     if not os.path.lexists(root / ".git"):
         raise ValueError("repository must be the exact Git worktree top level")
     worktree = directory_identity(root)
     top, common, index = (Path(os.fsdecode(git(root, "rev-parse", "--path-format=absolute",
-                                             *args, git_path=git_path).removesuffix(b"\n")))
+                                             *args, git_exe=git_exe).removesuffix(b"\n")))
                           for args in (("--show-toplevel",), ("--git-common-dir",), ("--git-path", "index")))
     if not all(path.is_absolute() for path in (top, common, index)) or top.resolve(strict=True) != root:
         raise ValueError("repository must be the exact Git worktree top level")
@@ -333,17 +377,17 @@ def git_snapshot(directory, git_path):
     common_dir = directory_identity(common)
     if (index.parent / "index.lock").exists():
         raise ValueError("locked Git index")
-    head = git(root, "rev-parse", "--verify", "HEAD^{commit}", git_path=git_path).decode("ascii").strip()
+    head = git(root, "rev-parse", "--verify", "HEAD^{commit}", git_exe=git_exe).decode("ascii").strip()
     index_state, raw = read_index(index)
     if directory_identity(root) != worktree or directory_identity(common) != common_dir:
         raise ValueError("Git directories changed during capture")
     return {"root": str(root), "worktree": worktree, "head": head, "common_dir": common_dir,
-            "index": index_state, "git_path": git_path}, raw
+            "index": index_state, "git_executable": git_exe}, raw
 
 
-def git_identity(directory, git_path):
+def git_identity(directory, git_exe):
     """Read the live identity using the executable from the trusted capture."""
-    return git_snapshot(directory, git_path)[0]
+    return git_snapshot(directory, git_exe)[0]
 
 
 def matches_blob(path, mode, oid):
@@ -372,20 +416,50 @@ INDEX_ENTRY = re.compile(rb"H (100644|100755|120000) ([0-9a-f]+) 0\t([^\0]+)\0"
                          rb"(?:  [^\n]*\n){4}  size: [0-9]+\tflags: 0\n")
 
 
+def worktree_listing(root):
+    """Stamp each directory before listing it, so any later entry change alters a stamp."""
+    directories, others, pending = {}, set(), [root]
+    while pending:
+        top = pending.pop()
+        info = os.lstat(top)
+        if not stat.S_ISDIR(info.st_mode):
+            raise ValueError("worktree directory was replaced")
+        directories[top] = (info.st_dev, info.st_ino, info.st_mtime_ns, info.st_ctime_ns)
+        with os.scandir(top) as listing:
+            for entry in listing:
+                if top == root and entry.name == ".git":
+                    continue
+                (pending.append if entry.is_dir(follow_symlinks=False) else others.add)(top / entry.name)
+    return directories, others
+
+
+def still_clean(state, versions, listing):
+    """Recheck an earlier capture; any change, new directory or new entry means not clean."""
+    root = Path(state["root"])
+    verify_git(state["git_executable"])
+    return (git_identity(root, state["git_executable"]) == state and worktree_listing(root) == listing
+            and all(path.parent.resolve(strict=True) == path.parent and file_version(path.lstat()) == version
+                    for path, version in versions.items()))
+
+
 def capture_git_tree(directory):
-    git_path = resolve_git()
-    state, raw = git_snapshot(directory, git_path)
+    git_exe = resolve_git()
+    state, raw = git_snapshot(directory, git_exe)
     root = Path(state["root"])
     algorithm = "sha256" if len(state["head"]) == 64 else "sha1"
-    tree = git(root, "ls-tree", "-rz", state["head"], git_path=git_path).split(b"\0")[:-1]
+    tree = git(root, "ls-tree", "-rz", state["head"], git_exe=git_exe).split(b"\0")[:-1]
+    # Before Git scans: a file created after Git passes a directory still changes its stamp.
+    listing = worktree_listing(root)
     with tempfile.TemporaryDirectory() as scratch:
         # Isolate the copied index, including any split-index lookup, from real Git metadata.
-        git(scratch, "init", "-q", "--bare", "--template=", f"--object-format={algorithm}", git_path=git_path)
-        (Path(scratch) / "index").write_bytes(raw)
+        git(scratch, "init", "-q", "--bare", "--template=", f"--object-format={algorithm}", git_exe=git_exe)
+        copy = Path(scratch) / "index"
+        copy.write_bytes(raw)
+        copied = file_version(os.lstat(scratch)), file_version(copy.lstat())
         records = git(root, "ls-files", "-v", "--stage", "--debug", "--sparse", "-z",
-                      git_path=git_path, git_dir=scratch)
+                      git_exe=git_exe, git_dir=scratch)
         # No exclude options: ignored files count too.
-        if git(root, "ls-files", "--others", "-z", git_path=git_path, git_dir=scratch):
+        if git(root, "ls-files", "--others", "-z", git_exe=git_exe, git_dir=scratch):
             raise ValueError("worktree contains untracked files")
         entries, versions, offset = {}, {}, 0
         for row in tree:
@@ -399,21 +473,25 @@ def capture_git_tree(directory):
                 raise ValueError("index or worktree differs from HEAD")
             entries[path] = (mode, oid)
             offset = match.end()
-        if offset != len(records) or git_identity(root, git_path) != state:
-            raise ValueError("index or repository identity changed")
-        if git(root, "ls-files", "--others", "-z", git_path=git_path, git_dir=scratch):
+        if offset != len(records) or listing[1] != set(entries):
+            raise ValueError("worktree entries differ from the index")
+        if git(root, "ls-files", "--others", "-z", git_exe=git_exe, git_dir=scratch):
             raise ValueError("worktree contains new untracked files")
-        if any(path.parent.resolve(strict=True) != path.parent or file_version(path.lstat()) != version
-               for path, version in versions.items()):
-            raise ValueError("tracked files changed during capture")
-    return state, entries
+        # Git read the copy by path; a rewrite or swap of it changes its change time.
+        if (copied != (file_version(os.lstat(scratch)), file_version(copy.lstat()))
+                or hashlib.sha256(copy.read_bytes()).hexdigest() != state["index"]["sha256"]):
+            raise ValueError("copied Git index changed during capture")
+    check = state, versions, listing
+    if not still_clean(*check):
+        raise ValueError("repository changed during capture")
+    return state, entries, check
 
 
 def capture_git_baseline(directory):
     """Capture before launch and retain the result in trusted caller state."""
     try:
         return dict(capture_git_tree(directory)[0], clean_start=True)
-    except GIT_ERRORS:
+    except Exception:  # Advisory: any failure only means "not clean".
         return None
 
 
@@ -486,48 +564,67 @@ def begin(args):
         path = Path(name).expanduser().resolve()
         if path.exists() and not path.is_file():
             sys.exit(f"kaizen-backup: {path} is not a regular file")
-    if fcntl is None:
-        return write_backup(args)
-    # Serialize numbering and baseline capture across simultaneous begins.
-    with open_directory(ROOT) as root_fd, open_backup_lock(root_fd) as lock_fd:
+    # Serialize numbering and baseline capture across simultaneous begins. Any lock
+    # problem drops only the clean-start stamp; the ordinary backup always proceeds.
+    with ExitStack() as stack:
         try:
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
-        except OSError as error:
-            if error.errno not in (errno.ENOLCK, errno.EOPNOTSUPP, errno.EBADF):
-                raise
-            return write_backup(args)
+            if fcntl is None:
+                raise ValueError("file locking is unavailable")
+            root_fd = stack.enter_context(open_directory(ROOT))
+            lock_fd = stack.enter_context(open_backup_lock(root_fd))
+            lock_exclusive(lock_fd)
+        except (OSError, ValueError) as error:
+            stack.close()
+            return write_backup(args, reason=f"backup lock unavailable: {error}")
         return write_backup(args, root_fd, lock_fd)
 
 
-def write_backup(args, root_fd=None, lock_fd=None):
+LOCK_WAIT_SECONDS = 10
+
+
+def lock_exclusive(fd):
+    deadline = time.monotonic() + LOCK_WAIT_SECONDS
+    while True:
+        try:
+            return fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(0.05)
+
+
+def capture_reason(error):
+    if isinstance(error, subprocess.SubprocessError):
+        return "a Git query failed"
+    return str(error) or type(error).__name__
+
+
+def write_backup(args, root_fd=None, lock_fd=None, reason=None):
     created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     run_id = args.run or os.environ.get("KAIZEN_RUN_ID") or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     session_id = os.environ.get("KAIZEN_SESSION_ID")
     valid_id(run_id)
     valid_id(args.skill)
     number = next_number(run_id)
-    baseline = None
     # A previous manifest's advisory Git stamp is never reused.
-    if args.repo is not None and root_fd is not None and session_id is None and number == 1:
-        try:
-            root_stamp = backup_root_stamp(ROOT, root_fd)
-            if root_stamp["lock"] == list(file_version(os.fstat(lock_fd))):
-                check_backup_root(BACKUP_ROOT, root_stamp)
-                baseline, blobs = capture_git_tree(args.repo)
-                repo = Path(baseline["root"])
-                check_backup_root(BACKUP_ROOT, root_stamp)
-        except GIT_ERRORS:
-            baseline = None
+    if reason is None and session_id is not None:
+        reason = "scheduled runs record no clean-start stamp"
+    elif reason is None and number != 1:
+        reason = "only the first backup of a run records a clean-start stamp"
+    baseline = None
     change = change_dir(ROOT / f"{run_id}-{number:02d}-{args.skill}")
     change.mkdir(mode=0o700)
     try:
-        if baseline is not None:
+        if args.repo is not None and reason is None:
             try:
                 root_stamp = backup_root_stamp(ROOT, root_fd)
                 if root_stamp["lock"] != list(file_version(os.fstat(lock_fd))):
-                    baseline = None
-            except OSError:
-                baseline = None
+                    raise ValueError("backup lock was replaced")
+                baseline, blobs, check = capture_git_tree(args.repo)
+                repo = Path(baseline["root"])
+                check_backup_root(BACKUP_ROOT, root_stamp)
+            except Exception as error:  # Advisory: never let the capture block the backup.
+                baseline, reason = None, capture_reason(error)
         (change / "files").mkdir(mode=0o700)
         entries = []
         for index, name in enumerate(args.files, 1):
@@ -541,23 +638,24 @@ def write_backup(args, root_fd=None, lock_fd=None):
                 try:
                     blob = blobs.get(path)
                     backup = entry["backup"]
-                    clean = backup is None if blob is None else (
-                        backup is not None and matches_blob(change / backup, *blob))
-                    if not clean:
-                        baseline = None
-                except GIT_ERRORS:
-                    baseline = None
+                    if not (backup is None if blob is None else (
+                            backup is not None and matches_blob(change / backup, *blob))):
+                        raise ValueError("a backed-up file differs from HEAD")
+                except Exception as error:
+                    baseline, reason = None, capture_reason(error)
             entries.append(entry)
         if baseline is not None:
             try:
                 check_backup_root(BACKUP_ROOT, root_stamp)
-                if git_identity(repo, baseline["git_path"]) != baseline:
-                    baseline = None
-            except GIT_ERRORS:
-                baseline = None
+                if not still_clean(*check):
+                    raise ValueError("repository changed during backup")
+            except Exception as error:
+                baseline, reason = None, capture_reason(error)
         stamp = {}
         if args.repo is not None:
             stamp["git"] = dict(baseline, clean_start=True) if baseline is not None else None
+            if baseline is None:
+                stamp["git_reason"] = reason
         save(change, {"run_id": run_id, "change": number, "skill": args.skill, "ledger": args.ledger,
                       "created_at": created_at, "session_id": session_id, **stamp,
                       "files": entries, "actions": [], "finished": False, "verification": None,

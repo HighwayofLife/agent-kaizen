@@ -79,37 +79,61 @@ class BackupCommitTests(unittest.TestCase):
         (first / "manifest.json").write_text(json.dumps(dict(data, git=stamp)))
         self.assertIsNone(self.manifest(self.begin("--run", "dirty", "--repo", "."))["git"])
 
-    def test_git_identity_uses_captured_executable_and_fixed_environment(self):
-        snapshot = self.helpers["git_snapshot"]
-        fake_dir = self.tmp / "bin"
+    def fake_git(self, name="bin"):
+        fake_dir = self.tmp / name
         fake_dir.mkdir()
-        fake_git = fake_dir / "git"
-        marker = self.tmp / "fake-git-ran"
+        fake_git, marker = fake_dir / "git", self.tmp / f"{name}-ran"
         fake_git.write_text(f"#!/bin/sh\n: > {shlex.quote(str(marker))}\nexit 1\n")
         fake_git.chmod(0o755)
+        fake_dir.chmod(0o755)
+        return fake_dir, fake_git, marker
 
-        def change_path_after_snapshot(*args, **kwargs):
-            result = snapshot(*args, **kwargs)
-            os.environ.update(PATH=str(fake_dir), LD_PRELOAD="inherited", BASH_ENV="inherited")
-            return result
-
-        with patch.dict(os.environ, self.env, clear=True), patch.dict(
-                self.helpers, git_snapshot=change_path_after_snapshot), patch.object(
+    def test_git_comes_only_from_trusted_locations_with_fixed_environment(self):
+        fake_dir, _, marker = self.fake_git()
+        env = dict(self.env, PATH=f"{fake_dir}{os.pathsep}{self.env.get('PATH', '')}",
+                   LD_PRELOAD="inherited", BASH_ENV="inherited", DEVELOPER_DIR=str(fake_dir))
+        with patch.dict(os.environ, env, clear=True), patch.object(
                 subprocess, "run", wraps=subprocess.run) as run:
             stamp = self.capture(self.repo)
+        self.env = env
+        change = self.begin("--run", "trusted", "--repo", ".")
         self.assertFalse(marker.exists())
         self.assertIsNotNone(stamp)
-        git_path = str(Path(shutil.which("git", path=self.env["PATH"])).resolve())
-        self.assertEqual(stamp["git_path"], git_path)
+        executable = stamp["git_executable"]
+        candidate = next(path for path in self.helpers["TRUSTED_GIT"] if os.path.lexists(path))
+        self.assertEqual(executable["path"], os.path.realpath(candidate))
+        info = os.stat(executable["path"])
+        self.assertEqual({key: executable[key] for key in ("dev", "ino", "size", "mtime_ns")},
+                         dict(dev=info.st_dev, ino=info.st_ino, size=info.st_size, mtime_ns=info.st_mtime_ns))
+        self.assertEqual(executable["sha256"], hashlib.sha256(Path(executable["path"]).read_bytes()).hexdigest())
+        self.assertEqual(self.manifest(change)["git"]["git_executable"], executable)
+        self.assertEqual(self.helpers["verify_git"](executable), executable["path"])
+        self.assertTrue(run.call_args_list)
         for call in run.call_args_list:
-            self.assertEqual(call.args[0][0], git_path)
+            self.assertEqual(call.args[0][0], executable["path"])
             self.assertEqual(call.kwargs["env"]["PATH"], "/usr/bin:/bin")
-            self.assertNotIn("LD_PRELOAD", call.kwargs["env"])
-            self.assertNotIn("BASH_ENV", call.kwargs["env"])
+            for name in ("LD_PRELOAD", "BASH_ENV", "DEVELOPER_DIR"):
+                self.assertNotIn(name, call.kwargs["env"])
 
-        fake_git.chmod(0o777)
-        with patch.dict(os.environ, dict(self.env, PATH=str(fake_dir)), clear=True):
-            self.assertIsNone(self.capture(self.repo))
+    def test_untrusted_or_replaced_git_is_never_run(self):
+        fake_dir, fake_git, marker = self.fake_git()
+        for name, mode in (("group-writable dir", (fake_dir, 0o775)), ("group-writable file", (fake_git, 0o775))):
+            with self.subTest(name), patch.dict(self.helpers, TRUSTED_GIT=(str(fake_git),)):
+                mode[0].chmod(mode[1])
+                with self.assertRaisesRegex(ValueError, "trusted"):
+                    self.helpers["resolve_git"]()
+                self.assertIsNone(self.capture(self.repo))
+                mode[0].chmod(0o755)
+        self.assertFalse(marker.exists())
+        record = self.helpers["resolve_git"]()
+        for key, value in (("sha256", "0" * 64), ("ino", record["ino"] + 1), ("path", str(fake_git))):
+            with self.subTest(key=key):
+                forged = dict(record, **{key: value})
+                with self.assertRaisesRegex(ValueError, "Git executable"):
+                    self.helpers["verify_git"](forged)
+                if key != "sha256":  # Each call rechecks identity; content is rehashed at verification.
+                    with self.assertRaisesRegex(ValueError, "Git executable"):
+                        self.helpers["git"](self.repo, "rev-parse", "HEAD", git_exe=forged)
         self.assertFalse(marker.exists())
 
     def test_filter_added_during_capture_never_executes(self):
@@ -162,6 +186,48 @@ class BackupCommitTests(unittest.TestCase):
                 self.assertIsNone(self.capture(self.repo))
                 self.assertTrue(untracked.exists())
             untracked.unlink()
+
+    def test_creation_after_final_untracked_scan_revokes_clean_start(self):
+        sub = self.repo / "sub"
+        sub.mkdir()
+        (sub / "kept").write_text("kept")
+        self.git("add", ".")
+        self.git("-c", "user.name=Test", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "sub")
+        git = self.helpers["git"]
+
+        for name, create in (("file in scanned directory", lambda: (sub / "late").touch()),
+                             ("empty directory", lambda: (sub / "late").mkdir())):
+            scans = 0
+
+            def create_after_final_scan(directory, *args, **kwargs):
+                nonlocal scans
+                result = git(directory, *args, **kwargs)
+                if "--others" in args:
+                    scans += 1
+                    if scans == 2:
+                        create()
+                return result
+
+            with self.subTest(name), patch.dict(self.helpers, git=create_after_final_scan):
+                self.assertIsNone(self.capture(self.repo))
+                self.assertEqual(scans, 2)
+            late = sub / "late"
+            late.rmdir() if late.is_dir() else late.unlink()
+        self.assertIsNotNone(self.capture(self.repo))
+
+    def test_copied_index_swap_during_scan_revokes_clean_start(self):
+        git = self.helpers["git"]
+
+        def swap_copied_index(directory, *args, **kwargs):
+            git_dir = kwargs.get("git_dir")
+            if git_dir is not None and "--stage" in args:
+                index = Path(git_dir) / "index"
+                original = index.read_bytes()
+                index.write_bytes(original)  # Same bytes, new change time.
+            return git(directory, *args, **kwargs)
+
+        with patch.dict(self.helpers, git=swap_copied_index):
+            self.assertIsNone(self.capture(self.repo))
 
     def test_forged_index_stat_cannot_hide_dirty_content(self):
         before = bytes.fromhex(self.git("rev-parse", "HEAD:tracked"))
@@ -362,7 +428,7 @@ class BackupCommitTests(unittest.TestCase):
         def unavailable(fd, operation):
             self.assertTrue(stat.S_ISREG(os.fstat(fd).st_mode))
             self.assertEqual(fcntl.fcntl(fd, fcntl.F_GETFL) & os.O_ACCMODE, os.O_RDWR)
-            self.assertEqual(operation, fcntl.LOCK_EX)
+            self.assertTrue(operation & fcntl.LOCK_EX)
             raise OSError(errno.ENOLCK, "lock unavailable")
 
         with patch.dict(os.environ, self.env, clear=True), patch.object(
@@ -377,6 +443,42 @@ class BackupCommitTests(unittest.TestCase):
         change = self.backups / "unlocked-01-trim"
         self.assertIsNone(self.manifest(change)["git"])
         self.assertEqual((change / "files" / "1").read_text(), "before")
+
+    def test_any_lock_failure_still_backs_up_without_clean_start(self):
+        fcntl = self.helpers["fcntl"]
+        lock_file = self.backups / ".kaizen-backup.lock"
+
+        def busy(fd, operation):
+            raise OSError(errno.EWOULDBLOCK, "busy")
+
+        def broken(fd, operation):
+            raise OSError(errno.EIO, "lock failed")
+
+        def as_directory():
+            lock_file.mkdir()
+
+        def shared_mode():
+            lock_file.touch(mode=0o644)
+            lock_file.chmod(0o644)
+
+        cases = (("unopenable", as_directory, {}), ("invalid", shared_mode, {}),
+                 ("flock error", None, {"flock": broken}), ("held", None, {"flock": busy}))
+        for run, (name, prepare, lock_patch) in enumerate(cases, 1):
+            with self.subTest(name):
+                self.backups.mkdir(exist_ok=True)
+                if prepare:
+                    prepare()
+                with patch.dict(os.environ, self.env, clear=True), patch.dict(
+                        self.helpers, LOCK_WAIT_SECONDS=0.2), patch.object(
+                        fcntl, "flock", lock_patch.get("flock", fcntl.flock)), patch("sys.stdout"):
+                    self.assertEqual(self.helpers["main"](
+                        ["begin", "--run", f"lock{run}", "--repo", str(self.repo), "--skill", "trim",
+                         "--ledger", "fixture", str(self.target)]), 0)
+                data = self.manifest(self.backups / f"lock{run}-01-trim")
+                self.assertIsNone(data["git"])
+                self.assertIn("lock", data["git_reason"])
+                self.assertEqual((self.backups / f"lock{run}-01-trim" / "files" / "1").read_text(), "before")
+                lock_file.rmdir() if lock_file.is_dir() else lock_file.unlink(missing_ok=True)
 
     def test_deep_manifest_uses_normal_rejection_path(self):
         change = self.begin()
