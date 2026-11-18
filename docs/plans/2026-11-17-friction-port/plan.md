@@ -230,3 +230,7 @@ Assemble README, command and scheduling docs, CI checks and the 0.13.0 CHANGELOG
 ### P28 real-input gate
 
 Use the 0.13.0 candidate on real disposable host installs and record each exit status, trimmed output, flags, base version, timing basis, negative tests and undo verification in `gate-results.md`. The packet covers new scripts and subcommands plus the previously existing commands that changed behavior. Use distinct eligible worktree, allow-rule, marker and backup fixtures, and verify a fresh scheduled review in both modes after permission persistence. Compare installed CLI extraction on/off against the installed 0.12.0 baseline for the same input. Normalize home paths to `~` and omit raw captures. Any failed advertised claim returns to P27. Repeat `tools/ci-local --python 3.9` on the integration tree. Status is pending. [Gate brief](briefs/28-real-input-gate.md)
+
+## Benchmark baseline (batch review 2, 2026-11-18)
+
+Every token-audit benchmark compares against the fixed pre-friction revision `d8a4cb7`, with friction on and with `--no-friction`, never against the previous tip: per-packet ratios compounded to 1.31× before BF4. Briefs write `python3 tests/bench_token_audit.py --baseline d8a4cb7 --max-ratio 1.10` (plus the `--no-friction` run).
