@@ -3,17 +3,17 @@
   "hooks": {
     "hooks/audit-notice.sh": {
       "literal_bytes": 392,
-      "sha256": "fdadb6755f371c2e28448145f10de90983c60f8d5df3a6103dd43759a36ba40f",
+      "sha256": "9eceb7979bc4329c31964bde2ccaced0486684c7d5951e0713e56b834038ebe2",
       "literal_text": "An unreviewed usage audit exists: . A propose-only review is ready too: . When there is a pause, run /agent-kaizen:review (read the headline and flagged sections, not the whole file), propose changes to the user, then touch .reviewed.\n\nExperiments need attention in this project (docs/kaizen/LEDGER.md):\n\nWhen there is a pause, run /agent-kaizen:review.\n\nREGRESSION expensive_agent_calls  vs "
     },
     "hooks/bash-burst.sh": {
       "literal_bytes": 157,
-      "sha256": "632c015d39800a02598958b9d0726919d75ad9cf2d22457a1a321ab3c52c9594",
+      "sha256": "137b07299e693595f01b97a13a1ff0c12e58509a8b8e4a332eb1b34f76b351fa",
       "literal_text": " Bash calls this turn. Chain the remaining steps into one command or script that prints a summary, or hand the investigation to a cheaper read-only subagent."
     },
     "hooks/session-audit.sh": {
       "literal_bytes": 0,
-      "sha256": "c7b6bf4c88ff99a8a45443a218935b649cb217a34ae4d20e10bd947786372bb8",
+      "sha256": "00e509a9a0feed1b859bef7a7dc63aa29904ad8233b42d79bb0631f5ee5a2866",
       "literal_text": ""
     }
   }

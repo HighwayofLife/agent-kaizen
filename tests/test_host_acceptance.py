@@ -51,7 +51,7 @@ class AcceptanceTests(unittest.TestCase):
         timestamp = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)).isoformat()
         events = [('SessionStart', None), ('UserPromptSubmit', None), ('PostToolUse', 'Bash')]
         def write_trace(items):
-            trace.write_text(''.join(json.dumps(dict(ts=timestamp, event=e, tool=t, keys=[], env=[])) + '\n' for e, t in items))
+            trace.write_text(''.join(json.dumps(dict(ts=timestamp, host="codex", event=e, tool=t, keys=[], env=[])) + '\n' for e, t in items))
         write_trace(events)
         result = self.command('check', '--host', 'codex', '--observe', 'skill_invoked=pass')
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
@@ -78,3 +78,50 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(rows['skill_invoked']['status'], 'PASS')
         self.assertNotIn(str(self.home), report.read_text())
         self.assertNotEqual(self.command('check', '--host', 'codex', '--observe', 'bad=pass').returncode, 0)
+
+    def test_host_filter_sanitization_and_required_observation(self):
+        self.command('install', '--host', 'codex')
+        trace = self.home / 'config/agent-kaizen/host-trace/trace.jsonl'
+        ts = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)).isoformat()
+        def record(host, event, tool=None, keys=None):
+            return dict(ts=ts, host=host, event=event, tool=tool, keys=keys or [], env=[])
+        trace.write_text(''.join(json.dumps(x) + '\n' for x in [
+            record('copilot', 'SessionStart'), record('copilot', 'UserPromptSubmit'),
+            record('copilot', 'PostToolUse', 'Bash')]))
+        self.command('check', '--host', 'codex', '--observe', 'skill_invoked=skip:unavailable')
+        report = max((ROOT / 'out/host-acceptance').glob('codex-*.json'), key=lambda p: p.stat().st_mtime_ns)
+        data = json.loads(report.read_text())
+        rows = {r['id']: r for r in data['checks']}
+        self.assertIn('no codex lines; seen hosts: copilot', rows['hooks-live:sessionStart']['detail'])
+        self.assertEqual(rows['skill_invoked']['detail'], 'required observation skipped: unavailable')
+        self.assertEqual(rows['skill_invoked']['status'], 'FAIL')
+        trace.write_text(''.join(json.dumps(x) + '\n' for x in [record('codex', 'SessionStart'),
+            record('codex', 'SessionStart'), record('codex', 'private value', 'secret value', ['bad key'])]))
+        self.command('check', '--host', 'codex', '--observe', 'skill_invoked=pass')
+        report = max((ROOT / 'out/host-acceptance').glob('codex-*.json'), key=lambda p: p.stat().st_mtime_ns)
+        data = json.loads(report.read_text())
+        rows = {r['id']: r for r in data['checks']}
+        self.assertIn('2 sessionStart lines (multiple sessions contributed)', rows['hooks-live:sessionStart']['detail'])
+        self.assertNotIn('secret value', json.dumps(data))
+        self.assertIn('<other>', json.dumps(data))
+
+    def test_manual_doctor_and_status_paths(self):
+        statefile = self.home / 'config/agent-kaizen/host-acceptance/vscode.json'
+        statefile.parent.mkdir(parents=True)
+        statefile.write_text(json.dumps({'install': 'manual', 'installed_at': '2020-01-01T00:00:00+00:00', 'report': '/etc/passwd'}))
+        self.assertIn('Phase 2', self.command('status', '--host', 'vscode').stdout)
+        self.command('check', '--host', 'vscode', '--install-dir', str(ROOT), '--observe', 'skill_invoked=pass')
+        report = max((ROOT / 'out/host-acceptance').glob('vscode-*.json'), key=lambda p: p.stat().st_mtime_ns)
+        rows = {r['id']: r for r in json.loads(report.read_text())['checks']}
+        self.assertEqual(rows['doctor']['status'], 'SKIP')
+        self.assertIn('Copilot CLI location only', rows['doctor']['detail'])
+        self.assertIn('Done: report at', self.command('status', '--host', 'vscode').stdout)
+
+    def test_redaction_before_serialization(self):
+        import runpy
+        module = runpy.run_path(str(TOOL))
+        redact = module['redact']
+        redact.__globals__['HOME'] = Path('/Users/' + 'éclair')
+        data = redact({'path': '/Users/' + 'éclair/test', 'nested': ['/home/' + 'someone/file', '/Users/' + 'another/file']})
+        self.assertEqual(data, {'path': '~/test', 'nested': ['~/file', '~/file']})
+        self.assertNotIn('éclair', json.dumps(data, ensure_ascii=False))

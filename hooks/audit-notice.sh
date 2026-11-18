@@ -36,7 +36,9 @@ kaizen_context() {
     fi
 }
 # --- end host helper ---
-if [[ -f ${CLAUDE_CONFIG_DIR:-$HOME/.claude}/agent-kaizen/host-trace/on ]]; then
+kaizen_tracing=0
+kaizen_input=
+if [[ -f ${CLAUDE_CONFIG_DIR:-${HOME:-}/.claude}/agent-kaizen/host-trace/on ]]; then
     # shellcheck source=hooks/lib/trace.sh
     source "$(dirname "${BASH_SOURCE[0]}")/lib/trace.sh"
     kaizen_input=$(cat)
