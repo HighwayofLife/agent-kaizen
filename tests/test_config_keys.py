@@ -79,6 +79,11 @@ class ConfigKeysTests(unittest.TestCase):
                 self.config.write_text(json.dumps({"pendingDays": value}))
                 self.assertEqual(json.loads(self.run_config("show").stdout)["pendingDays"]["value"], 10)
 
+    def test_mutation_limit_rejects_invalid_values(self):
+        for value in ("-1", '"3"', "true", "3.0"):
+            self.assertNotEqual(self.run_config("set", "maxChangesPerRun=" + value).returncode, 0)
+            self.assertFalse(self.config.exists())
+
     def test_global_only(self):
         project_config = self.project / "docs/kaizen/config.json"
         project_config.write_text(json.dumps(DEFAULTS))
