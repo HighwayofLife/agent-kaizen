@@ -1,0 +1,2 @@
+- Fix transcript trust checks, replay reconciliation and friction extract reporting.
+- Preserve measured timings and scope Codex warnings to the selected project.

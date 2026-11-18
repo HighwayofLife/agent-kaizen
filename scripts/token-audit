@@ -2,6 +2,8 @@
 """Stream Claude project transcripts and Codex sessions into a compact audit."""
 import argparse
 import bisect
+import ctypes
+import errno
 from contextlib import ExitStack, nullcontext
 import fnmatch
 import importlib.util
@@ -115,7 +117,7 @@ CODEX_SCALAR = re.compile(CODEX_STRING.pattern + rb'|null|true|false|-?[0-9.]+')
 CODEX_EVIDENCE_LIMIT = 400
 CODEX_WALL = re.compile(r"^Wall time:? ([0-9]+(?:\.[0-9]+)?) seconds\b", re.M)
 CODEX_OUTPUT_START = re.compile(r"^(?:Original output|Final output|Output|Stdout):", re.M | re.I)
-CODEX_OUTPUT_END = re.compile(rb'"\s*(?:}\s*\]\s*)?(}\s*}?)\s*$')
+CODEX_OUTPUT_END = re.compile(rb'(?:"|[0-9]|true|false|null)\s*(?:}\s*\]\s*)?(}\s*}?)\s*$')
 CODEX_EXIT = re.compile(r"^(?:Process exited with code|Exit code:?) (-?\d+)\s*$", re.M | re.I)
 CODEX_ERROR = re.compile(r"^(?:Stderr|Error):[ \t]*(.*)", re.M | re.I | re.S)
 CODEX_TIMEOUT = re.compile(r"\b(?:timed out|os error 60|(?:Process exited with code|Exit code:?) (?:124|137|143))\b", re.I)
@@ -141,6 +143,36 @@ def codex_fields(prefix, pos=0, wrapped=False):
         fields[key] = value[0]
         pos = value.end()
     return fields
+
+
+def envelope_timestamp(line):
+    # Skip nested values and strings without decoding potentially huge outputs.
+    depth, pos = 0, 0
+    token = re.compile(rb'["{}\[\]]')
+    while match := token.search(line, pos):
+        value = match.group()
+        pos = match.end()
+        if value == b'"':
+            start = match.start()
+            while True:
+                end = line.find(b'"', pos)
+                if end < 0:
+                    return None
+                slash = end
+                while slash > start and line[slash - 1] == 92:
+                    slash -= 1
+                pos = end + 1
+                if (end - slash) % 2 == 0:
+                    break
+            if depth == 1 and end - start == 10 and line[start:pos] == b'"timestamp"':
+                tail = re.match(rb'\s*:\s*"([^"\n]+)"', line[pos:pos + 100])
+                if tail:
+                    return tail[1].decode('ascii', 'replace')
+        elif value in (b'{', b'['):
+            depth += 1
+        else:
+            depth -= 1
+    return None
 
 
 def codex_tool_header(line, keep_calls):
@@ -248,7 +280,7 @@ def codex_evidence(value):
 UNPARSED = object()
 
 
-def canary_row(line, since, counts, codex, session_version, output_type=None, row=UNPARSED):
+def canary_row(line, since, counts, codex, session_version, output_type=None, row=UNPARSED, envelope_stamp=UNPARSED):
     # Decode candidate records for classification; never retain their content.
     known = CODEX_TYPES if codex else CLAUDE_TYPES
     prefix = line[:1024] if codex else b""
@@ -256,10 +288,10 @@ def canary_row(line, since, counts, codex, session_version, output_type=None, ro
     # Large ordinary Codex response items are content, not usage records.
     # Their session metadata carries the version; avoid decoding their bodies.
     if output_type is not None or (match and match[1] == b"response_item" and not VERSION_FIELD.search(prefix)):
-        stamp = TIMESTAMP.search(line[:1024])
+        stamp = envelope_timestamp(line) if envelope_stamp is UNPARSED else envelope_stamp
         if stamp and (output_type is None or CODEX_OUTPUT_END.search(line[-64:])):
             try:
-                if (stamp_time := friction_stamp(stamp[1].decode("ascii"))) is not None and stamp_time >= since:
+                if (stamp_time := friction_stamp(stamp)) is not None and stamp_time >= since:
                     entry = counts[session_version or "unknown"]
                     entry["records"] += 1
                     if output_type is not None and output_type not in known:
@@ -337,22 +369,25 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                 decoded = UNPARSED
                 tool = codex_tool_header(line, keep_codex) if keep_model and b'_call' in prefix else None
                 output_type = tool[0].decode("ascii") if tool and tool[1] in CODEX_OUTPUT_TYPES else None
+                tool_stamp = envelope_timestamp(line) if tool else None
                 session_meta = keep_codex and b'"session_meta"' in prefix
-                if canary is not None and b'"timestamp"' in prefix:
+                if canary is not None and (b'"timestamp"' in prefix or tool is not None):
                     stamp = TIMESTAMP.search(line)
                     if stamp:
-                        value = stamp[1].decode("ascii", "replace")
+                        value = (tool_stamp if keep_model and tool else
+                                 stamp[1].decode("ascii", "replace"))
                         try:
-                            recent = (value[:19] >= cutoff if value.endswith(("Z", "+00:00"))
+                            recent = value is not None and (value[:19] >= cutoff if value.endswith(("Z", "+00:00"))
                                       else date_time(value) >= since)
                             if recent or (keep_model and b'"session_meta"' in prefix):
                                 if not keep_model:
                                     decoded = json.loads(line)
                                 session_version = canary_row(line, since, canary, keep_model, session_version,
-                                                             output_type, decoded)
+                                                             output_type, decoded,
+                                                             tool_stamp if tool else UNPARSED)
                         except (ValueError, TypeError, OverflowError, RecursionError):
                             pass
-                if (bounds is not None and last_stamp is not None and line.startswith(last_prefix)
+                if (bounds is not None and last_stamp is not None and last_prefix is not None and line.startswith(last_prefix)
                         and keep_model and not keep_tools and not (tool or session_meta or CODEX_ROW.search(prefix))
                         and b'"model"' not in line):
                     continue
@@ -363,14 +398,15 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                 if bounds is not None:
                     if last_prefix is None or not line.startswith(last_prefix):
                         match = TIMESTAMP.search(prefix if tool else line)
-                        if not match:
+                        outer_stamp = tool_stamp
+                        if (tool and outer_stamp is None) or (not tool and not match):
                             if tool is not None and keep_codex:
                                 outer, kind, fields = tool
                                 yield dict(_codex_tool=(kind, *codex_call_row(line, kind, fields, outer == b"response_item")),
                                            timestamp=None)
                             continue
-                        last_prefix = line[:match.end()]
-                        last_timestamp = match[1].decode("ascii", "replace")
+                        last_prefix = None if tool else line[:match.end()]
+                        last_timestamp = outer_stamp if tool else match[1].decode("ascii", "replace")
                         try:
                             last_stamp = date_time(last_timestamp)
                         except (ValueError, TypeError, UnicodeError, OverflowError):
@@ -403,6 +439,12 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                     if not match:
                         if keep_signals and (b'"tool_use"' in line or b'"tool_result"' in line):
                             warnings["malformed rows"] += 1
+                            try:
+                                row = json.loads(line)
+                                if isinstance(row, dict):
+                                    yield dict(row, _invalid_friction_timestamp=True)
+                            except (ValueError, RecursionError):
+                                pass
                         continue
                     timestamp = match[1].decode("ascii", "replace")
                 try:
@@ -1004,8 +1046,53 @@ def sample_reader():
     return helper
 
 
+def has_allow_acl(fd):
+    """Deny-only Darwin ACLs cannot grant write access to another user."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    get_acl = libc.acl_get_fd_np
+    get_acl.argtypes = (ctypes.c_int, ctypes.c_int)
+    get_acl.restype = ctypes.c_void_p
+    libc.acl_free.argtypes = (ctypes.c_void_p,)
+    libc.acl_get_entry.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))
+    libc.acl_get_tag_type.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_int))
+    acl = get_acl(fd, 0x100)
+    if not acl:
+        error = ctypes.get_errno()
+        if error != errno.ENOENT:
+            raise OSError(error, "cannot verify transcript ACL")
+        return False
+    try:
+        entry = ctypes.c_void_p()
+        index = 0
+        while True:
+            result = libc.acl_get_entry(acl, index, ctypes.byref(entry))
+            if result != 0:
+                if index == -1 and ctypes.get_errno() == errno.EINVAL:
+                    return False
+                raise OSError(ctypes.get_errno(), "cannot inspect transcript ACL")
+            tag = ctypes.c_int()
+            if libc.acl_get_tag_type(entry, ctypes.byref(tag)) != 0:
+                raise OSError(ctypes.get_errno(), "cannot inspect transcript ACL tag")
+            if tag.value != 2:  # ACL_EXTENDED_DENY; unknown tags fail closed.
+                return True
+            index = -1  # ACL_NEXT_ENTRY
+    finally:
+        libc.acl_free(acl)
+
+
+def open_untrusted_transcript(path):
+    fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ValueError("not a regular transcript")
+        return os.fdopen(fd, "rb")
+    except BaseException:
+        os.close(fd)
+        raise
+
+
 def open_permission_transcript(path):
-    check_acl = sample_reader().has_extended_acl if sys.platform == "darwin" else None
+    check_acl = has_allow_acl if sys.platform == "darwin" else None
     with ExitStack() as stack:
         directory = trusted_audit_directory(stack, path.parent, check_acl)
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
@@ -1361,8 +1448,6 @@ def finalize_friction(state, thresholds, window):
         join_days = {(end + timedelta(seconds=offset)).astimezone(timezone.utc).date().isoformat()
                      for offset in (-SAMPLE_JOIN_SECONDS, SAMPLE_JOIN_SECONDS)}
         incomplete = name == "Bash" and bool(join_days.intersection(sample_data.get("skipped_days", ())))
-        if incomplete:
-            measured = None
         comparable = (sample is not None and not incomplete
                       and abs(sample[0] - end.timestamp()) <= SAMPLE_JOIN_SECONDS)
         if comparable and measured is not None and sample[1] is not None and abs(measured - sample[1]) > 0.001:
@@ -1437,8 +1522,6 @@ def finalize_friction(state, thresholds, window):
         join_days = {(end + timedelta(seconds=offset)).astimezone(timezone.utc).date().isoformat()
                      for offset in (-SAMPLE_JOIN_SECONDS, SAMPLE_JOIN_SECONDS)}
         incomplete = name == "Bash" and bool(join_days.intersection(sample_data.get("skipped_days", ())))
-        if incomplete:
-            cohort_measured = None
         if (sample is not None and not incomplete and cohort_measured is None
                 and abs(sample[0] - end.timestamp()) <= SAMPLE_JOIN_SECONDS):
             cohort_measured = sample[1]
@@ -1503,7 +1586,7 @@ def friction_sections(friction):
     return lines
 
 
-def scan_claude(path, agent, since, data, seen_messages, project, source=None):
+def scan_claude(path, agent, since, data, seen_messages, project, source=None, trusted=True):
     main = agent is None
     counter = Counter()
     tools = {}
@@ -1519,6 +1602,15 @@ def scan_claude(path, agent, since, data, seen_messages, project, source=None):
     cached_command = lru_cache(maxsize=64)(command_info)
     for row in rows(path, since, data["warnings"], keep_tools=True, canary=data["format_canary"],
                     keep_signals=friction is not None, source=source):
+        if row.get("_invalid_friction_timestamp"):
+            message = row.get("message")
+            content = blocks(message) if isinstance(message, dict) else []
+            results = sum(block.get("type") == "tool_result" for block in content)
+            for block in content:
+                if block.get("type") in ("tool_use", "tool_result"):
+                    friction_block(friction, row, block, block["type"] == "tool_use", results,
+                                   trusted_source=source is not None and trusted)
+            continue
         if row.get("type") in ("api-request-shape", "attachment"):
             tool_metadata(row, observed)
             continue
@@ -1620,7 +1712,7 @@ def scan_claude(path, agent, since, data, seen_messages, project, source=None):
                 observed["used"].add(name)
                 data["_tool_universe"].add(name)
                 if friction is not None:
-                    friction_block(friction, row, block, True, trusted_source=source is not None)
+                    friction_block(friction, row, block, True, trusted_source=source is not None and trusted)
                 if ("use", block.get("id")) in seen_messages:
                     continue
                 seen_messages.add(("use", block.get("id")))
@@ -1659,7 +1751,7 @@ def scan_claude(path, agent, since, data, seen_messages, project, source=None):
                                     else (friction_stamp(ts), ids[0] if result_count == 1
                                           and isinstance(ids[0], str) else replay_fingerprint(ids)))
                         row_event = (session_id, identity)
-                    friction_block(friction, row, block, False, result_count, row_event, source is not None)
+                    friction_block(friction, row, block, False, result_count, row_event, source is not None and trusted)
                 if ("result", block.get("tool_use_id")) in seen_messages:
                     continue
                 seen_messages.add(("result", block.get("tool_use_id")))
@@ -1723,7 +1815,7 @@ LINE_LIMIT = 1 << 20
 def cwd_of_file(path, limit=50):
     """Read only the first cwd recorded near the start of a Claude transcript."""
     try:
-        with path.open("rb") as stream:
+        with open_untrusted_transcript(path) as stream:
             for _ in range(limit):
                 line = stream.readline(LINE_LIMIT)
                 if not line:
@@ -1736,7 +1828,7 @@ def cwd_of_file(path, limit=50):
                     continue
                 if isinstance(row, dict) and isinstance(row.get("cwd"), str):
                     return row["cwd"]
-    except OSError:
+    except (OSError, ValueError):
         pass
     return None
 
@@ -1786,14 +1878,20 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
         return True
 
     def rollout_rows(path, bounds):
-        nonlocal trusted_rollout
+        nonlocal trusted_rollout, unsafe_rollout
         source = None
         if friction is not None:
             try:
                 source = open_permission_transcript(path)
                 trusted_rollout = True
             except (OSError, ValueError, AttributeError, ImportError):
-                data["warnings"]["unsafe permission transcript"] += 1
+                unsafe_rollout = True
+                try:
+                    source = open_untrusted_transcript(path)
+                except (OSError, ValueError):
+                    if cwd is None:
+                        data["warnings"]["unsafe permission transcript"] += 1
+                    return
         with (source if source is not None else nullcontext()):
             yield from rows(path, since, data["warnings"], keep_model=True, bounds=bounds,
                             canary=data["format_canary"], keep_codex=friction is not None,
@@ -1812,7 +1910,8 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
 
         bounds = [None, None]
         pairs, disqualified, turns, current_cwd = {}, set(), {}, None
-        future_header, scoped_turn, rejection_overflow, trusted_rollout = False, False, False, False
+        future_header, scoped_turn, rejection_overflow, trusted_rollout, unsafe_rollout = False, False, False, False, False
+        scanned_before = data["codex_files_scanned"]
         # Older session files can contain recent resumes. Keep earlier model
         # metadata, but count only sessions with a token_count in the window.
         for row in rollout_rows(path, bounds):
@@ -1912,6 +2011,8 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                     seen_usage = True
                     window.update(delta)
                     price(data, model, "codex", delta, codex=True)
+        if unsafe_rollout and (cwd is None or data["codex_files_scanned"] > scanned_before):
+            data["warnings"]["unsafe permission transcript"] += 1
         if friction is not None:
             finish_codex_pairs(pairs, friction, str(path), trusted_rollout)
         first, last = bounds
@@ -2014,6 +2115,12 @@ def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=No
                 source = open_permission_transcript(path)
             except (OSError, ValueError, AttributeError, ImportError):
                 data["warnings"]["unsafe permission transcript"] += 1
+                try:
+                    with open_untrusted_transcript(path) as fallback:
+                        scan_claude(path, agent, since, data, seen_messages, project, fallback, trusted=False)
+                except (OSError, ValueError):
+                    pass
+                return
         with (source if source is not None else nullcontext()):
             scan_claude(path, agent, since, data, seen_messages, project, source)
 
@@ -2699,6 +2806,8 @@ def report(data, out, scope, extract_binding=None, extract_mac=None):
 def write_extract(data, out, directory, scope, now=None):
     directory_fd = temporary = None
     try:
+        if not all(hasattr(os, name) for name in ("O_NOFOLLOW", "O_DIRECTORY", "geteuid")):
+            raise ValueError("secure extract storage unavailable on this platform")
         directory = directory.expanduser().absolute()
         # Walk from the filesystem root without following any symlink component.
         directory_fd = os.open(directory.anchor, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
@@ -2722,7 +2831,7 @@ def write_extract(data, out, directory, scope, now=None):
         value = dict(v=1, scope=scope, since=data["since"], report=out.name,
                      usage=dict(agents=data["agent_usage"], sessions=[], task_switches=[], instructions=[]))
         friction = data.get("friction")
-        if friction and (friction["summary"]["samples"] or friction["summary"]["capped"] or any(friction["signals"].values()) or friction["permission_acceptance"] or friction.get("host_load")):
+        if friction and (friction["summary"]["samples"] or friction["summary"]["capped"] or any(friction["signals"].values()) or friction["permission_acceptance"] or friction.get("host_load") or friction.get("permission_waits", {}).get("count")):
             value["friction"] = friction
             if now is not None and friction["permission_acceptance"]:
                 value["friction"] = dict(friction, audited_at=now.isoformat())

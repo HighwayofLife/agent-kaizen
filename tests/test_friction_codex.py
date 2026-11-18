@@ -68,6 +68,35 @@ class FrictionCodexTests(unittest.TestCase):
         self.assertFalse(any(friction['signals'].values()))
         self.assertNotIn('private', json.dumps(friction))
 
+    def test_envelope_timestamp_and_numeric_output_canary(self):
+        first = call('one')
+        first['payload']['timestamp'] = (SINCE - timedelta(days=1)).isoformat()
+        first = dict(type=first['type'], payload=first['payload'], timestamp=first['timestamp'])
+        last = result('one', exit_code=0)
+        jsonl(self.rollout, [self.meta, first, last])
+        data = self.collect(cwd=[self.work])
+        self.assertEqual(data['friction']['summary']['measured'], 1)
+        self.assertEqual(data['format_canary']['1.2.3']['records'], 2)
+
+    def test_envelope_timestamp_after_large_payload(self):
+        last = result('one', output='Wall time: 10 seconds\nOutput:\n' + 'x' * 5000)
+        last = dict(type=last['type'], payload=last['payload'], timestamp=last['timestamp'])
+        jsonl(self.rollout, [self.meta, call('one'), last])
+        data = self.collect(cwd=[self.work])
+        self.assertEqual(data['friction']['summary']['measured'], 1)
+        self.assertEqual(data['format_canary']['1.2.3']['records'], 2)
+
+    def test_envelope_timestamp_skips_large_strings_with_bounded_memory(self):
+        import tracemalloc
+        stamp = '2025-01-01T00:00:05Z'
+        record = json.dumps(dict(payload=dict(output='x' * 2_000_000), timestamp=stamp)).encode()
+        tracemalloc.start()
+        try:
+            self.assertEqual(AUDIT['envelope_timestamp'](record), stamp)
+            self.assertLess(tracemalloc.get_traced_memory()[1], 1_000_000)
+        finally:
+            tracemalloc.stop()
+
     def test_missing_invalid_and_conflicting_pairs(self):
         rows = [call('old', -1), result('old'), call('left'), result('orphan'), call(None), result(None),
                 call('cross-file'), call('backward', 8), result('backward', 7),

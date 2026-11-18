@@ -28,6 +28,50 @@ class SignedTranscriptTests(SecurityCase):
             self.assertIsNotNone(AUDIT['write_extract'](data, self.root / 'report.md', default, {}))
         self.assertEqual(default.stat().st_mode & 0o777, 0o700)
 
+    def test_extract_missing_unix_flags_does_not_abort(self):
+        from unittest.mock import patch
+        import os
+        with patch.object(os, 'O_DIRECTORY', create=True):
+            del os.O_DIRECTORY
+            self.assertIsNone(AUDIT['write_extract'](dict(since='2025-01-01', agent_usage={}),
+                                                     self.root / 'report.md', self.root / 'extracts', {}))
+
+    def test_nonregular_transcripts_never_block_fallback(self):
+        import os
+        import subprocess
+        import sys
+        for path in (self.cfg / 'projects/fixture/pipe.jsonl', self.cx / 'sessions/2025/01/01/pipe.jsonl'):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.mkfifo(path)
+        result = subprocess.run([sys.executable, str(Path(AUDIT['__file__'])), '--json'],
+                                cwd=self.work, env=self.env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_darwin_deny_acl_is_safe_but_allow_acl_is_not(self):
+        import os
+        import subprocess
+        import sys
+        if sys.platform != 'darwin':
+            self.skipTest('Darwin ACL API')
+        path = self.root / 'acl-test'
+        path.touch()
+        self.addCleanup(subprocess.run, ['chmod', '-N', str(path)], check=True)
+        subprocess.run(['chmod', '+a', 'everyone deny delete', str(path)], check=True)
+        with path.open('rb') as stream:
+            self.assertFalse(AUDIT['has_allow_acl'](stream.fileno()))
+        subprocess.run(['chmod', '+a', 'everyone allow write', str(path)], check=True)
+        with path.open('rb') as stream:
+            self.assertTrue(AUDIT['has_allow_acl'](stream.fileno()))
+
+    def test_unrelated_unsafe_rollout_does_not_warn(self):
+        project = self.project('selected')
+        other = self.project('other')
+        path = self.cx / 'sessions/2025/01/01/rollout.jsonl'
+        jsonl(path, [row('session_meta', 0, cwd=str(other))])
+        path.chmod(0o664)
+        data = json.loads(self.run_script('token-audit', '--cwd', project, '--json').stdout)
+        self.assertFalse(data['warnings'].get('unsafe permission transcript'))
+
     def test_unsafe_codex_rollout_cannot_authenticate_regression(self):
         project = self.project('codex-evidence')
         now = datetime.now(timezone.utc) - timedelta(minutes=1)
@@ -161,6 +205,30 @@ class FrictionSignalTests(FrictionClaudeTests):
         self.assertNotIn(first, json.dumps(data))
         self.assertEqual(self.collect()['friction']['permission_acceptance'], [])
         self.assertNotIn('friction', self.collect(cwd=[first], friction=False))
+
+    def test_timestampless_conflicting_denial_is_ambiguous(self):
+        root = str(self.work.resolve())
+        yes = end('conflict', 2, cwd=root, permissionDecision=dict(source='user', decision='accept'), toolUseResult=dict(durationMs=1000))
+        no = end('conflict', 2, cwd=root, permissionDecision=dict(source='user', decision='reject'))
+        del no['timestamp']
+        jsonl(self.session, [start('conflict', 0, 'ls', cwd=root), yes, no])
+        evidence = self.collect(cwd=[root])['friction']['permission_acceptance'][0]
+        self.assertEqual((evidence['accepted'], evidence['ambiguous']), (0, 1))
+
+    def test_skipped_sample_preserves_transcript_duration(self):
+        from unittest.mock import patch
+        jsonl(self.session, [start('duration', 0), end('duration', 180, toolUseResult=dict(durationMs=120000))])
+        samples = dict(events={}, load=[], procs=[], hours=set(), skipped_days={'2025-01-01'})
+        with patch.dict(AUDIT['collect'].__globals__, read_samples=lambda *args: samples):
+            summary = self.collect()['friction']['summary']
+        self.assertEqual((summary['samples'], summary['measured']), (1, 1))
+        self.assertEqual(summary['slow_calls'][0]['seconds_total'], 120)
+
+    def test_prompt_only_extract_includes_wait(self):
+        jsonl(self.session, [start('wait', 0), end('wait', 10, permissionDecision=dict(source='user', decision='accept'))])
+        data = self.audit('--since', '2025-01-01')
+        extract = json.loads(Path(data['extract_path']).read_text())
+        self.assertEqual(extract['friction']['permission_waits']['count'], 1)
 
     def test_conflicting_decisions_are_ambiguous(self):
         root = str(self.work.resolve())
