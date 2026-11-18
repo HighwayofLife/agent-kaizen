@@ -213,7 +213,7 @@ def _signature(receipt, secret):
 
 
 def prepare(audits, backups, project, report, cfg, mode, current, canonical_project, project_key,
-            *, interactive=False, _check=None, _complete=None):
+            *, interactive=False, retain=False, _check=None, _complete=None):
     """Freeze bounded inputs, or re-derive them under the generation lock for reconciliation."""
     if cfg["enabled"]["value"] is False or cfg["friction"]["value"] == "off":
         if _check is not None:
@@ -374,7 +374,10 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
             if ident in allowed:
                 raise ValueError("duplicate candidate identity")
             allowed[ident] = dict(canonical_project=str(project.canonical), catalog_id=entry["id"],
-                                 selector_key=selector, evidence=evidence, intents=["suggest"], provenance=finding)
+                                 selector_key=selector, evidence=evidence,
+                                 intents=(["suggest", "apply"] if not interactive and mode == "auto"
+                                          and cfg["hostActions"]["value"] == "apply" else ["suggest"]),
+                                 provenance=finding)
             actions.append(dict(id=ident, label=entry["problem"], evidence=list(finding["evidence"].values())))
         if not visible_flags and not actions:
             if _check is not None:
@@ -387,6 +390,19 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
                        identities=identities, policy=dict(mode=mode, window=block["window"] if block else None,
                        thresholds=block["thresholds"] if block else None, basis=block["basis"] if block else None, hostActions=cfg["hostActions"]["value"]),
                        comparison=snapshot, allowed=allowed, permission_provenance=block.get("permission_acceptance", []) if block else [])
+        if retain and _check is None and state.get("acknowledged_generation") != f"{state['generation']:020d}":
+            try:
+                previous = _json(host["_read"](directory, "receipt-" + project.key + "-" + f"{state['generation']:020d}" + ".json", LIMIT), host)
+                ignored = {"generation", "created", "signature", "view_sha256"}
+                same = all(previous.get(name) == value for name, value in receipt.items() if name not in ignored)
+                if (same and previous.get("channel") == "scheduled"
+                        and hmac.compare_digest(previous.get("signature", ""), _signature(previous, secret))
+                        and 0 <= (current - _stamp(previous["created"])).total_seconds() <= PROBE_AGE):
+                    generation = previous["generation"]
+                    receipt["generation"] = generation
+                    receipt["created"] = previous["created"]
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
         view = dict(v=1, generation=generation, flags=visible_flags, actions=actions)
         public = _encode(view)
         receipt["view_sha256"] = hashlib.sha256(public).hexdigest()
@@ -409,7 +425,27 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
         path = project.folder / ("friction-inputs-" + generation + ".json")
         with host["_directory"](path.parent, True) as output:
             host["_replace"](output, path.name, public)
-        return path
+        return (path, receipt) if retain else path
+
+
+def acknowledge_scheduled(store, project, receipt):
+    host = runpy.run_path(str(Path(__file__).resolve().parent / "kaizen_friction_actions.py"))
+    with host["_directory"](store.friction, private=True) as directory, host["_locked"](directory, "prepare"):
+        name = "prepare-" + project.key + ".json"
+        state = _json(host["_read"](directory, name, LIMIT), host)
+        if (state.get("project") != str(project.canonical)
+                or state.get("generation") != int(receipt["generation"])
+                or state.get("acknowledged") != receipt["baseline"]):
+            raise ValueError("scheduled comparison state changed")
+        with host["_directory"](store.path.parent) as actions_directory:
+            _, _, receipts = store._load(actions_directory)
+        generations = receipts.get(str(project.canonical), {})
+        if ("scheduled:" + receipt["generation"] not in generations
+                or any(value == "pending" for row in generations.values() for value in row.values())):
+            raise ValueError("pending or missing scheduled import")
+        state["acknowledged"] = receipt["comparison"]
+        state["acknowledged_generation"] = receipt["generation"]
+        host["_replace"](directory, name, _encode(state))
 
 
 def reconcile(audits, backups, project, inputs, cfg, current, canonical_project, project_key,
