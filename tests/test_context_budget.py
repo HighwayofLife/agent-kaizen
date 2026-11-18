@@ -16,6 +16,7 @@ class ContextBudgetTest(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.write('agents/a.md', '---\ndescription: Agent text\n---\n')
         self.write('skills/a/SKILL.md', '---\ndescription: "Hidden text"\ndisable-model-invocation: true\n---\n')
+        self.write('skills/a/agents/openai.yaml', 'policy:\n  allow_implicit_invocation: false\n')
         self.write('hooks/a.sh', '#!/bin/sh\n')
         self.write('hooks/hooks.json', json.dumps({'hooks': {'SessionStart': [
             {'hooks': [{'type': 'command', 'command': 'bash "${CLAUDE_' + 'PLUGIN_ROOT}/hooks/a.sh"'}]}]}}))
@@ -40,6 +41,23 @@ class ContextBudgetTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('0 bytes (disabled)', result.stdout)
         self.assertIn('Total: 18 UTF-8 bytes; bytes/4 proxy: 4.50', result.stdout)
+
+    def test_skill_without_codex_sidecar_is_visible(self):
+        (self.root / 'skills/a/agents/openai.yaml').unlink()
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('skill skills/a/SKILL.md: 11 bytes\n', result.stdout)
+
+    def test_skill_with_codex_policy_is_disabled(self):
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('skill skills/a/SKILL.md: 0 bytes (disabled)', result.stdout)
+
+    def test_skill_with_sidecar_missing_policy_is_visible(self):
+        self.write('skills/a/agents/openai.yaml', 'policy: {}\n')
+        result = self.run_check()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('skill skills/a/SKILL.md: 11 bytes\n', result.stdout)
 
     def test_flagless_skill_counted_and_rejected(self):
         self.write('skills/a/SKILL.md', '---\ndescription: "Visible é"\n---\n')

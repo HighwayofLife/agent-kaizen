@@ -49,6 +49,14 @@ class RepoTests(unittest.TestCase):
                 self.assertRegex(fields.get('description', ''), r'^".+"$', 'description must be quoted')
                 self.assertEqual(fields.get('disable-model-invocation'), 'true')
 
+    def test_skills_have_codex_visibility_sidecar(self):
+        for name in SKILLS:
+            with self.subTest(skill=name):
+                path = ROOT / 'skills' / name / 'agents' / 'openai.yaml'
+                self.assertTrue(path.is_file(), str(path))
+                self.assertEqual(path.read_text(encoding='utf-8'),
+                                 'policy:\n  allow_implicit_invocation: false\n')
+
     def test_agent_frontmatter(self):
         for path in [*ROOT.glob('agents/*.md'), *ROOT.glob('templates/agents/*.md')]:
             with self.subTest(agent=path.name):

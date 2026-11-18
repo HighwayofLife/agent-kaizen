@@ -77,7 +77,11 @@ def check(root):
         for path in sorted(root.glob(pattern)):
             fields = frontmatter(path)
             disabled = fields.get('disable-model-invocation')
-            visible = kind == 'agent' or disabled != 'true'
+            sidecar = path.parent / 'agents/openai.yaml'
+            codex_hidden = (sidecar.is_file() and re.search(
+                r'(?m)^\s*allow_implicit_invocation:\s*false\s*$',
+                sidecar.read_text(encoding='utf-8'))) if kind == 'skill' else False
+            visible = kind == 'agent' or disabled != 'true' or not codex_hidden
             size = len(fields['description'].encode('utf-8')) if visible else 0
             total += size
             print('{} {}: {} bytes{}'.format(kind, path.relative_to(root), size,
