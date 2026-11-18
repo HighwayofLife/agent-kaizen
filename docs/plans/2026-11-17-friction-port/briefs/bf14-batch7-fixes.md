@@ -1,14 +1,14 @@
 # BF14 batch-review-7 fixes
 
 Risk: normal. Model: terra / medium. Fix-Origin: batch-review. Fixes: BF13a, P20b, BF13b.
-Depends on: P23 and P18d landed (they own `scripts/kaizen_friction_prepare.py` and `scripts/token-audit` while in flight). Jumps the queue ahead of P24.
+Depends on: P23 and P18d landed (both done) (they own `scripts/kaizen_friction_prepare.py` and `scripts/token-audit` while in flight). Jumps the queue ahead of P24.
 Changelog: none.
 
 ## Goal
 
-Batch review 7 (Sol medium, 634c943..253dd03) found six defects, and item 7 is a pre-existing check failure. Fix ALL seven, each with a regression test that fails before the fix. Do not commit or push. Do not edit `.claude-plugin/plugin.json` or `CHANGELOG.md`. Do not delete or weaken tests. The line numbers are from 253dd03; P23 and P18d have since changed these files, so re-locate each finding in the current code and report any already fixed.
+Batch review 7 (Sol medium, 634c943..253dd03) found six defects, and item 7 is a pre-existing check failure. Fix ALL nine, each with a regression test that fails before the fix. Do not commit or push. Do not edit `.claude-plugin/plugin.json` or `CHANGELOG.md`. Do not delete or weaken tests. The line numbers are from 253dd03; P23 and P18d have since changed these files, so re-locate each finding in the current code and report any already fixed.
 
-Owned files: `hooks/audit-notice.sh`, `scripts/kaizen_friction_prepare.py`, `scripts/token-audit`, `tests/test_hooks.py`, `tests/test_friction_prepare.py`, `tests/test_friction_timeline.py`, `tools/context-budget.json`.
+Owned files: `hooks/audit-notice.sh`, `scripts/kaizen_friction_prepare.py`, `scripts/token-audit`, `tests/test_hooks.py`, `tests/test_friction_prepare.py`, `tests/test_friction_timeline.py`, `tools/context-budget.json`, `tests/test_friction_codex.py`, `tests/test_friction_signals.py`.
 
 ## Findings
 
@@ -21,6 +21,9 @@ Owned files: `hooks/audit-notice.sh`, `scripts/kaizen_friction_prepare.py`, `scr
 
 7. `tools/context_budget.py` fails on `release-0.13` with "hooks/audit-notice.sh: hook changed; review and update inventory": BF13a changed the hook without updating the reviewed inventory in `tools/context-budget.json`. After fix 1, review the hook's literal output bytes and update the inventory entry (hash and reviewed byte count) the way the file's other entries are recorded. The total must stay within the 1024-byte budget (it was 1023); if fix 1 adds printed bytes, trim them rather than raising the budget. Check: `python3 tools/context_budget.py` exits 0.
 
+8. `scripts/token-audit:2598` (live, regression from P18d): the legacy extract-store mode repair applies to arbitrary `--extract-out` destinations and follows symlinked ancestors, so an audit can strip group/other access from an unrelated user-owned directory. Fix: repair the mode only for the default extract store directory the tool itself creates, reached by a dir-fd walk with `O_NOFOLLOW|O_DIRECTORY` from a trusted root, and only when owned by euid; for a custom `--extract-out`, never chmod: warn and skip writing extracts if the mode is not 0700. Tests: a custom 0755 `--extract-out` keeps its mode; a symlinked ancestor is not followed; the default legacy store is still repaired.
+9. `scripts/token-audit:1766` (live): Codex rollouts with a future-dated header allocate tool-pair slots before checking cwd scope, so an out-of-scope rollout can mark the audit capped and suppress valid allow-rule proposals. Fix: count a pair toward the cap only after its cwd scope is established and in scope. Test in `tests/test_friction_codex.py`.
+
 ## Verification
 
 - `python3 -m unittest discover -s tests -p 'test_hooks.py'`
@@ -29,6 +32,8 @@ Owned files: `hooks/audit-notice.sh`, `scripts/kaizen_friction_prepare.py`, `scr
 - `python3 -m unittest discover -s tests -p 'test_runner.py'`
 - `python3 tests/bench_token_audit.py --baseline d8a4cb7 --max-ratio 1.10` and with `--no-friction`
 - `python3 tools/context_budget.py`
+- `python3 -m unittest discover -s tests -p 'test_friction_codex.py'`
+- `python3 -m unittest discover -s tests -p 'test_friction_signals.py'`
 - `git diff --check`
 
 ## Report
