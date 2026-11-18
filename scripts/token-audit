@@ -1471,7 +1471,7 @@ def friction_sections(friction):
     return lines
 
 
-def scan_claude(path, agent, since, data, seen_messages, project, source=None):
+def scan_claude(path, agent, since, data, seen_messages, project, source=None, *, friction_allowed=True):
     main = agent is None
     counter = Counter()
     tools = {}
@@ -1482,7 +1482,7 @@ def scan_claude(path, agent, since, data, seen_messages, project, source=None):
     turn = None
     cache_previous = None
     cache_seen = False
-    friction = data.get("_friction")
+    friction = data.get("_friction") if friction_allowed else None
     cached_head = lru_cache(maxsize=64)(bash_head)
     cached_command = lru_cache(maxsize=64)(command_info)
     for row in rows(path, since, data["warnings"], keep_tools=True, canary=data["format_canary"],
@@ -1957,13 +1957,15 @@ def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=No
 
     def scan(path, agent, project):
         source = None
-        if friction and cwd:
+        rejected = False
+        if friction:
             try:
                 source = open_permission_transcript(path)
             except (OSError, ValueError, AttributeError, ImportError):
                 data["warnings"]["unsafe permission transcript"] += 1
+                rejected = True
         with (source if source is not None else nullcontext()):
-            scan_claude(path, agent, since, data, seen_messages, project, source)
+            scan_claude(path, agent, since, data, seen_messages, project, source, friction_allowed=not rejected)
 
     for project in projects:
         for path in project.glob("*.jsonl"):
@@ -2807,7 +2809,8 @@ def main():
         if not args.no_write:
             out.parent.mkdir(parents=True, exist_ok=True)
             extract_path, binding = write_extract(data, out, args.extract_out, scope, now) or (None, None)
-            if binding is not None and data.get("friction", {}).get("comparisons"):
+            if (binding is not None and data.get("friction", {}).get("comparisons")
+                    and not data["warnings"].get("unsafe permission transcript")):
                 try:
                     secret = audit_machine_key(create=True)
                     if secret is not None:

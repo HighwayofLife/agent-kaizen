@@ -205,6 +205,53 @@ class BackupCommitTests(unittest.TestCase):
         self.assertEqual(self.target.read_text(), "after")
         self.assertEqual(subprocess.check_output([xattr, "-p", attr, str(self.target)], text=True).strip(), "fixture")
 
+    def test_ref_undo_refuses_live_extended_acl(self):
+        change = self.ready()
+        self.commit_cli(change)
+        ref = "refs/kaizen/" + datetime.date.today().isoformat()
+        oid = self.git("rev-parse", ref)
+        live = self.target.stat()
+        def has_acl(fd, label):
+            return os.path.samestat(os.fstat(fd), live)
+        with patch.object(sys, "platform", "darwin"):
+            self.assertIn("extended ACL", self.main("undo", change, expected=2, darwin_has_acl=has_acl))
+        self.assertEqual(self.git("rev-parse", ref), oid)
+        self.assertEqual(self.target.read_text(), "after")
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS extended ACLs")
+    def test_ref_undo_refuses_real_live_extended_acl(self):
+        change = self.ready()
+        self.commit_cli(change)
+        ref = "refs/kaizen/" + datetime.date.today().isoformat()
+        oid = self.git("rev-parse", ref)
+        result = subprocess.run(["/bin/chmod", "+a", "everyone deny write", str(self.target)],
+                                capture_output=True, text=True)
+        if result.returncode:
+            self.skipTest("cannot set ACL: " + result.stderr.strip())
+        self.assertIn("extended ACL", self.main("undo", change, expected=2))
+        self.assertEqual(self.git("rev-parse", ref), oid)
+        self.assertEqual(self.target.read_text(), "after")
+
+    def test_ref_undo_checks_flags_on_created_file_before_publishing(self):
+        created = self.repo / "created"
+        change = Path(self.script("begin", "--run", "created", "--repo", ".", "--skill", "trim",
+                                  "--ledger", "fixture", self.target, created))
+        self.target.write_text("after")
+        created.write_text("new")
+        self.script("finish", change)
+        self.commit_cli(change)
+        ref = "refs/kaizen/" + datetime.date.today().isoformat()
+        oid = self.git("rev-parse", ref)
+        info = created.stat()
+        def flags(fd, label):
+            return 0x10 if os.path.samestat(os.fstat(fd), info) else 0
+        with (patch.object(sys, "platform", "linux"),
+              patch.object(os, "listxattr", return_value=[], create=True)):
+            self.assertIn("filesystem flags", self.main("undo", change, expected=2, linux_inode_flags=flags))
+        self.assertEqual(self.git("rev-parse", ref), oid)
+        self.assertEqual(created.read_text(), "new")
+        self.assertEqual(self.target.read_text(), "after")
+
     def test_ref_undo_checks_linux_inode_flags(self):
         change = self.ready()
         self.commit_cli(change)

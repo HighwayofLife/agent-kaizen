@@ -2253,7 +2253,7 @@ def commit_generation(generation, run_id):
     return f"scheduled-local:{generation}:{run_id}"
 
 
-def recover_scheduled_suggestions(store, host, project):
+def recover_scheduled_suggestions(store, host, project, *, proposal_only=False):
     """Close legacy proposal-only receipts that have no native broker record."""
     if store.friction.resolve().is_relative_to(project):
         raise ValueError("broker state must be outside the project")
@@ -2273,8 +2273,9 @@ def recover_scheduled_suggestions(store, host, project):
                 os.stat("broker-" + ident + ".json", dir_fd=state, follow_symlinks=False)
             except FileNotFoundError:
                 catalog = rows[ident]["catalog_id"]
-                reason = ("commit was never reserved" if catalog == "local-commit"
-                          else scheduled_action_refusal(catalog))
+                reason = ("recovery is proposal-only" if proposal_only else
+                          "commit was never reserved" if catalog == "local-commit" else
+                          scheduled_action_refusal(catalog))
                 if reason:
                     suggestions[ident] = reason
         if suggestions:
@@ -2457,7 +2458,10 @@ def _run_review(audits, project_dirs, options, clock, safety):
     write_index(audits, projects)
     run_checks(audits, options, projects)
     rollback_failed = config_failed = False
-    degraded = recover_interrupted_run(audits, options)
+    try:
+        degraded = recover_interrupted_run(audits, options)
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
+        degraded = f"interrupted-run recovery failed ({failure_text(error)})"
     if degraded:
         log(f"recovery: {degraded}; every project runs as propose-only this cycle")
     cache = {}
@@ -3005,8 +3009,11 @@ def recover_scheduled_publication(audits, project, receipt=None, proposal=None, 
         store = host["HostActions"](audits, backup_root(), action_project, key)
         name = "publication-" + project.key + ".json"
         try:
-            if options is not None and any(row.get("pending") for row in store.scoped(project.canonical)):
-                run_scheduled_broker(audits, project, options)
+            if any(row.get("pending") for row in store.scoped(project.canonical)):
+                if options is None:
+                    recover_scheduled_suggestions(store, host, project.canonical, proposal_only=True)
+                else:
+                    run_scheduled_broker(audits, project, options)
         except (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
             log("friction: broker recovery remains pending")
         if (store.friction / name).exists():
