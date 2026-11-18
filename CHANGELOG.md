@@ -8,7 +8,7 @@ Codex CLI and GitHub Copilot support: the same plugin installs on Codex CLI and 
 
 `host support`:
 
-- Detect Copilot plugins loaded live from a local directory marketplace.
+- Detect Copilot plugins loaded live from a local directory marketplace and suggest updating that directory when its version differs.
 
 - GitHub Copilot support is experimental and has not been checked in a live session; Copilot usage is not measured yet.
 
