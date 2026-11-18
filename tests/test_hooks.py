@@ -14,9 +14,12 @@ ROOT = Path(__file__).resolve().parents[1]
 HOOKS = ROOT / 'hooks'
 
 
-def run_raw(hook, payload, env=None, cwd=None):
-    return subprocess.run(['bash', str(HOOKS / hook)], input=json.dumps(payload), text=True,
-                          capture_output=True, env={**os.environ, **(env or {})}, cwd=cwd, check=False)
+def run_raw(hook, payload, env=None, cwd=None, text=True):
+    inherited = {k: v for k, v in os.environ.items()
+                 if k not in ('KAIZEN_HOST', 'PLUGIN_ROOT', 'COPILOT_PLUGIN_ROOT')}
+    data = json.dumps(payload)
+    return subprocess.run(['bash', str(HOOKS / hook)], input=data if text else data.encode(), text=text,
+                          capture_output=True, env={**inherited, **(env or {})}, cwd=cwd, check=False)
 
 
 def run(hook, payload, env=None, cwd=None):
@@ -45,6 +48,104 @@ class HookTests(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
 
+    def notice_setup(self):
+        project, audits, plugin = (self.tmp / name for name in ('project', 'audits', 'plugin'))
+        (project / 'docs/kaizen').mkdir(parents=True)
+        audits.mkdir()
+        (plugin / 'scripts').mkdir(parents=True)
+        env = {'AUDIT_DIR': str(audits), 'HOME': str(self.tmp / 'home'),
+               'CLAUDE_CONFIG_DIR': str(self.tmp / 'cfg'), 'CLAUDE_PLUGIN_ROOT': str(plugin)}
+        return project, audits, plugin, env
+
+    def test_claude_notice_golden(self):
+        # Captured from d1accc4 scripts, not JSON reserialization; <TMP> replaces the temp root.
+        project, audits, plugin, env = self.notice_setup()
+        (audits / 'token-audit-1.md').write_text('audit')
+        expected = ('{\n  "hookSpecificOutput": {\n    "hookEventName": "SessionStart",\n'
+                    '    "additionalContext": "An unreviewed usage audit exists: <TMP>/audits/token-audit-1.md. '
+                    'When there is a pause, run /agent-kaizen:review (read the headline and flagged sections, '
+                    'not the whole file), propose changes to the user, then touch <TMP>/audits/token-audit-1.reviewed."\n  }\n}\n')
+        result = run_raw('audit-notice.sh', {'cwd': str(project)}, env, text=False)
+        self.assertEqual(result.stdout, expected.replace('<TMP>', str(self.tmp)).encode())
+        for path in audits.iterdir():
+            path.unlink()
+        (plugin / 'scripts/experiment-check').write_text('print("synthetic finding")\nraise SystemExit(1)\n')
+        expected = ('{\n  "hookSpecificOutput": {\n    "hookEventName": "SessionStart",\n'
+                    '    "additionalContext": "Experiments need attention in this project (docs/kaizen/LEDGER.md):'
+                    '\\nsynthetic finding\\nWhen there is a pause, run /agent-kaizen:review."\n  }\n}\n')
+        self.assertEqual(run_raw('audit-notice.sh', {'cwd': str(project)}, env, text=False).stdout, expected.encode())
+        self.assertEqual(run_raw('audit-notice.sh', {'cwd': str(self.tmp)}, env, text=False).stdout, b'{}\n')
+
+    def test_claude_burst_golden(self):
+        for event in ('PostToolUse', 'PostToolUseFailure'):
+            payload = {'session_id': event, 'hook_event_name': event, 'tool_name': 'Bash'}
+            expected = ('{\n  "hookSpecificOutput": {\n    "hookEventName": "' + event + '",\n'
+                        '    "additionalContext": "1 Bash calls this turn. Chain the remaining steps into one command '
+                        'or script that prints a summary, or hand the investigation to a cheaper read-only subagent."\n  }\n}\n')
+            self.assertEqual(run_raw('bash-burst.sh', payload, self.burst_env(KAIZEN_BASH_BURST='1'), text=False)
+                             .stdout, expected.encode())
+
+    def test_host_notice_detection_and_override(self):
+        project, audits, plugin, env = self.notice_setup()
+        (audits / 'token-audit-1.md').write_text('audit')
+        cases = [({'PLUGIN_ROOT': str(plugin)}, 'codex'),
+                 ({'PLUGIN_ROOT': str(plugin), 'COPILOT_PLUGIN_ROOT': str(plugin)}, 'copilot'),
+                 ({'COPILOT_PLUGIN_ROOT': str(plugin), 'KAIZEN_HOST': 'codex'}, 'codex'),
+                 ({'PLUGIN_ROOT': str(plugin), 'KAIZEN_HOST': 'claude'}, 'claude'),
+                 ({'PLUGIN_ROOT': str(plugin), 'KAIZEN_HOST': 'unknown'}, 'codex'),
+                 ({'COPILOT_PLUGIN_ROOT': str(plugin), 'KAIZEN_HOST': 'unknown'}, 'copilot')]
+        for extra, host in cases:
+            with self.subTest(extra=extra):
+                for marker in audits.glob('*.noticed-*'):
+                    marker.unlink()
+                fixture_host = 'copilot' if host == 'copilot' else 'codex'
+                payload = json.loads((ROOT / f'tests/fixtures/hooks/{fixture_host}_sessionstart.json').read_text())
+                payload['cwd'] = str(project)
+                out = run('audit-notice.sh', payload, {**env, **extra})
+                if host == 'copilot':
+                    self.assertEqual(set(out), {'additionalContext'})
+                    text = out['additionalContext']
+                else:
+                    self.assertEqual(set(out), {'hookSpecificOutput'})
+                    text = out['hookSpecificOutput']['additionalContext']
+                skill = '$agent-kaizen:review' if host == 'codex' else '/agent-kaizen:review'
+                self.assertIn(skill, text)
+                self.assertNotIn('/agent-kaizen:review' if host == 'codex' else '$agent-kaizen:review', text)
+
+    def test_host_burst_tools_and_reset(self):
+        for host in ('claude', 'codex', 'copilot'):
+            extra = {} if host == 'claude' else {'PLUGIN_ROOT': str(ROOT)}
+            if host == 'copilot':
+                extra['COPILOT_PLUGIN_ROOT'] = str(ROOT)
+            env = self.burst_env(**extra)
+            fixture_host = 'codex' if host == 'claude' else host
+            payload = json.loads((ROOT / f'tests/fixtures/hooks/{fixture_host}_posttooluse_bash.json').read_text())
+            reset = json.loads((ROOT / f'tests/fixtures/hooks/{fixture_host}_userpromptsubmit.json').read_text())
+            for index, tool in enumerate(('Bash', 'bash')):
+                with self.subTest(host=host, tool=tool):
+                    payload.update(session_id=f'{host}-{index}', tool_name=tool)
+                    reset['session_id'] = payload['session_id']
+                    self.assertIsNone(run('bash-burst.sh', payload, env))
+                    out = run('bash-burst.sh', payload, env)
+                    if tool == 'bash' and host != 'copilot':
+                        self.assertIsNone(out)
+                    else:
+                        key = 'additionalContext' if host == 'copilot' else 'hookSpecificOutput'
+                        self.assertEqual(set(out), {key})
+                    self.assertEqual(run_raw('bash-burst.sh', reset, env).stdout, '')
+                    self.assertIsNone(run('bash-burst.sh', payload, env))
+
+    def test_host_helpers_identical(self):
+        helpers = []
+        for name in ('audit-notice.sh', 'session-audit.sh', 'bash-burst.sh'):
+            text = (HOOKS / name).read_text()
+            start, end = '# --- host helper ---', '# --- end host helper ---'
+            self.assertEqual(text.count(start), 1)
+            self.assertEqual(text.count(end), 1)
+            helpers.append(text.split(start)[1].split(end)[0])
+        self.assertTrue(helpers[0].strip())
+        self.assertEqual(helpers, [helpers[0]] * 3)
+
     def test_bash_burst_counts_and_resets(self):
         env = {'TMPDIR': str(self.tmp), 'KAIZEN_BASH_BURST': '2'}
         payload = {'session_id': '../session', 'hook_event_name': 'PostToolUse',
@@ -66,7 +167,9 @@ class HookTests(unittest.TestCase):
                       ['hookSpecificOutput']['additionalContext'])
 
     def test_bash_burst_bad_json_and_default_threshold(self):
-        env = {**os.environ, 'TMPDIR': str(self.tmp), 'KAIZEN_BASH_BURST': 'invalid'}
+        env = {**os.environ, **self.burst_env(KAIZEN_BASH_BURST='invalid')}
+        for key in ('KAIZEN_HOST', 'PLUGIN_ROOT', 'COPILOT_PLUGIN_ROOT'):
+            env.pop(key, None)
         result = subprocess.run(['bash', str(HOOKS / 'bash-burst.sh')], input='{',
                                 text=True, capture_output=True, env=env, check=False)
         self.assertEqual((result.returncode, result.stdout), (0, ''))
@@ -570,6 +673,8 @@ class HookTests(unittest.TestCase):
             (bindir / name).symlink_to(shutil.which(name))
         env = {**os.environ, 'HOME': str(self.tmp / 'home'), 'CLAUDE_CONFIG_DIR': str(cfg),
                'AUDIT_DIR': '', 'PATH': str(bindir)}
+        for key in ('KAIZEN_HOST', 'PLUGIN_ROOT', 'COPILOT_PLUGIN_ROOT'):
+            env.pop(key, None)
         def invoke():
             return subprocess.run([bash, str(HOOKS / 'audit-notice.sh')],
                                   input=json.dumps({'cwd': str(project)}), text=True,

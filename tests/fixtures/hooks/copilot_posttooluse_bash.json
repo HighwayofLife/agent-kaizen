@@ -1,0 +1,9 @@
+{
+  "session_id": "copilot-session",
+  "cwd": "/path/to/project",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "bash",
+  "tool_input": {
+    "command": "printf hello"
+  }
+}

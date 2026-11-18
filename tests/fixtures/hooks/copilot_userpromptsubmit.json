@@ -1,0 +1,5 @@
+{
+  "session_id": "copilot-session",
+  "cwd": "/path/to/project",
+  "hook_event_name": "UserPromptSubmit"
+}

@@ -27,6 +27,8 @@ class RegressionNoticeTests(unittest.TestCase):
         self.db = root / 'usage.db'
         self.env = dict(os.environ, AUDIT_DIR=str(self.audits), CLAUDE_CONFIG_DIR=str(root / 'config'),
                         CLAUDE_PLUGIN_ROOT=str(self.plugin), KAIZEN_USAGE_DB=str(self.db))
+        for key in ('KAIZEN_HOST', 'PLUGIN_ROOT', 'COPILOT_PLUGIN_ROOT'):
+            self.env.pop(key, None)
         self.finding = 'REGRESSION main_avg_context 30000 vs 10000'
 
     def markers(self):
