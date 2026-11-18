@@ -263,6 +263,30 @@ if os.environ.get('REVIEW_SLEEP'): time.sleep(10)
         self.assertFalse(list(store.friction.glob("broker-*.json")))
         self.assertFalse((store.friction / "host-fixes").exists())
 
+    def test_recovery_exception_still_closes_recordless_suggestion(self):
+        import shutil
+        host = runpy.run_path(str(self.runner_path.parent / "kaizen_friction_actions.py"))
+        store = host["HostActions"](self.config / "audits", self.backups,
+                                    self.runner["action_project"], self.runner["key"])
+        target = self.project / "build"
+        target.mkdir()
+        ident = store.action_id(self.project, "linux-localsearch", str(target), allowed=[str(target)])
+        frozen = {ident: dict(canonical_project=str(self.project), catalog_id="linux-localsearch",
+                              selector_key=str(target), intents=["suggest", "apply"], evidence="fixture")}
+        block = '<!-- kaizen-host-actions ' + json.dumps(dict(v=1, actions=[dict(id=ident, intent="apply")])) + ' -->'
+        store.import_actions(block, frozen, self.project, "scheduled:00000000000000000001")
+        scripts = self.root / "recovery-scripts"
+        shutil.copytree(self.runner_path.parent, scripts)
+        runner = scripts / "kaizen-scheduled"
+        source = runner.read_text().replace('    root = backup_root().resolve()\n    statuses = []',
+                                            '    raise OSError("injected recovery error")\n    statuses = []', 1)
+        runner.write_text(source)
+        result = self.review_run(runner=runner)
+        self.assertIn("injected recovery error", result.stdout)
+        receipts = json.loads(store.path.read_text())["receipts"][str(self.project)]
+        self.assertEqual(receipts["scheduled:00000000000000000001"][ident], "terminal")
+        self.assertFalse((target / ".nomedia").exists())
+
     def test_group_writable_checkout_recovers_suggestion_and_refuses_broker_apply(self):
         audits = self.config / "audits"
         host = runpy.run_path(str(self.runner_path.parent / "kaizen_friction_actions.py"))

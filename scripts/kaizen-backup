@@ -1871,6 +1871,8 @@ def undo_file_hash(name, fd, version, *, restoring=False, replacement=None):
             raise ValueError("working file changed during undo")
         if restoring:
             check_restore_metadata(stream.fileno(), replacement, label="working file")
+        else:
+            check_inode_flags(stream.fileno(), "working file")
         digest = hashlib.sha256()
         remaining = info.st_size
         while remaining:
@@ -1922,13 +1924,40 @@ def linux_inode_flags(fd, label):
     return ctypes.c_uint.from_buffer(flags).value
 
 
+def check_inode_flags(fd, label):
+    info = os.fstat(fd)
+    # FS_EXTENT_FL describes the normal on-disk layout of ext4 files.
+    if getattr(info, "st_flags", 0) or (sys.platform == "linux" and linux_inode_flags(fd, label) & ~0x80000):
+        raise ValueError(f"cannot restore {label} with filesystem flags")
+
+
+def darwin_has_acl(fd, label):
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        get_acl = libc.acl_get_fd_np
+        get_acl.argtypes = (ctypes.c_int, ctypes.c_int)
+        get_acl.restype = ctypes.c_void_p
+        free_acl = libc.acl_free
+        free_acl.argtypes = (ctypes.c_void_p,)
+        acl = get_acl(fd, 0x100)  # ACL_TYPE_EXTENDED
+        if acl:
+            free_acl(acl)
+            return True
+        error = ctypes.get_errno()
+        if error != errno.ENOENT:
+            raise OSError(error, os.strerror(error))
+        return False
+    except (OSError, AttributeError) as error:
+        raise ValueError(f"cannot verify {label} extended ACL: {error}") from error
+
+
 def check_restore_metadata(fd, replacement=None, *, label="undo backup"):
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode):
         raise ValueError(f"{label} must be a regular file")
-    # FS_EXTENT_FL describes the normal on-disk layout of ext4 files.
-    if getattr(info, "st_flags", 0) or (sys.platform == "linux" and linux_inode_flags(fd, label) & ~0x80000):
-        raise ValueError(f"cannot restore {label} with filesystem flags")
+    check_inode_flags(fd, label)
+    if sys.platform == "darwin" and darwin_has_acl(fd, label):
+        raise ValueError(f"cannot restore {label} with extended ACL")
     if hasattr(os, "listxattr"):
         if os.listxattr(fd):
             raise ValueError(f"cannot restore {label} with extended attributes")
