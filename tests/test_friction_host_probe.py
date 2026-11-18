@@ -19,6 +19,52 @@ loader.exec_module(probe_module)
 
 
 class HostProbeTests(unittest.TestCase):
+    def test_configured_clean_filter_is_not_run(self):
+        def git(*args):
+            return subprocess.run(['git', '-C', str(self.project), *args], check=True, capture_output=True)
+        git('init', '-q')
+        (self.project / '.gitattributes').write_text('tracked filter=evil\n')
+        (self.project / 'tracked').write_text('before')
+        git('add', '.')
+        git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+            '-c', 'commit.gpgsign=false', 'commit', '-qm', 'initial')
+        marker = self.root / 'filter-ran'
+        git('config', 'filter.evil.clean', 'touch ' + str(marker))
+        (self.project / 'tracked').write_text('changed')
+        self.assertIsNone(self.probe().git(self.project, 'status', '--porcelain'))
+        self.assertFalse(marker.exists())
+
+    def test_output_stays_with_open_directory_after_replacement(self):
+        out = self.root / 'reports'
+        moved = self.root / 'original'
+        outside = self.root / 'outside'
+        out.mkdir()
+        outside.mkdir()
+        def replace(_probe):
+            out.rename(moved)
+            out.symlink_to(outside, target_is_directory=True)
+            return {'private': str(self.project)}
+        with mock.patch.object(probe_module.Probe, 'run', replace), \
+             mock.patch('builtins.print'):
+            self.assertEqual(probe_module.main(['--project', str(self.project), '--out', str(out)]), 0)
+        self.assertEqual(list(outside.iterdir()), [])
+        self.assertEqual(len(list(moved.glob('host-probe-*.json'))), 1)
+
+    def test_bare_repository_and_fifo_pointer_are_rejected(self):
+        bare = self.project / 'build'
+        subprocess.run(['git', 'init', '--bare', '-q', str(bare)], check=True)
+        self.assertIsNone(self.probe().size(bare))
+        fifo = self.root / 'pointer'
+        os.mkfifo(fifo)
+        with self.assertRaises(ValueError):
+            self.probe().pointer(fifo)
+
+    def test_idle_process_is_not_busy(self):
+        probe = self.probe('macos')
+        with mock.patch.object(probe, 'command', return_value='0.0 mds\n2.0 other\n'):
+            self.assertEqual(probe.processes()['spotlight']['count'], 1)
+        self.assertNotIn('spotlight', probe.busy_categories)
+
     def test_hidden_index_and_submodule_ignore_make_cleanliness_unknown(self):
         def git(root, *args):
             return subprocess.run(['git', '-C', str(root), *args], check=True, capture_output=True)
@@ -262,7 +308,7 @@ class HostProbeTests(unittest.TestCase):
                 if argv[0] == 'tmutil':
                     self.assertEqual(argv, ['tmutil', 'isexcluded', str(output)])
                     return tm_output
-                return 'mds\nbackupd\n'
+                return '10.0 mds\n9.0 backupd\n'
             with mock.patch.object(probe, 'command', side_effect=command) as runner, \
                  mock.patch.object(probe, 'worktrees', return_value=trees), \
                  mock.patch.object(probe, 'directories', return_value=[directory]):
@@ -408,7 +454,7 @@ class HostProbeTests(unittest.TestCase):
         trees = [{'path': str(self.project), 'is_main': True}]
         for state in ('Indexing disabled.\n', None, 'unexpected'):
             def command(argv):
-                return state if argv[0] == 'mdutil' else 'mds\n'
+                return state if argv[0] == 'mdutil' else '10.0 mds\n'
             with mock.patch.object(probe, 'command', side_effect=command), mock.patch.object(probe, 'worktrees', return_value=trees), mock.patch.object(probe, 'directories', return_value=[directory]):
                 self.assertNotIn('spotlight-output', [f['catalog_id'] for f in probe.run()['findings']])
 

@@ -100,6 +100,15 @@ class SamplerTests(unittest.TestCase):
         self.assertEqual(self.process_rows(), [b"P\t1735775999999\t4\t4\tmds",
                                                b"P\t1735776299999\t4\t4\tmds"])
 
+    def test_unknown_boot_identity_still_rate_limits(self):
+        self.samples.mkdir(parents=True)
+        lock = os.open(self.samples / sampler.LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, lock)
+        with patch.object(time, "clock_gettime_ns", return_value=123), \
+                patch.object(sampler, "boot_identity", return_value=None):
+            self.assertTrue(sampler.claim_process(lock))
+            self.assertFalse(sampler.claim_process(lock))
+
     def test_claim_changes_with_boot_identity(self):
         self.samples.mkdir(parents=True)
         lock = os.open(self.samples / sampler.LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o600)
@@ -173,16 +182,35 @@ class SamplerTests(unittest.TestCase):
         pid_file = self.root / "query-pid"
         for cancel in (False, True):
             with self.subTest(cancel=cancel):
-                query = ("import os, pathlib, signal, sys, time; "
+                query = ("import signal, time; "
                          "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                         "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
-                         + ("os.kill(os.getppid(), signal.SIGTERM); " if cancel else "") + "time.sleep(3)")
+                         "time.sleep(3)")
+                # The query can be killed before it publishes its own PID. Record
+                # the spawn result in the parent, where cancellation only sets a flag.
+                worker = """
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+import kaizen_friction_sample as s
+
+s.metrics = lambda: ('4', '4')
+s.PROCESS_COMMAND = (sys.executable, '-c', sys.argv[1])
+spawn = os.posix_spawn
+def record_spawn(*args, **kwargs):
+    pid = spawn(*args, **kwargs)
+    Path(sys.argv[2]).write_text(str(pid))
+    if sys.argv[3] == 'True':
+        os.kill(os.getpid(), signal.SIGTERM)
+    return pid
+s.os.posix_spawn = record_spawn
+start = time.monotonic()
+s.main()
+assert time.monotonic() - start < s.BUDGET + 0.1
+"""
                 self.command = [sys.executable, "-c",
-                                "import sys, time; import kaizen_friction_sample as s; "
-                                "s.metrics = lambda: ('4', '4'); "
-                                "s.PROCESS_COMMAND = (sys.executable, '-c', *sys.argv[1:]); "
-                                "start = time.monotonic(); s.main(); "
-                                "assert time.monotonic() - start < s.BUDGET + 0.1", query, str(pid_file)]
+                                worker, query, str(pid_file), str(cancel)]
                 self.run_hook(PYTHONPATH=str(SCRIPTS))
                 with self.assertRaises(ProcessLookupError):
                     os.kill(int(pid_file.read_text()), 0)

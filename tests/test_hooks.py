@@ -57,6 +57,15 @@ class HookTests(unittest.TestCase):
                'CLAUDE_CONFIG_DIR': str(self.tmp / 'cfg'), 'CLAUDE_PLUGIN_ROOT': str(plugin)}
         return project, audits, plugin, env
 
+    def test_notice_isolates_python_from_project_imports(self):
+        project, _, _, env = self.notice_setup()
+        marker = self.tmp / 'imported'
+        (project / 'json.py').write_text('open(' + repr(str(marker)) + ', "w").close()\n')
+        config = project / 'docs/kaizen/config.json'
+        config.write_text('{"schedule":"off"}')
+        run('audit-notice.sh', {'cwd': str(project)}, env, cwd=project)
+        self.assertFalse(marker.exists())
+
     def test_notice_rejects_fifo_and_oversized_config(self):
         project, audits, _, env = self.notice_setup()
         (audits / 'token-audit-fixture.md').write_text('fixture')
@@ -163,6 +172,12 @@ class HookTests(unittest.TestCase):
             clear()
             config.write_text(json.dumps(settings))
             self.assertIsNone(notice())
+        config.unlink()
+        clear()
+        target = self.tmp / 'action-config.json'
+        target.write_text('{"hostActions":"off"}')
+        config.symlink_to(target)
+        self.assertIsNone(notice())
         config.unlink()
         path = audits / 'host-actions.json'
         original = path.read_bytes()

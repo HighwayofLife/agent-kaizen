@@ -83,7 +83,7 @@ if ! command -v python3 >/dev/null 2>&1; then
     fi
     config_values=
 else
-config_values=$(python3 - "$home/agent-kaizen.json" "${root:+$root/docs/kaizen/config.json}" <<'PYCODE'
+config_values=$(python3 -I - "$home/agent-kaizen.json" "${root:+$root/docs/kaizen/config.json}" <<'PYCODE'
 import json, os, stat, sys
 values = []
 for path in sys.argv[1:]:
@@ -209,7 +209,7 @@ if [ -f "$checker" ] && command -v python3 >/dev/null 2>&1 &&
     { [ -n "${KAIZEN_USAGE_DB:-}" ] || [ -f "$home/kaizen-usage.db" ]; } &&
     today=$(date -u +%F 2>/dev/null) && [ ! -e "$dir/usage-regression.noticed-$today" ]; then
     # Python provides the deadline on macOS too, without coreutils or a watchdog shell.
-    output=$(python3 -c '
+    output=$(python3 -I -c '
 import subprocess, sys
 result = subprocess.run([sys.executable, "-B", sys.argv[1], "guard"], capture_output=True,
                         text=True, timeout=2, check=True)
@@ -226,14 +226,14 @@ fi
 
 actions_msg=
 actions_marker=
-if [ -n "$root" ] && command -v python3 >/dev/null 2>&1 && [ -f "$plugin_root/scripts/kaizen-scheduled" ]; then
+if [ -n "$root" ] && [ -f "$dir/host-actions.json" ] && command -v python3 >/dev/null 2>&1 && [ -f "$plugin_root/scripts/kaizen-scheduled" ]; then
         # The store validates ownership, links, size, records and the canonical project.
-        result=$(python3 - "$plugin_root/scripts/kaizen-scheduled" "$dir" "$root" "$home" <<'PYCODE' 2>/dev/null
+        result=$(python3 -I - "$plugin_root/scripts/kaizen-scheduled" "$dir" "$root" "$home" <<'PYCODE' 2>/dev/null
 import hashlib, json, os, runpy, stat, sys
 from pathlib import Path
 def settings(path):
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:

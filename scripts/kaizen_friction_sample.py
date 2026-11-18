@@ -27,6 +27,8 @@ INPUT_LIMIT = 1024 * 1024
 DAY_LIMIT = 5 * 1024 * 1024
 ROW_LIMIT = 4096
 BUDGET = 0.250
+# Leave slack for delayed signals and lock cleanup around blocking file I/O.
+IO_BUDGET = 0.150
 LOCK_RETRY_BUDGET = 0.020
 LOCK_NAME = ".lock"
 PROCESS_INTERVAL_NS = 300_000_000_000
@@ -223,26 +225,34 @@ def boot_identity():
 
 
 def claim_process(lock):
-    # Unknown boot identity fails open rather than persisting an ambiguous stamp.
     boot = boot_identity()
     previous = os.pread(lock, 25, 0)
     now = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
-    if boot is not None and len(previous) == 24 and previous[:16] == boot:
+    boot = boot if boot is not None else bytes(16)
+    if len(previous) == 24 and previous[:16] == boot:
         stamp = int.from_bytes(previous[16:], "big")
         if now >= stamp and now - stamp < PROCESS_INTERVAL_NS:
             return False
     if sys.platform == "darwin" and has_extended_acl(lock):
         return False
-    if boot is None:
-        os.ftruncate(lock, 0)
-        return True
     record = boot + now.to_bytes(8, "big")
     claimed = os.pwrite(lock, record, 0) == len(record)
     os.ftruncate(lock, len(record) if claimed else 0)
     return claimed
 
 
-def append(path, day, row, deadline, want_process=False, process_min_size=32):
+@contextmanager
+def io_deadline(deadline, active):
+    if active:
+        signal.setitimer(signal.ITIMER_REAL, max(0.000001, min(IO_BUDGET, deadline - time.monotonic())))
+    # Restore only on success. After a timeout, leave the one-shot alarm
+    # disarmed while the enclosing contexts release their file locks.
+    yield
+    if active:
+        signal.setitimer(signal.ITIMER_REAL, max(0.000001, deadline - time.monotonic()))
+
+
+def append(path, day, row, deadline, want_process=False, process_min_size=32, bounded_io=False):
     if len(row) >= ROW_LIMIT or time.monotonic() >= deadline:
         return
     with storage(path, deadline) as directory:
@@ -261,7 +271,9 @@ def append(path, day, row, deadline, want_process=False, process_min_size=32):
                     return
                 size = repair_tail(fd, size)
                 if size + len(row) <= DAY_LIMIT and time.monotonic() < deadline:
-                    if os.write(fd, row) != len(row):
+                    with io_deadline(deadline, bounded_io):
+                        written = os.write(fd, row)
+                    if written != len(row):
                         os.ftruncate(fd, size)  # Roll back a partial row before unlocking.
                     elif (want_process and size + len(row) + process_min_size <= DAY_LIMIT
                           and deadline - time.monotonic() >= PROCESS_QUERY_BUDGET):
@@ -365,13 +377,15 @@ def process_basename_fields(output, names):
     return [name for _, name in nlargest(10, rows) if name in names]
 
 
-def sample(fd, deadline=None):
+def sample(fd, deadline=None, bounded_io=False):
     if deadline is None:
         deadline = time.monotonic() + BUDGET
     if fcntl is None or host() != "claude":
         return
     home = Path(os.getenv("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
-    if not enabled(home):
+    with io_deadline(deadline, bounded_io):
+        collect = enabled(home)
+    if not collect:
         return
     data = read_bounded(fd, deadline, INPUT_LIMIT)
     event = decode(data) if data is not None else None
@@ -392,13 +406,13 @@ def sample(fd, deadline=None):
     want_process = bool(load and cores and float(load) >= int(cores))
     process_min_size = len("\t".join(("P", str(ms), load, cores, "x")) + "\n")
     if append(path, day, ("\t".join(fields) + "\n").encode("ascii"), deadline,
-              want_process, process_min_size):
+              want_process, process_min_size, bounded_io):
         names = catalogue_names()
         if names:
             hits = process_basename_fields(query_processes(deadline), names)
             if hits:
                 prefix = "\t".join(("P", str(ms), load, cores)).encode("ascii")
-                append(path, day, b"\t".join([prefix] + hits) + b"\n", deadline)
+                append(path, day, b"\t".join([prefix] + hits) + b"\n", deadline, bounded_io=bounded_io)
 
 
 def deadline_expired(_signum, _frame):
@@ -412,8 +426,8 @@ def main():
     previous = {sig: signal.signal(sig, deadline_expired) for sig in CANCEL_SIGNALS}
     try:
         try:
-            signal.setitimer(signal.ITIMER_REAL, max(0, deadline - time.monotonic()))
-            sample(sys.stdin.fileno(), deadline)
+            signal.setitimer(signal.ITIMER_REAL, max(0.000001, deadline - time.monotonic()))
+            sample(sys.stdin.fileno(), deadline, bounded_io=True)
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
     except (OSError, ValueError, RuntimeError):
