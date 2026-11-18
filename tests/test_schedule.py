@@ -184,6 +184,83 @@ class ScheduleTests(StubCase):
         self.assertIn('skip LOCAL notes-ledger', result.stdout)
         self.assertFalse((target / 'notes-ledger').exists())
 
+    def test_friction_inventory_in_link_and_cache_installs(self):
+        aliases = {name: 'kaizen-' + name for name in
+                   ('host-probe', 'host-fix', 'allow-rule', 'worktree-prune', 'friction-catalog.json')}
+        helpers = ('kaizen_worktree_facts.py', 'kaizen_friction_actions.py')
+        for mode in ('link', 'copy'):
+            with self.subTest(mode=mode):
+                plugin = self.root / ('plugins/cache/agent-kaizen/version' if mode == 'copy' else 'plugin')
+                shutil.copytree(SCRIPTS, plugin / 'scripts')
+                config = self.root / ('config-' + mode)
+                env = dict(self.env, CLAUDE_CONFIG_DIR=str(config))
+                target = config / 'bin'
+                command = [sys.executable, str(plugin / 'scripts/install-schedule'), '--apply', '--scheduler', 'cron']
+                for _ in range(2):
+                    result = subprocess.run(command, env=env, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual(self.cron_file.read_text().count('# agent-kaizen-audit'), 1)
+                self.assertNotIn('# agent-kaizen-review', self.cron_file.read_text())
+                for source, name in list(aliases.items()) + [(name, name) for name in helpers]:
+                    path = target / name
+                    self.assertEqual(path.read_bytes(), (plugin / 'scripts' / source).read_bytes())
+                    self.assertEqual(path.is_symlink(), mode == 'link')
+                    if source != name:
+                        self.assertFalse((target / source).exists())
+                    if source in ('host-probe', 'host-fix', 'allow-rule', 'worktree-prune'):
+                        self.assertTrue(os.access(path, os.X_OK))
+                        result = subprocess.run([sys.executable, str(path), '--help'], env=env,
+                                                capture_output=True, text=True)
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                check = subprocess.run([sys.executable, str(target / 'kaizen-link'), '--check'],
+                                       env=env, capture_output=True, text=True)
+                self.assertEqual(check.returncode, 0, check.stdout + check.stderr)
+                if mode == 'copy':
+                    shutil.rmtree(plugin)
+                    imports = subprocess.run([sys.executable, '-c',
+                        'import kaizen_worktree_facts, kaizen_friction_actions'], cwd=target,
+                        env=env, capture_output=True, text=True)
+                    self.assertEqual(imports.returncode, 0, imports.stderr)
+                    output = self.root / 'probe-output'
+                    probe = subprocess.run([sys.executable, str(target / 'kaizen-host-probe'),
+                                            '--project', str(self.work), '--out', str(output), '--json'],
+                                           env=env, capture_output=True, text=True)
+                    self.assertEqual(probe.returncode, 0, probe.stderr)
+                    report = json.loads(next(output.glob('host-probe-*.json')).read_text())
+                    self.assertNotIn('catalogue', report['warnings'])
+                    loader = importlib.machinery.SourceFileLoader('copied_runner', str(target / 'kaizen-scheduled'))
+                    spec = importlib.util.spec_from_loader(loader.name, loader)
+                    runner = importlib.util.module_from_spec(spec)
+                    loader.exec_module(runner)
+                    self.assertEqual(runner.sibling(None, 'kaizen-friction-catalog.json',
+                                                    'friction-catalog.json'), target / 'kaizen-friction-catalog.json')
+
+    def test_friction_cache_upgrade_collision_and_missing_source(self):
+        plugin = self.root / 'plugins/cache/agent-kaizen/version'
+        shutil.copytree(SCRIPTS, plugin / 'scripts')
+        target = self.home / '.claude/bin'
+        target.mkdir()
+        (target / 'kaizen-host-fix').write_text('user collision')
+        (plugin / 'scripts/allow-rule').unlink()
+        command = [sys.executable, str(plugin / 'scripts/install-schedule'), '--apply', '--scheduler', 'cron']
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertFalse((target / 'kaizen-allow-rule').exists())
+        self.assertEqual(next(target.glob('kaizen-host-fix.replaced-*')).read_text(), 'user collision')
+        (plugin / 'scripts/host-fix').write_text('upgraded')
+        shutil.copy2(SCRIPTS / 'allow-rule', plugin / 'scripts/allow-rule')
+        result = subprocess.run(command, env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual((target / 'kaizen-host-fix').read_text(), 'upgraded')
+        self.assertTrue((target / 'kaizen-allow-rule').is_file())
+        (target / 'kaizen-host-fix').write_text('user edit')
+        unlink = subprocess.run([sys.executable, str(plugin / 'scripts/kaizen-link'), '--unlink',
+                                 '--only', 'kaizen-host-fix,kaizen-allow-rule'],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(unlink.returncode, 0, unlink.stderr)
+        self.assertEqual((target / 'kaizen-host-fix').read_text(), 'user edit')
+        self.assertFalse((target / 'kaizen-allow-rule').exists())
+
     def test_cache_install_replaces_stale_credentials_module(self):
         plugin = self.root / 'plugins/cache/agent-kaizen/version'
         shutil.copytree(SCRIPTS, plugin / 'scripts')
