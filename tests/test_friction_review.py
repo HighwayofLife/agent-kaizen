@@ -6,6 +6,14 @@ from test_friction_prepare import PreparationTests, prepare
 
 
 class ScheduledFrictionTests(PreparationTests):
+    def setUp(self):
+        super().setUp()
+        from unittest.mock import patch
+        clock = patch.dict(self.runner["reconcile_scheduled"].__globals__,
+                           {"now": lambda: self.current + timedelta(seconds=3)})
+        clock.start()
+        self.addCleanup(clock.stop)
+
     def scheduled(self, mode="propose-only"):
         return prepare.prepare(self.config / "audits", self.backups, self.obj, self.report,
                                self.runner["effective"](self.project), mode, self.current + timedelta(seconds=2),
@@ -38,6 +46,55 @@ class ScheduledFrictionTests(PreparationTests):
         with self.assertRaises(ValueError):
             self.runner["reconcile_scheduled"](self.config / "audits", self.obj, output, receipt)
         self.assertIsNotNone(self.scheduled())
+
+    def test_recheck_refuses_changed_policy_age_and_generation(self):
+        from unittest.mock import patch
+        for change in ("policy", "age", "generation"):
+            with self.subTest(change=change):
+                _, receipt = self.scheduled()
+                output = self.write(self.obj.folder / "review.md", '<!-- kaizen-host-actions {"v":1,"actions":[]} -->\n')
+                original = output.read_text()
+                if change == "policy":
+                    self.write(self.config / "agent-kaizen.json", '{"friction":"off"}')
+                elif change == "age":
+                    import runpy
+                    from test_friction_prepare import PATH
+                    host = runpy.run_path(str(PATH.parent / "kaizen_friction_actions.py"))
+                    store = host["HostActions"](self.config / "audits", self.backups,
+                                                self.runner["action_project"], self.runner["key"])
+                    receipt["created"] = (self.current - timedelta(hours=2)).isoformat()
+                    receipt["signature"] = prepare._signature(receipt, store._secret())
+                elif change == "generation":
+                    state_path = next((self.backups / "friction").glob("prepare-*.json"))
+                    state = json.loads(state_path.read_text())
+                    state["generation"] += 1
+                    state_path.write_text(json.dumps(state))
+                clock = self.current + timedelta(seconds=3)
+                with patch.dict(self.runner["reconcile_scheduled"].__globals__, {"now": lambda: clock}):
+                    with self.assertRaises(ValueError):
+                        self.runner["reconcile_scheduled"](self.config / "audits", self.obj, output, receipt)
+                self.assertEqual(output.read_text(), original)
+                self.assertFalse((self.config / "audits/host-actions.json").exists())
+                if change == "policy":
+                    (self.config / "agent-kaizen.json").unlink()
+
+    def test_publication_failure_and_recovery(self):
+        import os
+        _, receipt = self.scheduled()
+        output = self.write(self.obj.folder / "review.tmp", '<!-- kaizen-host-actions {"v":1,"actions":[]} -->\n')
+        proposal = self.obj.folder / "cycle-2026-11-18.md"
+        self.assertTrue(self.runner["reconcile_scheduled"](self.config / "audits", self.obj, output, receipt, acknowledge=False))
+        recover = self.runner["recover_scheduled_publication"]
+        recover(self.config / "audits", self.obj, receipt, proposal, output)
+        # A failed rename leaves no publication and must not acknowledge.
+        self.assertFalse(recover(self.config / "audits", self.obj))
+        self.assertNotIn("acknowledged_generation", json.loads(next((self.backups / "friction").glob("prepare-*.json")).read_text()))
+        recover(self.config / "audits", self.obj, receipt, proposal, output)
+        os.replace(output, proposal)  # Simulate a crash after publication.
+        self.assertEqual(recover(self.config / "audits", self.obj), proposal)
+        self.assertFalse(recover(self.config / "audits", self.obj))
+        self.assertEqual(len(list(self.obj.folder.glob("cycle-*.md"))), 1)
+        self.assertEqual(json.loads(next((self.backups / "friction").glob("prepare-*.json")).read_text())["acknowledged_generation"], receipt["generation"])
 
     def test_audit_policy_global_and_scoped(self):
         options = self.runner["command_options"](type("Args", (), {"dry_run": True})())
@@ -86,6 +143,103 @@ if os.environ.get('REVIEW_SLEEP'): time.sleep(10)
 
     def state(self):
         return json.loads(next((self.backups / 'friction').glob('prepare-*.json')).read_text())
+
+    def test_publish_failure_and_crash_recovery_in_review(self):
+        import shutil
+        scripts = self.root / 'publication-scripts'
+        shutil.copytree(self.runner_path.parent, scripts)
+        runner = scripts / 'kaizen-scheduled'
+        source = runner.read_text()
+        statement = '                os.replace(temporary, proposal)'
+        runner.write_text(source.replace(statement, '                raise OSError("injected publish failure")', 1))
+        result = self.review_run(runner=runner)
+        self.assertIn('injected publish failure', result.stdout)
+        self.assertNotIn('acknowledged_generation', self.state())
+        self.assertTrue(list(self.obj.folder.glob('cycle-*.failed.md')))
+        self.assertFalse([p for p in self.obj.folder.glob('cycle-*.md') if not p.name.endswith('.failed.md')])
+        runner.write_text(source.replace(statement, statement + '\n                os._exit(77)', 1))
+        result = self.review_run(runner=runner)
+        self.assertEqual(result.returncode, 77)
+        proposals = [p for p in self.obj.folder.glob('cycle-*.md') if not p.name.endswith('.failed.md')]
+        self.assertEqual(len(proposals), 1)
+        self.assertNotIn('acknowledged_generation', self.state())
+        runner.write_text(source)
+        calls_before = len(self.calls())
+        result = self.review_run(runner=runner)
+        self.assertIn('recovered published review', result.stdout)
+        self.assertEqual(len(self.calls()), calls_before)
+        self.assertEqual([p for p in self.obj.folder.glob('cycle-*.md') if not p.name.endswith('.failed.md')], proposals)
+        self.assertEqual(self.state()['acknowledged_generation'], '00000000000000000001')
+
+    def test_probe_refresh_fresh_stale_and_failure(self):
+        import os
+        import shutil
+        import sys
+        scripts = self.root / 'probe-scripts'
+        shutil.copytree(self.runner_path.parent, scripts)
+        probe = scripts / 'host-probe'
+        probe.write_text("#!" + sys.executable + "\n" + """
+import datetime, json, pathlib, sys
+if __import__('os').environ.get('PROBE_FAIL'):
+    print('injected probe failure', file=sys.stderr)
+    sys.exit(1)
+args = sys.argv
+out = pathlib.Path(args[args.index('--out') + 1])
+project = args[args.index('--project') + 1]
+(out / 'host-probe-999.json').write_text(json.dumps(dict(v=1, project=project,
+    generated_at=datetime.datetime.now(datetime.timezone.utc).isoformat(), findings=[], regenerable_dirs=[])))
+""")
+        self.probe_path.unlink()
+        for case in ('fresh', 'stale', 'failure'):
+            with self.subTest(case=case):
+                shutil.rmtree(self.backups, ignore_errors=True)
+                for path in self.obj.folder.glob('host-probe-*.json'):
+                    path.unlink()
+                if case != 'fresh':
+                    self.probe['generated_at'] = (self.current - timedelta(hours=2)).isoformat()
+                    stale = self.write(self.obj.folder / 'host-probe-000.json', json.dumps(self.probe))
+                    old = (self.current - timedelta(hours=2)).timestamp()
+                    os.utime(stale, (old, old))
+                env = dict(self.env, **({'PROBE_FAIL': '1'} if case == 'failure' else {}))
+                result = self.review_run(runner=scripts / 'kaizen-scheduled', env=env)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual('friction-inputs=' in self.calls()[-1]['argv'][1], case != 'failure')
+                if case == 'failure':
+                    self.assertIn('injected probe failure', result.stdout)
+
+    def test_audit_policy_through_all_scheduled_paths(self):
+        import shutil
+        import subprocess
+        import sys
+        scripts = self.root / 'audit-scripts'
+        shutil.copytree(self.runner_path.parent, scripts)
+        recorder = scripts / 'token-audit'
+        recorder.write_text("#!" + sys.executable + "\n" + """
+import json, os, sys
+with open(os.environ['AUDIT_RECORD'], 'a') as out:
+    out.write(json.dumps(sys.argv[1:]) + '\\n')
+print(os.environ['AUDIT_REPORT'])
+""")
+        env = dict(self.env, AUDIT_RECORD=str(self.root / 'audit-calls'), AUDIT_REPORT=str(self.report), KAIZEN_SKIP_CHECKS='1')
+        self.write(self.config / 'agent-kaizen.json', '{"friction":"off","frictionSlowCallSeconds":123,"frictionHeavySeconds":77}')
+        self.write(self.project / 'docs/kaizen/config.json', '{"friction":"on","frictionSlowCallSeconds":124,"frictionHeavySeconds":78}')
+        runner = scripts / 'kaizen-scheduled'
+        subprocess.run([sys.executable, str(runner), 'audit'], env=env, capture_output=True, text=True, check=True)
+        (self.config / 'audits/auto-audit-state.json').unlink()
+        subprocess.run([sys.executable, str(runner), 'auto-audit'], env=env, capture_output=True, text=True, check=True)
+        self.audit = recorder
+        self.review_run(runner=runner, env=env)
+        calls = [json.loads(line) for line in (self.root / 'audit-calls').read_text().splitlines()]
+        self.assertEqual(sum(argv[:1] == ['ingest'] for argv in calls), 2)
+        calls = [argv for argv in calls if '--extract-out' in argv]
+        self.assertEqual(len(calls), 3)
+        for argv in calls[:2]:
+            self.assertIn('--no-friction', argv)
+            self.assertEqual(argv[argv.index('--friction-slow-seconds') + 1], '123')
+            self.assertEqual(argv[argv.index('--friction-heavy-seconds') + 1], '77')
+        self.assertNotIn('--no-friction', calls[2])
+        self.assertEqual(calls[2][calls[2].index('--friction-slow-seconds') + 1], '124')
+        self.assertEqual(calls[2][calls[2].index('--friction-heavy-seconds') + 1], '78')
 
     def test_copied_install_runs_installed_preparation(self):
         import os

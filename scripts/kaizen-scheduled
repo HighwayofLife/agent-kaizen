@@ -1758,7 +1758,7 @@ def run_review(audits, project_dirs, options, clock):
 def run_step(name, options, arguments, success=(0,)):
     """Return bounded step output, or None when the optional sibling is absent."""
     try:
-        script = sibling(None, name)
+        script = sibling(None, "kaizen-host-probe", name) if name == "host-probe" else sibling(None, name)
     except FileNotFoundError:
         return None
     try:
@@ -2174,6 +2174,16 @@ def _run_review(audits, project_dirs, options, clock, safety):
     for project in sorted(projects, key=lambda project: project.canonical):
         project.folder = audits / "projects" / project.key
         cfg, state = effective(project.canonical), read_state(project)
+        try:
+            recovered = recover_scheduled_publication(audits, project)
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+            log(f"friction: publication recovery failed ({failure_text(error)})")
+            continue
+        if recovered:
+            state.update(reviewed_at=timestamp(clock()), status="ok", proposal=str(recovered))
+            write_state(project, state)
+            log(f"{project.canonical}: recovered published review")
+            continue
         due, reason = review_gate(project, projects, cfg, state, clock(), cache, options, project_dirs)
         if not due:
             log(f"{project.canonical}: {reason}")
@@ -2202,13 +2212,17 @@ def _run_review(audits, project_dirs, options, clock, safety):
         started = clock()
         prepared = None
         try:
-            prepared = friction_prepare(audits, project, report, options, cfg, mode, lambda: started, retain=True)
+            if cfg["enabled"]["value"] and cfg["friction"]["value"] != "off" and cfg["hostActions"]["value"] != "off":
+                probe = run_step("host-probe", options, ["--project", project.canonical, "--out", project.folder])
+                if probe is None or probe.startswith("unavailable:"):
+                    raise ValueError("host probe refresh failed")
+            prepared = friction_prepare(audits, project, report, options, cfg, mode, now, retain=True)
             if prepared is not None and (not isinstance(prepared, tuple) or len(prepared) != 2
                                          or not isinstance(prepared[0], Path) or not isinstance(prepared[1], dict)):
                 raise ValueError("invalid preparation result")
-        except (OSError, RuntimeError, ValueError, RecursionError, KeyError, TypeError, AttributeError):
+        except (OSError, RuntimeError, ValueError, RecursionError, KeyError, TypeError, AttributeError) as error:
             prepared = None
-            log("friction: preparation unavailable; continuing review")
+            log(f"friction: preparation unavailable ({failure_text(error)}); continuing review")
         session_id = str(uuid.uuid4())
         ignored = state.get("ignore_sessions", [])
         ignored = [value for value in ignored if isinstance(value, str)] if isinstance(ignored, list) else []
@@ -2307,12 +2321,17 @@ def _run_review(audits, project_dirs, options, clock, safety):
             elif timed_out:
                 outcome = f"failed (timed out after {timed_out:g} s)"
             elif result.returncode == 0:
+                terminal = False
                 if prepared:
                     try:
-                        reconcile_scheduled(audits, project, temporary, prepared[1])
+                        terminal = reconcile_scheduled(audits, project, temporary, prepared[1], acknowledge=False)
                     except (OSError, RuntimeError, ValueError, RecursionError, KeyError, TypeError, AttributeError):
                         log("friction: review output could not be reconciled")
+                if terminal:
+                    recover_scheduled_publication(audits, project, prepared[1], proposal, temporary)
                 os.replace(temporary, proposal)
+                if terminal:
+                    recover_scheduled_publication(audits, project)
                 succeeded = True
                 outcome = f"reviewed ({mode})"
             else:
@@ -2577,7 +2596,7 @@ def friction_prepare(audits, project, report, options, cfg, mode, clock, *, inte
 
 
 
-def reconcile_scheduled(audits, project, output, receipt):
+def reconcile_scheduled(audits, project, output, receipt, *, acknowledge=True):
     """Import one validated action line, then acknowledge only terminal requests."""
     module = runpy.run_path(str(HERE / "kaizen_friction_prepare.py"))
     host = runpy.run_path(str(HERE / "kaizen_friction_actions.py"))
@@ -2589,14 +2608,26 @@ def reconcile_scheduled(audits, project, output, receipt):
     if len(matches) != 1 or text.count(host["BLOCK_PREFIX"]) != 1:
         raise ValueError("expected one action comment")
     block = matches[0].rstrip("\r\n")
-    requests = host["_requests"](block)
-    # Remove only a validated comment, even if the later transactional import fails.
-    output.write_text("".join(line for line in lines if line != matches[0]), encoding="utf-8")
+    host["_requests"](block)
     store = host["HostActions"](audits, backup_root(), action_project, key)
-    imported = store.import_actions(block, receipt["allowed"], project.canonical,
-                                    "scheduled:" + receipt["generation"])
-    if all(value == "terminal" for value in imported.values()):
+    imported = module["import_scheduled"](audits, backup_root(), project, receipt,
+                                          effective(project.canonical), now(), action_project, key, block)
+    output.write_text("".join(line for line in lines if line != matches[0]), encoding="utf-8")
+    terminal = all(value == "terminal" for value in imported.values())
+    if terminal and acknowledge:
         module["acknowledge_scheduled"](store, project, receipt)
+    return terminal
+
+
+def recover_scheduled_publication(audits, project, receipt=None, proposal=None, output=None):
+    try:
+        module = runpy.run_path(str(HERE / "kaizen_friction_prepare.py"))
+    except FileNotFoundError:
+        return False
+    if "scheduled_publication" not in module:
+        return False
+    return module["scheduled_publication"](audits, backup_root(), project, action_project, key,
+                                            receipt, proposal, output)
 
 def friction_reconcile_command(args):
     try:

@@ -276,6 +276,9 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
             current = max(current, datetime.now(timezone.utc))
             if live_cfg != cfg or live_cfg["enabled"]["value"] is False or live_cfg["friction"]["value"] == "off":
                 raise ValueError("friction policy changed during reconciliation")
+            if (cfg["hostActions"]["value"] != "off"
+                    and not 0 <= (current - _stamp(probe["generated_at"])).total_seconds() <= PROBE_AGE):
+                raise ValueError("probe expired during reconciliation")
         state_name = "prepare-" + project.key + ".json"
         try:
             state = _json(host["_read"](directory, state_name, LIMIT), host)
@@ -290,7 +293,7 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
         secret = store._secret(create=_check is None)
         if _check is not None:
             if (not hmac.compare_digest(_check.get("signature", ""), _signature(_check, secret))
-                    or _check.get("channel") != "interactive"
+                    or _check.get("channel") != ("interactive" if interactive else "scheduled")
                     or _check.get("generation") != f"{generation:020d}"
                     or not 0 <= (current - _stamp(_check["created"])).total_seconds() <= PROBE_AGE):
                 raise ValueError("invalid, stale or noninteractive preparation receipt")
@@ -303,13 +306,13 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
                 with host["_directory"](store.path.parent) as actions_directory:
                     _, _, receipts = store._load(actions_directory)
                 generations = receipts.get(str(project.canonical), {})
-                imported = generations.get("interactive:" + _check["generation"])
-                if any(value == "pending" for receipt in generations.values() for value in receipt.values()):
+                imported = generations.get(("interactive:" if interactive else "scheduled:") + _check["generation"])
+                if interactive and any(value == "pending" for receipt in generations.values() for value in receipt.values()):
                     raise ValueError("pending host actions require runner reconciliation")
             except FileNotFoundError:
                 pass
             if imported is not None and (not set(imported) <= set(_check["allowed"])
-                                         or any(value != "terminal" for value in imported.values())):
+                                         or (interactive and any(value != "terminal" for value in imported.values()))):
                 raise ValueError("unmatched interactive import receipt")
         cohort = json.dumps([str(project.canonical), scope], sort_keys=True, separators=(",", ":"))
         if block is not None and (not isinstance(block.get("flags"), list)
@@ -444,8 +447,9 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
         if _check is not None:
             if receipt != _check:
                 raise ValueError("preparation no longer matches live scope, policy or evidence")
-            for identity in identities.values():
-                if _read(Path(identity["path"]), host)[1] != identity:
+            for kind, identity in identities.items():
+                age = PROBE_AGE if kind == "probe" else REPORT_AGE if kind in ("report", "extract") else None
+                if _read(Path(identity["path"]), host, current, age)[1] != identity:
                     raise ValueError("evidence changed during reconciliation")
             if canonical_project(project.canonical) != project.canonical:
                 raise ValueError("project scope changed during reconciliation")
@@ -464,6 +468,11 @@ def acknowledge_scheduled(store, project, receipt):
     with host["_directory"](store.friction, private=True) as directory, host["_locked"](directory, "prepare"):
         name = "prepare-" + project.key + ".json"
         state = _json(host["_read"](directory, name, LIMIT), host)
+        if (state.get("project") == str(project.canonical)
+                and state.get("generation") == int(receipt["generation"])
+                and state.get("acknowledged_generation") == receipt["generation"]
+                and state.get("acknowledged") == receipt["comparison"]):
+            return
         if (state.get("project") != str(project.canonical)
                 or state.get("generation") != int(receipt["generation"])
                 or state.get("acknowledged") != receipt["baseline"]):
@@ -517,3 +526,49 @@ def reconcile(audits, backups, project, inputs, cfg, current, canonical_project,
     return prepare(audits, backups, project, Path(receipt["identities"]["report"]["path"]), cfg,
                    "propose-only", current, canonical_project, project_key, interactive=True,
                    _check=receipt, _complete=complete)
+
+
+def import_scheduled(audits, backups, project, receipt, cfg, current, canonical_project, project_key, block):
+    """Recheck the retained scheduled authority under the generation lock before import."""
+    def complete(store, host, directory, state_name, state, checked, imported):
+        return store.import_actions(block, checked["allowed"], project.canonical,
+                                    "scheduled:" + checked["generation"])
+    return prepare(audits, backups, project, Path(receipt["identities"]["report"]["path"]), cfg,
+                   receipt["policy"]["mode"], current, canonical_project, project_key,
+                   _check=receipt, _complete=complete)
+
+
+def scheduled_publication(audits, backups, project, canonical_project, project_key, receipt=None, proposal=None, output=None):
+    """Record a publication before rename, or recover its acknowledgement after rename."""
+    host = runpy.run_path(str(Path(__file__).resolve().parent / "kaizen_friction_actions.py"))
+    store = host["HostActions"](audits, backups, canonical_project, project_key)
+    name = "publication-" + project.key + ".json"
+    with host["_directory"](store.friction, True, private=True) as directory:
+        if receipt is not None:
+            digest = hashlib.sha256(Path(output).read_bytes()).hexdigest()
+            host["_replace"](directory, name, _encode(dict(v=1, generation=receipt["generation"],
+                                                           proposal=proposal.name, sha256=digest)))
+            return False
+        try:
+            marker = _json(host["_read"](directory, name, LIMIT), host)
+        except FileNotFoundError:
+            return False
+        generation, filename = marker.get("generation"), marker.get("proposal")
+        if (not isinstance(generation, str) or not re.fullmatch(r"[0-9]{20}", generation)
+                or not isinstance(filename, str) or not re.fullmatch(r"cycle-[0-9-]+\.md", filename)):
+            raise ValueError("invalid publication marker")
+        published = project.folder / filename
+        if not published.exists():
+            os.unlink(name, dir_fd=directory)
+            return False
+        raw, _ = _read(published, host)
+        if hashlib.sha256(raw).hexdigest() != marker.get("sha256"):
+            raise ValueError("published review changed before acknowledgement")
+        frozen = _json(host["_read"](directory, "receipt-" + project.key + "-" + generation + ".json", LIMIT), host)
+        if (frozen.get("channel") != "scheduled" or frozen.get("project") != str(project.canonical)
+                or frozen.get("generation") != generation
+                or not hmac.compare_digest(frozen.get("signature", ""), _signature(frozen, store._secret()))):
+            raise ValueError("invalid publication receipt")
+        acknowledge_scheduled(store, project, frozen)
+        os.unlink(name, dir_fd=directory)
+        return published
