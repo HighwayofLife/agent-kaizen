@@ -57,6 +57,33 @@ class HousekeepTests(StubCase):
             self.assertTrue(line.endswith('housekeep: deleted {path} kind={kind} size={size} reason={reason}'.format(**entry)))
         self.assertTrue(fresh.exists())
 
+    def test_samples_utc_retention_cap_and_live_day(self):
+        old = self.file('samples/2026-10-15.tsv', days=0)
+        boundary = self.file('samples/2026-10-16.tsv', days=100)
+        today = self.file('samples/2026-10-30.tsv', days=100, size=1024 * 1024)
+        lock = self.file('samples/.lock', days=100)
+        unrelated = self.file('samples/not-a-date.tsv', days=100)
+        plan, _, _ = self.cleanup()
+        self.assertEqual([e['path'] for e in plan], ['samples/2026-10-15.tsv'])
+        self.assertFalse(old.exists())
+        self.assertTrue(boundary.exists() and today.exists() and lock.exists() and unrelated.exists())
+        self.cfg['retentionOverrides']['value'] = {'samples': {'maxMB': 1}}
+        boundary.write_bytes(b'x' * 100)
+        plan, _, _ = self.cleanup()
+        self.assertEqual([(e['path'], e['reason']) for e in plan], [('samples/2026-10-16.tsv', 'cap')])
+        self.assertTrue(today.exists())
+
+    def test_samples_skip_locked_writer(self):
+        import fcntl
+        old = self.file('samples/2026-01-01.tsv')
+        lock = self.file('samples/.lock')
+        with lock.open('r+b') as stream:
+            fcntl.flock(stream, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            plan, output, _ = self.cleanup()
+        self.assertEqual(plan, [])
+        self.assertIn('skipped samples/', output)
+        self.assertTrue(old.exists())
+
     def test_report_families_and_reviewed_siblings(self):
         for folder in ('', 'projects/p/'):
             for family in ('token-audit', 'cycle') if folder else ('token-audit',):

@@ -72,6 +72,7 @@ class SamplerTests(unittest.TestCase):
                 patch.object(sampler, "metrics", return_value=("4", "4")), \
                 patch.object(time, "time_ns", side_effect=lambda: ms * 1_000_000), \
                 patch.object(time, "clock_gettime_ns", side_effect=lambda _: elapsed), \
+                patch.object(sampler, "boot_identity", return_value=b"a" * 16), \
                 patch.object(sampler, "query_processes", side_effect=query) as poll:
             with ThreadPoolExecutor(max_workers=2) as pool:
                 future = pool.submit(self.sample_event, time.monotonic() + 2)
@@ -98,6 +99,29 @@ class SamplerTests(unittest.TestCase):
                 self.assertEqual(poll.call_count, 2)
         self.assertEqual(self.process_rows(), [b"P\t1735775999999\t4\t4\tmds",
                                                b"P\t1735776299999\t4\t4\tmds"])
+
+    def test_claim_changes_with_boot_identity(self):
+        self.samples.mkdir(parents=True)
+        lock = os.open(self.samples / sampler.LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, lock)
+        with patch.object(time, "clock_gettime_ns", return_value=123), \
+                patch.object(sampler, "boot_identity", side_effect=[b"a" * 16, b"a" * 16, b"b" * 16]):
+            self.assertTrue(sampler.claim_process(lock))
+            self.assertFalse(sampler.claim_process(lock))
+            self.assertTrue(sampler.claim_process(lock))
+
+    def test_no_claim_when_file_full_or_query_budget_short(self):
+        for remaining, budget in ((2, 1), (100, 0.001)):
+            with self.subTest(remaining=remaining, budget=budget):
+                with patch.object(sampler, "DAY_LIMIT", 128), \
+                        patch.object(sampler, "boot_identity", return_value=b"a" * 16):
+                    day = "2025-01-01"
+                    initial = b"x" * (127 - remaining) + b"\n"
+                    sampler.append(self.samples, day, initial, time.monotonic() + 1)
+                    self.assertFalse(sampler.append(self.samples, day, b"x\n", time.monotonic() + budget, True))
+                    lock = self.samples / sampler.LOCK_NAME
+                    self.assertEqual(lock.read_bytes(), b"")
+                    (self.samples / (day + ".tsv")).unlink()
 
     def test_process_append_rechecks_cap_after_query(self):
         def query(_deadline):
@@ -150,6 +174,7 @@ class SamplerTests(unittest.TestCase):
         for cancel in (False, True):
             with self.subTest(cancel=cancel):
                 query = ("import os, pathlib, signal, sys, time; "
+                         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
                          "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
                          + ("os.kill(os.getppid(), signal.SIGTERM); " if cancel else "") + "time.sleep(3)")
                 self.command = [sys.executable, "-c",
