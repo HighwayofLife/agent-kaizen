@@ -3,6 +3,8 @@ name: CI
 on:
   push:
     tags: ['v*']
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 concurrency:
@@ -50,6 +52,8 @@ jobs:
           node-version: '22'
       - name: Install Claude Code
         run: npm install -g @anthropic-ai/claude-code
+      - name: Install Codex CLI
+        run: npm install -g @openai/codex
       - name: Local checks
         run: tools/ci-local --skip-tests
       - name: Check release tag

@@ -10,13 +10,14 @@ Use `python3`, not `python` (which often isn't on PATH).
 python3 -m unittest discover -s tests      # unit, hook, repo-consistency and privacy tests
 shellcheck -S warning hooks/*.sh
 claude plugin validate .
+tools/host-probe --host codex           # install check in an isolated home; prints SKIP when codex is missing
 ```
 
-CI (.github/workflows/ci.yml) also checks that every JSON file parses and that each script answers `--help`.
+CI (.github/workflows/ci.yml) also checks that every JSON file parses and that each script answers `--help`. It also runs `tools/host-probe` when the `codex` or `copilot` CLI is installed.
 
 ## Rules
 
-- **Version and changelog:** any change under `skills/`, `agents/`, `hooks/`, `scripts/`, `templates/` or `.claude-plugin/`, or to `docs/autonomy.md` or `docs/outcome-log.md` (skills read them at runtime), bumps `version` in `.claude-plugin/plugin.json` and adds a `## x.y.z (date)` entry to CHANGELOG.md. CI enforces this on PRs.
+- **Version and changelog:** any change under `skills/` (including `skills/*/agents/openai.yaml`), `agents/`, `hooks/`, `scripts/`, `templates/` or `.claude-plugin/`, or to `docs/autonomy.md`, `docs/hosts.md` or `docs/outcome-log.md` (skills read them at runtime), bumps `version` in `.claude-plugin/plugin.json` and adds a `## x.y.z (date)` entry to CHANGELOG.md. CI runs on PRs to `main` and fails when the current version has no CHANGELOG entry; it does not check that the version was bumped, so do it.
 - **Skills:** frontmatter `name` equals the folder name, `description` is quoted, and `disable-model-invocation: true`. Every skill is listed in the README skills table. Tests check all three.
 - **Privacy:** no home-directory paths, personal emails or key-like strings in any file git tracks (tests/test_repo.py). Never commit audit reports or transcripts.
 - **Scripts:** Python 3.9+, standard library only. `token-audit` must stay zero-token and fast; time it against `git show HEAD:scripts/token-audit` when changing the scan.
