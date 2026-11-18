@@ -107,7 +107,10 @@ class DoctorTests(unittest.TestCase):
         self.assertNotIn('claude plugin', out)
         self.assertNotIn('kaizen-link --apply', out)
         self.assertIn("update the plugin with your host's plugin command", out)
-        (cache / version).rename(cache / '0.0.1')
+        (cache / '0.0.1').mkdir()
+        self.assertIn('PASS Codex: plugin installed (version ' + version + ')', self.doctor())
+        (cache / version).rmdir()
+        self.assertIn('WARN Codex:', self.doctor())
         self.assertIn('fix: codex plugin add agent-kaizen@agent-kaizen-tools', self.doctor())
         (cache / '0.0.1').rmdir()
         copilot = Path(self.env['COPILOT_HOME']) / 'installed-plugins/agent-kaizen-tools/agent-kaizen'

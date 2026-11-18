@@ -66,7 +66,7 @@ class StubCase(unittest.TestCase):
         executable(self.bin / 'codex', FAKE_CODEX)
         self.record = self.root / 'calls.jsonl'
         self.env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin) + os.pathsep + os.environ['PATH'], RECORD=str(self.record), PYTHONDONTWRITEBYTECODE='1')
-        for name in ('CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'CODEX_DISPATCH_MODEL', 'CODEX_REVIEW_MODEL', 'CODEX_LOOK_MODEL', 'FINAL', 'SCENARIO', 'CODEMAP_TIMEOUT', 'DISPATCH_ROUND', 'DISPATCH_PASS'):
+        for name in ('CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'COPILOT_HOME', 'CODEX_DISPATCH_MODEL', 'CODEX_REVIEW_MODEL', 'CODEX_LOOK_MODEL', 'FINAL', 'SCENARIO', 'CODEMAP_TIMEOUT', 'DISPATCH_ROUND', 'DISPATCH_PASS'):
             self.env.pop(name, None)
         self.brief = write(self.work / 'task.md', 'Fix the example.\n')
 

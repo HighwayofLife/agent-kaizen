@@ -19,7 +19,7 @@ AGENT_PREAMBLE = PREAMBLE.replace(
 FILES = subprocess.run(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], cwd=ROOT,
                        capture_output=True, text=True, check=True).stdout.split('\0')
 TEXT = [ROOT / f for f in FILES if f and (ROOT / f).is_file() and Path(f).suffix in
-        {'.md', '.json', '.sh', '.py', '.toml', '.conf', '.yml', ''}]
+        {'.md', '.json', '.sh', '.py', '.toml', '.conf', '.yml', '.yaml', ''}]
 
 
 def frontmatter(path):

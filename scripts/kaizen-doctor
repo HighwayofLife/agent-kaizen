@@ -67,7 +67,7 @@ def main():
     neutral = not (HOME / 'plugins/installed_plugins.json').exists() and (bool(versions) or copilot_present)
     neutral_fix = "update the plugin with your host's plugin command (see docs/hosts.md)"
     if versions:
-        if versions == [version]:
+        if version in versions:
             emit('PASS', 'Codex: plugin installed (version {})'.format(version))
         else:
             emit('WARN', 'Codex: installed version(s) {} differ from plugin root {}'.format(', '.join(versions), version),
