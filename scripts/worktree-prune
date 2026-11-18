@@ -473,24 +473,31 @@ def check_alternates(common, admin, path):
         if (not any(within(objects, target) for target in protected)
                 and any(within(filename.resolve(strict=True), target) for target in protected)):
             raise Refused('Git alternates file is inside the removal scope')
-        for entry in regular_bytes(filename, 1024 * 1024).split(b'\n'):
-            if not entry or entry.startswith(b'#'):
-                continue
-            if entry.startswith(b'"'):
-                quoted = QUOTED_ALTERNATE.match(entry)
-                if quoted is None:
-                    raise Refused('cannot safely resolve Git alternates')
-                entry = codecs.escape_decode(quoted[1])[0]
-            if not entry or b'\0' in entry:
+        for line in regular_bytes(filename, 1024 * 1024).split(b'\n'):
+            if b'\0' in line:
                 raise Refused('cannot safely resolve Git alternates')
-            alternate = objects / os.fsdecode(entry)
-            resolved = alternate.resolve(strict=True)
-            if any(within(alternate, target) or within(resolved, target)
-                   for target in protected):
-                raise Refused('Git alternate object directory is inside the removal scope')
-            pending.append(resolved)
-            if len(pending) > 256:
-                raise Refused('too many Git alternate object directories')
+            if not line:
+                continue
+            if line.startswith(b'"'):
+                quoted = QUOTED_ALTERNATE.match(line)
+                if quoted is None or line[quoted.end():] not in (b'', b'\r'):
+                    raise Refused('cannot safely resolve Git alternates')
+                entries = [codecs.escape_decode(quoted[1])[0]]
+            else:
+                entries = line.split(b':')
+                if any(entry.startswith(b'"') for entry in entries):
+                    raise Refused('cannot safely resolve Git alternates')
+            for entry in entries:
+                if not entry or b'\0' in entry:
+                    raise Refused('cannot safely resolve Git alternates')
+                alternate = objects / os.fsdecode(entry)
+                resolved = alternate.resolve(strict=True)
+                if any(within(alternate, target) or within(resolved, target)
+                       for target in protected):
+                    raise Refused('Git alternate object directory is inside the removal scope')
+                pending.append(resolved)
+                if len(pending) > 256:
+                    raise Refused('too many Git alternate object directories')
 
 
 def check_blobs(executable, path, blobs, algorithm):
