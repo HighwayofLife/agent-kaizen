@@ -171,6 +171,34 @@ class FrictionCodexTests(unittest.TestCase):
         jsonl(self.rollout, [self.meta, *events])
         self.assertEqual(self.collect()['friction']['signals']['lock_phrases'], 3)
 
+    def test_large_turn_ids_have_bounded_pending_storage_and_pair_normally(self):
+        events = [self.meta]
+        for i in range(40):
+            turn = str(i) + 'x' * 20000
+            events.extend((call(str(i)), result(str(i), turn_id=turn)))
+        events.extend((call('ordinary', turn_id='turn-1'), result('ordinary', turn_id='turn-1'),
+                       call('mismatch', turn_id='turn-1'), result('mismatch', turn_id='turn-2')))
+        jsonl(self.rollout, events)
+        original = AUDIT['finish_codex_pairs']
+        def inspect(pairs, *args):
+            for pair in pairs.values():
+                if pair:
+                    for item in pair:
+                        if item:
+                            if item[3]['turn_id'] is not None:
+                                self.assertLessEqual(len(item[3]['turn_id']), 256)
+            return original(pairs, *args)
+        with patch.dict(AUDIT['collect'].__globals__, finish_codex_pairs=inspect):
+            self.assertEqual(self.collect()['friction']['summary']['measured'], 41)
+
+    def test_lock_conflicting_exit_metadata_prefers_explicit_exit_code(self):
+        events = [call('zero'), result('zero', exit_code=0,
+                  output='Process exited with code 1\nOutput:\ndatabase is locked'),
+                  call('failure'), result('failure', exit_code=1,
+                  output='Process exited with code 0\nOutput:\ndatabase is locked')]
+        jsonl(self.rollout, [self.meta, *events])
+        self.assertEqual(self.collect()['friction']['signals']['lock_phrases'], 1)
+
     def test_lock_in_combined_output_requires_nonzero_exit(self):
         for code, expected in ((0, 0), (1, 1)):
             with self.subTest(code=code):
