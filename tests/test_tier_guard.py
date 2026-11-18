@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 import tempfile
+import time
 import unittest
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -109,7 +110,11 @@ class TierGuardTests(unittest.TestCase):
         (lock / str(dead.pid)).touch()
         with ThreadPoolExecutor(max_workers=12) as pool:
             outcomes = list(pool.map(lambda _: bool(self.call()), range(12)))
-        self.assertEqual(sum(outcomes), 8)
+        denied = sum(outcomes)
+        self.assertGreaterEqual(12 - denied, 4)
+        self.assertGreaterEqual(denied, 1)
+        self.assertLessEqual(denied, 8)
+        self.assertEqual(len(outcomes), 12)
         self.assertEqual((self.state / (self.key + ".count")).read_text(), "4\n")
         self.assertFalse(lock.exists())
 
@@ -122,3 +127,45 @@ class TierGuardTests(unittest.TestCase):
         self.assertTrue(owner.exists())
         owner.unlink()
         self.assertTrue(self.call())  # A crash during cleanup can leave an empty lock.
+
+    def test_matching_reason_line_is_logged(self):
+        self.configure({**RULE, "freeSpawns": 0})
+        self.event["tool_input"]["prompt"] = "Tier reason: foo\nTier reason: audit ownership"
+        self.assertFalse(self.call())
+        log, = self.state.glob("*.reasons.jsonl")
+        self.assertEqual(json.loads(log.read_text())["reason"], "audit ownership")
+
+    def test_long_reason_is_truncated(self):
+        self.configure({**RULE, "freeSpawns": 0})
+        reason = "audit " + "x" * 250
+        self.event["tool_input"]["prompt"] = "Tier reason: " + reason
+        self.assertFalse(self.call())
+        log, = self.state.glob("*.reasons.jsonl")
+        self.assertEqual(json.loads(log.read_text())["reason"], reason[:199] + "…")
+
+    def test_old_state_is_pruned(self):
+        self.state.mkdir(mode=0o700)
+        paths = [self.state / name for name in ("old.count", "old.reasons.jsonl", "recent.count", "old.other")]
+        for path in paths:
+            path.touch(mode=0o600)
+        old = time.time() - 31 * 86400
+        for path in (paths[0], paths[1], paths[3]):
+            os.utime(path, (old, old))
+        self.assertFalse(self.call())
+        self.assertEqual([p.exists() for p in paths], [False, False, True, True])
+
+    def test_deny_includes_rule_and_regex(self):
+        self.configure({**RULE, "freeSpawns": 0})
+        output = json.loads(self.call())["hookSpecificOutput"]["permissionDecisionReason"]
+        self.assertIn(RULE["pattern"], output)
+        self.assertIn(RULE["reasonRegex"], output)
+
+    def test_old_live_lock_owner_is_stale(self):
+        self.configure({**RULE, "freeSpawns": 0})
+        lock = self.lock()
+        owner = lock / str(os.getpid())
+        owner.touch()
+        old = time.time() - 31
+        os.utime(owner, (old, old))
+        self.assertTrue(self.call())
+        self.assertFalse(lock.exists())

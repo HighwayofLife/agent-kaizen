@@ -64,10 +64,12 @@ merge the settings template's `PreToolUse` entry with matcher `Agent`. Install
 The first case-sensitive glob matching `tool_input.subagent_type` sets the free
 allowance per session, including requests that omit `model`. After the allowance,
 retry with a non-empty `Tier reason: <why>` line. The guard searches the prompt
-with the configured Python regex and multiline anchors. Disable it by
+on each reason line with the configured Python regex and multiline anchors. Disable it by
 removing the `Agent` entry, clearing `agentTiers`, or setting global `enabled` to `false`.
 
 The counter tracks allowed PreToolUse requests even if the spawn later fails.
+The config directory must be owner-owned and not group- or world-writable, or the guard silently stays off.
+A held lock is treated as stale after 30 seconds.
 Owner-only state lives in `<Claude config dir>/kaizen-tier-guard/`. Log entries
 contain only a timestamp, rule and supplied reason. Keep sensitive details out
 of the reason. Input, config, dependency, state and lock errors allow the request.

@@ -2,7 +2,7 @@
 # Opt-in PreToolUse(Agent). Only a successful policy decision can emit a denial.
 command -v jq >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1 || exit 0
 
-python3 -I - 3<&0 2>/dev/null <<'PY'
+decision=$(python3 -I - 3<&0 2>/dev/null <<'PY'
 import errno
 import fnmatch
 import hashlib
@@ -99,11 +99,14 @@ def reap_lock(lock):
             if len(entries) != 1 or not re.fullmatch(r"[1-9][0-9]{0,9}", entries[0]):
                 raise ValueError("invalid lock owner")
             try:
-                os.kill(int(entries[0]), 0)
-                return
+                owner_info = os.stat(entries[0], dir_fd=fd, follow_symlinks=False)
+                if time.time() - owner_info.st_mtime <= 30:
+                    os.kill(int(entries[0]), 0)
+                    return
             except ProcessLookupError:
-                with suppress(FileNotFoundError):  # Another contender may have reaped this owner.
-                    os.unlink(entries[0], dir_fd=fd)
+                pass
+            with suppress(FileNotFoundError):  # Another contender may have reaped this owner.
+                os.unlink(entries[0], dir_fd=fd)
         remove_empty_lock(lock)
     finally:
         os.close(fd)
@@ -136,16 +139,15 @@ def supplied_reason(prompt, regex):
     def regex_timeout(*_):
         raise TimeoutError("tier reason match timed out")
 
-    lines = re.finditer(r"^Tier reason:([^\r\n]*)", prompt, re.MULTILINE)
-    reason = next((line[1].strip() for line in lines if line[1].strip()), "")
-    if reason:
-        signal.signal(signal.SIGALRM, regex_timeout)
-        try:
-            signal.setitimer(signal.ITIMER_REAL, 0.1)
-            if regex.search(prompt):
+    signal.signal(signal.SIGALRM, regex_timeout)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 0.1)
+        for line in re.finditer(r"^Tier reason:([^\r\n]*)", prompt, re.MULTILINE):
+            reason = line[1].strip()
+            if reason and regex.search(line[0]):
                 return reason
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
     return ""
 
 
@@ -173,7 +175,7 @@ def decide(state, key, rule, prompt):
         try:
             if reason:
                 entry = {"timestamp": datetime.now(timezone.utc).isoformat(),
-                         "rule": pattern, "reason": reason}
+                         "rule": pattern, "reason": reason if len(reason) <= 200 else reason[:199] + "…"}
                 record = (json.dumps(entry) + "\n").encode("ascii")
                 offset = os.fstat(fd).st_size
                 if os.write(fd, record) != len(record):
@@ -222,7 +224,16 @@ def guard():
     if not acquire(lock, owner):
         return False
     try:
-        return decide(state, key, rule, prompt)
+        with suppress(OSError):
+            for path in state.iterdir():
+                if path.name.endswith((".count", ".reasons.jsonl")):
+                    with suppress(OSError):
+                        info = path.lstat()
+                        if stat.S_ISREG(info.st_mode) and time.time() - info.st_mtime > 30 * 86400:
+                            path.unlink()
+        if decide(state, key, rule, prompt):
+            return rule[0], rule[2].pattern
+        return None
     finally:
         (lock / owner).unlink()
         remove_empty_lock(lock)
@@ -230,12 +241,17 @@ def guard():
 
 try:
     denied = guard()
+    if denied:
+        print(json.dumps({"pattern": denied[0], "regex": denied[1]}))
 except Exception:
-    denied = False
-sys.exit(10 if denied else 0)
+    pass
 PY
-if [[ $? == 10 ]]; then
-    jq -nc '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",
-        permissionDecisionReason:"Agent tier allowance reached. Retry with a separate line: Tier reason: <why>. Follow the configured reason regex."}}' 2>/dev/null
+)
+if [[ -n $decision ]]; then
+    pattern=$(printf '%s' "$decision" | jq -er '.pattern + "x"' 2>/dev/null) || exit 0
+    regex=$(printf '%s' "$decision" | jq -er '.regex + "x"' 2>/dev/null) || exit 0
+    jq -nc --arg pattern "${pattern%x}" --arg regex "${regex%x}" \
+        '{hookSpecificOutput:{hookEventName:"PreToolUse",permissionDecision:"deny",
+        permissionDecisionReason:("Agent tier allowance reached. Retry with a separate line: Tier reason: <why>. Rule: " + $pattern + "; reason regex: " + $regex)}}' 2>/dev/null
 fi
 exit 0
