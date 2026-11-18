@@ -57,6 +57,70 @@ class HookTests(unittest.TestCase):
                'CLAUDE_CONFIG_DIR': str(self.tmp / 'cfg'), 'CLAUDE_PLUGIN_ROOT': str(plugin)}
         return project, audits, plugin, env
 
+    def test_scoped_actions_notice(self):
+        import runpy
+        import sys
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        self.addCleanup(sys.path.remove, str(ROOT / 'scripts'))
+        runner = runpy.run_path(str(ROOT / 'scripts/kaizen-scheduled'))
+        self.tmp = self.tmp.resolve()
+        from kaizen_friction_actions import HostActions
+        project, audits, _, env = self.notice_setup()
+        other = self.tmp / 'other'
+        (other / 'docs/kaizen').mkdir(parents=True)
+        env.update(CLAUDE_PLUGIN_ROOT=str(ROOT), KAIZEN_BACKUP_DIR=str(self.tmp / 'backup'))
+        store = HostActions(audits, self.tmp / 'backup', runner['action_project'], runner['key'])
+        store.record(project, 'test', 'one', 'private evidence', allowed=('one',))
+        store.record(other, 'test', 'two', 'private evidence', allowed=('two',))
+        def clear():
+            for marker in audits.glob('host-actions-*.noticed-*'):
+                marker.unlink()
+        def notice(path=project, **extra):
+            return run('audit-notice.sh', {'cwd': str(path)}, {**env, **extra})
+        for host in ('claude', 'codex', 'copilot'):
+            clear()
+            output = notice(KAIZEN_HOST=host)
+            text = output['additionalContext'] if host == 'copilot' else output['hookSpecificOutput']['additionalContext']
+            self.assertEqual(text, '1 open host action(s): run kaizen-scheduled actions list --for .')
+            self.assertLessEqual(len(text.encode()) + 2, 200)
+            self.assertIsNone(notice(KAIZEN_HOST=host))
+            self.assertIsNotNone(notice(other, KAIZEN_HOST=host))
+        clear()
+        (audits / 'projects').mkdir(exist_ok=True)
+        (audits / 'projects/index.json').write_text('{invalid')
+        self.assertIsNotNone(notice())
+        clear()
+        with bare_path('jq', 'date', 'python3', 'git', 'dirname', 'ls', 'head', 'grep', 'cksum', 'rm') as bindir:
+            jq = Path(bindir) / 'jq'
+            jq.unlink()
+            jq.write_text('#!/bin/bash\n[ "$1" = -n ] && exit 1\nexec "' + shutil.which('jq') + '" "$@"\n')
+            jq.chmod(0o755)
+            self.assertEqual(run_raw('audit-notice.sh', {'cwd': str(project)}, {**env, 'PATH': bindir}).stdout, '{}\n')
+            self.assertEqual(list(audits.glob('host-actions-*.noticed-*')), [])
+        self.assertIsNotNone(notice())
+        clear()
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            results = list(pool.map(lambda _: notice(), range(4)))
+        self.assertEqual(sum(item is not None for item in results), 1)
+        config = project / 'docs/kaizen/config.json'
+        for settings in ({'friction': 'off'}, {'hostActions': 'off'}, {'schedule': 'off'}):
+            clear()
+            config.write_text(json.dumps(settings))
+            self.assertIsNone(notice())
+        config.unlink()
+        path = audits / 'host-actions.json'
+        original = path.read_bytes()
+        for content in (b'{', b' ' * (1024 * 1024 + 1)):
+            clear()
+            path.write_bytes(content)
+            self.assertIsNone(notice())
+        path.unlink()
+        target = self.tmp / 'target'
+        target.write_bytes(original)
+        path.symlink_to(target)
+        clear()
+        self.assertIsNone(notice())
+
     def test_claude_notice_golden(self):
         # Captured from d1accc4 scripts, not JSON reserialization; <TMP> replaces the temp root.
         project, audits, plugin, env = self.notice_setup()

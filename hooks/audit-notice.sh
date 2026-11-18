@@ -177,6 +177,43 @@ print(result.stdout.partition("\n")[0])
     fi
 fi
 
+actions_msg=
+actions_marker=
+if [ -n "$root" ] && command -v python3 >/dev/null 2>&1 && [ -f "$plugin_root/scripts/kaizen-scheduled" ]; then
+    for setting in friction hostActions; do
+        values='(. == "off" or . == "on")'
+        [ "$setting" = hostActions ] && values='(. == "off" or . == "suggest" or . == "apply")'
+        value=$(jq -r --arg s "$setting" "select(.[\$s] | $values) | .[\$s]" "$root/docs/kaizen/config.json" 2>/dev/null)
+        [ -n "$value" ] || value=$(jq -r --arg s "$setting" "select(.[\$s] | $values) | .[\$s]" "$home/agent-kaizen.json" 2>/dev/null)
+        [ "$value" = off ] && break
+    done
+    if [ "$value" != off ]; then
+        # The store validates ownership, links, size, records and the canonical project.
+        result=$(python3 - "$plugin_root/scripts/kaizen-scheduled" "$dir" "$root" <<'PYCODE' 2>/dev/null
+import hashlib, runpy, sys
+try:
+    runner = runpy.run_path(sys.argv[1])
+    host = runpy.run_path(str(runner['HERE'] / 'kaizen_friction_actions.py'))['HostActions']
+    rows = host(sys.argv[2], runner['backup_root'](), runner['action_project'], runner['key']).scoped(sys.argv[3])
+    opened = [row for row in rows if row['status'] == 'open']
+    if opened:
+        project = opened[0]['canonical_project']
+        print(len(opened), hashlib.sha256(project.encode('utf-8', 'surrogateescape')).hexdigest())
+except (OSError, ValueError, RuntimeError, KeyError, UnicodeError):
+    pass
+PYCODE
+        )
+        read -r count scope_hash <<< "$result"
+        if [[ $count =~ ^[1-9][0-9]*$ && $scope_hash =~ ^[0-9a-f]{64}$ ]] && today=$(date +%F 2>/dev/null); then
+            marker="$dir/host-actions-$scope_hash.noticed-$today"
+            if (umask 077; set -o noclobber; : > "$marker") 2>/dev/null; then
+                actions_marker=$marker
+                actions_msg="$count open host action(s): run kaizen-scheduled actions list --for ."
+            fi
+        fi
+    fi
+fi
+
 msg=$audit_msg
 if [ -n "$experiment_msg" ]; then
     msg="${msg:+$msg
@@ -188,12 +225,18 @@ if [ -n "$regression_msg" ]; then
 
 }$regression_msg"
 fi
+if [ -n "$actions_msg" ]; then
+    msg="${msg:+$msg
+
+}$actions_msg"
+fi
 [ -n "$msg" ] || exit 0
 if ! out=$(kaizen_context SessionStart "$msg") ||
     [ -z "$out" ]; then
     [ -n "$audit_marker" ] && rm -f "$audit_marker"
     [ -n "$experiment_marker" ] && rm -f "$experiment_marker"
     [ -n "$regression_marker" ] && rm -f "$regression_marker"
+    [ -n "$actions_marker" ] && rm -f "$actions_marker"
     exit 0
 fi
 if printf '%s\n' "$out"; then
@@ -202,6 +245,7 @@ else
     [ -n "$audit_marker" ] && rm -f "$audit_marker"
     [ -n "$experiment_marker" ] && rm -f "$experiment_marker"
     [ -n "$regression_marker" ] && rm -f "$regression_marker"
+    [ -n "$actions_marker" ] && rm -f "$actions_marker"
     emitted=1
 fi
 exit 0
