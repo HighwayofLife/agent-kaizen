@@ -10,6 +10,11 @@
       "literal_bytes": 157,
       "sha256": "d311e02e53265bec316347a0d6caf9071cbdbec10fcd84f7db8d93f032c32439",
       "literal_text": " Bash calls this turn. Chain the remaining steps into one command or script that prints a summary, or hand the investigation to a cheaper read-only subagent."
+    },
+    "hooks/session-audit.sh": {
+      "literal_bytes": 0,
+      "sha256": "eb49bf59850bac160fbf5feec6d07f990adda3fa6d53db4457fa619411ba7fef",
+      "literal_text": ""
     }
   }
 }
