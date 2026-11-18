@@ -35,7 +35,7 @@ SCRIPTS = {
     "usage-series": "usage-series", "usage-compare": "usage-compare", "usage-db": "usage-db",
     "rules-lint": "rules-lint", "packet-report": "packet-report",
     "kaizen-project-report": "kaizen-project-report", "notes-ledger": "notes-ledger",
-    "kaizen-link": "kaizen-link", "codex-review": "codex-review",
+    "kaizen-link": "kaizen-link", "kaizen-doctor": "kaizen-doctor", "codex-review": "codex-review",
     "codex-dispatch": "codex-dispatch", "codex-run": "codex-run",
     "codex_common.py": "codex_common.py", "dispatch-status": "dispatch-status",
     "prompts": "prompts", "preambles": "preambles",
