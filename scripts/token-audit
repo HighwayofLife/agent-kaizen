@@ -3,6 +3,7 @@
 import argparse
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 import json
 import math
 import os
@@ -48,6 +49,23 @@ METADATA_FIELDS = {key: re.compile(('"' + key + r'"\s*:\s*').encode()) for key i
     "tools", "addedNames", "readdedNames", "surfacedDefinitions", "removedNames")}
 ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*=")
 CHEAPER_MODEL_THRESHOLDS = dict(cost_share=0.05, calls_median=15, result_chars_median=4000)
+FRICTION_THRESHOLDS = dict(slow_call_seconds=120, heavy_seconds=60)
+FRICTION_PAIR_LIMIT = 16384
+MAX_TIMING_MS = timedelta.max.total_seconds() * 1000
+TIMED_TOOLS = frozenset(("Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch",
+                         "NotebookEdit", "Skill", "LSP"))
+UNTIMED_TOOLS = frozenset(("Agent", "Task", "SendMessage", "AskUserQuestion"))
+SHELL_PROGRAMS = frozenset("ls rg grep find make cmake pytest sleep curl wget rsync sed awk cat diff".split())
+SHELL_VERBS = {
+    "cargo": "build check clippy fmt run test",
+    "docker": "build compose pull run",
+    "git": "add blame checkout clone commit diff fetch log merge pull push rebase show status switch",
+    "go": "build run test vet",
+    "gradlew": "build check test",
+    "npm": "build ci install run test",
+    "pnpm": "build install run test",
+    "yarn": "build install run test",
+}
 
 
 def date_time(value):
@@ -561,6 +579,157 @@ def finish_turn(turn, project, session_id, agent, data):
                 break
 
 
+def friction_signature(command):
+    # Only emit fixed vocabulary. Executable names, script names, and arguments
+    # can all contain private data, even after path and secret redaction.
+    if isinstance(command, str):
+        for segment in re.split(r"&&|[;\n|]", command[:1024]):
+            words = segment.split()
+            while words and (ASSIGNMENT.match(words[0]) or
+                             words[0] in ("time", "nohup", "nice", "command", "exec")):
+                words.pop(0)
+            if not words or words[0] in ("cd", "export", "set"):
+                continue
+            program = words[0].strip("\"'").replace("\\", "/").rsplit("/", 1)[-1]
+            if program in SHELL_VERBS:
+                verb = words[1] if len(words) > 1 else ""
+                return program + " " + verb if verb in SHELL_VERBS[program].split() else program
+            if program in ("python", "python3"):
+                return "python -m unittest" if words[1:3] == ["-m", "unittest"] else "python"
+            if program in SHELL_PROGRAMS:
+                return program
+            break
+    return "(shell)"
+
+
+@lru_cache(maxsize=256)
+def friction_stamp(stamp):
+    try:
+        return date_time(stamp)
+    except (ValueError, OverflowError):
+        return None
+
+
+def friction_block(state, row, block, start, content):
+    if row.get("type") != ("assistant" if start else "user"):
+        return
+    session_id = row.get("sessionId")
+    tool_id = block.get("id" if start else "tool_use_id")
+    if not (isinstance(session_id, str) and 0 < len(session_id) <= 256 and
+            isinstance(tool_id, str) and 0 < len(tool_id) <= 256):
+        return
+    key = (session_id, tool_id)
+    pairs = state["pairs"]
+    if key not in pairs:
+        if len(pairs) >= FRICTION_PAIR_LIMIT:
+            state["capped"] = True
+            return
+        pairs[key] = [None, None]
+    pair = pairs[key]
+    if pair is None:
+        return
+    ts = row.get("timestamp")
+    stamp = friction_stamp(ts) if isinstance(ts, str) and len(ts) <= 40 else None
+    if stamp is None or stamp < state["since"]:
+        pairs[key] = None
+        return
+    row_id = row.get("uuid") or (row["message"].get("id") if start else None)
+    identity = row_id if isinstance(row_id, str) and 0 < len(row_id) <= 256 else None
+    if start:
+        name, tool_input = block.get("name"), block.get("input")
+        tool_input = tool_input if isinstance(tool_input, dict) else {}
+        command = tool_input.get("command") if name == "Bash" else None
+        signature = friction_signature(command) if name == "Bash" else name if name in TIMED_TOOLS else "(tool)"
+        skipped = name in UNTIMED_TOOLS or tool_input.get("run_in_background") is True
+        # Keep only a fingerprint for conflict detection, including starts whose
+        # private arguments collapse to the same public signature.
+        private_input = command if name == "Bash" else json.dumps(tool_input, sort_keys=True)
+        fingerprint = hash((name, private_input)) if isinstance(private_input, str) else None
+        value = (stamp, identity, signature, skipped, fingerprint)
+    else:
+        details = row.get("toolUseResult")
+        details = details if isinstance(details, dict) else {}
+        decision = row.get("permissionDecision")
+        source = decision.get("source") if isinstance(decision, dict) else None
+        prompted = isinstance(source, str) and source.startswith("user")
+        duration = details.get("durationMs")
+        # Row-level duration is attributable only when exactly one result owns it.
+        measured = (duration / 1000 if type(duration) in (float, int)
+                    and 0 <= duration <= MAX_TIMING_MS
+                    and (len(content) == 1 or sum(item.get("type") == "tool_result" for item in content) == 1)
+                    else None)
+        result = block.get("content")
+        result_hash = hash(result if isinstance(result, str) else json.dumps(result, sort_keys=True))
+        value = (stamp, identity, measured, prompted, bool(details.get("backgroundTaskId")),
+                 result_hash, block.get("is_error") is True)
+    slot = 0 if start else 1
+    # Retain both observations until the scan ends, so later replayed rows can
+    # invalidate an otherwise plausible but conflicting pair.
+    if pair[slot] is None:
+        pair[slot] = value
+    elif pair[slot] != value:
+        pairs[key] = None
+
+
+def friction_basis(measured, estimated):
+    return "mixed" if measured and estimated else "measured" if measured else "row_gap" if estimated else "none"
+
+
+def finalize_friction(state, thresholds, window):
+    grouped = defaultdict(list)
+    for pair in state["pairs"].values():
+        if pair is None or None in pair:
+            continue
+        (start, _, signature, skipped, _), (end, _, measured, prompted, background, _, _) = pair
+        if skipped or background or end < start or (prompted and measured is None):
+            continue
+        seconds = measured if measured is not None else (end - start).total_seconds()
+        grouped[signature].append((seconds, measured is not None))
+    rows, flags = [], []
+    measured = samples = 0
+    for signature, group in grouped.items():
+        values = sorted(seconds for seconds, _ in group)
+        count = len(group)
+        measured_count = sum(is_measured for _, is_measured in group)
+        measured += measured_count
+        samples += count
+        p50 = statistics.median(values)
+        slow = sum(value >= thresholds["slow_call_seconds"] for value in values)
+        heavy = count >= 3 and p50 >= thresholds["heavy_seconds"]
+        if slow or heavy:
+            rows.append(dict(signature=signature, count=count, slow=slow, heavy=heavy,
+                             seconds_total=round(sum(values), 3), p50=round(p50, 3),
+                             p90=round(values[math.ceil(0.9 * count) - 1], 3),
+                             basis=friction_basis(measured_count, count - measured_count)))
+    rows.sort(key=lambda row: (-row["seconds_total"], row["signature"]))
+    for row in rows[:10]:
+        if row["slow"]:
+            flags.append(dict(id="slow-calls", subject=row["signature"], value=row["slow"],
+                              detail=f"{row['slow']} calls met the slow threshold."))
+        if row["heavy"]:
+            flags.append(dict(id="heavy-calls", subject=row["signature"], value=row["p50"],
+                              detail=f"Median timing was {row['p50']:g} seconds."))
+    return dict(v=1, thresholds=thresholds, window=window, basis=friction_basis(measured, samples - measured),
+                summary=dict(samples=samples, measured=measured, estimated=samples - measured,
+                             capped=state["capped"], slow_calls=rows[:50]), flags=flags)
+
+
+def friction_sections(friction):
+    summary = friction["summary"]
+    thresholds = friction["thresholds"]
+    lines = ["", "## Friction",
+             f"Timed calls {summary['samples']} ({summary['measured']} measured, "
+             f"{summary['estimated']} estimated from row gaps). "
+             f"Slow ≥ {thresholds['slow_call_seconds']}s, heavy median ≥ {thresholds['heavy_seconds']}s."]
+    if summary["capped"]:
+        lines.append("Timing reached its pair limit. Counts and percentiles cover retained pairs.")
+    if summary["slow_calls"]:
+        lines += ["Signature | p50 (s) | p90 (s) | Samples | Basis", "--- | --- | --- | --- | ---"]
+        lines += [" | ".join(str(row[key]) for key in ("signature", "p50", "p90", "count", "basis"))
+                  for row in summary["slow_calls"][:5]]
+    return lines
+
+
 def scan_claude(path, agent, since, data, seen_messages, project):
     main = agent is None
     counter = Counter()
@@ -572,6 +741,7 @@ def scan_claude(path, agent, since, data, seen_messages, project):
     turn = None
     cache_previous = None
     cache_seen = False
+    friction = data.get("_friction")
     for row in rows(path, since, data["warnings"], keep_tools=True, canary=data["format_canary"]):
         if row.get("type") in ("api-request-shape", "attachment"):
             tool_metadata(row, observed)
@@ -661,6 +831,8 @@ def scan_claude(path, agent, since, data, seen_messages, project):
                 name, head = block.get("name", "unknown"), None
                 observed["used"].add(name)
                 data["_tool_universe"].add(name)
+                if friction is not None:
+                    friction_block(friction, row, block, True, content)
                 if ("use", block.get("id")) in seen_messages:
                     continue
                 seen_messages.add(("use", block.get("id")))
@@ -685,6 +857,8 @@ def scan_claude(path, agent, since, data, seen_messages, project):
                     data["bash"][agent][head] += 1
                 tools[block.get("id")] = (name, head, original_name, failure_head, match_head, order)
             elif block.get("type") == "tool_result":
+                if friction is not None:
+                    friction_block(friction, row, block, False, content)
                 if ("result", block.get("tool_use_id")) in seen_messages:
                     continue
                 seen_messages.add(("result", block.get("tool_use_id")))
@@ -857,12 +1031,15 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                          output=window["output_tokens"], tokens=tokens)
 
 
-def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=None):
+def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=None, *,
+            friction=True, friction_thresholds=None, friction_window=None):
     data = dict(models=defaultdict(Counter), sessions=[], agents=defaultdict(list),
                 triggers=defaultdict(Counter), tool_chars=Counter(), tool_counts=Counter(),
                 images=0, bash=defaultdict(Counter), bash_chars=defaultdict(Counter),
                 codex=defaultdict(Counter), codex_sessions=[], briefs=defaultdict(list), codex_briefs=defaultdict(list), warnings=Counter(), codex_files_scanned=0)
     data["format_canary"] = defaultdict(Counter)
+    if friction:
+        data["_friction"] = dict(pairs={}, capped=False, since=since)
     data["cache_writes"] = {kind: {bucket: Counter(writes=0, write_tokens=0, full_rewrites=0) for bucket in CACHE_BUCKETS}
                             for kind in ("main", "subagent")}
     data.update(cost=dict(total=0, by_agent=Counter(), by_model=Counter(), components=Counter(),
@@ -956,6 +1133,10 @@ def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=No
     for key in ("briefs", "codex_briefs"):
         data[key] = {name: dict(median=statistics.median(values), max=max(values), count=len(values))
                      for name, values in data[key].items()}
+    if friction:
+        window = friction_window or dict(kind="fixed", cutoff=since.astimezone(timezone.utc).isoformat())
+        thresholds = dict(FRICTION_THRESHOLDS, **(friction_thresholds or {}))
+        data["friction"] = finalize_friction(data.pop("_friction"), thresholds, window)
     finalize_measurements(data, seen, since)
     data["since"] = since.isoformat()
     return data
@@ -1460,6 +1641,8 @@ def report(data, out, scope):
         else:
             lines += body
     extra, headlines = measurement_sections(data)
+    if "friction" in data:
+        extra += friction_sections(data["friction"])
     return "\n".join(lines + extra) + "\n", headline + headlines
 
 
@@ -1471,6 +1654,9 @@ def write_extract(data, out, directory, scope):
         path = directory / (out.stem + ".extract.json")
         value = dict(v=1, scope=scope, since=data["since"], report=out.name,
                      usage=dict(agents=data["agent_usage"], sessions=[], task_switches=[], instructions=[]))
+        friction = data.get("friction")
+        if friction and (friction["summary"]["samples"] or friction["summary"]["capped"]):
+            value["friction"] = friction
         with tempfile.NamedTemporaryFile(mode="w", dir=directory, delete=False) as stream:
             temporary = stream.name
             json.dump(value, stream)
@@ -1522,6 +1708,11 @@ def main():
                         help="extract directory (default: Claude config dir/audits/extracts)")
     parser.add_argument("--json", action="store_true", help="print full structured data instead of headline stdout")
     parser.add_argument("--no-write", action="store_true", help="do not write a report or extract")
+    parser.add_argument("--no-friction", action="store_true", help="disable Claude timing collection and reporting")
+    parser.add_argument("--friction-slow-seconds", type=int, default=FRICTION_THRESHOLDS["slow_call_seconds"],
+                        help="flag individual calls at or above this duration (default: %(default)s)")
+    parser.add_argument("--friction-heavy-seconds", type=int, default=FRICTION_THRESHOLDS["heavy_seconds"],
+                        help="flag median durations at or above this value across 3 or more calls (default: %(default)s)")
     parser.add_argument("--pricing", type=Path, default=Path(__file__).resolve().with_name("pricing.json"),
                         help="pricing file (default: pricing.json next to this script)")
     for flag, default, text in (
@@ -1536,6 +1727,9 @@ def main():
                                                   "prune_min_sessions", "prune_sessions")}
     if any(value < 1 for value in options.values()):
         parser.error("measurement thresholds must be positive")
+    friction_thresholds = dict(slow_call_seconds=args.friction_slow_seconds, heavy_seconds=args.friction_heavy_seconds)
+    if any(value < 1 for value in friction_thresholds.values()):
+        parser.error("friction thresholds must be positive")
     if not 0 <= args.days <= MAX_DAYS:
         parser.error(f"--days must be between 0 and {MAX_DAYS}")
     now = datetime.now(timezone.utc)
@@ -1552,6 +1746,8 @@ def main():
     if not args.project_dir and not projects and not next(codex_root.glob("*/*/*/*.jsonl"), None):
         print(f"token-audit: no Claude Code projects under {root} "
               "(set CLAUDE_CONFIG_DIR if they live elsewhere)", file=sys.stderr)
+    if os.path.isdir(Path(os.environ.get("COPILOT_HOME") or Path.home() / ".copilot").expanduser() / "session-state"):
+        print("token-audit: Copilot sessions found but not measured in this version", file=sys.stderr)
     if args.project:
         projects = [p for p in projects if args.project.casefold() in p.name.casefold()]
     directory = (args.out or claude_home() / "audits").expanduser().resolve()
@@ -1561,7 +1757,11 @@ def main():
             if not path.is_dir():
                 raise ValueError(f"project directory missing: {path}")
         pricing, pricing_error = load_pricing(args.pricing.expanduser())
-        data = collect(projects, codex_root, since, pricing, pricing_error, options, cwd)
+        friction_window = None if args.since else dict(kind="rolling", seconds=args.days * 86400,
+                                                        policy="utc-now-floor-second")
+        data = collect(projects, codex_root, since, pricing, pricing_error, options, cwd,
+                       friction=not args.no_friction, friction_thresholds=friction_thresholds,
+                       friction_window=friction_window)
         data["cost"]["pricing_warning"] = pricing_age_warning(pricing, now)
         data["scope"] = scope
         for warning in data["parser_warnings"]:
