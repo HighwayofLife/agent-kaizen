@@ -82,7 +82,10 @@ def main():
             copilot_version = read_json(installed_copilot / '.claude-plugin/plugin.json')['version']
         except (OSError, ValueError, KeyError, TypeError):
             copilot_version = None
-        if copilot_version is not None and copilot_version != version:
+        if copilot_version is None:
+            emit('WARN', 'Copilot: plugin folder found but its manifest is missing or unreadable',
+                 'copilot plugin install {}@{}'.format(plugin_name, marketplace))
+        elif copilot_version != version:
             emit('WARN', 'Copilot: installed version(s) {} differ from plugin root {}'.format(copilot_version, version),
                  'copilot plugin install {}@{}'.format(plugin_name, marketplace))
         else:
