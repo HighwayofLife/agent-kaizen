@@ -1,0 +1,171 @@
+#!/usr/bin/env python3
+"""Prepare an evidence-backed exact Claude project allow rule."""
+import argparse
+from datetime import datetime, timedelta, timezone
+import hashlib
+import json
+from pathlib import Path
+import runpy
+import stat
+import sys
+
+LITERALS = ("ls", "ls -a", "ls -l")
+TARGET = Path(".claude/settings.local.json")
+MAX_AGE = timedelta(days=7)
+EXTRACT_LIMIT = 8 * 1024 * 1024
+SETTINGS_LIMIT = 1024 * 1024
+HERE = Path(__file__).resolve().parent
+regular_bytes = runpy.run_path(str(HERE / "kaizen_worktree_facts.py"))["regular_bytes"]
+
+
+class Refused(Exception):
+    pass
+
+
+def unique_object(pairs):
+    value = dict(pairs)
+    if len(value) != len(pairs):
+        raise Refused("duplicate JSON field")
+    return value
+
+
+def v1(value):
+    return isinstance(value, dict) and type(value.get("v")) is int and value["v"] == 1
+
+
+def project_scope(directory, runner):
+    path = runner["canonical_path"](Path(directory).expanduser())
+    member = runner["enrolled_project"](path)
+    if not path.is_dir() or member is None:
+        raise Refused("an enrolled project directory is required")
+    projects, _ = runner["discover"](None, None, {}, [member])
+    if len(projects) != 1 or projects[0].unknown:
+        raise Refused("project scope is unknown")
+    return projects[0]
+
+
+def find_extract(audits, project, now):
+    """Select the newest exact scope in the primary store before the legacy store."""
+    members = {str(path) for path in project.paths}
+    cutoff = (now - MAX_AGE).timestamp()
+    for directory in (audits / "extracts", audits / "projects" / project.key):
+        candidates = []
+        for path in directory.glob("*.extract.json"):
+            info = path.lstat()
+            if stat.S_ISREG(info.st_mode) and cutoff <= info.st_mtime <= now.timestamp():
+                candidates.append((info.st_mtime_ns, path))
+                if len(candidates) > 512:
+                    raise Refused("too many recent audit extracts")
+        for stamp, path in sorted(candidates, reverse=True):
+            try:
+                raw = regular_bytes(path, EXTRACT_LIMIT)
+                data = json.loads(raw)
+            except (OSError, ValueError, RecursionError):
+                continue
+            scope = data.get("scope") if isinstance(data, dict) else None
+            roots = scope.get("cwd") if isinstance(scope, dict) else None
+            if (isinstance(roots, list) and roots
+                    and all(isinstance(root, str) and root in members for root in roots)):
+                # Once scoped, a newer invalid or negative extract cannot fall back.
+                return json.loads(raw, object_pairs_hook=unique_object), stamp / 1e9
+    raise Refused("no recent audit extract with an exact project cwd scope")
+
+
+def check_evidence(extract, stamp, literal, now):
+    scope, friction = extract["scope"], extract.get("friction")
+    roots = scope["cwd"]
+    if (not v1(extract) or not v1(scope) or not v1(friction)
+            or scope.get("project") is not None or scope.get("project_dirs") != []
+            or len(set(roots)) != len(roots)):
+        raise Refused("unsupported or filtered audit extract")
+    since = datetime.fromisoformat(extract["since"])
+    if since.tzinfo is None or not now - MAX_AGE <= since <= datetime.fromtimestamp(stamp, timezone.utc):
+        raise Refused("audit evidence must start within the last seven days; run a fresh scoped audit with --days 6")
+    summary = friction.get("summary")
+    rows = friction.get("permission_acceptance")
+    if not isinstance(summary, dict) or summary.get("capped") is not False or not isinstance(rows, list):
+        raise Refused("permission evidence is incomplete")
+    members = {hashlib.sha256(root.encode()).hexdigest() for root in roots}
+    seen, accepted = set(), 0
+    for row in rows:
+        if not isinstance(row, dict):
+            raise Refused("invalid permission evidence row")
+        if row.get("literal") != literal:
+            continue
+        member = row.get("cwd_id")
+        counts = [row.get(field) for field in ("accepted", "denied", "ambiguous")]
+        if (not isinstance(member, str) or member not in members or member in seen
+                or any(type(count) is not int or count < 0 for count in counts)):
+            raise Refused("invalid or repeated permission evidence for this literal")
+        seen.add(member)
+        if counts[1:] == [0, 0]:
+            accepted = max(accepted, counts[0])
+    if accepted < 10:
+        raise Refused("one scope member needs ten verified acceptances and zero denials or ambiguities")
+    return accepted
+
+
+def load_permissions(target):
+    if target.parent.is_symlink() or (target.parent.exists() and not target.parent.is_dir()):
+        raise Refused("expected a real .claude directory")
+    try:
+        data = json.loads(regular_bytes(target, SETTINGS_LIMIT), object_pairs_hook=unique_object)
+    except FileNotFoundError:
+        data = {}
+    permissions = data.get("permissions", {}) if isinstance(data, dict) else None
+    if not isinstance(permissions, dict):
+        raise Refused("expected a settings object with a permissions object")
+    for field in ("allow", "ask", "deny"):
+        entries = permissions.get(field, [])
+        if not isinstance(entries, list) or any(not isinstance(entry, str) for entry in entries):
+            raise Refused("permission rules must be lists of strings")
+    return permissions
+
+
+def prepare_add(directory, literal):
+    if literal not in LITERALS:
+        raise Refused("expected one exact command: ls, ls -a, or ls -l")
+    runner = runpy.run_path(str(HERE / "kaizen-scheduled"))
+    project = project_scope(directory, runner)
+    now = datetime.now(timezone.utc)
+    extract, stamp = find_extract(runner["audits_dir"](), project, now)
+    accepted = check_evidence(extract, stamp, literal, now)
+    target = project.canonical / TARGET
+    permissions = load_permissions(target)
+    rule = f"Bash({literal})"
+    # Catch direct conflicts locally. Effective matching remains a live Claude gate.
+    conflicts = {"Bash", "Bash(*)", "Bash(ls:*)", rule, f"Bash({literal}:*)"}
+    for field in ("deny", "ask"):
+        if conflicts.intersection(permissions.get(field, [])):
+            raise Refused(f"conflicting local permissions.{field} rule")
+    return dict(operation="add", project=project.canonical, target=target, rule=rule,
+                accepted=accepted, present=rule in permissions.get("allow", []))
+
+
+def main():
+    parser = argparse.ArgumentParser(prog="kaizen-allow-rule", description=__doc__)
+    commands = parser.add_subparsers(dest="operation", required=True)
+    add = commands.add_parser("add", help="prepare an exact rule proposal")
+    add.add_argument("--project", required=True, metavar="DIR")
+    add.add_argument("--command", required=True)
+    undo = commands.add_parser("undo", help="reserved for managed-rule revocation")
+    undo.add_argument("record")
+    undo.add_argument("--project", required=True, metavar="DIR")
+    args = parser.parse_args()
+    try:
+        if args.operation == "undo":
+            raise Refused("undo is disabled pending live Claude proof and recovery")
+        operation = prepare_add(args.project, args.command)
+        print(json.dumps(dict(operation=operation["operation"], target=str(TARGET),
+                              rule=operation["rule"], accepted=operation["accepted"],
+                              status="already-present" if operation["present"] else "proposal-only")))
+        return 0
+    except Refused as exc:
+        print(f"kaizen-allow-rule: {exc}", file=sys.stderr)
+    except (OSError, ValueError, TypeError, KeyError, RuntimeError):
+        print("kaizen-allow-rule: invalid or unreadable project, settings, or evidence", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
