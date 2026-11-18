@@ -5,6 +5,7 @@ TOKEN_AUDIT_BASELINE environment variable names another revision.
 """
 import argparse
 from datetime import datetime, timezone
+from inspect import signature
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,13 @@ def codex_fixture(root):
     lines = [dict(timestamp='2026-01-01T00:00:00Z', type='turn_context', payload={'model': 'example'})]
     lines += [dict(timestamp='2026-01-01T00:00:01Z', type='response_item',
                    payload={'role': 'assistant', 'content': 'x' * 4000}) for _ in range(1998)]
+    for index in range(40):
+        for kind, fields in (
+            ('function_call', dict(name='exec_command', arguments='{"cmd":"cargo test"}')),
+            ('function_call_output', dict(output='Wall time: 2 seconds\nOutput:\n' + 'x' * 12000)),
+        ):
+            lines.append(dict(timestamp='2026-01-01T00:00:01Z', type='response_item',
+                              payload=dict(type=kind, call_id=f'call-{index}', **fields)))
     lines.append(dict(timestamp='2026-01-01T00:00:02Z', type='event_msg',
                       payload={'type': 'token_count', 'info': {'total_token_usage': {'total_tokens': 100}}}))
     write_jsonl(root / 'sessions/2026/01/01/session.jsonl', lines)
@@ -58,6 +66,7 @@ def main():
                         help='git revision holding the baseline scripts/token-audit '
                         '(default: TOKEN_AUDIT_BASELINE or HEAD)')
     parser.add_argument('--max-ratio', type=float, help='fail if current/baseline median exceeds this ratio')
+    parser.add_argument('--no-friction', action='store_true', help='benchmark with friction disabled where supported')
     args = parser.parse_args()
     with tempfile.TemporaryDirectory() as temp:
         root = Path(temp)
@@ -72,21 +81,29 @@ def main():
         since = datetime(2025, 1, 1, tzinfo=timezone.utc)
         projects = [root / 'claude/projects/example']
 
-        def run(module):
-            return module['collect'](projects, root / 'sessions', since, {}, None, dict(OPTIONS))
+        modes = [dict(friction=False) if args.no_friction and 'friction' in signature(module['collect']).parameters
+                 else {} for module in (baseline, current)]
 
-        base_data, current_data = run(baseline), run(current)
+        def run(module, mode):
+            return module['collect'](projects, root / 'sessions', since, {}, None, dict(OPTIONS), **mode)
+
+        base_data, current_data = (run(module, mode) for module, mode in zip((baseline, current), modes))
         assert current_data['headline']['claude_calls'] == 400, 'the Claude fixture was not scanned'
+        assert current_data['headline']['codex_tokens'] == 100, 'the Codex fixture was not scanned'
+        if 'friction' in current_data and not args.no_friction:
+            assert current_data['friction']['summary']['measured'] == 40
         for key in COMPARED:
             assert base_data[key] == current_data[key], key
         times = [[], []]
-        for _ in range(5):
-            for index, module in enumerate((baseline, current)):
+        modules = (baseline, current)
+        for repeat in range(45):
+            for index in (repeat % 2, 1 - repeat % 2):
                 start = time.perf_counter()
-                run(module)
+                run(modules[index], modes[index])
                 times[index].append(time.perf_counter() - start)
         before, after = (statistics.median(samples) for samples in times)
-        print(f'baseline {args.baseline}: {before:.6f}s; current: {after:.6f}s; ratio: {after / before:.3f}x')
+        mode = 'off' if args.no_friction else 'default'
+        print(f'{mode} | baseline {args.baseline}: {before:.6f}s; current: {after:.6f}s; ratio: {after / before:.3f}x')
         if args.max_ratio is not None and after / before > args.max_ratio:
             raise SystemExit(1)
 
