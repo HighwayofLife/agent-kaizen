@@ -2,10 +2,49 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
-## Unreleased
+## 0.10.0 (2026-11-17)
 
-- Fixed: SQL with multiple statements now returns a clear error on Python 3.9.
-- Tests: checkpoint the WAL through a writable connection when checking database pruning on Python 3.9.
+Packet flow, experiment follow-up, brief preflight and due-check notices.
+
+`packet-event`, `flow-report`, `flow`:
+
+- New `packet-event` appends packet state events (queued, dispatched, round-N, checks, slot-wait, review, ready, landed, failed) atomically to `out/packet-events.jsonl`. The format is in `docs/flow.md`.
+- New `flow-report` reports lead time, time in each state, waits and work in progress from the event log.
+- The new `flow` skill instruments packet states and reads flow reports.
+
+`experiment-check`, `kaizen-scheduled`, audit notice:
+
+- New `experiment-check` lists experiments past their review date without a measurement and ledger rows pending too long. It never runs metric commands.
+- The ledger gains optional `metric command` and `review date` columns. Old ledgers keep working; rows dated before 2026-11-17 are never reported as missing these fields.
+- Scheduled checks and the session notice surface overdue experiments. `pendingDays` defaults to 10. `KAIZEN_NOTICE_TIMEOUT` allows 10 seconds by default for the notice's experiment check.
+- `kaizen-scheduled checks record` records completed audit, models, roster, whats-new and cycle checks per project. `experiment-check --checks` reports checks that are due or have never been recorded. Completion dates live in `<audits>/projects/<key>/checks.json` per machine.
+- The due-check nag appears in every enrolled project until its first recorded completion, at most once a day. Nothing is recorded today; past completions are not recovered.
+- The session-notice hook escalates a stuck checker from SIGTERM to SIGKILL so SessionStart finishes and prints its JSON. The daily marker is created atomically so concurrent sessions show the notice once.
+- `experiment-check` stops reading the ledger at its first non-table line, so later prose containing `|` is not treated as a malformed row.
+- Scheduled-step output keeps its final summary line when truncated.
+
+`brief-lint`, `codex-dispatch`:
+
+- New `brief-lint` checks required sections, named repository paths (including declared new paths), verify commands and size warnings before dispatch. It supports `--json`.
+- `codex-dispatch --brief-lint` enables preflight; it is off by default.
+
+`packet-report`:
+
+- Model labels are normalised, including aliases such as `gpt-6.1-terra` to `terra`. Unknown labels are counted and listed. Rows missing tokens or cost are reported rather than treated as zero. Landed packets with failing checks are flagged.
+- Review economics reports fix packets per landed packet, the fix-of-fix rate and fix packets without a MUST-FIX. Small fix packets hold a tier's calibration increase, with the reason.
+
+`install-schedule`, `kaizen-link`:
+
+- Both installers include the new scripts, documented in `scripts/README.md`. Machines with a linked bin see `kaizen-link --check` drift for the new scripts until `kaizen-link --apply` is re-run.
+
+`usage-db`:
+
+- SQL with multiple statements now returns a clear error on Python 3.9.
+- Tests checkpoint the WAL through a writable connection when checking database pruning on Python 3.9.
+
+Tests:
+
+- The helper cleanup test waits for helper startup and leader exit before timing out, so interpreter startup time cannot race the PID assertion.
 
 ## 0.9.1 (2026-11-10)
 

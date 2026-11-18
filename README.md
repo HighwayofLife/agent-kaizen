@@ -56,7 +56,7 @@ So this plugin is built as a **loop**:
 3. **Change one thing** at a time, and log it in `LEDGER.md`.
 4. **Re-measure:** the next audit shows whether the change paid off, so you keep, tune or revert it.
 
-Every change gets a row in `docs/kaizen/LEDGER.md` (date, change, why, expected effect, **measured effect**, keep or revert). The next audit fills in the measured effect. Over time the ledger becomes a record of what actually works for *your* setup. Our own results are in [docs/what-we-learned.md](docs/what-we-learned.md).
+Every change gets a row in `docs/kaizen/LEDGER.md` (date, change, why, expected effect, **measured effect**, keep or revert), with optional `metric command` and `review date` columns. The next audit fills in the measured effect. Over time the ledger becomes a record of what actually works for *your* setup. Our own results are in [docs/what-we-learned.md](docs/what-we-learned.md).
 
 ## Quick start
 
@@ -160,6 +160,7 @@ Project files (`docs/kaizen/`), reports in `<Claude config dir>/audits/` and bac
 | `CLAUDE_CONFIG_DIR` | Scheduler, audit, hooks | Claude config directory; default `~/.claude` |
 | `CODEX_HOME` | Scheduler, audit | Codex data directory; default `~/.codex` |
 | `AUDIT_DIR` | Audit notice hook | Overrides notice audit directory; default `<Claude config dir>/audits` |
+| `KAIZEN_NOTICE_TIMEOUT` | Audit notice hook | Seconds allowed for the experiment check; default 10 |
 | `KAIZEN_NOTICE_ALL` | Audit notice hook | `1` enables notices outside enrolled projects; default off |
 | `IMAGE_AGENTS` | Image guard | Space-separated agent names; default `image-reader` |
 | `ALLOW_IMAGE_READS` | Image guard | `1` disables the guard; default off |
@@ -237,12 +238,13 @@ hooks/              audit-notice and bash-burst (enabled by the plugin), plus op
                     (lists running dispatches and dirty worktrees, pending ledger rows and stale rules at session start)
 scripts/            token-audit (+ pricing.json), usage-series, usage-compare, usage-db, kaizen-backup (backups + undo), codex-dispatch, codex-run, codex-review,
                     dispatch-status, install-schedule, kaizen-scheduled, kaizen-link, packet-report,
-                    kaizen-project-report, rules-lint (+ rules-lint.patterns), notes-ledger
+                    kaizen-project-report, rules-lint (+ rules-lint.patterns), notes-ledger,
+                    packet-event, flow-report, experiment-check, brief-lint
 templates/          starting points: global and project CLAUDE.md, orchestrator.md,
                     Codex AGENTS.md and config.toml, settings.example.json,
                     agent templates (scout, judge, swarm-lead, verifier, planner,
                     debugger, image-reader), agent-context role files, plan + brief
-docs/               what-we-learned.md, scheduling.md, autonomy.md, outcome-log.md, prompt-evaluation.md
+docs/               what-we-learned.md, scheduling.md, autonomy.md, outcome-log.md, prompt-evaluation.md, flow.md
 assets/             banner, teaser animation and loop diagram; assets/src/ has the scripts that draw them
 ```
 
