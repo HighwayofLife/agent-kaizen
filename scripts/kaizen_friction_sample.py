@@ -229,7 +229,7 @@ def claim_process(lock):
     previous = os.pread(lock, 25, 0)
     now = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
     boot = boot if boot is not None else bytes(16)
-    if len(previous) == 24 and previous[:16] == boot:
+    if len(previous) == 24 and (previous[:16] == boot or boot == bytes(16) or previous[:16] == bytes(16)):
         stamp = int.from_bytes(previous[16:], "big")
         if now >= stamp and now - stamp < PROCESS_INTERVAL_NS:
             return False

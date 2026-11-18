@@ -109,6 +109,16 @@ class SamplerTests(unittest.TestCase):
             self.assertTrue(sampler.claim_process(lock))
             self.assertFalse(sampler.claim_process(lock))
 
+    def test_intermittent_boot_identity_does_not_reset_rate_limit(self):
+        self.samples.mkdir(parents=True)
+        lock = os.open(self.samples / sampler.LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, lock)
+        with patch.object(time, "clock_gettime_ns", return_value=123), \
+                patch.object(sampler, "boot_identity", side_effect=[b"a" * 16, None, b"a" * 16]):
+            self.assertTrue(sampler.claim_process(lock))
+            self.assertFalse(sampler.claim_process(lock))
+            self.assertFalse(sampler.claim_process(lock))
+
     def test_claim_changes_with_boot_identity(self):
         self.samples.mkdir(parents=True)
         lock = os.open(self.samples / sampler.LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o600)
@@ -182,8 +192,10 @@ class SamplerTests(unittest.TestCase):
         pid_file = self.root / "query-pid"
         for cancel in (False, True):
             with self.subTest(cancel=cancel):
-                query = ("import signal, time; "
+                ready_file = self.root / "query-ready"
+                query = ("import signal, time, pathlib; "
                          "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                         f"pathlib.Path({str(ready_file)!r}).touch(); "
                          "time.sleep(3)")
                 # The query can be killed before it publishes its own PID. Record
                 # the spawn result in the parent, where cancellation only sets a flag.
@@ -202,6 +214,11 @@ def record_spawn(*args, **kwargs):
     pid = spawn(*args, **kwargs)
     Path(sys.argv[2]).write_text(str(pid))
     if sys.argv[3] == 'True':
+        ready = Path(sys.argv[2]).parent / 'query-ready'
+        end = time.monotonic() + 0.15
+        while not ready.exists() and time.monotonic() < end:
+            time.sleep(0.001)
+        assert ready.exists(), 'child did not install SIGTERM handler'
         os.kill(os.getpid(), signal.SIGTERM)
     return pid
 s.os.posix_spawn = record_spawn
@@ -215,6 +232,7 @@ assert time.monotonic() - start < s.BUDGET + 0.1
                 with self.assertRaises(ProcessLookupError):
                     os.kill(int(pid_file.read_text()), 0)
                 pid_file.unlink()
+                ready_file.unlink(missing_ok=True)
                 self.assertEqual(self.process_rows(), [])
                 (self.samples / sampler.LOCK_NAME).write_bytes(b"")
 

@@ -197,7 +197,14 @@ class Probe:
             # Status may invoke repository-configured clean or process filters.
             # Never inspect a working tree with those commands configured.
             config = self.command(['git', '-c', 'core.fsmonitor=false', '-C', str(root), 'config', '--null', '--list'])
-            if config is None or re.search(r'(?:^|\0)filter\.[^\n]+\.(?:clean|process)\n', config, re.I):
+            index = self.command(['git', '-c', 'core.fsmonitor=false', '-C', str(root), 'ls-files', '--stage', '-z'])
+            if index is not None and any(entry.startswith('160000 ') for entry in index.split('\0')):
+                subconfig = self.command(['git', '-c', 'core.fsmonitor=false', '-C', str(root),
+                                          'submodule', 'foreach', '--quiet', '--recursive', 'git config --null --list'])
+            else:
+                subconfig = ''
+            if (config is None or index is None or subconfig is None or
+                    re.search(r'(?:^|\0)filter\.[^\n]+\.(?:clean|process)\n', config + subconfig, re.I)):
                 self.warn('unsafe_git_filter')
                 return None
         return self.command(['git', '-c', 'core.fsmonitor=false', '-C', str(root), *args])
@@ -306,14 +313,20 @@ class Probe:
 
     def size(self, path):
         total, count = 0, 0
-        pending = []
+        pending = [()]
+        root_fd = None
         try:
-            pending.append(open_directory(path))
+            root_fd = open_directory(path)
             while pending:
                 if self.remaining('size') <= 0:
                     return None
-                fd = pending.pop()
+                parts = pending.pop()
+                fd = os.dup(root_fd)
                 try:
+                    for component in parts:
+                        child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                        os.close(fd)
+                        fd = child
                     entries = []
                     with os.scandir(fd) as scan:
                         for entry in scan:
@@ -329,7 +342,7 @@ class Probe:
                         if self.remaining('size') <= 0:
                             return None
                         if entry.is_dir(follow_symlinks=False):
-                            pending.append(os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd))
+                            pending.append(parts + (entry.name,))
                         elif entry.is_file(follow_symlinks=False):
                             total += entry.stat(follow_symlinks=False).st_size
                 finally:
@@ -338,8 +351,8 @@ class Probe:
             self.warn('directory_unavailable')
             return None
         finally:
-            for fd in pending:
-                os.close(fd)
+            if root_fd is not None:
+                os.close(root_fd)
         return total
 
     def directories(self, trees):
@@ -413,7 +426,6 @@ class Probe:
                 if any((root.joinpath(*relative.split('/')[:i])).is_symlink()
                        for i in range(1, len(relative.split('/')) + 1)) or not path.is_dir():
                     continue
-                path = path.resolve()
                 if any(path == other or path in other.parents for other in roots):
                     continue
                 ignored = self.git(root, 'check-ignore', '--', relative + '/')
@@ -573,6 +585,13 @@ def main(argv=None):
                 os.link(temporary, destination.name, src_dir_fd=out_fd, dst_dir_fd=out_fd)
             finally:
                 os.unlink(temporary, dir_fd=out_fd)
+            check_fd = open_directory(out)
+            try:
+                pinned, current = os.fstat(out_fd), os.fstat(check_fd)
+                if (pinned.st_dev, pinned.st_ino) != (current.st_dev, current.st_ino):
+                    raise ValueError('output directory moved')
+            finally:
+                os.close(check_fd)
         finally:
             os.close(out_fd)
         if args.json:

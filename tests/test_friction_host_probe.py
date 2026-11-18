@@ -34,6 +34,55 @@ class HostProbeTests(unittest.TestCase):
         self.assertIsNone(self.probe().git(self.project, 'status', '--porcelain'))
         self.assertFalse(marker.exists())
 
+    def test_submodule_filter_prevents_status(self):
+        probe = self.probe()
+        def command(args):
+            if 'foreach' in args:
+                return 'filter.evil.clean\ntouch marker\0'
+            if 'ls-files' in args:
+                return '160000 abc 0\tsub\0'
+            if 'config' in args:
+                return ''
+            self.fail('status must not run with a submodule filter')
+        with mock.patch.object(probe, 'command', side_effect=command):
+            self.assertIsNone(probe.git(self.project, 'status', '--porcelain'))
+
+    def test_output_replaced_after_symlink_check_is_not_followed(self):
+        def git(*args):
+            subprocess.run(['git', '-C', str(self.project), *args], check=True, capture_output=True)
+        git('init', '-q')
+        (self.project / '.gitignore').write_text('build/\n')
+        build = self.project / 'build'
+        build.mkdir()
+        outside = self.root / 'outside'
+        outside.mkdir()
+        (outside / 'data').write_text('outside')
+        original = Path.is_dir
+        def replace(path):
+            if path == build:
+                build.rename(self.project / 'moved')
+                build.symlink_to(outside, target_is_directory=True)
+                return True
+            return original(path)
+        probe = self.probe()
+        def git_result(_root, *args):
+            return {'status': '!! build/\0', 'check-ignore': 'build/\n', 'ls-files': ''}[args[0]]
+        with mock.patch.object(Path, 'is_dir', replace), mock.patch.object(probe, 'git', side_effect=git_result):
+            self.assertIsNone(probe.directories([{'path': str(self.project)}]))
+
+    def test_wide_tree_does_not_keep_sibling_descriptors_open(self):
+        import resource
+        build = self.project / 'build'
+        build.mkdir()
+        for i in range(120):
+            (build / str(i)).mkdir()
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (min(soft, 64), hard))
+            self.assertEqual(self.probe().size(build), 0)
+        finally:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
     def test_output_stays_with_open_directory_after_replacement(self):
         out = self.root / 'reports'
         moved = self.root / 'original'
@@ -46,7 +95,7 @@ class HostProbeTests(unittest.TestCase):
             return {'private': str(self.project)}
         with mock.patch.object(probe_module.Probe, 'run', replace), \
              mock.patch('builtins.print'):
-            self.assertEqual(probe_module.main(['--project', str(self.project), '--out', str(out)]), 0)
+            self.assertEqual(probe_module.main(['--project', str(self.project), '--out', str(out)]), 1)
         self.assertEqual(list(outside.iterdir()), [])
         self.assertEqual(len(list(moved.glob('host-probe-*.json'))), 1)
 

@@ -229,8 +229,14 @@ actions_marker=
 if [ -n "$root" ] && [ -f "$dir/host-actions.json" ] && command -v python3 >/dev/null 2>&1 && [ -f "$plugin_root/scripts/kaizen-scheduled" ]; then
         # The store validates ownership, links, size, records and the canonical project.
         result=$(python3 -I - "$plugin_root/scripts/kaizen-scheduled" "$dir" "$root" "$home" <<'PYCODE' 2>/dev/null
-import hashlib, json, os, runpy, stat, sys
+import hashlib, json, os, runpy, signal, stat, sys
 from pathlib import Path
+class NoticeDeadline(BaseException):
+    pass
+def deadline(_signum, _frame):
+    raise NoticeDeadline()
+signal.signal(signal.SIGALRM, deadline)
+signal.setitimer(signal.ITIMER_REAL, 1.0)
 def settings(path):
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
@@ -257,7 +263,7 @@ try:
             if value == 'off':
                 sys.exit(0)
         print(len(opened), hashlib.sha256(project.encode('utf-8', 'surrogateescape')).hexdigest())
-except (OSError, ValueError, RuntimeError, KeyError, UnicodeError):
+except (OSError, ValueError, RuntimeError, KeyError, UnicodeError, NoticeDeadline):
     pass
 PYCODE
         )

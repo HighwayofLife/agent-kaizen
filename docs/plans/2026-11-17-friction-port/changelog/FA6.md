@@ -1,1 +1,1 @@
-Harden host evidence collection and respect friction opt-outs in interactive notices and refreshes.
+Harden host evidence collection and respect friction opt-outs in interactive notices and refreshes. Keep action notices bounded, find canonical worktree audits, and handle wide output trees and intermittent boot identifiers.

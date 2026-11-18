@@ -117,6 +117,22 @@ class HookTests(unittest.TestCase):
                 self.assertEqual(result.stdout, '{}\n')
                 config.unlink()
 
+    def test_slow_action_discovery_does_not_block_audit_notice(self):
+        project, audits, _, env = self.notice_setup()
+        (project / '.git').mkdir()
+        (audits / 'host-actions.json').write_text('{}')
+        (audits / 'token-audit-fixture.md').write_text('fixture')
+        env['CLAUDE_PLUGIN_ROOT'] = str(ROOT)
+        with bare_path('jq', 'date', 'python3', 'git', 'dirname', 'ls', 'head', 'grep', 'cksum', 'rm') as bindir:
+            git = Path(bindir) / 'git'
+            git.unlink()
+            git.write_text('#!/bin/bash\nexec /bin/sleep 5\n')
+            git.chmod(0o755)
+            start = time.monotonic()
+            result = run('audit-notice.sh', {'cwd': str(project)}, {**env, 'PATH': bindir})
+            self.assertLess(time.monotonic() - start, 3)
+            self.assertIn('unreviewed usage audit', result['hookSpecificOutput']['additionalContext'])
+
     def test_scoped_actions_notice(self):
         import runpy
         import sys
