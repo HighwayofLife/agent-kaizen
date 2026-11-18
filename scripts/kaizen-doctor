@@ -55,7 +55,7 @@ def copilot_plugin(home):
                 if manifest.get('name') == 'agent-kaizen':
                     return root, 'live'
                 return None, None
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError):
         pass
     return None, None
 
@@ -89,7 +89,11 @@ def main():
         versions = sorted(p.name for p in cache.iterdir() if p.is_dir())
     except OSError:
         versions = []
-    copilot = Path(os.environ.get('COPILOT_HOME') or Path.home() / '.copilot').expanduser()
+    copilot = Path(os.environ.get('COPILOT_HOME') or Path.home() / '.copilot')
+    try:
+        copilot = copilot.expanduser()
+    except RuntimeError:
+        pass
     installed_copilot, copilot_kind = copilot_plugin(copilot)
     copilot_present = installed_copilot is not None
     neutral = not (HOME / 'plugins/installed_plugins.json').exists() and (bool(versions) or copilot_present)
@@ -111,12 +115,14 @@ def main():
         except (OSError, ValueError, KeyError, TypeError):
             copilot_version = None
         live_detail = ' (live from local marketplace)' if copilot_kind == 'live' else ''
+        copilot_fix = ('update the local marketplace directory (see docs/hosts.md)' if copilot_kind == 'live' else
+                       'copilot plugin install {}@{}'.format(plugin_name, marketplace))
         if copilot_version is None:
             emit('WARN', 'Copilot: plugin folder found but its manifest is missing or unreadable' + live_detail,
-                 'copilot plugin install {}@{}'.format(plugin_name, marketplace))
+                 copilot_fix)
         elif copilot_version != version:
             emit('WARN', 'Copilot: installed version(s) {} differ from plugin root {}'.format(copilot_version, version) + live_detail,
-                 'copilot plugin install {}@{}'.format(plugin_name, marketplace))
+                 copilot_fix)
         else:
             emit('PASS', 'Copilot: plugin installed' + (' (live from local marketplace)' if copilot_kind == 'live' else ''))
     if not neutral:

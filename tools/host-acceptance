@@ -43,7 +43,8 @@ def safe_trace(value):
 
 def redact(value):
     if isinstance(value, str):
-        value = value.replace(str(HOME), '~')
+        value = re.sub(re.escape(str(HOME)), lambda _: '~', value, flags=re.IGNORECASE)
+        value = re.sub(r'[A-Za-z]:\\Users\\[^\\\n]+', lambda _: '~', value, flags=re.IGNORECASE)
         return re.sub(r'/(?:Users|home)/[^/\n]+', '~', value)
     if isinstance(value, list):
         return [redact(item) for item in value]
@@ -83,7 +84,7 @@ def copilot_plugin(home):
                 if manifest.get('name') == 'agent-kaizen':
                     return root, 'live'
                 return None, None
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError):
         pass
     return None, None
 
@@ -142,7 +143,11 @@ def main():
         print('Trace disabled. Uninstall with: {} plugin {} agent-kaizen@agent-kaizen-tools'.format(cli, 'remove' if cli == 'codex' else 'uninstall'))
         return 0
     if args.action == 'install':
-        manual = args.host == 'vscode' and not shutil.which(cli)
+        available = bool(shutil.which(cli))
+        if available and cli == 'copilot':
+            result = run([cli, '--version'])
+            available = result.returncode == 0 and 'not found' not in (result.stdout + result.stderr).lower()
+        manual = args.host == 'vscode' and not available
         source = 'HighwayofLife/agent-kaizen'
         if args.source == 'local':
             source = Path(os.environ.get('XDG_CACHE_HOME') or HOME / '.cache') / 'agent-kaizen-acceptance/source'
@@ -151,9 +156,10 @@ def main():
             print('VS Code Agents app: The Agents app loads plugins only from the Copilot CLI install (~/.copilot). Install GitHub Copilot CLI (see https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli), sign in, then run install again.')
             print('VS Code chat: In VS Code enable chat.plugins.enabled, choose the Copilot session target, and run Chat: Install Plugin from Source using {}.'.format(source))
         else:
-            if not shutil.which(cli):
+            if not available:
                 print('Missing {} CLI; install it and sign in first.'.format(cli), file=sys.stderr)
                 return 1
+            statefile.unlink(missing_ok=True)
             # Discover removal syntax from the CLI rather than assuming it.
             helptext = run([cli, 'plugin', 'marketplace', '--help']).stdout
             if 'remove' in helptext:
@@ -194,7 +200,11 @@ def check(args, state, statefile, cli):
         add('cli', 'PASS' if result.returncode == 0 else 'FAIL', version)
     else:
         add('cli', 'SKIP' if args.host == 'vscode' else 'FAIL', 'CLI not found')
-    copilot_home = Path(os.environ.get('COPILOT_HOME') or HOME / '.copilot').expanduser()
+    copilot_home = Path(os.environ.get('COPILOT_HOME') or HOME / '.copilot')
+    try:
+        copilot_home = copilot_home.expanduser()
+    except RuntimeError:
+        pass
     copilot_root, kind = copilot_plugin(copilot_home) if cli == 'copilot' else (None, None)
     base = (Path(os.environ.get('CODEX_HOME') or HOME / '.codex') / 'plugins/cache/agent-kaizen-tools/agent-kaizen' / VERSION if cli == 'codex' else copilot_root or copilot_home / 'installed-plugins/agent-kaizen-tools/agent-kaizen')
     chat_match = vscode_installs() if args.host == 'vscode' and args.install_dir is None else None
@@ -285,7 +295,7 @@ def check(args, state, statefile, cli):
                 'seen: ' + str(seen) if traces else
                 'no {} lines; seen hosts: {}'.format(cli, ', '.join(hosts)) if hosts else
                 'hooks not trusted in /hooks or session started before install' if cli == 'codex' else 'hooks not loaded')
-        if chat_install and not traces and not hosts:
+        if state.get('installed_at') and chat_install and not traces and not hosts:
             hint += '; plugin is installed for VS Code chat only; Agents-app sessions load plugins from ~/.copilot (install the Copilot CLI)'
         detail = 'observed' if found else hint
         if event == 'sessionStart':

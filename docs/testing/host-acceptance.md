@@ -48,7 +48,7 @@ python3 tools/host-acceptance status --host HOST
 
 1. Run `python3 tools/host-acceptance install --host HOST`.
    - By default it copies this checkout to `~/.cache/agent-kaizen-acceptance/source` and installs from there. It never installs from the checkout itself, because Codex copies the whole folder it installs from.
-   - If it removes an existing `agent-kaizen-tools` marketplace first, that is expected.
+   - If it removes an existing `agent-kaizen-tools` marketplace first, it also uninstalls the plugin first; that is expected.
    - `--source github` installs from `HighwayofLife/agent-kaizen` instead. Use it only if the human asks.
    - It also turns on the hook trace by creating `~/.claude/agent-kaizen/host-trace/on`. While that file exists, each Agent Kaizen hook appends one line to `trace.jsonl` in the same folder. The line holds only the event name, the tool name, the payload's key names, and which plugin-root variables are set. It never holds payload values.
 2. For VS Code, ask the human whether they use the Agents app or the editor Chat view if unclear. The Agents app needs the signed-in Copilot CLI; install it and run `install` again if it is missing. For VS Code chat without the CLI, ask the human to follow the printed manual steps:
@@ -76,7 +76,7 @@ Run `status` first (Step 0). If it says Phase 2, make these observations in orde
    - You can't see your skill list: `skip:cannot-tell`.
 3. **Invoke a skill (`skill_invoked`).** Invoke the scan skill in demo mode:
    - Codex: `$agent-kaizen:scan --demo`.
-   - Copilot CLI and VS Code: `/agent-kaizen:scan --demo`. If the host only lets the human type slash commands, ask the human to type it.
+   - Copilot CLI and VS Code: `/agent-kaizen:scan --demo`. Type it in an interactive session: headless `copilot -p` does not run slash commands, and `/scan` without the prefix is unknown. Copilot hides user-only skills from the model.
 
    `pass` if the skill loaded and ran `scripts/kaizen-scan` and printed a demo scorecard, `fail` if the host did not find the skill or it errored. Put a short reason after a colon, for example `fail:skill-not-found`. This observation is required and cannot be skipped. If the host cannot invoke it, report `fail:<reason>`.
 4. **Trigger the shell hook.** Run one command through your host's shell tool, for example `git status`. This fires the after-tool hook. The prompt you were given has already fired the prompt-submit hook.
@@ -112,9 +112,9 @@ Only trace lines from this host count. Multiple session starts mean several sess
 
 The "Trace combinations" part of the report lists each distinct event, tool name and key set your host sent. Keep it even when everything passes: it records how your host shapes hook payloads.
 
-Local-directory marketplace installs are live: Copilot loads the plugin in place, and `check` reports that location.
-
 ## Troubleshooting VS Code
+
+Local-directory marketplace installs are live: Copilot loads the plugin in place, and `check` reports that location.
 
 The Agents app runs a Copilot runtime agent host that loads plugins from `~/.copilot`, while an install from source in VS Code reaches editor chat. VS Code syncs MCP servers to the agent host, not plugins. Install and sign in to the GitHub Copilot CLI, then run the install again for Agents-app sessions.
 
