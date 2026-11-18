@@ -49,3 +49,10 @@ Report changed files and line counts, exact checks and outcomes, known uncertain
 - The clean-start stamp in any manifest is advisory only and never confers commit authority, interactive or scheduled. Commit authority comes from a live proof at commit time: HEAD and the index are unchanged from the trusted baseline (the runner tuple for scheduled runs; for interactive runs, the human invoking `commit` plus the `begin --repo` record), and the worktree differs from HEAD only by the manifest's files. Each of those files' before-hash must equal its HEAD blob, and its after-hash must equal its live bytes. Any other tracked or untracked difference is refused. This makes a forged or copied stamp harmless.
 - Bind the validated manifest's SHA-256 (as returned by P08's handoff) and re-check it before building the commit, so replacing `manifest.json` in place after approval is refused.
 - Run Git by the absolute path that P08's capture resolved before launch, never through the inherited `PATH`.
+
+## Delta 2 from P08 round 3 (2026-11-18)
+
+- P08's stamp now records `git_executable` (`{path, dev, ino, size, mtime_ns, ctime_ns, sha256}`) instead of `git_path`, and the manifest has a `git_reason` key. Code against these names.
+- Before the first git use, call P08's `verify_git(baseline["git_executable"])`; refuse on any mismatch. Use only that path.
+- Git does not re-hash loose objects on read, so a forged tree object stored under HEAD's tree id would pass both P08 and the live proof. Before building a commit, verify the HEAD commit object and every tree object it uses hash to their ids (read raw bytes with `cat-file`, hash `<type> <len>\0<bytes>` in Python with the repo's object format).
+- Accepted residuals from P08: a user-owned git in `/opt/homebrew` or `/usr/local` can be replaced before capture (the hash catches a later swap); the macOS `/usr/bin/git` shim's selected developer-dir git is not in the identity record.
