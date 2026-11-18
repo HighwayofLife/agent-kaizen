@@ -169,6 +169,9 @@ Reference sizing (source + tests): P01/P01b take 613 + 160 catalogue lines with 
 | [P25 scheduled-commit](briefs/25-scheduled-commit.md) | M | P16b, P24 | sol / high<br>Sol reason: Brokered commits must bind trusted pre-review Git state to current-run backups. | high<br>security review before landing | ~385 | `python3 -m unittest discover -s tests -p 'test_friction_apply.py'` |
 | [BF16 p24-review-residuals](briefs/bf16-p24-review-residuals.md)<br>Fix-Origin: batch-review (P24 + P25 residuals) | M2 | P25 | terra / high | normal | ~250 | `python3 -m unittest discover -s tests -p 'test_friction_review.py'` |
 | [P26 friction-skill](briefs/26-friction-skill.md) | N | P20b, P22, P25, BF16 | terra / medium | normal | ~375 | `python3 -m unittest discover -s tests -p 'test_friction_skill.py'` |
+| [BF17a batch9-token-audit](briefs/bf17a-batch9-token-audit.md)<br>Fix-Origin: batch-review (batch 9) | O | P26 | terra / high | normal | ~150 | `python3 -m unittest discover -s tests -p 'test_friction_signals.py'` |
+| [BF17b batch9-scheduler](briefs/bf17b-batch9-scheduler.md)<br>Fix-Origin: batch-review (batch 9) | O | P26 | terra / high | normal | ~200 | `python3 -m unittest discover -s tests -p 'test_friction_review.py'` |
+| [BF17c batch9-skill-text](briefs/bf17c-batch9-skill-text.md)<br>Fix-Origin: batch-review (batch 9) | O | P26 | terra / high | normal | ~80 | `python3 -m unittest discover -s tests -p 'test_friction_skill.py'` |
 | [P27 release](briefs/27-release.md) | O | P26 | terra / medium | low | ~320 | `python3 -m unittest discover -s tests -p 'test_repo.py'` |
 | [P28 real-input-gate](briefs/28-real-input-gate.md) | P | P27 | terra / medium | normal | ~300 | `python3 -m unittest discover -s tests -p 'test_repo.py'` |
 
