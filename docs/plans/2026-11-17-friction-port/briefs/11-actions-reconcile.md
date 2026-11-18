@@ -44,3 +44,15 @@ Report changed files and line counts, exact checks and outcomes, known uncertain
 
 - Scope follows plan.md's root-wins rule: an enrolled repository root absorbs nested enrollments and linked worktrees; `action_project` maps targets through per-worktree `anchors` onto the root's canonical project, and refuses when `Project.unknown` is set (failed git probe, incomplete worktree listing).
 - An action ID minted for a subproject before its repository root was enrolled differs from the ID after enrollment (the canonical project changes). Reconcile must treat such rows as stale (no match), never re-key or merge them silently; add a test.
+
+## Delta 2 from P07 final verification review (fix these first, in P07's files)
+
+P07 landed with actions still gated; these review findings are P11's to fix before reconcile can rely on IDs or the store. Each gets a regression test.
+
+1. MUST — `scripts/kaizen_friction_actions.py` (~line 171): a failed directory fsync leaves the replacement visible and a retry can reuse it without syncing. On fsync failure, treat the write as not durable: re-fsync on retry (or roll back the rename) and never report success until the parent directory sync succeeds.
+2. MUST — `scripts/kaizen-scheduled` (~line 645, 589): a listing with missing (unmounted) worktrees must count as incomplete, so the minted ID cannot change; mark scope unknown instead. Decode `worktree list --porcelain -z` output as bytes/surrogateescape, never text mode, so paths with `\r` are kept.
+3. MUST — `scripts/kaizen-scheduled` (~line 2311): selector remapping must check ownership (innermost independently enrolled repo) before translating to the main checkout, so a file in a nested enrolled repository inside a linked worktree gets one ID regardless of caller scope.
+4. SHOULD — (~line 2315): a mapped counterpart that symlinks into an unenrolled directory must yield unknown scope (refusal), not pass `None` to discovery (TypeError).
+5. SHOULD — (~line 638): when the `-z` probe fails, the legacy porcelain fallback must not mark the listing complete; scope is unknown.
+
+Settled stance (do not reopen): root-wins discovery; same-UID forgery is an accepted residual; caller environment trusted. Verification will confirm these five and look for regressions only.
