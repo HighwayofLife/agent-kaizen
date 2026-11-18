@@ -94,7 +94,13 @@ Or install it straight from GitHub, without a clone:
 
 To update: `git pull` in the clone (or `/plugin marketplace update` for a GitHub install), then `/reload-plugins` or start a new session. Releases bump `version` in `plugin.json` (see [CHANGELOG.md](CHANGELOG.md)); a GitHub install only picks up a new version. Re-run `install-schedule --apply` after updating to refresh the scheduled scripts. See the [0.4.0 migration note](docs/scheduling.md#03x-migration).
 
-### 2. Start the loop in a project
+### 2. Scan recent usage
+
+Run `/agent-kaizen:scan` for a no-write scorecard across local projects, or
+`/agent-kaizen:scan --demo` for an isolated synthetic example. The scan points
+each warning to a skill and skips checks with missing data.
+
+### 3. Start the loop in a project
 
 Open Claude Code in your project and run:
 
@@ -197,6 +203,7 @@ All skills are user-triggered (`disable-model-invocation: true`), so their descr
 
 | Skill | What it does | When |
 |---|---|---|
+| `/agent-kaizen:scan` | No-write scorecard and offline demo | After installation |
 | `/agent-kaizen:start` | Ledger, loop README and baseline of what loads every turn | Once per project |
 | `/agent-kaizen:audit` | Token, turn and tool usage per session and agent type; ranked savings | First, then every few changes |
 | `/agent-kaizen:cycle` | One full loop: audit → review → model and release checks when due → proposals | The default entry point |
