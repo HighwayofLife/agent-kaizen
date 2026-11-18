@@ -877,6 +877,10 @@ def friction_block(state, row, block, start, result_count=0, row_event=None):
     if not (isinstance(session_id, str) and 0 < len(session_id) <= 256 and
             isinstance(tool_id, str) and 0 < len(tool_id) <= 256):
         return
+    ts = row.get("timestamp")
+    stamp = friction_stamp(ts) if isinstance(ts, str) and len(ts) <= 40 else None
+    if stamp is not None and stamp > state["until"]:
+        return
     key = (session_id, tool_id)
     pairs = state["pairs"]
     if key not in pairs:
@@ -887,8 +891,6 @@ def friction_block(state, row, block, start, result_count=0, row_event=None):
     pair = pairs[key]
     if pair is None:
         return
-    ts = row.get("timestamp")
-    stamp = friction_stamp(ts) if isinstance(ts, str) and len(ts) <= 40 else None
     if stamp is None or stamp < state["since"]:
         if stamp is None:
             state["warnings"]["malformed rows"] += 1
@@ -1173,7 +1175,9 @@ def scan_claude(path, agent, since, data, seen_messages, project):
         if (friction is not None and row.get("type") == "system"
                 and row.get("subtype") == "informational" and not row.get("_before_window")):
             text = row.get("content")
-            if isinstance(text, str) and "usage limit" in text[:400].lower():
+            timestamp = row.get("timestamp")
+            stamp = friction_stamp(timestamp) if isinstance(timestamp, str) and len(timestamp) <= 40 else None
+            if stamp is not None and stamp <= friction["until"] and isinstance(text, str) and "usage limit" in text[:400].lower():
                 if len(friction["usage_limits"]) < FRICTION_PAIR_LIMIT:
                     friction["usage_limits"].add(tuple(str(row.get(key, ""))[:256]
                                                        for key in ("sessionId", "uuid", "timestamp")))
@@ -1436,7 +1440,8 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                         admit=admit if cwd is not None else None):
             if "_codex_tool" in row:
                 kind, ident, observation = row["_codex_tool"]
-                if ident is None:
+                stamp = row["timestamp"]
+                if ident is None or (stamp is not None and stamp > friction["until"]):
                     continue
                 if ident not in pairs:
                     if len(pairs) >= FRICTION_PAIR_LIMIT:
@@ -1446,7 +1451,6 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                 pair = pairs[ident]
                 if pair is None:
                     continue
-                stamp = row["timestamp"]
                 if observation is None or stamp is None or stamp < since:
                     pairs[ident] = None
                     continue
@@ -1557,7 +1561,7 @@ def finish_codex_pairs(pairs, friction, session=None):
 
 
 def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=None, *,
-            friction=True, friction_thresholds=None, friction_window=None):
+            friction=True, friction_thresholds=None, friction_window=None, now=None):
     if cwd is not None:
         cwd = [os.path.normpath(os.path.realpath(path)) for path in cwd]
     data = dict(models=defaultdict(Counter), sessions=[], agents=defaultdict(list),
@@ -1567,6 +1571,7 @@ def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=No
     data["format_canary"] = defaultdict(Counter)
     if friction:
         data["_friction"] = dict(pairs={}, capped=False, since=since, usage_limits=set(),
+                                 until=now or datetime.now(timezone.utc),
                                  cwd=set(cwd or ()), permissions={}, warnings=data["warnings"], codex_calls=defaultdict(list),
                                  codex_signals=Counter(), codex_samples=0, timeline=[])
     data["cache_writes"] = {kind: {bucket: Counter(writes=0, write_tokens=0, full_rewrites=0) for bucket in CACHE_BUCKETS}
@@ -2241,7 +2246,7 @@ def report(data, out, scope):
     return "\n".join(lines + extra + ["<!-- token-audit-complete -->"]) + "\n", headline + headlines
 
 
-def write_extract(data, out, directory, scope):
+def write_extract(data, out, directory, scope, now=None):
     temporary = None
     try:
         directory = directory.expanduser().resolve()
@@ -2252,6 +2257,8 @@ def write_extract(data, out, directory, scope):
         friction = data.get("friction")
         if friction and (friction["summary"]["samples"] or friction["summary"]["capped"] or any(friction["signals"].values()) or friction["permission_acceptance"]):
             value["friction"] = friction
+            if now is not None and friction["permission_acceptance"]:
+                value["friction"] = dict(friction, audited_at=now.isoformat())
         with tempfile.NamedTemporaryFile(mode="w", dir=directory, delete=False) as stream:
             temporary = stream.name
             json.dump(value, stream)
@@ -2356,7 +2363,7 @@ def main():
                                                         policy="utc-now-floor-second")
         data = collect(projects, codex_root, since, pricing, pricing_error, options, cwd,
                        friction=not args.no_friction, friction_thresholds=friction_thresholds,
-                       friction_window=friction_window)
+                       friction_window=friction_window, now=now)
         data["cost"]["pricing_warning"] = pricing_age_warning(pricing, now)
         data["scope"] = scope
         apply_regression(data, out, scope, args.extract_out)
@@ -2367,7 +2374,7 @@ def main():
         if not args.no_write:
             out.parent.mkdir(parents=True, exist_ok=True)
             out.write_text(text)
-            extract_path = write_extract(data, out, args.extract_out, scope)
+            extract_path = write_extract(data, out, args.extract_out, scope, now)
         if args.json:
             print(json.dumps(dict(report_path=None if args.no_write else str(out), extract_path=extract_path, **data), indent=2))
         else:
