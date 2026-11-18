@@ -42,9 +42,13 @@ elif args == ['app-server']:
             print(json.dumps({'id': 2, 'result': {'data': [{'hooks': hooks}]}}), flush=True)
 '''
 COPILOT = r'''#!/usr/bin/env python3
-import os, pathlib, sys
+import json, os, pathlib, sys
+with open(os.environ['RECORD'], 'a') as f:
+    f.write(json.dumps(sys.argv[1:]) + '\n')
 if os.environ.get('SIGNIN'):
     print('Please sign in'); sys.exit(1)
+if os.environ.get('MARKET_FAIL'):
+    print('marketplace unavailable'); sys.exit(1)
 if sys.argv[1:3] == ['plugin', 'install']:
     pathlib.Path(os.environ['COPILOT_HOME'], 'installed-plugins/agent-kaizen-tools/agent-kaizen').mkdir(parents=True)
 '''
@@ -114,7 +118,15 @@ class HostProbeTest(unittest.TestCase):
         self.stub('copilot', COPILOT)
         run = self.run_probe('--host', 'copilot', SIGNIN='1')
         self.assertEqual(run.returncode, 0)
-        self.assertIn('needs sign-in', run.stdout)
+        self.assertIn('SKIP copilot plugin install: needs sign-in', run.stdout)
+        calls = [json.loads(line) for line in self.record.read_text().splitlines()]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:3], ['plugin', 'marketplace', 'add'])
+        self.record.unlink()
+        run = self.run_probe('--host', 'copilot', MARKET_FAIL='1')
+        self.assertEqual(run.returncode, 1)
+        self.assertIn('SKIP copilot plugin install: marketplace unavailable', run.stdout)
+        self.assertEqual(len(self.record.read_text().splitlines()), 1)
         run = self.run_probe('--host', 'copilot')
         self.assertEqual(run.returncode, 0, run.stdout)
         self.assertEqual(run.stdout.count('PASS'), 3)
@@ -135,8 +147,13 @@ class HostProbeTest(unittest.TestCase):
         self.assertEqual(run.returncode, 1)
         self.assertIn('FAIL codex hooks discovered:', run.stdout)
         (self.source / 'new-file').write_text('new')
+        outside = self.scratch / 'outside'
+        outside.write_text('private')
+        (self.source / 'external-link').symlink_to(outside)
         self.assertEqual(self.run_probe('--host', 'codex', '--worktree').returncode, 0)
-        self.assertIn('new-file', json.loads(self.export_record.read_text()))
+        exported = json.loads(self.export_record.read_text())
+        self.assertIn('new-file', exported)
+        self.assertNotIn('external-link', exported)
 
 
 if __name__ == '__main__':

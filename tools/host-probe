@@ -66,7 +66,7 @@ def main():
                     listing = run(['git', '-C', str(source), 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], check=True).stdout
                     for name in set(os.fsdecode(listing).split('\0')) - {''}:
                         src, dst = source / name, export / name
-                        if src.is_file():
+                        if not src.is_symlink() and src.is_file():
                             dst.parent.mkdir(parents=True, exist_ok=True)
                             shutil.copy2(src, dst)
                 else:
@@ -170,8 +170,12 @@ def main():
                     if not shutil.which('copilot', path=env.get('PATH')):
                         add('SKIP', 'copilot', 'cli', 'copilot not found on PATH')
                     else:
-                        command('copilot', 'marketplace add', ['copilot', 'plugin', 'marketplace', 'add', str(export)])
-                        installed = command('copilot', 'plugin install', ['copilot', 'plugin', 'install', PLUGIN])
+                        marketplace_added = command('copilot', 'marketplace add', ['copilot', 'plugin', 'marketplace', 'add', str(export)])
+                        if marketplace_added:
+                            installed = command('copilot', 'plugin install', ['copilot', 'plugin', 'install', PLUGIN])
+                        else:
+                            add('SKIP', 'copilot', 'plugin install', results[-1]['detail'])
+                            installed = False
                         if installed:
                             path = tmp / 'copilot/installed-plugins/agent-kaizen-tools/agent-kaizen'
                             add('PASS' if path.is_dir() else 'FAIL', 'copilot', 'installed', 'installation found' if path.is_dir() else 'installation missing')
