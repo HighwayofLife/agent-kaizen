@@ -21,6 +21,7 @@ import argparse
 import contextlib
 import fnmatch
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 import hashlib
 import json
 import math
@@ -702,6 +703,11 @@ def worktree_paths(directory):
         return [], False
     listed, complete = [], exact
     common = git_common_dir(directory)
+    primary = None
+    if common is not None and common.name != ".git":
+        worktree = _git(common, "config", "--local", "--path", "--get", "core.worktree")
+        if worktree and not any(c in worktree for c in "\r\n"):
+            primary = common / worktree
     for field in output.split("\0" if exact else "\n"):
         if not field.startswith("worktree "):
             continue
@@ -710,6 +716,8 @@ def worktree_paths(directory):
             if any(c in name for c in "\r\n"):
                 raise ValueError("invalid worktree path")
             path = canonical_path(name)
+            if path == common and primary is not None:
+                path = canonical_path(primary)
             dotgit = path / ".git"
             if not path.is_dir() or not dotgit.exists():
                 raise ValueError("worktree registration is missing")
@@ -720,6 +728,10 @@ def worktree_paths(directory):
             if dotgit.is_dir():
                 if canonical_path(dotgit) != gitdir:
                     raise ValueError("worktree gitdir mismatch")
+            elif gitdir == common:
+                # A submodule keeps its primary Git directory in the superproject.
+                if primary is None or canonical_path(primary) != path:
+                    raise ValueError("primary worktree registration mismatch")
             elif (common is None or gitdir.parent != common / "worktrees"
                   or canonical_path(gitdir / os.fsdecode((gitdir / "gitdir").read_bytes()).removesuffix("\n")) != dotgit):
                 raise ValueError("worktree registration mismatch")
@@ -932,21 +944,34 @@ def read_state(project):
     return {}
 
 
-def write_state(project, state):
+def write_state(project, state, *, durable=False):
     """Atomically save state, including review ids before starting Claude."""
     path = project.folder / "state.json"
     path.parent.mkdir(parents=True, exist_ok=True)
-    write_state_file(path, state)
+    write_state_file(path, state, durable=durable)
 
 
-def write_state_file(path, state):
+def sync_directory(path):
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def write_state_file(path, state, *, durable=False):
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
                                          prefix=path.name + ".", delete=False) as stream:
             temporary = Path(stream.name)
             stream.write(json.dumps(state, indent=2) + "\n")
+            if durable:
+                stream.flush()
+                os.fsync(stream.fileno())
         os.replace(temporary, path)
+        if durable:
+            sync_directory(path.parent)
     finally:
         if temporary is not None:
             temporary.unlink(missing_ok=True)
@@ -1111,7 +1136,7 @@ def review_dry_run(audits, project_dirs=None, now=None, options=None, json_outpu
             print("audit command: " + shlex.join(audit_command(options, project.folder, project)))
             try:
                 print("review command: " + shlex.join(review_command(
-                    options, mode, report, str(uuid.uuid4()), project.canonical)))
+                    options, mode, report, str(uuid.uuid4()), project.canonical, audits)))
             except ValueError as error:
                 print(f"review command: not built ({error})")
     for path in not_enrolled:
@@ -1167,6 +1192,7 @@ def command_options(args):
         raise FileNotFoundError("token-audit not found; pass --token-audit")
     return argparse.Namespace(
         python=python, claude=claude or "claude", token_audit=token_audit,
+        audits_alias=getattr(args, "audits", None),
         pricing=sibling(getattr(args, "pricing", None), "kaizen-pricing.json", "pricing.json"),
         model=getattr(args, "model", None) or os.environ.get("KAIZEN_REVIEW_MODEL") or "sonnet",
         max_turns=getattr(args, "max_turns", None) or os.environ.get("KAIZEN_REVIEW_MAX_TURNS") or "40",
@@ -1282,10 +1308,11 @@ def backup_root():
     return Path(os.environ.get("KAIZEN_BACKUP_DIR") or claude_home() / "kaizen-backups").expanduser()
 
 
-def backup_deny():
+def backup_deny(*audits):
     paths = dict.fromkeys(deny_path(backup_root(), resolve=resolve) for resolve in (False, True))
     private = [path + "/**" for path in paths]
-    for path in dict.fromkeys(deny_path(audits_dir(), resolve=value) for value in (False, True)):
+    roots = [audits_dir(), *(Path(root).expanduser().absolute() for root in audits if root is not None)]
+    for path in dict.fromkeys(deny_path(root, resolve=value) for root in roots for value in (False, True)):
         private.extend((path + "/host-actions.json", path + "/host-actions.json.*"))
     return [f"{tool}({path})" for path in private for tool in ("Read", "Edit", "Write")]
 
@@ -1454,7 +1481,8 @@ def review_command(options, mode, report, session_id, project_dir=None, audits=N
     denied = [*credential_deny(project_dir), HARD_STOP_DENY]
     if auto:
         denied.extend([*GIT_DENY, *config_home_deny(project_dir), *ledger_rules])
-    denied.extend(backup_deny())
+        denied.extend(f"{tool}({deny_path(HERE)}/**)" for tool in ("Edit", "Write"))
+    denied.extend(backup_deny(audits, getattr(options, "audits_alias", None)))
     command.extend(["--disallowedTools", ",".join(denied)])
     return command + ["--permission-mode", "default" if auto else "dontAsk"]
 
@@ -2189,7 +2217,7 @@ def scheduled_authority(audits, project, options, command, root):
             if (target.is_relative_to(root) or target.is_relative_to(HERE) or target in executables
                     or target.parent == audits and target.name.startswith("host-actions.json")):
                 raise ValueError("notes ledger overlaps the broker state")
-    backup = runpy.run_path(str(backup_script))
+    backup = review_helper("kaizen-backup")
     cfg = effective(project)
     if (not cfg["enabled"]["value"] or cycle_mode(cfg, options) != "auto"
             or cfg["schedule"]["value"] == "off" or cfg["friction"]["value"] == "off"
@@ -2203,7 +2231,7 @@ def scheduled_budget(audits, project, options, command, root, prepared, started,
         return None
     try:
         backup, config = scheduled_authority(audits, project, options, command, root)
-        broker = runpy.run_path(str(HERE / "kaizen_friction_apply.py"))
+        broker = review_helper("kaizen_friction_apply.py")
         if broker["scheduled_marker_refusal"]():
             return None
         version = run_group([command[0], "--version"], cwd="/", timeout=STEP_TIMEOUT,
@@ -2234,7 +2262,7 @@ def scheduled_budget(audits, project, options, command, root, prepared, started,
                         targets[ident] = [info.st_dev, info.st_ino]
         commit_id = None
         if config[0]:
-            host = runpy.run_path(str(HERE / "kaizen_friction_actions.py"))
+            host = review_helper("kaizen_friction_actions.py")
             store = host["HostActions"](audits, root, action_project, key)
             commit_id = store.action_id(project, broker["LOCAL_COMMIT"], run_id, allowed=(run_id,))
         return broker, version[1], proof, targets, commit_id
@@ -2245,7 +2273,7 @@ def scheduled_budget(audits, project, options, command, root, prepared, started,
 def scheduled_action_refusal(catalog_id):
     if catalog_id not in ("linux-localsearch", "local-commit"):
         return "operation is proposal-only"
-    runtime = runpy.run_path(str(HERE / "kaizen_friction_apply.py"))
+    runtime = review_helper("kaizen_friction_apply.py")
     return runtime["scheduled_marker_refusal"]()
 
 
@@ -2292,7 +2320,7 @@ def recover_scheduled_suggestions(store, host, project, *, proposal_only=False):
 def run_scheduled_broker(audits, project, options, *, receipt=None, attempt=None):
     """Reconcile older reservations before allowing any new fixed operation."""
     root = backup_root().resolve()
-    host = runpy.run_path(str(HERE / "kaizen_friction_actions.py"))
+    host = review_helper("kaizen_friction_actions.py")
     store = host["HostActions"](audits, root, action_project, key)
     project_path = project.canonical
     if attempt is None and not recover_scheduled_suggestions(store, host, project_path):
@@ -2308,7 +2336,7 @@ def run_scheduled_broker(audits, project, options, *, receipt=None, attempt=None
     if attempt is not None:
         authorize()
     broker_path = HERE / "kaizen_friction_apply.py"
-    runtime = runpy.run_path(str(broker_path))
+    runtime = review_helper("kaizen_friction_apply.py")
     broker = runtime["BrokerLedger"]
     local_commit = runtime["LOCAL_COMMIT"]
     helper_env = dict(HOME=str(canonical_path(Path.home())), CLAUDE_CONFIG_DIR=str(canonical_path(claude_home())),
@@ -2457,7 +2485,7 @@ def _run_review(audits, project_dirs, options, clock, safety):
                            read_index(audits), project_dirs)
     write_index(audits, projects)
     run_checks(audits, options, projects)
-    rollback_failed = config_failed = False
+    rollback_failed = config_failed = recovery_failed = False
     try:
         degraded = recover_interrupted_run(audits, options)
     except (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
@@ -2468,14 +2496,14 @@ def _run_review(audits, project_dirs, options, clock, safety):
     for project in sorted(projects, key=lambda project: project.canonical):
         project.folder = audits / "projects" / project.key
         cfg, state = effective(project.canonical), read_state(project)
+        project_recovery_failed = False
         try:
             recovered = recover_scheduled_publication(audits, project, options=options, degraded=bool(degraded))
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
-            log(f"friction: publication recovery failed ({failure_text(error)})")
-            continue
+            log(f"friction: publication recovery failed ({failure_text(error)}); continuing ordinary review")
+            recovered = None
+            project_recovery_failed = recovery_failed = True
         if recovered:
-            state.update(reviewed_at=timestamp(clock()), status="ok", proposal=str(recovered))
-            write_state(project, state)
             log(f"{project.canonical}: recovered published review")
             continue
         due, reason = review_gate(project, projects, cfg, state, clock(), cache, options, project_dirs)
@@ -2502,18 +2530,22 @@ def _run_review(audits, project_dirs, options, clock, safety):
             log(f"{project.canonical}: {audit_error}")
             continue
         run_project_report(audits, project.canonical, project.key, options)
-        mode = "propose-only" if degraded else cycle_mode(cfg, options)
+        mode = "propose-only" if degraded or project_recovery_failed else cycle_mode(cfg, options)
         started = clock()
         prepared = None
         try:
-            if cfg["enabled"]["value"] and cfg["friction"]["value"] != "off" and cfg["hostActions"]["value"] != "off":
+            if (recovered is not None and cfg["enabled"]["value"] and cfg["friction"]["value"] != "off"
+                    and cfg["hostActions"]["value"] != "off"):
                 probe = run_step("host-probe", options, ["--project", project.canonical, "--out", project.folder])
                 if probe is None or probe.startswith("unavailable:"):
                     raise ValueError("host probe refresh failed")
-            prepared = friction_prepare(audits, project, report, options, cfg, mode, now, retain=True)
+            if recovered is not None:
+                prepared = friction_prepare(audits, project, report, options, cfg, mode, now, retain=True)
             if prepared is not None and (not isinstance(prepared, tuple) or len(prepared) != 2
                                          or not isinstance(prepared[0], Path) or not isinstance(prepared[1], dict)):
                 raise ValueError("invalid preparation result")
+            if prepared and mode == "auto":
+                review_helper("kaizen_friction_apply.py")
         except (OSError, RuntimeError, ValueError, RecursionError, KeyError, TypeError, AttributeError) as error:
             prepared = None
             log(f"friction: preparation unavailable ({failure_text(error)}); continuing review")
@@ -2529,8 +2561,8 @@ def _run_review(audits, project_dirs, options, clock, safety):
             proposal = project.folder / f"{base}-{number}.md"
             number += 1
         failed = proposal.with_suffix(".failed.md")
-        temporary = None
-        succeeded = False
+        output = temporary = publication_time = None
+        succeeded = imported = publication_saved = False
         ledger_problems = []
         path_error = config_error = timed_out = terminated = None
         rollbacks, rollback_problems = [], []
@@ -2545,9 +2577,9 @@ def _run_review(audits, project_dirs, options, clock, safety):
             if mode == "auto":
                 root.mkdir(parents=True, exist_ok=True)
                 before = backup_directories(root)
-            with (audits / "run.log").open("a", encoding="utf-8") as errors, tempfile.NamedTemporaryFile(
-                    mode="w", encoding="utf-8", dir=project.folder,
-                    prefix=proposal.name + ".", delete=False) as output:
+            with (audits / "run.log").open("a", encoding="utf-8") as errors:
+                output = tempfile.NamedTemporaryFile(mode="w+", encoding="utf-8", dir=project.folder,
+                                                     prefix=proposal.name + ".", delete=False)
                 temporary = Path(output.name)
                 # mkdtemp creates a private (0700) state directory for this run.
                 try:
@@ -2631,7 +2663,6 @@ def _run_review(audits, project_dirs, options, clock, safety):
                 outcome = f"failed (timed out after {timed_out:g} s)"
             elif result.returncode == 0:
                 terminal = False
-                imported = False
                 attempt = None
                 if prepared:
                     try:
@@ -2645,7 +2676,7 @@ def _run_review(audits, project_dirs, options, clock, safety):
                                 raise ValueError("scheduled mutation budget is unknown")
                             commit = broker["commit_tuple"](proof, attestation, verified)
                         terminal, requested = reconcile_scheduled(
-                            audits, project, temporary, prepared[1], acknowledge=False, rendered=rendered,
+                            audits, project, output, prepared[1], acknowledge=False, rendered=rendered,
                             commit_id=commit_id, commit_run=run_id if commit_id and commit and slots else None,
                             authorize=lambda: scheduled_authority(audits, project.canonical, options, command, root))
                         if observation is not None and slots:
@@ -2656,23 +2687,27 @@ def _run_review(audits, project_dirs, options, clock, safety):
                     except (OSError, RuntimeError, ValueError, RecursionError, KeyError, TypeError, AttributeError):
                         log("friction: review output could not be reconciled")
                 if imported and (terminal or attempt is not None):
-                    with temporary.open("rb") as publication:
-                        os.fsync(publication.fileno())
-                    recover_scheduled_publication(audits, project, prepared[1], proposal, temporary)
+                    output.flush()
+                    os.fsync(output.fileno())
+                    publication_time = timestamp(clock())
+                    recover_scheduled_publication(audits, project, prepared[1], proposal, output,
+                                                  reviewed_at=publication_time)
+                if not os.path.samestat(temporary.lstat(), os.fstat(output.fileno())):
+                    raise ValueError("review output path was replaced")
                 os.replace(temporary, proposal)
                 if imported and (terminal or attempt is not None):
-                    descriptor = os.open(proposal.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
-                    try:
-                        os.fsync(descriptor)
-                    finally:
-                        os.close(descriptor)
+                    sync_directory(proposal.parent)
                 if imported and attempt is not None and not terminal:
                     try:
                         run_scheduled_broker(audits, project, options, receipt=prepared[1], attempt=attempt)
                     except (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
                         log("friction: broker work remains pending")
                 if imported and (terminal or attempt is not None):
-                    recover_scheduled_publication(audits, project, degraded=bool(degraded))
+                    try:
+                        publication_saved = bool(recover_scheduled_publication(audits, project, degraded=bool(degraded)))
+                    except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+                        project_recovery_failed = recovery_failed = True
+                        log(f"friction: publication recovery failed ({failure_text(error)})")
                 succeeded = True
                 outcome = f"reviewed ({mode})"
             else:
@@ -2685,26 +2720,30 @@ def _run_review(audits, project_dirs, options, clock, safety):
             outcome = "unsupported-path: " + path_error
         except (OSError, ValueError) as error:
             outcome = f"failed ({error})"
+        finally:
+            if ledger_problems:
+                safety["ledger_violation"] = True
+            if output is not None:
+                with output:
+                    if config_error and not ledger_problems:
+                        output.write("\nledger-config-error: " + config_error + "\n")
+                    if ledger_problems:
+                        output.write("\nledger-violation: " + "; ".join(ledger_problems) + "\n")
         rollback_failed = rollback_failed or bool(rollback_problems)
         if rollbacks and not rollback_problems:
             outcome = "rolled-back"
         if config_error and not ledger_problems:
             config_failed = True
             outcome = "ledger-config-error: " + config_error
-            if temporary is not None:
-                with temporary.open("a", encoding="utf-8") as output:
-                    output.write("\n" + outcome + "\n")
         if ledger_problems:
-            safety["ledger_violation"] = True
             outcome = "ledger-violation: " + "; ".join(ledger_problems)
-            if temporary is not None:
-                with temporary.open("a", encoding="utf-8") as output:
-                    output.write("\n" + outcome + "\n")
         exited = clock()
         if succeeded:
             state.pop("ledger_errors", None)
             state.pop("last_error", None)
-            state.update(reviewed_at=timestamp(exited), status="ok", report=str(report), proposal=str(proposal))
+            state.update(status="ok", report=str(report), proposal=str(proposal))
+            if not project_recovery_failed and (not prepared or imported):
+                state["reviewed_at"] = publication_time or timestamp(exited)
         else:
             state.update(status="ledger-violation" if ledger_problems else
                          "ledger-config-error" if config_error else
@@ -2730,13 +2769,14 @@ def _run_review(audits, project_dirs, options, clock, safety):
                     outcome += f"; output: {failed}"
                 except (OSError, ValueError) as error:
                     outcome += f"; output: {temporary} (could not save as {failed}: {error})"
-        write_state(project, state)
+        if not publication_saved:
+            write_state(project, state)
         log(f"{project.canonical}: {outcome}")
         if terminated is not None:
             raise terminated
         if ledger_problems:
             return 1
-    return 1 if rollback_failed or config_failed else 0
+    return 1 if rollback_failed or config_failed or recovery_failed else 0
 
 
 def write_config(path, updates):
@@ -2825,7 +2865,7 @@ def show_config(project_dir=None):
     print(json.dumps(result, indent=2))
 
 
-def action_project(directory, *, selector=None):
+def action_project(directory, *, selector=None, allow_missing=False):
     directory = canonical_path(Path(directory).expanduser())
     if not directory.is_dir():
         raise ValueError("expected a project directory")
@@ -2859,7 +2899,13 @@ def action_project(directory, *, selector=None):
     if anchor is None:
         raise ValueError("action target is outside the enrolled project")
     check_owner(target, required=False)
-    target = canonical_path(project.canonical / target.relative_to(anchor))
+    target = project.canonical / target.relative_to(anchor)
+    try:
+        target = canonical_path(target)
+    except FileNotFoundError:
+        if not allow_missing:
+            raise
+        target = target.resolve()
     if target != project.canonical and project.canonical not in target.parents:
         raise ValueError("action target scope is unknown")
     check_owner(target)
@@ -2931,22 +2977,50 @@ def actions_command(args):
     return 2
 
 
+@lru_cache(maxsize=None)
+def review_helper(name):
+    """Keep the runner's Python helpers loaded across the unattended review."""
+    return runpy.run_path(str(HERE / name))
+
+
 def friction_prepare(audits, project, report, options, cfg, mode, clock, *, interactive=False, retain=False):
     """Prepare bounded local evidence without a review or acknowledgement."""
-    module = runpy.run_path(str(HERE / "kaizen_friction_prepare.py"))
+    module = review_helper("kaizen_friction_prepare.py")
     return module["prepare"](Path(audits), backup_root(), project, report, cfg, mode,
-                             clock(), action_project, key, interactive=interactive, retain=retain)
+                             clock(), action_project, key, interactive=interactive, retain=retain,
+                             host=review_helper("kaizen_friction_actions.py"))
 
+
+@contextlib.contextmanager
+def review_output(output):
+    if isinstance(output, Path):
+        descriptor = os.open(output, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, "r+", encoding="utf-8") as stream:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError("expected a regular review output file")
+            yield stream
+    else:
+        yield output
 
 
 def reconcile_scheduled(audits, project, output, receipt, *, acknowledge=True, rendered=None, authorize=None,
                         commit_id=None, commit_run=None):
     """Import one validated action line, then acknowledge only terminal requests."""
-    module = runpy.run_path(str(HERE / "kaizen_friction_prepare.py"))
-    host = runpy.run_path(str(HERE / "kaizen_friction_actions.py"))
-    if (len(rendered.encode("utf-8")) if rendered is not None else output.stat().st_size) > 1024 * 1024:
+    if isinstance(output, Path):
+        with review_output(output) as stream:
+            return reconcile_scheduled(audits, project, stream, receipt, acknowledge=acknowledge, rendered=rendered,
+                                       authorize=authorize, commit_id=commit_id, commit_run=commit_run)
+    module = review_helper("kaizen_friction_prepare.py")
+    host = review_helper("kaizen_friction_actions.py")
+    output.flush()
+    output.seek(0)
+    limit = 1024 * 1024
+    if os.fstat(output.fileno()).st_size > limit:
         raise ValueError("review output too large")
-    text = output.read_text(encoding="utf-8") if rendered is None else rendered
+    text = output.read(limit + 1) if rendered is None else rendered
+    if len(text.encode("utf-8")) > limit:
+        raise ValueError("review output too large")
     lines = text.splitlines(keepends=True)
     matches = [line for line in lines if line.startswith(host["BLOCK_PREFIX"])]
     if len(matches) != 1 or text.count(host["BLOCK_PREFIX"]) != 1:
@@ -2971,7 +3045,7 @@ def reconcile_scheduled(audits, project, output, receipt, *, acknowledge=True, r
             dict(v=1, actions=[dict(id=ident, intent=intent) for ident, intent in requests.items()])) + " -->"
     store = host["HostActions"](audits, backup_root(), action_project, key)
     imported = module["import_scheduled"](audits, backup_root(), project, receipt,
-                                          effective(project.canonical), now(), action_project, key, block)
+                                          effective(project.canonical), now(), action_project, key, block, host=host)
     reserved = commit_run is not None and commit_intent == "apply"
     if reserved:
         # The public catalogue import has already revalidated the preparation.
@@ -2990,26 +3064,41 @@ def reconcile_scheduled(audits, project, output, receipt, *, acknowledge=True, r
             rows[commit_id] = store._new_row(identity, "Verified scheduled review backup", now().isoformat())
             generations[bound] = {commit_id: "pending"}
             store._save(directory, rows, receipts)
-    output.write_text("".join(line for line in lines if line != matches[0]), encoding="utf-8")
+    output.seek(0)
+    output.write("".join(line for line in lines if line != matches[0]))
+    output.truncate()
     terminal = not reserved and all(value == "terminal" for value in imported.values())
     if terminal and acknowledge:
-        module["acknowledge_scheduled"](store, project, receipt)
+        module["acknowledge_scheduled"](store, project, receipt, host)
     return terminal, reserved
 
 
-def recover_scheduled_publication(audits, project, receipt=None, proposal=None, output=None, *, options=None, degraded=False):
+def recover_scheduled_publication(audits, project, receipt=None, proposal=None, output=None, *,
+                                  options=None, degraded=False, reviewed_at=None):
     try:
-        module = runpy.run_path(str(HERE / "kaizen_friction_prepare.py"))
+        module = review_helper("kaizen_friction_prepare.py")
     except FileNotFoundError:
         return False
     if "scheduled_publication" not in module:
         return False
-    if receipt is None:
-        host = runpy.run_path(str(HERE / "kaizen_friction_actions.py"))
-        store = host["HostActions"](audits, backup_root(), action_project, key)
-        name = "publication-" + project.key + ".json"
+    host = review_helper("kaizen_friction_actions.py")
+    store = host["HostActions"](audits, backup_root(), action_project, key)
+    digest = None
+    if receipt is not None:
+        with review_output(output) as stream:
+            stream.flush()
+            stream.seek(0)
+            raw = stream.buffer.read((1 << 20) + 1)
+            if len(raw) > 1 << 20:
+                raise ValueError("review output too large")
+            digest = hashlib.sha256(raw).hexdigest()
+        reviewed_at = reviewed_at or timestamp(now())
+
+    def ready():
+        if not os.path.lexists(store.path):
+            return True
+        pending_before = any(row.get("pending") for row in store.scoped(project.canonical))
         try:
-            pending_before = any(row.get("pending") for row in store.scoped(project.canonical))
             if pending_before:
                 if degraded:
                     recover_scheduled_suggestions(store, host, project.canonical, proposal_only=True)
@@ -3018,19 +3107,20 @@ def recover_scheduled_publication(audits, project, receipt=None, proposal=None, 
         except (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
             log("friction: broker recovery remains pending")
             return False
-        if (degraded and pending_before) or any(row.get("pending") for row in store.scoped(project.canonical)):
-            return False
-        if (store.friction / name).exists():
-            with host["_directory"](store.friction, private=True) as directory:
-                marker = json.loads(host["_read"](directory, name, 1 << 20))
-                state = json.loads(host["_read"](directory, "prepare-" + project.key + ".json", 1 << 20))
-                if str(state["generation"]).zfill(20) > marker["generation"]:
-                    os.unlink(name, dir_fd=directory)
-                    return False
-            if any(row.get("pending") for row in store.scoped(project.canonical)):
-                return False
-    return module["scheduled_publication"](audits, backup_root(), project, action_project, key,
-                                            receipt, proposal, output)
+        return not (degraded and pending_before) and not any(
+            row.get("pending") for row in store.scoped(project.canonical))
+
+    def persist(published, cutoff, report):
+        state = read_state(project)
+        previous = parse_time(state.get("reviewed_at"))
+        if previous is None or previous <= cutoff:
+            for field in ("ledger_errors", "last_error", "last_error_at"):
+                state.pop(field, None)
+            state.update(reviewed_at=timestamp(cutoff), status="ok", report=report, proposal=str(published))
+        write_state(project, state, durable=True)
+
+    return module["scheduled_publication"](audits, store, project, host, persist, ready, receipt=receipt,
+                                           proposal=proposal, digest=digest, reviewed_at=reviewed_at)
 
 def friction_reconcile_command(args):
     try:

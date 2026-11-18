@@ -15,6 +15,7 @@ import re
 import runpy
 import stat
 import warnings
+from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
 
 
@@ -218,7 +219,7 @@ def _signature(receipt, secret):
 
 
 def prepare(audits, backups, project, report, cfg, mode, current, canonical_project, project_key,
-            *, interactive=False, retain=False, _check=None, _complete=None):
+            *, interactive=False, retain=False, _check=None, _complete=None, host=None):
     """Freeze bounded inputs, or re-derive them under the generation lock for reconciliation."""
     if cfg["enabled"]["value"] is False or cfg["friction"]["value"] == "off":
         if _check is not None:
@@ -235,7 +236,8 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
             or project.folder != audits / "projects" / project.key):
         raise ValueError("noncanonical preparation scope")
     here = Path(__file__).resolve().parent
-    host = runpy.run_path(str(here / "kaizen_friction_actions.py"))
+    if host is None:
+        host = runpy.run_path(str(here / "kaizen_friction_actions.py"))
     current = current.astimezone(timezone.utc)
     folders = (project.folder, project.canonical / "docs/kaizen")
     if report is not None:
@@ -332,6 +334,7 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
         cohort = json.dumps([str(project.canonical), scope], sort_keys=True, separators=(",", ":"))
         if block is not None and (not isinstance(block.get("flags"), list)
                 or any(not isinstance(flag, dict) or flag.get("id") not in LABELS
+                       or ("basis" in flag and flag["basis"] not in ("none", "measured", "row_gap", "mixed"))
                        or not isinstance(flag.get("subject"), str) or len(flag["subject"]) > 4096
                        for flag in block["flags"])):
             raise ValueError("unsupported flag")
@@ -339,8 +342,13 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
                                          block.get("flags"), baseline) if block is not None else ([], baseline))
         visible_flags, allowed, action_views = [], {}, {}
         for flag in flags:
-            ident = host["_id"](secret, str(project.canonical), flag["id"], flag["subject"])
-            visible_flags.append(dict(id=ident, label=LABELS[flag["id"]], value=flag["value"]))
+            subject = flag["subject"]
+            view = dict(label=LABELS[flag["id"]], value=flag["value"])
+            if "basis" in flag:
+                view["basis"] = flag["basis"]
+                subject = json.dumps([subject, flag["basis"]])
+            view["id"] = host["_id"](secret, str(project.canonical), flag["id"], subject)
+            visible_flags.append(view)
         for finding in probe["findings"] if cfg["hostActions"]["value"] != "off" else []:
             entry = catalog.get(finding.get("catalog_id")) if isinstance(finding, dict) else None
             if (not entry or entry.get("needs_research") or finding.get("id") != entry["detect"].get("finding")
@@ -354,24 +362,13 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
                 if not selector.startswith("/"):
                     raise ValueError("expected a path selector")
                 try:
-                    _, target = canonical_project(project.canonical, selector=selector)
+                    _, target = canonical_project(project.canonical, selector=selector,
+                                                  allow_missing=finding["id"] == "indexed-output")
                 except (ValueError, OSError):
                     if finding["id"] != "indexed-output":
                         raise
-                    try:
-                        raw = Path(selector)
-                        anchor = max((p for p in project.anchors if p == raw or p in raw.parents),
-                                     key=lambda p: len(p.parts))
-                        resolved = raw.resolve(strict=True)
-                        if resolved != anchor and anchor not in resolved.parents:
-                            raise ValueError("selector escapes worktree")
-                        target = project.canonical / resolved.relative_to(anchor)
-                        mapped = target.resolve()
-                        if mapped != project.canonical and project.canonical not in mapped.parents:
-                            raise ValueError("selector escapes canonical project")
-                    except (ValueError, OSError):
-                        warnings.warn("dropping indexed-output finding with invalid selector")
-                        continue
+                    warnings.warn("dropping indexed-output finding with invalid selector")
+                    continue
                 selector = str(target)
                 if finding["id"] == "sprawl" and target != project.canonical:
                     raise ValueError("invalid sprawl selector")
@@ -479,8 +476,7 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
         return (path, receipt) if retain else path
 
 
-def acknowledge_scheduled(store, project, receipt):
-    host = runpy.run_path(str(Path(__file__).resolve().parent / "kaizen_friction_actions.py"))
+def acknowledge_scheduled(store, project, receipt, host):
     with host["_directory"](store.friction, private=True) as directory, host["_locked"](directory, "prepare"):
         name = "prepare-" + project.key + ".json"
         state = _json(host["_read"](directory, name, LIMIT), host)
@@ -561,7 +557,7 @@ def reconcile(audits, backups, project, inputs, cfg, current, canonical_project,
                    _check=receipt, _complete=complete)
 
 
-def import_scheduled(audits, backups, project, receipt, cfg, current, canonical_project, project_key, block):
+def import_scheduled(audits, backups, project, receipt, cfg, current, canonical_project, project_key, block, *, host=None):
     """Recheck the retained scheduled authority under the generation lock before import."""
     def complete(store, host, directory, state_name, state, checked, imported):
         result = store.import_actions(block, checked["allowed"], project.canonical,
@@ -573,40 +569,55 @@ def import_scheduled(audits, backups, project, receipt, cfg, current, canonical_
         return result
     return prepare(audits, backups, project, Path(receipt["identities"]["report"]["path"]), cfg,
                    receipt["policy"]["mode"], current, canonical_project, project_key,
-                   _check=receipt, _complete=complete)
+                   _check=receipt, _complete=complete, host=host)
 
 
-def scheduled_publication(audits, backups, project, canonical_project, project_key, receipt=None, proposal=None, output=None):
-    """Record a publication before rename, or recover its acknowledgement after rename."""
-    host = runpy.run_path(str(Path(__file__).resolve().parent / "kaizen_friction_actions.py"))
-    store = host["HostActions"](audits, backups, canonical_project, project_key)
+def scheduled_publication(audits, store, project, host, persist, ready, *, receipt=None, proposal=None,
+                          digest=None, reviewed_at=None):
+    """Track a publication until acknowledgement and review state are both durable."""
     name = "publication-" + project.key + ".json"
-    with host["_directory"](store.friction, True, private=True) as directory:
-        if receipt is not None:
-            digest = hashlib.sha256(Path(output).read_bytes()).hexdigest()
-            host["_replace"](directory, name, _encode(dict(v=1, generation=receipt["generation"],
-                                                           proposal=proposal.name, sha256=digest)))
-            return False
+    with ExitStack() as stack:
         try:
-            marker = _json(host["_read"](directory, name, LIMIT), host)
+            directory = stack.enter_context(host["_directory"](store.friction, receipt is not None, private=True))
+            if receipt is None:
+                marker = _json(host["_read"](directory, name, LIMIT), host)
         except FileNotFoundError:
+            if receipt is not None:
+                raise
+            ready()
+            return False
+        if receipt is not None:
+            host["_replace"](directory, name, _encode(dict(v=1, audits=str(audits), reviewed_at=reviewed_at,
+                                                           generation=receipt["generation"], proposal=proposal.name,
+                                                           sha256=digest)))
             return False
         generation, filename = marker.get("generation"), marker.get("proposal")
         if (not isinstance(generation, str) or not re.fullmatch(r"[0-9]{20}", generation)
                 or not isinstance(filename, str) or not re.fullmatch(r"cycle-[0-9-]+\.md", filename)):
             raise ValueError("invalid publication marker")
-        published = project.folder / filename
-        if not published.exists():
-            os.unlink(name, dir_fd=directory)
-            return False
-        raw, _ = _read(published, host)
-        if hashlib.sha256(raw).hexdigest() != marker.get("sha256"):
-            warnings.warn("published review changed before acknowledgement; preserving the edited report")
+        if marker.get("audits", str(audits)) != str(audits):
+            return None  # Another audit root owns the generation until its publication is recovered.
         frozen = _json(host["_read"](directory, "receipt-" + project.key + "-" + generation + ".json", LIMIT), host)
         if (frozen.get("channel") != "scheduled" or frozen.get("project") != str(project.canonical)
                 or frozen.get("generation") != generation
                 or not hmac.compare_digest(frozen.get("signature", ""), _signature(frozen, store._secret()))):
             raise ValueError("invalid publication receipt")
-        acknowledge_scheduled(store, project, frozen)
+        if "audits" not in marker and Path(frozen["identities"]["extract"]["path"]).parent.parent != audits:
+            return None
+        if not ready():
+            return False
+        cutoff = (_stamp(marker["reviewed_at"]) if "reviewed_at" in marker else
+                  datetime.fromtimestamp(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mtime, timezone.utc))
+        published = project.folder / filename
+        state = _json(host["_read"](directory, "prepare-" + project.key + ".json", LIMIT), host)
+        if str(state["generation"]).zfill(20) > generation or not published.exists():
+            os.unlink(name, dir_fd=directory)
+            return False
+        raw, _ = _read(published, host)
+        if hashlib.sha256(raw).hexdigest() != marker.get("sha256"):
+            warnings.warn("published review changed before acknowledgement; preserving the edited report")
+        acknowledge_scheduled(store, project, frozen, host)
+        persist(published, cutoff, frozen["identities"]["report"]["path"])
         os.unlink(name, dir_fd=directory)
+        os.fsync(directory)
         return published

@@ -1,0 +1,3 @@
+- Protect installed helpers and host-action receipts during unattended reviews, and strip action comments through the original output file handle.
+- Recover publications using their original audit root and activity cutoff. Ordinary reviews continue after recovery errors, and failed friction imports remain eligible for retry.
+- Prepare friction for enrolled submodules, reject another project's indexed outputs, and distinguish measured regressions from row-gap estimates.

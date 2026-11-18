@@ -31,6 +31,24 @@ class ScheduledFrictionTests(PreparationTests):
         self.assertIsNone(self.scheduled())
         self.assertTrue(inputs.exists())
 
+    def test_stripping_uses_the_open_output_after_path_is_replaced(self):
+        _, receipt = self.scheduled()
+        output = self.write(self.obj.folder / "review.md", 'Review\n' + self.actions().read_text())
+        victim = self.write(self.root / "unrelated", "Keep\n")
+        host = runpy.run_path(str(self.runner["HERE"] / "kaizen_friction_actions.py"))
+        import_actions = host["HostActions"].import_actions
+
+        def swap(store, *args, **kwargs):
+            output.unlink()
+            output.symlink_to(victim)
+            return import_actions(store, *args, **kwargs)
+
+        load = runpy.run_path
+        with patch.object(host["HostActions"], "import_actions", swap), patch.object(
+                runpy, "run_path", side_effect=lambda path: host if path.endswith("kaizen_friction_actions.py") else load(path)):
+            self.runner["reconcile_scheduled"](self.config / "audits", self.obj, output, receipt)
+        self.assertEqual(victim.read_text(), "Keep\n")
+
     def marker_request(self):
         target = self.project / "build"
         target.mkdir()
@@ -217,6 +235,20 @@ class ScheduledFrictionTests(PreparationTests):
         state = json.loads(next((self.backups / "friction").glob("prepare-*.json")).read_text())
         self.assertEqual(state["acknowledged_generation"], receipt["generation"])
 
+    def test_other_audits_root_leaves_publication_marker(self):
+        _, receipt = self.scheduled()
+        audits = self.config / "audits"
+        output = self.write(self.obj.folder / "review.tmp", "Review\n" + self.actions().read_text())
+        self.runner["reconcile_scheduled"](audits, self.obj, output, receipt, acknowledge=False)
+        recover = self.runner["recover_scheduled_publication"]
+        proposal = self.obj.folder / "cycle-2026-11-18.md"
+        recover(audits, self.obj, receipt, proposal, output)
+        output.rename(proposal)
+        other = self.root / "other-audits"
+        other_project = self.runner["Project"](self.project, [self.project], other / "projects" / self.obj.key)
+        self.assertFalse(recover(other, other_project))
+        self.assertEqual(recover(audits, self.obj), proposal)
+
     def test_degraded_recovery_does_not_acknowledge_pending_project_actions(self):
         import os
         _, _, output, receipt = self.marker_request()
@@ -281,6 +313,17 @@ if os.environ.get('REVIEW_SLEEP'): time.sleep(10)
     def state(self):
         return json.loads(next((self.backups / 'friction').glob('prepare-*.json')).read_text())
 
+    def test_unsafe_publication_directory_still_allows_ordinary_review(self):
+        self.write(self.config / 'agent-kaizen.json', '{"friction":"off"}')
+        self.backups.mkdir()
+        unsafe = self.root / 'unsafe'
+        unsafe.mkdir()
+        (self.backups / 'friction').symlink_to(unsafe, target_is_directory=True)
+        result = self.review_run()
+        self.assertIn('publication recovery failed', result.stdout)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertEqual(result.returncode, 1)
+
     def test_publish_failure_and_crash_recovery_in_review(self):
         import shutil
         scripts = self.root / 'publication-scripts'
@@ -300,13 +343,23 @@ if os.environ.get('REVIEW_SLEEP'): time.sleep(10)
         proposals = [p for p in self.obj.folder.glob('cycle-*.md') if not p.name.endswith('.failed.md')]
         self.assertEqual(len(proposals), 1)
         self.assertNotIn('acknowledged_generation', self.state())
+        marker = next((self.backups / 'friction').glob('publication-*.json'))
+        cutoff = json.loads(marker.read_text())['reviewed_at']
+        persist = '        write_state(project, state, durable=True)'
+        runner.write_text(source.replace(persist, '        os._exit(78)', 1))
+        self.assertEqual(self.review_run(runner=runner).returncode, 78)
+        self.assertTrue(marker.exists())
+        review_state = self.obj.folder / 'state.json'
+        self.assertNotIn('reviewed_at', json.loads(review_state.read_text()))
         runner.write_text(source)
         calls_before = len(self.calls())
-        result = self.review_run(runner=runner)
+        result = self.review_run('--now', (self.current + timedelta(days=1)).isoformat(), runner=runner)
         self.assertIn('recovered published review', result.stdout)
         self.assertEqual(len(self.calls()), calls_before)
         self.assertEqual([p for p in self.obj.folder.glob('cycle-*.md') if not p.name.endswith('.failed.md')], proposals)
         self.assertEqual(self.state()['acknowledged_generation'], '00000000000000000001')
+        self.assertEqual(json.loads(review_state.read_text())['reviewed_at'], cutoff)
+        self.assertFalse(marker.exists())
 
     def test_legacy_pending_receipts_stop_blocking_scheduled_acknowledgement(self):
         host = runpy.run_path(str(self.runner_path.parent / "kaizen_friction_actions.py"))
@@ -565,6 +618,8 @@ print(os.environ['AUDIT_REPORT'])
         helper.write_text(original.replace('def import_actions(self,', 'def import_actions_disabled(self,', 1))
         first = self.review_run(runner=scripts / 'kaizen-scheduled')
         self.assertIn('could not be reconciled', first.stdout)
+        review_state = json.loads((self.obj.folder / 'state.json').read_text())
+        self.assertNotIn('reviewed_at', review_state)
         state = self.state()
         self.assertNotIn('acknowledged_generation', state)
         receipt_path = next((self.backups / 'friction').glob('receipt-*.json'))

@@ -9,7 +9,7 @@ import shutil
 import subprocess
 import sys
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from test_scripts import SCRIPTS, StubCase, executable, write
 
@@ -567,15 +567,16 @@ path.symlink_to(target)
     def test_violation_write_errors_skip_later_projects_and_housekeeping(self):
         later = self.root / 'z-project'
         (later / 'docs/kaizen').mkdir(parents=True)
-        original_open, original_state = Path.open, self.module.write_state
+        temporary, original_state = self.module.tempfile.NamedTemporaryFile, self.module.write_state
         for failure in ('report', 'state'):
             with self.subTest(failure=failure):
                 self.configure_ledgers()
 
-                def guarded_open(path, mode='r', *args, **kwargs):
-                    if failure == 'report' and path.name.startswith('cycle-') and mode == 'a':
-                        raise OSError('report write fixture')
-                    return original_open(path, mode, *args, **kwargs)
+                def guarded_output(*args, **kwargs):
+                    output = temporary(*args, **kwargs)
+                    if failure == 'report' and Path(output.name).name.startswith('cycle-'):
+                        output.write = Mock(side_effect=OSError('report write fixture'))
+                    return output
 
                 def guarded_state(project, state):
                     if failure == 'state' and state.get('status') == 'ledger-violation':
@@ -584,7 +585,7 @@ path.symlink_to(target)
 
                 with patch.dict(os.environ, self.env, clear=True), \
                         patch.object(self.module.LedgerGuard, 'verify', return_value=['violation fixture']), \
-                        patch.object(Path, 'open', guarded_open), \
+                        patch.object(self.module.tempfile, 'NamedTemporaryFile', guarded_output), \
                         patch.object(self.module, 'write_state', guarded_state), \
                         patch.object(self.module, 'scheduled_housekeep') as housekeep:
                     code = self.module.main(['review', '--force', '--project-dir', str(self.project),
