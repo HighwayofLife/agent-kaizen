@@ -3009,7 +3009,8 @@ def recover_scheduled_publication(audits, project, receipt=None, proposal=None, 
         store = host["HostActions"](audits, backup_root(), action_project, key)
         name = "publication-" + project.key + ".json"
         try:
-            if any(row.get("pending") for row in store.scoped(project.canonical)):
+            pending_before = any(row.get("pending") for row in store.scoped(project.canonical))
+            if pending_before:
                 if degraded:
                     recover_scheduled_suggestions(store, host, project.canonical, proposal_only=True)
                 elif options is not None:
@@ -3017,7 +3018,7 @@ def recover_scheduled_publication(audits, project, receipt=None, proposal=None, 
         except (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
             log("friction: broker recovery remains pending")
             return False
-        if degraded or any(row.get("pending") for row in store.scoped(project.canonical)):
+        if (degraded and pending_before) or any(row.get("pending") for row in store.scoped(project.canonical)):
             return False
         if (store.friction / name).exists():
             with host["_directory"](store.friction, private=True) as directory:
