@@ -64,7 +64,7 @@ class HostProbeTests(unittest.TestCase):
 
     def test_linux_findings_and_unavailable(self):
         probe = self.probe()
-        with mock.patch.object(probe, 'command', side_effect=['mds\n', 'a\0b\0']), \
+        with mock.patch.object(probe, 'command', side_effect=['mds\n', 'a\0b\0', None]), \
              mock.patch.object(probe, 'read_proc', return_value=1), \
              mock.patch.object(probe_module.shutil, 'disk_usage', return_value=mock.Mock(total=100, free=5)):
             report = probe.run()
@@ -95,6 +95,130 @@ class HostProbeTests(unittest.TestCase):
         self.assertIn('timeout', probe.warnings)
         probe.deadline = 0
         self.assertIsNone(probe.command(['missing']))
+        self.assertIn('budget', probe.warnings)
+
+    def test_git_output_safety_and_worktree_identity(self):
+        def git(*args):
+            return subprocess.run(['git', '-C', str(self.project), *args],
+                                  check=True, capture_output=True, text=True)
+        git('init', '-q')
+        git('config', 'commit.gpgsign', 'false')
+        git('config', 'user.name', 'Test')
+        git('config', 'user.email', 'test@example.invalid')
+        (self.project / '.gitignore').write_text('build/\ndist/\nout/\ncoverage/\n')
+        (self.project / 'seed').write_text('seed')
+        git('add', '.')
+        git('commit', '-qm', 'initial')
+        for name in ('build', 'dist', 'coverage'):
+            (self.project / name).mkdir()
+            (self.project / name / 'data').write_text('abc')
+        git('add', '-f', 'dist/data')
+        (self.project / 'coverage' / '.git').mkdir()
+        (self.project / 'out').symlink_to(self.project / 'build', target_is_directory=True)
+        linked = self.root / 'linked'
+        git('worktree', 'add', '-qb', 'linked', str(linked))
+        probe = self.probe()
+        trees = probe.worktrees()
+        self.assertEqual({t['path'] for t in trees}, {str(self.project), str(linked)})
+        directories = probe.directories(trees)
+        # A nested repository makes the entire measurement unknown.
+        self.assertIsNone(directories)
+        (self.project / 'coverage' / '.git').rmdir()
+        directories = probe.directories(trees)
+        self.assertEqual([d['path'] for d in directories],
+                         [str(self.project / 'build'), str(self.project / 'coverage')])
+        self.assertEqual([d['size_bytes'] for d in directories], [3, 3])
+        self.assertTrue(all(d['path'] != str(linked) for d in directories))
+
+    def test_unknown_git_and_bounded_size(self):
+        probe = self.probe()
+        with mock.patch.object(probe, 'command', return_value=None):
+            report = probe.run()
+        self.assertIsNone(report['facts']['worktree_count'])
+        self.assertIsNone(report['facts']['regenerable_bytes'])
+        probe.deadline = 0
+        self.assertIsNone(probe.size(self.project))
+
+    def test_macos_index_exclusions_and_unknown(self):
+        probe = self.probe('macos')
+        output = self.project / 'build'
+        output.mkdir()
+        directory = {'path': str(output), 'worktree': str(self.project), 'size_bytes': 11 * 1024**3,
+                     'excluded': {'nomedia': False, 'noindex_ancestor': False}}
+        trees = [{'path': str(self.project), 'is_main': True}]
+        def run(tm_output, marker=None, platform='macos'):
+            directory['excluded'].pop('timemachine', None)
+            directory['excluded'].pop('spotlight', None)
+            if marker:
+                marker.touch()
+            probe.platform = platform
+            def command(argv):
+                if argv[0] == 'tmutil':
+                    self.assertEqual(argv, ['tmutil', 'isexcluded', str(output)])
+                    return tm_output
+                return 'mds\nbackupd\n'
+            with mock.patch.object(probe, 'command', side_effect=command) as runner, \
+                 mock.patch.object(probe, 'worktrees', return_value=trees), \
+                 mock.patch.object(probe, 'directories', return_value=[directory]):
+                report = probe.run()
+            if marker:
+                marker.unlink()
+            return {f['catalog_id'] for f in report['findings']}, runner
+        findings, _ = run('[Included] /output\n')
+        self.assertIn('spotlight-output', findings)
+        self.assertIn('timemachine-output', findings)
+        findings, _ = run('[Excluded] /output\n', self.project / '.metadata_never_index')
+        self.assertNotIn('spotlight-output', findings)
+        self.assertNotIn('timemachine-output', findings)
+        findings, _ = run(None, output / '.metadata_never_index')
+        self.assertNotIn('spotlight-output', findings)
+        self.assertNotIn('timemachine-output', findings)
+        self.assertIsNone(directory['excluded']['timemachine'])
+        self.assertIn('timemachine_unknown', probe.warnings)
+        findings, runner = run('[Included] /output', platform='linux')
+        self.assertNotIn('spotlight-output', findings)
+        self.assertNotIn('timemachine-output', findings)
+        self.assertFalse(any(call.args[0][0] == 'tmutil' for call in runner.call_args_list))
+
+    def test_linked_worktree_candidate_refused(self):
+        linked = self.project / 'build'
+        linked.mkdir()
+        probe = self.probe()
+        trees = [{'path': str(self.project), 'is_main': True},
+                 {'path': str(linked), 'is_main': False}]
+        with mock.patch.object(probe, 'git', side_effect=['!! build/\0', '']):
+            self.assertEqual(probe.directories(trees), [])
+
+    def test_tmutil_deadline_timeout_is_unknown(self):
+        probe = self.probe('macos')
+        probe.deadline = time.monotonic() + 0.05
+        with mock.patch.object(probe_module.subprocess, 'Popen') as popen:
+            popen.side_effect = OSError('unavailable')
+            self.assertIsNone(probe.command(['tmutil', 'isexcluded', str(self.project)]))
+        self.assertIn('command_unavailable', probe.warnings)
+        probe.deadline = 0
+        self.assertIsNone(probe.command(['tmutil', 'isexcluded', str(self.project)]))
+        self.assertIn('budget', probe.warnings)
+
+    def test_sensitive_and_ambiguous_scope_refused(self):
+        probe = self.probe()
+        self.assertIsNone(probe.directories([{'path': str(self.root)}]))
+        self.assertIn('ambiguous_scope', probe.warnings)
+        for root in (Path('/'), Path.home().resolve(), self.root / 'Dropbox'):
+            probe.project = root
+            self.assertIsNone(probe.directories([{'path': str(root)}]))
+            self.assertIn('sensitive_scope', probe.warnings)
+
+    def test_enumeration_bounds_are_unknown(self):
+        probe = self.probe()
+        trees = [{'path': str(self.project), 'is_main': True}]
+        with mock.patch.object(probe, 'git', return_value='!! build/\0' * 257):
+            self.assertIsNone(probe.directories(trees))
+        self.assertIn('directory_limit', probe.warnings)
+        with mock.patch.object(probe, 'git', return_value=None):
+            self.assertIsNone(probe.directories(trees))
+        probe.deadline = 0
+        self.assertIsNone(probe.size(self.project))
         self.assertIn('budget', probe.warnings)
 
     def test_missing_catalog_and_copied_install(self):
