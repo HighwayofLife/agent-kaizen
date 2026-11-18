@@ -1,0 +1,8 @@
+{
+  "session_id": "00000000-0000-0000-0000-000000000000",
+  "transcript_path": "/path/to/transcript.jsonl",
+  "cwd": "/path/to/project",
+  "permission_mode": "default",
+  "hook_event_name": "SessionStart",
+  "source": "startup"
+}
