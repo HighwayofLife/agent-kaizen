@@ -125,6 +125,12 @@ SCHEMA = {
     "retention": {"kind": "enum", "default": "auto", "choices": ("auto", "off"), "global_only": True},
     "retentionOverrides": {"kind": "object", "default": {}, "global_only": True,
                            "check": valid_retention_overrides},
+    "friction": {"kind": "enum", "default": "on", "choices": ("on", "off")},
+    "frictionSlowCallSeconds": {"kind": "int", "default": 120, "minimum": 10},
+    "frictionHeavySeconds": {"kind": "int", "default": 60, "minimum": 5},
+    "frictionOutputDirs": {"kind": "paths", "default": [], "project_only": True},
+    "frictionSampler": {"kind": "enum", "default": "on", "choices": ("on", "off"), "global_only": True},
+    "hostActions": {"kind": "enum", "default": "apply", "choices": ("apply", "suggest", "off")},
     "projectCommands": {"kind": "object", "default": {}, "global_only": True,
                         "check": valid_project_commands},
     "notesLedger": {"kind": "object", "default": {}, "global_only": True,
@@ -243,6 +249,9 @@ def effective(project_dir=None):
                 continue
             if SCHEMA[name].get("global_only", False) and source == "project":
                 print(f"config: {path}: {name} is global-only, ignored", file=sys.stderr)
+                continue
+            if SCHEMA[name].get("project_only", False) and source == "global":
+                print(f"config: {path}: {name} is project-only, ignored", file=sys.stderr)
                 continue
             value = cfg[name]
             if not valid_value(name, value):
@@ -2307,6 +2316,8 @@ def main(argv=None):
             spec = SCHEMA[name]
             if spec.get("global_only", False) and args.project_dir is not None:
                 parser.error(f"{name} is global-only")
+            if spec.get("project_only", False) and args.project_dir is None:
+                parser.error(f"{name} is project-only")
             kind = spec["kind"]
             if kind == "bool":
                 if value not in ("true", "false"):
