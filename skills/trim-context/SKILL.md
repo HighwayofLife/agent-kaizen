@@ -7,6 +7,9 @@ argument-hint: "[propose|safe|auto|yolo]"
 
 # Trim the always-loaded tool and context surface
 
+**Plugin root:** `${CLAUDE_PLUGIN_ROOT}`. If that is still a `${...}` placeholder, use the folder that contains `skills/` (this file is `skills/<name>/SKILL.md`), and substitute that path, in quotes, wherever this skill uses `CLAUDE_PLUGIN_ROOT`.
+**Not in Claude Code?** Read `docs/hosts.md` in the plugin root first. Skip steps that only work in Claude Code, and follow its propose-only rule before changing any host configuration.
+
 Every MCP tool schema, connector, enabled plugin, skill description and custom-agent description can add tokens to every turn, even if you never use it. Removing what this project never uses saves tokens on every turn after that.
 
 **Changes:** settings and config, after you approve. Back up each file changed, including `.claude/settings.local.json` when used, first.

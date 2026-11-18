@@ -7,6 +7,9 @@ argument-hint: "[propose|safe|auto|yolo|propose-only]"
 
 # Review the latest audit and improve (the recurring step)
 
+**Plugin root:** `${CLAUDE_PLUGIN_ROOT}`. If that is still a `${...}` placeholder, use the folder that contains `skills/` (this file is `skills/<name>/SKILL.md`), and substitute that path, in quotes, wherever this skill uses `CLAUDE_PLUGIN_ROOT`.
+**Not in Claude Code?** Read `docs/hosts.md` in the plugin root first. Skip steps that only work in Claude Code, and follow its propose-only rule before changing any host configuration.
+
 The part of the loop that repeats. Check whether past changes paid off, keep the ones that did, revert the ones that didn't, and pick the next improvements.
 
 **Changes:** proposes changes, then implements the ones you approve.

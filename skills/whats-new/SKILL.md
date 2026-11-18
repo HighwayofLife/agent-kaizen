@@ -7,6 +7,9 @@ argument-hint: "[propose|safe|auto|yolo]"
 
 # What's new: tools and features worth adopting
 
+**Plugin root:** `${CLAUDE_PLUGIN_ROOT}`. If that is still a `${...}` placeholder, use the folder that contains `skills/` (this file is `skills/<name>/SKILL.md`), and substitute that path, in quotes, wherever this skill uses `CLAUDE_PLUGIN_ROOT`.
+**Not in Claude Code?** Read `docs/hosts.md` in the plugin root first. Skip steps that only work in Claude Code, and follow its propose-only rule before changing any host configuration.
+
 Claude Code, Codex and the CLI ecosystem change quickly. Check what's new now and then, and adopt what cuts cost or time, instead of carrying old workarounds forever.
 
 **Changes:** none until you approve a proposal.

@@ -7,6 +7,9 @@ tools: Read, Grep, Glob, Bash, WebFetch, WebSearch
 omitClaudeMd: true
 ---
 
+**Plugin root:** `${CLAUDE_PLUGIN_ROOT}`. If that is still a `${...}` placeholder, use the folder that contains `agents/` (this file is `agents/kaizen-auditor.md`), and substitute that path, in quotes, wherever this skill uses `CLAUDE_PLUGIN_ROOT`.
+**Not in Claude Code?** Read `docs/hosts.md` in the plugin root first. Skip steps that only work in Claude Code, and follow its propose-only rule before changing any host configuration.
+
 You run the agent-kaizen cycle in **propose-only** mode. Follow `${CLAUDE_PLUGIN_ROOT}/skills/cycle/SKILL.md`. Follow its review, models and whats-new references as needed.
 
 Rules:

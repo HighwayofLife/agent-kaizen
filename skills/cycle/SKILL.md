@@ -7,6 +7,9 @@ argument-hint: "[propose|safe|auto|yolo|propose-only]"
 
 # One self-improvement cycle
 
+**Plugin root:** `${CLAUDE_PLUGIN_ROOT}`. If that is still a `${...}` placeholder, use the folder that contains `skills/` (this file is `skills/<name>/SKILL.md`), and substitute that path, in quotes, wherever this skill uses `CLAUDE_PLUGIN_ROOT`.
+**Not in Claude Code?** Read `docs/hosts.md` in the plugin root first. Skip steps that only work in Claude Code, and follow its propose-only rule before changing any host configuration.
+
 This is the entry point when you don't know which skill to run. It runs the loop once. With `propose-only` it changes nothing and prints the proposal as Markdown. The scheduler saves it as `cycle-<yyyy-mm-dd>.md` (`-2` suffix for a second one that day) in this project's report folder, printed as `reports` by `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled config show --for .`. Run interactively, write it to `docs/kaizen/`.
 
 

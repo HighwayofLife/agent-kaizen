@@ -7,6 +7,10 @@ argument-hint: "[propose|safe|auto|yolo]"
 
 # Hand coding to Codex by script, not by a wrapper agent
 
+**Plugin root:** `${CLAUDE_PLUGIN_ROOT}`. If that is still a `${...}` placeholder, use the folder that contains `skills/` (this file is `skills/<name>/SKILL.md`), and substitute that path, in quotes, wherever this skill uses `CLAUDE_PLUGIN_ROOT`.
+**Not in Claude Code?** Read `docs/hosts.md` in the plugin root first. Skip steps that only work in Claude Code, and follow its propose-only rule before changing any host configuration.
+Inside Codex, this skill does not apply: do the work in the current session.
+
 If you use OpenAI Codex as well as Claude, send it work through a script that runs it, runs the checks, loops failures back and prints a short report. A Claude subagent that only relays Codex output costs a full agent context for nothing.
 
 **Changes:** installs the bundled scripts and adds a CLAUDE.md section, after you approve.
