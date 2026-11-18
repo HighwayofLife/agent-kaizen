@@ -41,3 +41,11 @@ Read `git show wt/p14:scripts/worktree-prune` at `apply`, `undo`, `check_idle`, 
 ## Report
 
 Report changed files and line counts, exact checks and outcomes, known uncertainty and any blocked verification. Label measurements with baseline/conditions. Redact paths and identifiers from shared output. Leave plugin version and release CHANGELOG to P27. Do not commit or push.
+
+## Delta from P12 security review (2026-11-18)
+
+P12 fixed the preflight findings (hardened git runner, live-byte cleanliness, identity-bound registration and containment, cache-free ancestry, worktree-private refs and reflog). These review findings were deferred here and must be closed before apply or undo can write:
+
+1. **Effect-boundary race.** Repeating preflight still leaves a window before deletion in which files, refs, locks and path identity can change, and Git's no-force removal check omits ignored files. Do not rely on `git worktree remove`'s own cleanliness check. Make removal compare-before-remove: move the target directory atomically to a private quarantine sibling (same filesystem, `rename` by dir fd), re-verify identity and live-byte cleanliness of the quarantined tree, and only then delete it or restore it on any difference. Remove the admin dir only after that.
+2. **Journal authentication.** An environment-selected journal location and same-UID permissions do not authenticate a record. Fix the journal location (no env override for apply/undo), bind each record to the target's recorded identity, branch oid and primary oid, and refuse undo when the restore path exists, is outside the recorded project, or the branch tip no longer matches the record. A forged record must never select an unrelated restore path.
+3. **Hooks during undo.** Undo's `worktree add` must run through the P12 hardened runner (`core.hooksPath=/dev/null`, fsmonitor off, fixed env, absolute git) with `--no-checkout` followed by a filter-free restore (write blobs from `cat-file` yourself, or `checkout` only after proving no filter/attribute drivers apply), so no `post-checkout` hook or filter can run.
