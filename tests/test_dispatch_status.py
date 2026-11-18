@@ -91,6 +91,7 @@ class DispatchStatusTests(StubCase):
         wrapper.write_text('#!/bin/sh\ncase "$*" in *"worktree list"*" -z"*) exit 129;; esac\n'
                            'exec "%s" "$@"\n' % real)
         wrapper.chmod(0o755)
+        self.env['KAIZEN_GIT'] = str(wrapper)
         output = self.run_script('dispatch-status', '--worktree-facts').stdout
         self.assertIn(': unknown', output.split('WORKTREE FACTS (advisory)')[1])
         wrapper.write_text('#!/bin/sh\nexit 127\n')
@@ -110,6 +111,7 @@ class DispatchStatusTests(StubCase):
         wrapper.write_text('#!/bin/sh\ncase "$*" in *"worktree list"*" -z"*) exit 129;; esac\n'
                            'exec "%s" "$@"\n' % real)
         wrapper.chmod(0o755)
+        self.env['KAIZEN_GIT'] = str(wrapper)
         output = self.run_script('dispatch-status', '--worktree-facts').stdout
         self.assertIn(str(other), output.split('WORKTREE FACTS (advisory)')[1])
 
