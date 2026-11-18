@@ -35,7 +35,8 @@ before it and docs/kaizen/LEDGER.md.
    If a change made things worse or nobody is using it (for
    example a tool that agents never call), propose the fix: better wording where agents
    actually read it, a hook, or a revert.
-2. List the 5 largest remaining costs and any new patterns since the last review.
+2. Include measured findings from `${CLAUDE_PLUGIN_ROOT}/skills/friction/SKILL.md` in the review and distinguish hypotheses; cycle runs that analysis once. An absent view skips only friction analysis.
+   List the 5 largest remaining costs and any new patterns since the last review.
 3. Check that the rules are reaching the agents. In propose-only mode (no shell), use the
    newest token-audit report only (the per-agent Bash and tool sections; use Grep to count, e.g.
    codemap vs rg calls); never Read raw transcripts. Interactively, pick 3 recent subagent transcripts and

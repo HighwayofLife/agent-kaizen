@@ -163,7 +163,7 @@ If you'd rather not approve every change:
 |---|---|
 | `propose` | Default: every change is shown and waits for your OK |
 | `safe` | Applies low-risk, reversible changes (docs, instruction cleanups that drop no rule, new scripts, one-row model trials) and proposes the rest |
-| `auto` / `yolo` | Applies everything except the hard stops: secrets, spending money or new vendors, loosening permissions, deleting things, commits and pushes, package installs (unless `allowInstalls`) |
+| `auto` / `yolo` | Applies everything except the hard stops: secrets, spending money or new vendors, loosening permissions, deleting things, outward-facing Git actions, package installs (unless `allowInstalls`) |
 
 In every mode, each applied change is backed up (to `KAIZEN_BACKUP_DIR`, or `kaizen-backups/` under the Claude config dir), verified (`jq`, hook tests, `claude plugin validate`), rolled back automatically if verification fails, and logged in the ledger. At most 3 changes are made per run (`maxChangesPerRun`), so the next audit can tell which change did what. `/agent-kaizen:undo last` (or `run`) reverses changes. Claude Code's own permission prompts still apply: run the session with edits auto-accepted to avoid them. Details: [docs/autonomy.md](docs/autonomy.md).
 
@@ -246,6 +246,7 @@ All skills are user-triggered (`disable-model-invocation: true`), so their descr
 | `/agent-kaizen:start` | Ledger, loop README and baseline of what loads every turn | Once per project |
 | `/agent-kaizen:audit` | Token, turn and tool usage per session and agent type; ranked savings | First, then every few changes |
 | `/agent-kaizen:cycle` | One full loop: audit → review → model and release checks when due → proposals | The default entry point |
+| `/agent-kaizen:friction` | Analyze measured tool-call friction and propose remedies | When a prepared friction view is available |
 | `/agent-kaizen:review` | Fill in measured effects, keep or revert, pick the next 3 changes | When a new audit appears |
 | `/agent-kaizen:roster` | Finds the AI subscriptions and CLIs you have, researches each model's strengths, and builds agents, routing, fallbacks and escalation ladders | Once, then when you add or drop a subscription |
 | `/agent-kaizen:slim-instructions` | Shrink CLAUDE.md / AGENTS.md into core + topic docs + orchestrator-only import | Big instruction overhead |

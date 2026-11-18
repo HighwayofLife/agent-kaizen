@@ -59,7 +59,7 @@ rare workflow.
 - Spending money or using a new vendor: new subscriptions or API plans, or sending repo code to a vendor that hasn't seen it (for example the roster bake-off).
 - Loosening permissions: `bypassPermissions`, broad allow rules, or removing deny rules or safety hooks.
 - Deleting things: transcripts, backups, branches, build caches in active worktrees, or files kaizen did not create. Exceptions: the plugin's own generated data under <audits> (deleted on the retention schedule in every mode; see the retention and retentionOverrides settings in scheduling.md); files kaizen created in an earlier run, through `kaizen-backup undo`.
-- Outward-facing actions: commits, pushes, PRs, publishing, messages.
+- Outward-facing actions: pushes, PRs, publishing, messages. A scoped local commit of kaizen’s own changes through `kaizen-backup commit` is allowed only when its checks pass and the tree was clean at the start; it is never pushed.
 - Installing packages, unless `allowInstalls` is true.
 - Installing, changing or removing scheduled jobs (launchd, cron).
 - Changing the interactive `autonomy` setting itself (only `/agent-kaizen:autonomy`, run by you, does that).
