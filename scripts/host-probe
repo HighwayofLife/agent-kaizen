@@ -1,0 +1,231 @@
+#!/usr/bin/env python3
+"""Collect bounded, read-only host facts in a private local report."""
+import argparse
+import csv
+from datetime import datetime, timezone
+import fnmatch
+import io
+import json
+import math
+import os
+from pathlib import Path
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import uuid
+
+HERE = Path(__file__).resolve().parent
+LIMIT = 1024 * 1024
+
+
+def sibling(*names):
+    for name in names:
+        path = HERE / name
+        if path.is_file():
+            return path
+    return HERE / names[-1]
+
+
+class Probe:
+    def __init__(self, project, platform, proc, catalog):
+        self.project, self.platform, self.proc = project, platform, proc
+        self.deadline = time.monotonic() + 30
+        self.warnings = []
+        self.catalog = {}
+        try:
+            with catalog.open('rb') as stream:
+                data = json.loads(stream.read(LIMIT + 1))
+            if (not isinstance(data, dict) or not isinstance(data.get('actions'), list)
+                    or not isinstance(data.get('processes'), dict)
+                    or not isinstance(data.get('cloud_sync_names'), list)):
+                raise ValueError('invalid catalogue')
+            self.catalog = data
+        except (OSError, ValueError, UnicodeError):
+            self.warn('catalogue')
+
+    def warn(self, category):
+        if category not in self.warnings:
+            self.warnings.append(category)
+
+    def remaining(self, check):
+        left = self.deadline - time.monotonic()
+        if left <= 0:
+            self.warn('budget')
+        return left
+
+    def command(self, argv):
+        left = self.remaining(argv[0])
+        if left <= 0:
+            return None
+        try:
+            process = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       start_new_session=(os.name == 'posix'),
+                                       env=dict(os.environ, GIT_OPTIONAL_LOCKS='0'))
+            buffers = [bytearray(), bytearray()]
+            overflow = [False, False]
+
+            def drain(stream, index):
+                with stream:
+                    while True:
+                        chunk = stream.read(65536)
+                        if not chunk:
+                            break
+                        room = max(0, LIMIT - len(buffers[index]))
+                        buffers[index].extend(chunk[:room])
+                        overflow[index] |= len(chunk) > room
+
+            threads = [threading.Thread(target=drain, args=(stream, i), daemon=True)
+                       for i, stream in enumerate((process.stdout, process.stderr))]
+            for thread in threads:
+                thread.start()
+            try:
+                process.wait(timeout=min(5, left))
+            except subprocess.TimeoutExpired:
+                if os.name == 'posix':
+                    os.killpg(process.pid, signal.SIGKILL)
+                else:
+                    process.kill()
+                process.wait()
+                self.warn('timeout')
+                return None
+            finally:
+                for thread in threads:
+                    thread.join(timeout=max(0, min(0.1, self.remaining('command'))))
+            if any(overflow) or any(thread.is_alive() for thread in threads):
+                self.warn('command_output')
+                return None
+            if process.returncode:
+                self.warn('command_failed')
+                return None
+            return bytes(buffers[0]).decode('utf-8', errors='replace')
+        except OSError:
+            self.warn('command_unavailable')
+            return None
+
+    def processes(self):
+        output = self.command(['tasklist', '/fo', 'csv', '/nh'] if self.platform == 'windows'
+                              else ['ps', '-A', '-o', 'comm='])
+        if output is None:
+            return None
+        if self.platform == 'windows':
+            names = [row[0] for row in csv.reader(io.StringIO(output)) if row][:10000]
+        else:
+            names = output.splitlines()[:10000]
+        names = [os.path.basename(name.strip()).lower().removesuffix('.exe') for name in names]
+        result = {}
+        for category, spec in self.catalog.get('processes', {}).items():
+            if not isinstance(spec, dict) or not isinstance(spec.get('names'), list):
+                self.warn('catalogue')
+                continue
+            if self.platform not in spec.get('os', []) and 'any' not in spec.get('os', []):
+                continue
+            patterns = [p.lower() for p in spec['names'] if isinstance(p, str)]
+            hits = sum(any(fnmatch.fnmatchcase(name, p) for p in patterns) for name in names)
+            result[category] = {'count': hits, 'informational': bool(spec.get('informational'))}
+        return result
+
+    def read_proc(self, relative):
+        if self.remaining('proc') <= 0:
+            return None
+        try:
+            with (self.proc / relative).open() as stream:
+                value = int(stream.read(4096).strip())
+            if value < 0:
+                raise ValueError('negative')
+            return value
+        except (OSError, ValueError):
+            self.warn('proc_unavailable')
+            return None
+
+    def run(self):
+        facts = {'cpu_count': os.cpu_count(), 'load': None, 'free_disk_bytes': None,
+                 'free_disk_pct': None, 'cloud_roots': [], 'processes': None,
+                 'inotify_max_user_watches': None, 'tracked_files': None}
+        try:
+            load = os.getloadavg()
+            if all(math.isfinite(v) and v >= 0 for v in load):
+                facts['load'] = list(load)
+        except (AttributeError, OSError):
+            self.warn('load_unavailable')
+        try:
+            disk = shutil.disk_usage(self.project)
+            facts['free_disk_bytes'] = disk.free
+            facts['free_disk_pct'] = 100 * disk.free / disk.total if disk.total else None
+        except OSError:
+            self.warn('disk_unavailable')
+        patterns = [p for p in self.catalog.get('cloud_sync_names', []) if isinstance(p, str)]
+        facts['cloud_roots'] = sorted({part for part in self.project.parts
+                                       if any(fnmatch.fnmatchcase(part, p) for p in patterns)})[:100]
+        facts['processes'] = self.processes()
+        if self.platform == 'linux':
+            facts['inotify_max_user_watches'] = self.read_proc('sys/fs/inotify/max_user_watches')
+            output = self.command(['git', '-c', 'core.fsmonitor=false', '-C', str(self.project), 'ls-files', '-z'])
+            if output is not None:
+                facts['tracked_files'] = min(500000, output.count('\0'))
+        else:
+            self.warn('inotify_unavailable')
+        findings = []
+
+        def add(detector, action_id, subject, evidence):
+            for action in self.catalog.get('actions', []):
+                if (isinstance(action, dict) and action.get('id') == action_id
+                        and not action.get('needs_research')
+                        and isinstance(action.get('detect'), dict)
+                        and action['detect'].get('finding') == detector):
+                    findings.append({'id': detector, 'catalog_id': action_id,
+                                     'subject': subject, 'evidence': evidence})
+                    break
+
+        free, pct = facts['free_disk_bytes'], facts['free_disk_pct']
+        if free is not None and (free < 20 * 1024**3 or (pct is not None and pct < 10)):
+            add('low-disk', 'low-disk', 'project-volume', {'free_disk_bytes': free})
+        for name in facts['cloud_roots']:
+            add('cloud-paths', 'cloud-sync-repo', name, {'matched': 1})
+        watches, tracked = facts['inotify_max_user_watches'], facts['tracked_files']
+        if watches is not None and tracked is not None and watches < 2 * tracked:
+            add('inotify', 'inotify-limit', 'inotify', {'watches': watches, 'tracked_files': tracked})
+        return {'v': 1, 'project': str(self.project), 'generated_at': datetime.now(timezone.utc).isoformat(),
+                'facts': facts, 'findings': findings, 'regenerable_dirs': [], 'worktrees': [],
+                'warnings': self.warnings}
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--project', required=True, type=Path)
+    parser.add_argument('--out', required=True, type=Path)
+    parser.add_argument('--json', action='store_true')
+    args = parser.parse_args(argv)
+    if not args.project.is_dir():
+        parser.error('--project must be an existing directory')
+    out = args.out.absolute()
+    try:
+        if any(path.is_symlink() for path in (out, *out.parents)):
+            raise OSError('symlink in output path')
+        out.mkdir(parents=True, exist_ok=True, mode=0o700)
+        platform = {'darwin': 'macos', 'linux': 'linux', 'win32': 'windows'}.get(sys.platform, 'unknown')
+        report = Probe(args.project.resolve(), platform, Path('/proc'),
+                       sibling('kaizen-friction-catalog.json', 'friction-catalog.json')).run()
+        payload = json.dumps(report, indent=2, allow_nan=False) + '\n'
+        destination = out / ('host-probe-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ-') + uuid.uuid4().hex + '.json')
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(mode='w', encoding='utf-8', dir=out, prefix='.host-probe-', delete=False) as stream:
+                temporary = stream.name
+                stream.write(payload)
+            os.link(temporary, destination)
+        finally:
+            if temporary:
+                os.unlink(temporary)
+        print(payload if args.json else destination, end='' if args.json else '\n')
+        return 0
+    except (OSError, ValueError) as exc:
+        print('host-probe: output failed: {}'.format(type(exc).__name__), file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
