@@ -19,6 +19,28 @@ loader.exec_module(probe_module)
 
 
 class HostProbeTests(unittest.TestCase):
+    def test_hidden_index_and_submodule_ignore_make_cleanliness_unknown(self):
+        def git(root, *args):
+            return subprocess.run(['git', '-C', str(root), *args], check=True, capture_output=True)
+        git(self.project, 'init', '-q')
+        (self.project / 'tracked').write_text('original')
+        git(self.project, 'add', 'tracked')
+        git(self.project, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+            '-c', 'commit.gpgsign=false', 'commit', '-qm', 'initial')
+        linked = self.root / 'linked'
+        git(self.project, 'worktree', 'add', '-qb', 'linked', str(linked))
+        self.assertTrue(self.probe().worktrees()[1]['clean'])
+        for flag in ('assume-unchanged', 'skip-worktree'):
+            with self.subTest(flag=flag):
+                git(linked, 'update-index', '--' + flag, 'tracked')
+                self.assertIsNone(self.probe().worktrees()[1]['clean'])
+                git(linked, 'update-index', '--no-' + flag, 'tracked')
+        for key in ('submodule.example.ignore', 'diff.ignoreSubmodules'):
+            with self.subTest(key=key):
+                git(linked, 'config', key, 'all')
+                self.assertIsNone(self.probe().worktrees()[1]['clean'])
+                git(linked, 'config', '--unset', key)
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

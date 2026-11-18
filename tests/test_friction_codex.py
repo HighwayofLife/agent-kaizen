@@ -40,7 +40,7 @@ class FrictionCodexTests(unittest.TestCase):
                     input='text(await tools.exec_command({cmd:"cargo test --lib"}))')
         end = row('response_item', 5, type='custom_tool_call_output', call_id='private-id',
                   output=[dict(type='input_text', text='Script completed\nWall time 125.5 seconds\nOutput:\n'
-                               + 'private-body' * 1000 + ' upper limit on inotify watches reached')])
+                               + 'private-body' * 2000 + ' upper limit on inotify watches reached')])
         usage = dict(input_tokens=7, output_tokens=3, total_tokens=10)
         jsonl(self.rollout, [self.meta, row('turn_context', -1, model='example', effort='medium'),
                              start, end, start, end,
@@ -130,7 +130,16 @@ class FrictionCodexTests(unittest.TestCase):
         with self.rollout.open('a') as stream:
             invalid = json.dumps(result('invalid', output=prefix + 'x' * 600))
             stream.write(invalid.replace('xxxx', r'\qxx', 1) + '\n')
-        self.assertEqual(self.collect()['friction']['summary']['measured'], 0)
+        friction = self.collect()['friction']
+        self.assertEqual(friction['summary']['measured'], 1)
+        self.assertEqual(friction['summary']['slow_calls'][0]['seconds_total'], 150)
+
+    def test_large_output_retains_timing_and_signals(self):
+        output = 'Wall time: 121 seconds\nProcess exited with code 124\nOutput:\n' + 'x' * 20000
+        jsonl(self.rollout, [self.meta, call('large'), result('large', output=output)])
+        friction = self.collect()['friction']
+        self.assertEqual(friction['summary']['slow_calls'][0]['seconds_total'], 121)
+        self.assertEqual(friction['signals']['timeout_hints'], 1)
 
     def test_output_scope_fields_after_output(self):
         other = str(self.root / 'elsewhere')
@@ -160,4 +169,11 @@ class FrictionCodexTests(unittest.TestCase):
         events += [call('status'), result('status', output='database is locked', status='error'),
                    call('stderr'), result('stderr', output='stdout', status='error', stderr='database is locked')]
         jsonl(self.rollout, [self.meta, *events])
-        self.assertEqual(self.collect()['friction']['signals']['lock_phrases'], 2)
+        self.assertEqual(self.collect()['friction']['signals']['lock_phrases'], 3)
+
+    def test_lock_in_combined_output_requires_nonzero_exit(self):
+        for code, expected in ((0, 0), (1, 1)):
+            with self.subTest(code=code):
+                jsonl(self.rollout, [self.meta, call('combined'), result(
+                    'combined', output=f'Process exited with code {code}\nOutput:\ndatabase is locked')])
+                self.assertEqual(self.collect()['friction']['signals']['lock_phrases'], expected)
