@@ -4,6 +4,7 @@ import argparse
 import datetime
 import json
 import os
+import re
 from pathlib import Path
 import shutil
 import subprocess
@@ -36,6 +37,21 @@ def export_source(dest):
             shutil.copy2(src, target)
 
 
+def safe_trace(value):
+    return value if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,64}', value, flags=re.ASCII) else '<other>'
+
+
+def redact(value):
+    if isinstance(value, str):
+        value = value.replace(str(HOME), '~')
+        return re.sub(r'/(?:Users|home)/[^/\n]+', '~', value)
+    if isinstance(value, list):
+        return [redact(item) for item in value]
+    if isinstance(value, dict):
+        return {redact(key): redact(item) for key, item in value.items()}
+    return value
+
+
 def observe(value):
     name, sep, result = value.partition('=')
     status, _, note = result.partition(':')
@@ -54,7 +70,8 @@ def main():
             p.add_argument('--source', choices=('local', 'github'), default='local')
         if action == 'check':
             p.add_argument('--install-dir', type=Path)
-            p.add_argument('--observe', action='append', type=observe, default=[])
+            p.add_argument('--observe', action='append', type=observe, default=[],
+                           help='skill_invoked is required: run agent-kaizen:scan --demo; report pass or fail[:note]')
     args = parser.parse_args()
     statefile = CONFIG / 'host-acceptance' / (args.host + '.json')
     try:
@@ -63,7 +80,10 @@ def main():
         state = {}
     cli = 'codex' if args.host == 'codex' else 'copilot'
     if args.action == 'status':
-        print('Done: report at ' + state['report'] if state.get('report') else
+        report = Path(state['report']).resolve() if isinstance(state.get('report'), str) else None
+        reportdir = (ROOT / 'out/host-acceptance').resolve()
+        valid_report = report and report.is_file() and reportdir in report.parents
+        print('Done: report at ' + redact(str(report)) if valid_report else
               'Phase 2: start a new session, then run `check`' if state.get('installed_at') else
               'Phase 1: run `install`')
         return 0
@@ -143,12 +163,16 @@ def check(args, state, statefile, cli):
         except (OSError, subprocess.SubprocessError):
             errors.append(script)
     add('scripts', 'FAIL' if errors else 'PASS', ', '.join(errors) or 'help commands passed')
+    manual = args.host == 'vscode' and (state.get('install') == 'manual' or args.install_dir is not None)
     try:
         result = run([sys.executable, installed / 'scripts/kaizen-doctor'])
         match = 'Codex: plugin version' if cli == 'codex' else 'Copilot: plugin installed'
-        add('doctor', 'PASS' if result.returncode == 0 and any('PASS' in line and match in line for line in result.stdout.splitlines()) else 'FAIL', match)
+        passed = result.returncode == 0 and any('PASS' in line and match in line for line in result.stdout.splitlines())
+        add('doctor', 'PASS' if passed else 'SKIP' if manual else 'FAIL',
+            'manual install; kaizen-doctor checks the Copilot CLI location only' if manual and not passed else match)
     except (OSError, subprocess.SubprocessError) as exc:
-        add('doctor', 'FAIL', exc)
+        add('doctor', 'SKIP' if manual else 'FAIL',
+            'manual install; kaizen-doctor checks the Copilot CLI location only' if manual else exc)
     errors = []
     with tempfile.TemporaryDirectory() as tmp:
         env = {k: v for k, v in os.environ.items() if not k.startswith(('KAIZEN_', 'CLAUDE_', 'CODEX_', 'COPILOT_'))}
@@ -176,16 +200,32 @@ def check(args, state, statefile, cli):
                 traces.append(item)
     except (OSError, ValueError, KeyError, TypeError):
         pass
+    hosts = sorted({safe_trace(t.get('host')) for t in traces})
+    traces = [t for t in traces if t.get('host') == cli]
+    for item in traces:
+        for key in ('event', 'tool'):
+            if item.get(key) is not None:
+                item[key] = safe_trace(item[key])
+        item['keys'] = [safe_trace(k) for k in item['keys']] if isinstance(item.get('keys'), list) else None
+        item['env'] = [safe_trace(k) for k in item['env']] if isinstance(item.get('env'), list) else None
     seen = sorted(set((str(t.get('event')), str(t.get('tool'))) for t in traces))
+    sessions = sum(str(t.get('event', '')).lower() == 'sessionstart' for t in traces)
     for event in ('sessionStart', 'userPromptSubmit', 'postToolUse'):
         found = any(str(t.get('event', '')).lower() == event.lower() and (event != 'postToolUse' or str(t.get('tool', '')).lower() in ('bash', 'shell', 'shell_command', 'powershell')) for t in traces)
-        hint = ('hooks not trusted in /hooks or session started before install' if cli == 'codex' else 'hooks not loaded') if not traces else 'seen: ' + str(seen)
-        add('hooks-live:' + event, 'PASS' if found else 'FAIL', 'observed' if found else hint)
+        hint = ('seen: ' + str(seen) if traces else
+                'no {} lines; seen hosts: {}'.format(cli, ', '.join(hosts)) if hosts else
+                'hooks not trusted in /hooks or session started before install' if cli == 'codex' else 'hooks not loaded')
+        detail = 'observed' if found else hint
+        if event == 'sessionStart':
+            detail += '; {} sessionStart lines{}'.format(sessions, ' (multiple sessions contributed)' if sessions > 1 else '')
+        add('hooks-live:' + event, 'PASS' if found else 'FAIL', detail)
     observations = {name: (status, note) for name, status, note in args.observe}
     for name in ('skill_invoked', 'notice_seen', 'skills_not_preloaded'):
         status, detail = observations.get(name, ('FAIL' if name == 'skill_invoked' else 'SKIP', 'not reported'))
+        if name == 'skill_invoked' and status == 'SKIP':
+            status, detail = 'FAIL', 'required observation skipped: ' + detail
         add(name, status, detail or 'reported')
-    combinations = sorted(set(json.dumps({k: t.get(k) for k in ('event', 'tool', 'keys', 'env')}, sort_keys=True) for t in traces))
+    combinations = sorted(set(json.dumps({k: t.get(k) for k in ('event', 'tool', 'keys', 'env')}, sort_keys=True, ensure_ascii=False) for t in traces))
     counts = {s: sum(r['status'] == s for r in rows) for s in ('PASS', 'FAIL', 'SKIP')}
     outcome = 'FAIL' if counts['FAIL'] else 'PASS'
     commit = run(['git', '-C', ROOT, 'rev-parse', 'HEAD']).stdout.strip()
@@ -193,8 +233,7 @@ def check(args, state, statefile, cli):
     reportdir.mkdir(parents=True, exist_ok=True)
     path = reportdir / (args.host + '-' + datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ'))
     data = dict(result=outcome, host=args.host, cli_version=version, plugin_version=VERSION, commit=commit, checks=rows, trace_combinations=[json.loads(c) for c in combinations])
-    redact = lambda s: s.replace(str(HOME), '~')
-    path.with_suffix('.json').write_text(redact(json.dumps(data, indent=2)) + '\n')
+    path.with_suffix('.json').write_text(json.dumps(redact(data), indent=2, ensure_ascii=False) + '\n')
     lines = ['RESULT: ' + outcome, '', 'Host: ' + args.host, 'CLI version: ' + version, 'Plugin version: ' + VERSION, 'Git commit: ' + commit, '', '| Check | Result | Detail |', '| --- | --- | --- |']
     lines += ['| {} | {} | {} |'.format(r['id'], r['status'], r['detail'].replace('|', '\\|').replace('\n', ' ')) for r in rows]
     lines += ['', 'Trace combinations:', ''] + ['- `' + c + '`' for c in combinations]

@@ -72,11 +72,11 @@ Run `status` first (Step 0). If it says Phase 2, make these observations in orde
    - Agent Kaizen skills (names like `agent-kaizen:scan`, `agent-kaizen:audit`) are not listed with their descriptions: `pass`.
    - They are listed: `fail`.
    - You can't see your skill list: `skip:cannot-tell`.
-3. **Invoke a skill (`skill_invoked`).** Invoke the doctor skill by name:
-   - Codex: `$agent-kaizen:doctor`.
-   - Copilot CLI and VS Code: `/agent-kaizen:doctor`. If the host only lets the human type slash commands, ask the human to type it.
+3. **Invoke a skill (`skill_invoked`).** Invoke the scan skill in demo mode:
+   - Codex: `$agent-kaizen:scan --demo`.
+   - Copilot CLI and VS Code: `/agent-kaizen:scan --demo`. If the host only lets the human type slash commands, ask the human to type it.
 
-   `pass` if the skill loaded and ran `kaizen-doctor`, `fail` if the host did not find the skill or it errored. Put a short reason after a colon, for example `fail:skill-not-found`. This observation is required.
+   `pass` if the skill loaded and ran `scripts/kaizen-scan` and printed a demo scorecard, `fail` if the host did not find the skill or it errored. Put a short reason after a colon, for example `fail:skill-not-found`. This observation is required and cannot be skipped. If the host cannot invoke it, report `fail:<reason>`.
 4. **Trigger the shell hook.** Run one command through your host's shell tool, for example `git status`. This fires the after-tool hook. The prompt you were given has already fired the prompt-submit hook.
 5. **Run the check:**
 
@@ -87,7 +87,7 @@ Run `status` first (Step 0). If it says Phase 2, make these observations in orde
      --observe skills_not_preloaded=VALUE
    ```
 
-   Each `VALUE` is `pass`, `fail`, `skip:<reason>` or `fail:<reason>`. The reason uses no spaces, for example `skip:no-audit-due`.
+   Each `VALUE` is `pass`, `fail` or `fail:<reason>`. The optional observations also accept `skip:<reason>`. The reason uses no spaces, for example `skip:no-audit-due`.
    - If `installed` fails because the plugin is somewhere else (possible with a manual VS Code install), find the folder that holds `.claude-plugin/plugin.json` with `"name": "agent-kaizen"`. Re-run `check` with `--install-dir PATH`.
 6. **Turn the trace off:** `python3 tools/host-acceptance cleanup --host HOST`. This removes the trace switch only. It prints the uninstall command but does not run it. Leave the plugin installed unless the human asks.
 
@@ -99,12 +99,14 @@ Run `status` first (Step 0). If it says Phase 2, make these observations in orde
 | `installed` | The installed copy exists and its version equals this checkout's | Install failed, an older install is active, or it lives elsewhere (`--install-dir`) |
 | `files` | Every skill, hook, `hooks/hooks.json` and, on Codex, every `skills/*/agents/openai.yaml` was installed | The host copied only part of the plugin |
 | `scripts` | `kaizen-doctor`, `kaizen-scan` and `token-audit` from the installed copy run | Python missing or too old |
-| `doctor` | `kaizen-doctor` sees the install for this host | Install in an unexpected folder |
+| `doctor` | `kaizen-doctor` sees the install for this host; manual VS Code installs may skip this check | Install in an unexpected folder |
 | `hooks-offline` | The installed hooks give valid output for this host's sample payloads | A hook bug on this host |
-| `hooks-live:sessionStart` | Your host ran the session-start hook in this session | Codex: hooks not trusted in `/hooks`. Any host: the session started before the install. |
-| `hooks-live:userPromptSubmit` | Your host ran the prompt-submit hook | Same as above |
-| `hooks-live:postToolUse` | Your host ran the after-tool hook for a shell command | The hook's `Bash` matcher does not match your host's shell tool name (see the trace) |
+| `hooks-live:sessionStart` | This host ran the session-start hook; the report counts session starts | Codex: hooks not trusted in `/hooks`. Any host: the session started before the install. |
+| `hooks-live:userPromptSubmit` | This host ran the prompt-submit hook | Same as above |
+| `hooks-live:postToolUse` | This host ran the after-tool hook for a shell command | The hook's `Bash` matcher does not match your host's shell tool name (see the trace) |
 | `skill_invoked`, `notice_seen`, `skills_not_preloaded` | Your observations | |
+
+Only trace lines from this host count. Multiple session starts mean several sessions contributed.
 
 The "Trace combinations" part of the report lists each distinct event, tool name and key set your host sent. Keep it even when everything passes: it records how your host shapes hook payloads.
 
