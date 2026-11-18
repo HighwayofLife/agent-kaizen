@@ -157,6 +157,8 @@ def main():
             # Discover removal syntax from the CLI rather than assuming it.
             helptext = run([cli, 'plugin', 'marketplace', '--help']).stdout
             if 'remove' in helptext:
+                # Copilot refuses to remove a marketplace while its plugin is installed.
+                run([cli, 'plugin', 'remove' if cli == 'codex' else 'uninstall', 'agent-kaizen@agent-kaizen-tools'])
                 run([cli, 'plugin', 'marketplace', 'remove', 'agent-kaizen-tools'])
             else:
                 print('If the marketplace already exists, remove it using {} plugin marketplace --help first.'.format(cli))
@@ -279,7 +281,8 @@ def check(args, state, statefile, cli):
     sessions = sum(str(t.get('event', '')).lower() == 'sessionstart' for t in traces)
     for event in ('sessionStart', 'userPromptSubmit', 'postToolUse'):
         found = any(str(t.get('event', '')).lower() == event.lower() and (event != 'postToolUse' or str(t.get('tool', '')).lower() in ('bash', 'shell', 'shell_command', 'powershell')) for t in traces)
-        hint = ('seen: ' + str(seen) if traces else
+        hint = ('install has not completed; run install again and read its errors' if not state.get('installed_at') else
+                'seen: ' + str(seen) if traces else
                 'no {} lines; seen hosts: {}'.format(cli, ', '.join(hosts)) if hosts else
                 'hooks not trusted in /hooks or session started before install' if cli == 'codex' else 'hooks not loaded')
         if chat_install and not traces and not hosts:
