@@ -282,3 +282,11 @@ One branch, one 0.12.0 release. Rollback: revert the branch; Claude Code users a
 ## Open questions
 
 None blocking beyond D1 to D4 and O1 to O3.
+
+### Release gate outside the sandbox (2026-11-17, after fx3, branch tip 1e2eab2)
+
+- `tools/host-probe --host all --worktree`: exit 0. Codex 0.167.0: marketplace add, plugin add, installed version 0.12.0, 0 skills listed, 4 hooks (postToolUse, sessionStart x2, userPromptSubmit). Copilot: SKIP, CLI not installed.
+- `git diff --exit-code d1accc4 -- hooks/hooks.json`: exit 0.
+- `tools/ci-local`: exit 0, 920 tests OK (2 skipped), 377 s.
+- `UV_OFFLINE=1 tools/ci-local --python 3.9`: exit 0, 920 tests OK (2 skipped), 628 s.
+- O5 done for Codex. Still open: O1 (signed-in Copilot CLI and VS Code), O2 (live Codex hook run), O3 (Codex IDE sessions in token-audit).
