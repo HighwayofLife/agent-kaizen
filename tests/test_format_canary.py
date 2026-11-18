@@ -29,7 +29,7 @@ class FormatCanaryTests(unittest.TestCase):
             path.write_text(''.join(json.dumps(dict(row, timestamp='2026-01-01T00:00:00Z')) + '\n' for row in rows)
                             + '{"type":"new_kind", broken}\n')
             list(AUDIT['rows'](path, SINCE, Counter(), keep_tools=True, canary=counts))
-        self.assertEqual(dict(counts['1.0']), dict(records=3, unknown_records=1))
+        self.assertEqual(dict(counts['1.0']), {'records': 3, 'unknown_records': 1, ('unknown_type', 'new_kind'): 1})
         self.assertEqual(dict(counts['unknown']), dict(records=3, missing_usage=1))
         self.assertNotIn('private prompt', repr(counts))
 
@@ -60,8 +60,18 @@ class FormatCanaryTests(unittest.TestCase):
         for row in rows:
             row['timestamp'] = '2026-01-01T00:00:00Z'
             version = AUDIT['canary_row'](json.dumps(row).encode(), SINCE, counts, True, version)
-        self.assertEqual(dict(counts['2.0']), dict(records=4, unknown_records=1, missing_usage=1))
+        self.assertEqual(dict(counts['2.0']), {'records': 4, 'unknown_records': 1, 'missing_usage': 1, ('unknown_type', 'future'): 1})
         self.assertEqual(AUDIT['canary_summary'](counts), 'format_canary: v1 unknown_records=1 missing_usage=1 cli=2.0')
+
+    def test_new_known_types(self):
+        claude = 'api-request api-request-blob atis-latch session-owner mode ai-title permission-mode tools-used cost-state file-history-delta'.split()
+        codex = ['token_usage_record', 'world_state']
+        for kinds, is_codex in ((claude, False), (codex, True)):
+            counts = defaultdict(Counter)
+            for kind in kinds:
+                row = dict(type=kind, timestamp='2026-01-01T00:00:00Z')
+                AUDIT['canary_row'](json.dumps(row).encode(), SINCE, counts, is_codex, None)
+            self.assertEqual(counts['unknown']['unknown_records'], 0)
 
     def test_report_metadata_round_trip_and_no_data(self):
         options = dict(stuck_repeats=3, fact_sessions=3, prune_prompts=10, prune_min_sessions=2, prune_sessions=5)
@@ -78,7 +88,7 @@ class FormatCanaryTests(unittest.TestCase):
             project = root / 'project'
             project.mkdir()
             path = project / 'session.jsonl'
-            for kind, expected in [('user', 0), ('future', 1)]:
+            for kind, expected in [('user', 0), ('brand-new', 1), ('unsafe type', 1)]:
                 path.write_text(json.dumps(dict(type=kind, version='1.0', timestamp='2026-01-01T00:00:00Z', message={})) + '\n')
                 with patch.dict(os.environ, {'CLAUDE_CONFIG_DIR': str(root / 'empty')}):
                     data = AUDIT['collect']([project], root / 'absent', SINCE, {}, None, options)
@@ -87,6 +97,10 @@ class FormatCanaryTests(unittest.TestCase):
                 previous, _ = AUDIT['previous_audit'](root / 'token-audit-two.md', scope)
                 self.assertIn('unknown_records=' + str(expected), previous[1]['format_canary'])
                 self.assertEqual('FORMAT-DRIFT:' in text, bool(expected))
+                if expected:
+                    name = kind if kind == 'brand-new' else '<other>'
+                    self.assertIn('unknown_types=' + name + ':1', text)
+                    self.assertNotIn('unknown_types=', previous[1]['format_canary'])
 
 
 if __name__ == '__main__':
