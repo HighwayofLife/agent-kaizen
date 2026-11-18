@@ -20,7 +20,8 @@ class AcceptanceTests(unittest.TestCase):
         self.env = {k: v for k, v in os.environ.items() if not k.startswith(('KAIZEN_', 'CLAUDE_', 'CODEX_', 'COPILOT_', 'XDG_'))}
         self.env.update(HOME=str(self.home), CLAUDE_CONFIG_DIR=str(self.home / 'config'),
                         XDG_CACHE_HOME=str(self.home / 'cache'), CODEX_HOME=str(self.home / 'codex'),
-                        COPILOT_HOME=str(self.home / 'copilot'))
+                        COPILOT_HOME=str(self.home / 'copilot'),
+                        KAIZEN_VSCODE_DATA_DIRS=str(self.home / 'vscode'))
         bindir = self.home / 'bin'
         bindir.mkdir()
         fake = bindir / 'codex'
@@ -116,6 +117,39 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(rows['doctor']['status'], 'SKIP')
         self.assertIn('Copilot CLI location only', rows['doctor']['detail'])
         self.assertIn('Done: report at', self.command('status', '--host', 'vscode').stdout)
+
+    def test_vscode_discovery_and_copilot_precedence(self):
+        statefile = self.home / 'config/agent-kaizen/host-acceptance/vscode.json'
+        statefile.parent.mkdir(parents=True)
+        statefile.write_text(json.dumps({'install': 'manual', 'installed_at': '2020-01-01T00:00:00+00:00'}))
+        chat = self.home / 'vscode/agentPlugins/file-x/hash'
+        shutil.copytree(ROOT, chat, ignore=shutil.ignore_patterns('.git', 'out', '__pycache__'))
+        self.command('check', '--host', 'vscode', '--observe', 'skill_invoked=pass')
+        report = max((ROOT / 'out/host-acceptance').glob('vscode-*.json'), key=lambda p: p.stat().st_mtime_ns)
+        rows = {r['id']: r for r in json.loads(report.read_text())['checks']}
+        for name in ('installed', 'files', 'scripts', 'hooks-offline'):
+            self.assertEqual(rows[name]['status'], 'PASS', rows[name])
+        self.assertIn('VS Code chat:', rows['installed']['detail'])
+        self.assertIn('plugin is installed for VS Code chat only', rows['hooks-live:sessionStart']['detail'])
+        copilot = self.home / 'copilot/installed-plugins/agent-kaizen-tools/agent-kaizen'
+        shutil.copytree(chat, copilot)
+        self.command('check', '--host', 'vscode', '--observe', 'skill_invoked=pass')
+        report = max((ROOT / 'out/host-acceptance').glob('vscode-*.json'), key=lambda p: p.stat().st_mtime_ns)
+        rows = {r['id']: r for r in json.loads(report.read_text())['checks']}
+        self.assertIn('copilot/installed-plugins', rows['installed']['detail'])
+        self.assertIn('VS Code chat install also found', rows['installed']['detail'])
+        self.assertNotIn('chat only', rows['hooks-live:sessionStart']['detail'])
+
+    def test_vscode_install_without_copilot(self):
+        for name in ('python3', 'git'):
+            (self.home / 'bin' / name).symlink_to(shutil.which(name))
+        self.env['PATH'] = str(self.home / 'bin')
+        result = self.command('install', '--host', 'vscode')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Install GitHub Copilot CLI', result.stdout)
+        self.assertIn('Chat: Install Plugin from Source', result.stdout)
+        state = json.loads((self.home / 'config/agent-kaizen/host-acceptance/vscode.json').read_text())
+        self.assertEqual(state['install'], 'manual')
 
     def test_redaction_before_serialization(self):
         import runpy

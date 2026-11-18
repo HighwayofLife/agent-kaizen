@@ -27,7 +27,8 @@ You are a coding agent running inside Codex CLI, GitHub Copilot CLI, or VS Code 
 - The host CLI, signed in if your host needs it:
   - Codex: `codex --version`.
   - Copilot CLI: `copilot --version`.
-  - VS Code: Copilot Chat signed in. The `copilot` CLI is optional. With it, `install` uses it. Without it, the human installs the plugin by hand (see VS Code below).
+  - VS Code Agents app: GitHub Copilot CLI installed and signed in (`copilot --version`).
+  - VS Code chat: Copilot Chat signed in; the Copilot CLI is not required.
 
 ## Step 0: find your phase
 
@@ -50,14 +51,15 @@ python3 tools/host-acceptance status --host HOST
    - If it removes an existing `agent-kaizen-tools` marketplace first, that is expected.
    - `--source github` installs from `HighwayofLife/agent-kaizen` instead. Use it only if the human asks.
    - It also turns on the hook trace by creating `~/.claude/agent-kaizen/host-trace/on`. While that file exists, each Agent Kaizen hook appends one line to `trace.jsonl` in the same folder. The line holds only the event name, the tool name, the payload's key names, and which plugin-root variables are set. It never holds payload values.
-2. VS Code without the `copilot` CLI: the command prints manual steps. Ask the human to do them:
+2. For VS Code, ask the human whether they use the Agents app or the editor Chat view if unclear. The Agents app needs the signed-in Copilot CLI; install it and run `install` again if it is missing. For VS Code chat without the CLI, ask the human to follow the printed manual steps:
    1. Set `chat.plugins.enabled` to true.
    2. Choose Copilot as the chat session target.
    3. Run **Chat: Install Plugin from Source** with the folder or URL that was printed.
 3. Stop and tell the human the next step `install` printed. Then end your turn. The human will:
    - Codex: quit Codex, start a new Codex session in this folder, run `/hooks`, and trust the Agent Kaizen hooks. Codex hooks do nothing until they are trusted.
    - Copilot CLI: quit and start a new Copilot CLI session in this folder.
-   - VS Code: run **Developer: Reload Window**, then open a new Copilot chat session.
+   - VS Code Agents app: start a new agent session.
+   - VS Code chat: run **Developer: Reload Window**, then open a new chat.
 
    Then they paste the same prompt again.
 
@@ -109,6 +111,10 @@ Run `status` first (Step 0). If it says Phase 2, make these observations in orde
 Only trace lines from this host count. Multiple session starts mean several sessions contributed.
 
 The "Trace combinations" part of the report lists each distinct event, tool name and key set your host sent. Keep it even when everything passes: it records how your host shapes hook payloads.
+
+## Troubleshooting VS Code
+
+The Agents app runs a Copilot runtime agent host that loads plugins from `~/.copilot`, while an install from source in VS Code reaches editor chat. VS Code syncs MCP servers to the agent host, not plugins. Install and sign in to the GitHub Copilot CLI, then run the install again for Agents-app sessions.
 
 ## What to send back
 
