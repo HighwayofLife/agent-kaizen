@@ -193,7 +193,7 @@ Flags, timeouts and the report format are in [scripts/README.md](scripts/README.
 
 ## Skills
 
-All skills are user-triggered (`disable-model-invocation: true`), so their descriptions don't cost context on every turn.
+All skills are user-triggered (`disable-model-invocation: true`), so their descriptions don't cost context on every turn. In Claude Code 2.1.327, the auditor agent description was about 110 tokens; `claude plugin details` overcounts by including hidden skill descriptions. The repository budget uses bytes/4 as a proxy, not an exact token count.
 
 | Skill | What it does | When |
 |---|---|---|
