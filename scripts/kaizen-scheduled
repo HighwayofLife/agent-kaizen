@@ -8,6 +8,7 @@ Commands:
                                     DIR in the global autoProjects list, which project auto needs)
   checks path --for DIR            show the project check state path
   checks record --for DIR NAME     record a completed check (optional --date YYYY-MM-DD)
+  friction prepare --for DIR       prepare bounded inputs (--report FILE selects an audit)
   audit                            run the global token audit
   auto-audit                       run the global token audit if due (SessionStart)
   review [--dry-run]                audit and review every due project
@@ -2499,9 +2500,37 @@ def actions_command(args):
     return 2
 
 
+def friction_prepare(audits, project, report, options, cfg, mode, clock):
+    """Prepare bounded local evidence without a review or acknowledgement."""
+    module = runpy.run_path(str(HERE / "kaizen_friction_prepare.py"))
+    return module["prepare"](Path(audits), backup_root(), project, report, cfg, mode,
+                             clock(), action_project, key)
+
+
+def friction_prepare_command(args):
+    try:
+        canonical = action_project(args.project_dir)
+        (project,), _ = discover(None, None, {}, [canonical])
+        cfg = effective(project.canonical)
+        path = friction_prepare(audits_dir(), project, args.report, None, cfg,
+                                "propose-only", now)
+        if path is not None:
+            print(path)
+        return 0
+    except (OSError, RuntimeError, ValueError, RecursionError, KeyError, TypeError, AttributeError):
+        print("friction: preparation refused; local evidence or private state is invalid or unavailable",
+              file=sys.stderr)
+        return 2
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
+    friction = commands.add_parser("friction", help="prepare scoped friction evidence")
+    friction_commands = friction.add_subparsers(dest="action", required=True)
+    prepare = friction_commands.add_parser("prepare", help="prepare bounded friction inputs")
+    prepare.add_argument("--for", dest="project_dir", type=Path, required=True)
+    prepare.add_argument("--report", type=Path, help="use this scoped token-audit report")
     config = commands.add_parser("config", help="show or set scheduled settings")
     actions = config.add_subparsers(dest="action", required=True)
     for action in ("show", "set"):
@@ -2552,6 +2581,8 @@ def main(argv=None):
         parser.error("--json requires --dry-run")
     global LOG_TO_STDERR
     LOG_TO_STDERR = getattr(args, "json", False)
+    if args.command == "friction":
+        return friction_prepare_command(args)
     if args.command == "actions":
         return actions_command(args)
     if args.command == "auto-audit":

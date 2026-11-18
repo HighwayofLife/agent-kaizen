@@ -180,18 +180,22 @@ fi
 actions_msg=
 actions_marker=
 if [ -n "$root" ] && command -v python3 >/dev/null 2>&1 && [ -f "$plugin_root/scripts/kaizen-scheduled" ]; then
-    for setting in friction hostActions; do
-        values='(. == "off" or . == "on")'
-        [ "$setting" = hostActions ] && values='(. == "off" or . == "suggest" or . == "apply")'
-        value=$(jq -r --arg s "$setting" "select(.[\$s] | $values) | .[\$s]" "$root/docs/kaizen/config.json" 2>/dev/null)
-        [ -n "$value" ] || value=$(jq -r --arg s "$setting" "select(.[\$s] | $values) | .[\$s]" "$home/agent-kaizen.json" 2>/dev/null)
-        [ "$value" = off ] && break
-    done
-    if [ "$value" != off ]; then
         # The store validates ownership, links, size, records and the canonical project.
-        result=$(python3 - "$plugin_root/scripts/kaizen-scheduled" "$dir" "$root" <<'PYCODE' 2>/dev/null
-import hashlib, json, runpy, sys
+        result=$(python3 - "$plugin_root/scripts/kaizen-scheduled" "$dir" "$root" "$home" <<'PYCODE' 2>/dev/null
+import hashlib, json, os, runpy, stat, sys
 from pathlib import Path
+def settings(path):
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        with os.fdopen(fd, "rb") as stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_size > 65536:
+                return {}
+            data = stream.read(65537)
+            value = json.loads(data) if len(data) <= 65536 else {}
+            return value if isinstance(value, dict) else {}
+    except (OSError, ValueError):
+        return {}
 try:
     runner = runpy.run_path(sys.argv[1])
     host = runpy.run_path(str(runner['HERE'] / 'kaizen_friction_actions.py'))['HostActions']
@@ -199,12 +203,12 @@ try:
     opened = [row for row in rows if row['status'] == 'open']
     if opened:
         project = opened[0]['canonical_project']
-        try:
-            settings = json.loads((Path(project) / 'docs/kaizen/config.json').read_text())
-            if any(settings.get(name) == 'off' for name in ('friction', 'hostActions')):
+        configs = [settings(Path(p) / 'docs/kaizen/config.json') for p in (sys.argv[3], project)]
+        configs.append(settings(Path(sys.argv[4]) / 'agent-kaizen.json'))
+        for name, allowed in (('friction', ('on', 'off')), ('hostActions', ('off', 'suggest', 'apply'))):
+            value = next((config[name] for config in configs if config.get(name) in allowed), None)
+            if value == 'off':
                 sys.exit(0)
-        except (OSError, ValueError, AttributeError):
-            pass
         print(len(opened), hashlib.sha256(project.encode('utf-8', 'surrogateescape')).hexdigest())
 except (OSError, ValueError, RuntimeError, KeyError, UnicodeError):
     pass
@@ -224,7 +228,6 @@ PYCODE
                 fi
             fi
         fi
-    fi
 fi
 
 msg=$audit_msg

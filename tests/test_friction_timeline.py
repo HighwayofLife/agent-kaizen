@@ -5,6 +5,7 @@ import os
 from datetime import timedelta
 from pathlib import Path
 import tempfile
+import tracemalloc
 import unittest
 
 import test_friction_claude as claude
@@ -50,6 +51,34 @@ class TimelineTests(unittest.TestCase):
         self.assertEqual(parallel['peak'], 16000)
         self.assertEqual(rows[0]['overlapped_n'], 16000)
         self.assertEqual(self.heavy(list(reversed(calls))), (rows, parallel))
+
+    def test_staggered_contention_memory_is_bounded(self):
+        calls = [call(i, i + 2000) for i in range(2000)]
+        tracemalloc.start()
+        try:
+            AUDIT['heavy_timeline'](calls, THRESHOLDS, (), calls)
+            peak = tracemalloc.get_traced_memory()[1]
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 4 * 1024 * 1024)
+
+    def test_long_turn_cwds_do_not_accumulate(self):
+        from test_friction_codex import row
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = root / '2025/01/01/rollout.jsonl'
+            path.parent.mkdir(parents=True)
+            with path.open('w') as stream:
+                for i in range(1200):
+                    stream.write(json.dumps(row('turn_context', 0, turn_id=str(i),
+                                                cwd='/tmp/' + str(i) + 'x' * 10000)) + '\n')
+            tracemalloc.start()
+            try:
+                AUDIT['collect']([], root, claude.SINCE, {}, None, claude.OPTIONS)
+                peak = tracemalloc.get_traced_memory()[1]
+            finally:
+                tracemalloc.stop()
+            self.assertLess(peak, 8 * 1024 * 1024)
 
     def test_codex_pair_timestamps_reach_timeline(self):
         from test_friction_codex import call as codex_call, result, row

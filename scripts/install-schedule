@@ -49,11 +49,14 @@ AUDITS = claude_home().resolve() / "audits"
 BIN = claude_home().resolve() / "bin"
 MANAGED_NAMES = (
     "kaizen-scheduled", "kaizen-token-audit", "token-audit", "kaizen-backup",
-    "kaizen_credentials.py",
+    "kaizen_credentials.py", "kaizen_friction_sample.py", "kaizen_friction_prepare.py", "kaizen_friction_actions.py",
+    "kaizen-friction-catalog.json",
     "kaizen-pricing.json", "pricing.json", "kaizen-link", "kaizen-doctor", "rules-lint",
     "rules-lint.patterns", "packet-report", "kaizen-project-report", "notes-ledger",
     "usage-series", "usage-compare", "usage-db", "kaizen-demo-fixtures", "kaizen-scan",
     "packet-event", "flow-report", "experiment-check", "brief-lint",
+    "kaizen-host-probe", "kaizen-host-fix", "kaizen-allow-rule", "kaizen-worktree-prune",
+    "kaizen-friction-catalog.json", "kaizen_worktree_facts.py", "kaizen_friction_actions.py",
 )
 LABEL = "com.agent-kaizen"
 MARK = "# agent-kaizen"
@@ -422,7 +425,9 @@ def main(argv=None):
             print(f"install-schedule: refusing symlinked plugin-root record: {record}", file=sys.stderr)
             return 2
         AUDITS.mkdir(parents=True, exist_ok=True)
-        aliases = {"kaizen-token-audit": "token-audit", "kaizen-pricing.json": "pricing.json"}
+        aliases = {"kaizen-token-audit": "token-audit", "kaizen-pricing.json": "pricing.json",
+                   **{f"kaizen-{name}": name for name in ("host-probe", "host-fix", "allow-rule",
+                                                             "worktree-prune", "friction-catalog.json")}}
         names = [name for name in MANAGED_NAMES if (HERE / aliases.get(name, name)).exists()]
         link = [str(Path(sys.executable).absolute()), str(HERE / "kaizen-link"),
                 "--bin", str(BIN), "--hooks-dir", str(BIN.parent / "hooks"),
