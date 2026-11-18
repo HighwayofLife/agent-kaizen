@@ -1395,6 +1395,7 @@ def main():
     parser.add_argument("--extract-out", type=Path, default=claude_home() / "audits" / "extracts",
                         help="extract directory (default: Claude config dir/audits/extracts)")
     parser.add_argument("--json", action="store_true", help="print full structured data instead of headline stdout")
+    parser.add_argument("--no-write", action="store_true", help="do not write a report or extract")
     parser.add_argument("--pricing", type=Path, default=Path(__file__).resolve().with_name("pricing.json"),
                         help="pricing file (default: pricing.json next to this script)")
     for flag, default, text in (
@@ -1440,13 +1441,15 @@ def main():
         for warning in data["parser_warnings"]:
             print(warning, file=sys.stderr)
         text, headline = report(data, out, scope)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(text)
-        extract_path = write_extract(data, out, args.extract_out, scope)
+        extract_path = None
+        if not args.no_write:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(text)
+            extract_path = write_extract(data, out, args.extract_out, scope)
         if args.json:
-            print(json.dumps(dict(report_path=str(out), extract_path=extract_path, **data), indent=2))
+            print(json.dumps(dict(report_path=None if args.no_write else str(out), extract_path=extract_path, **data), indent=2))
         else:
-            print(str(out) + "\n" + "\n".join(headline))
+            print(("" if args.no_write else str(out) + "\n") + "\n".join(headline))
         return 0
     except (OSError, ValueError) as exc:
         print(f"token-audit: {exc}", file=sys.stderr)

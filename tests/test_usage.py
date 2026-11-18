@@ -145,6 +145,55 @@ class UsageTests(StubCase):
         self.assertTrue(report.is_file())
         self.assertTrue((self.root / 'extracts' / (report.stem + '.extract.json')).is_file())
 
+    def test_no_write_preserves_config_roots_and_data(self):
+        pricing = self.fixture()
+        claude = self.home / '.claude'
+        codex = self.root / 'codex'
+        write(codex / 'sentinel', 'unchanged')
+        self.env.update(CLAUDE_CONFIG_DIR=str(claude), CODEX_HOME=str(codex))
+        output, extracts = self.root / 'output', self.root / 'extracts'
+
+        def snapshot():
+            return {str(path): path.read_bytes() if path.is_file() else None
+                    for root in (claude, codex) for path in [root, *root.rglob('*')]}
+
+        args = ('--pricing', pricing, '--since', '2025-01-01', '--json')
+        normal = json.loads(self.run_script('token-audit', *args, '--out', output,
+                                            '--extract-out', extracts).stdout)
+        before = snapshot()
+        destinations = {str(path): path.read_bytes() for root in (output, extracts)
+                        for path in root.rglob('*') if path.is_file()}
+        result = json.loads(self.run_script('token-audit', *args, '--no-write', '--out', output,
+                                            '--extract-out', extracts).stdout)
+        self.assertIsNone(result.pop('report_path'))
+        self.assertIsNone(result.pop('extract_path'))
+        normal.pop('report_path')
+        normal.pop('extract_path')
+        self.assertEqual(result, normal)
+        self.assertEqual(snapshot(), before)
+        self.assertEqual(destinations, {str(path): path.read_bytes() for root in (output, extracts)
+                                        for path in root.rglob('*') if path.is_file()})
+
+        missing_output = self.root / 'missing-output'
+        blocked = write(self.root / 'blocked', 'file, not a directory')
+        for destination in (None, missing_output, blocked):
+            with self.subTest(destination=destination):
+                extra = ('--out', destination, '--extract-out', destination) if destination else ()
+                data = json.loads(self.run_script('token-audit', *args, '--no-write', *extra).stdout)
+                self.assertIsNone(data['report_path'])
+                self.assertIsNone(data['extract_path'])
+                self.assertEqual(snapshot(), before)
+        failed = self.run_script('token-audit', *args, '--no-write', '--out', missing_output,
+                                 '--extract-out', missing_output,
+                                 '--project-dir', self.root / 'missing', code=1)
+        self.assertEqual(failed.stdout, '')
+        self.assertIn('project directory missing:', failed.stderr)
+        invalid = self.run_script('token-audit', '--no-write', '--json', '--days', '-1', code=2)
+        self.assertEqual(invalid.stdout, '')
+        self.assertFalse(missing_output.exists())
+        self.assertEqual(blocked.read_text(), 'file, not a directory')
+        self.assertEqual(snapshot(), before)
+
     def test_atomic_replace_failure_cleans_temporary_file(self):
         directory = self.root / 'extracts'
         out = self.root / 'token-audit-test.md'
