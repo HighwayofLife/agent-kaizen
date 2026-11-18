@@ -1,3 +1,5 @@
 - Protect installed helpers and host-action receipts during unattended reviews, and strip action comments through the original output file handle.
 - Recover publications using their original audit root and activity cutoff. Ordinary reviews continue after recovery errors, and failed friction imports remain eligible for retry.
 - Prepare friction for enrolled submodules, reject another project's indexed outputs, and distinguish measured regressions from row-gap estimates.
+- Protect activity cutoffs from unattended edits and recover published cutoffs after a newer interactive preparation.
+- Isolate malformed markers to their project. Successful friction-disabled reviews advance the cutoff after recovery errors, and unknown Git scope without a publication marker permits ordinary auto review.

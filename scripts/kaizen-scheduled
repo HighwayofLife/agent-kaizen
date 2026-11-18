@@ -1312,9 +1312,11 @@ def backup_deny(*audits):
     paths = dict.fromkeys(deny_path(backup_root(), resolve=resolve) for resolve in (False, True))
     private = [path + "/**" for path in paths]
     roots = [audits_dir(), *(Path(root).expanduser().absolute() for root in audits if root is not None)]
-    for path in dict.fromkeys(deny_path(root, resolve=value) for root in roots for value in (False, True)):
+    audit_paths = dict.fromkeys(deny_path(root, resolve=value) for root in roots for value in (False, True))
+    for path in audit_paths:
         private.extend((path + "/host-actions.json", path + "/host-actions.json.*"))
-    return [f"{tool}({path})" for path in private for tool in ("Read", "Edit", "Write")]
+    return ([f"{tool}({path})" for path in private for tool in ("Read", "Edit", "Write")]
+            + [f"{tool}({path}/projects/*/state.json)" for path in audit_paths for tool in ("Edit", "Write")])
 
 
 class LedgerConfigError(ValueError):
@@ -2498,7 +2500,8 @@ def _run_review(audits, project_dirs, options, clock, safety):
         cfg, state = effective(project.canonical), read_state(project)
         project_recovery_failed = False
         try:
-            recovered = recover_scheduled_publication(audits, project, options=options, degraded=bool(degraded))
+            recovered = recover_scheduled_publication(audits, project, options=options, degraded=bool(degraded),
+                                                      review_state=state)
         except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
             log(f"friction: publication recovery failed ({failure_text(error)}); continuing ordinary review")
             recovered = None
@@ -2704,7 +2707,8 @@ def _run_review(audits, project_dirs, options, clock, safety):
                         log("friction: broker work remains pending")
                 if imported and (terminal or attempt is not None):
                     try:
-                        publication_saved = bool(recover_scheduled_publication(audits, project, degraded=bool(degraded)))
+                        publication_saved = bool(recover_scheduled_publication(
+                            audits, project, degraded=bool(degraded), review_state=state))
                     except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
                         project_recovery_failed = recovery_failed = True
                         log(f"friction: publication recovery failed ({failure_text(error)})")
@@ -2742,7 +2746,7 @@ def _run_review(audits, project_dirs, options, clock, safety):
             state.pop("ledger_errors", None)
             state.pop("last_error", None)
             state.update(status="ok", report=str(report), proposal=str(proposal))
-            if not project_recovery_failed and (not prepared or imported):
+            if (not project_recovery_failed or cfg["friction"]["value"] == "off") and (not prepared or imported):
                 state["reviewed_at"] = publication_time or timestamp(exited)
         else:
             state.update(status="ledger-violation" if ledger_problems else
@@ -3074,7 +3078,7 @@ def reconcile_scheduled(audits, project, output, receipt, *, acknowledge=True, r
 
 
 def recover_scheduled_publication(audits, project, receipt=None, proposal=None, output=None, *,
-                                  options=None, degraded=False, reviewed_at=None):
+                                  options=None, degraded=False, reviewed_at=None, review_state=None):
     try:
         module = review_helper("kaizen_friction_prepare.py")
     except FileNotFoundError:
@@ -3093,6 +3097,8 @@ def recover_scheduled_publication(audits, project, receipt=None, proposal=None, 
                 raise ValueError("review output too large")
             digest = hashlib.sha256(raw).hexdigest()
         reviewed_at = reviewed_at or timestamp(now())
+    elif review_state is None:
+        review_state = read_state(project)
 
     def ready():
         if not os.path.lexists(store.path):
@@ -3111,7 +3117,8 @@ def recover_scheduled_publication(audits, project, receipt=None, proposal=None, 
             row.get("pending") for row in store.scoped(project.canonical))
 
     def persist(published, cutoff, report):
-        state = read_state(project)
+        # The in-flight review may have started with a model-writable audit root.
+        state = review_state.copy()
         previous = parse_time(state.get("reviewed_at"))
         if previous is None or previous <= cutoff:
             for field in ("ledger_errors", "last_error", "last_error_at"):

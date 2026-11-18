@@ -491,6 +491,7 @@ class AutoEditDenyTests(SecurityCase):
         denied = set(self.values(command, '--disallowedTools')[0].split(','))
         for tool in ('Edit', 'Write'):
             self.assertIn(f'{tool}({self.runner.deny_path(SCRIPTS)}/**)', denied)
+            self.assertIn(f'{tool}({self.runner.deny_path(audits)}/projects/*/state.json)', denied)
         for tool in ('Read', 'Edit', 'Write'):
             for name in ('host-actions.json', 'host-actions.json.*'):
                 self.assertIn(f'{tool}({self.runner.deny_path(audits)}/{name})', denied)

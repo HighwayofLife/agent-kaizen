@@ -153,6 +153,8 @@ def _files(folder, pattern, host):
 
 
 def _stamp(value):
+    if not isinstance(value, str):
+        raise ValueError("invalid evidence time")
     stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
     if stamp.utcoffset() != timedelta(0):
         raise ValueError("evidence time must be UTC")
@@ -476,17 +478,22 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
         return (path, receipt) if retain else path
 
 
-def acknowledge_scheduled(store, project, receipt, host):
+def acknowledge_scheduled(store, project, receipt, host, *, allow_superseded=False):
     with host["_directory"](store.friction, private=True) as directory, host["_locked"](directory, "prepare"):
         name = "prepare-" + project.key + ".json"
         state = _json(host["_read"](directory, name, LIMIT), host)
+        receipt_generation = int(receipt["generation"])
+        if (allow_superseded and state.get("project") == str(project.canonical)
+                and type(state.get("generation")) is int and state["generation"] > receipt_generation):
+            # Leave the newer preparation intact. Publication still needs to save its cutoff.
+            return
         if (state.get("project") == str(project.canonical)
-                and state.get("generation") == int(receipt["generation"])
+                and state.get("generation") == receipt_generation
                 and state.get("acknowledged_generation") == receipt["generation"]
                 and state.get("acknowledged") == receipt["comparison"]):
             return
         if (state.get("project") != str(project.canonical)
-                or state.get("generation") != int(receipt["generation"])
+                or state.get("generation") != receipt_generation
                 or state.get("acknowledged") != receipt["baseline"]):
             raise ValueError("scheduled comparison state changed")
         with host["_directory"](store.path.parent) as actions_directory:
@@ -584,7 +591,8 @@ def scheduled_publication(audits, store, project, host, persist, ready, *, recei
         except FileNotFoundError:
             if receipt is not None:
                 raise
-            ready()
+            if not project.unknown:
+                ready()
             return False
         if receipt is not None:
             host["_replace"](directory, name, _encode(dict(v=1, audits=str(audits), reviewed_at=reviewed_at,
@@ -604,19 +612,20 @@ def scheduled_publication(audits, store, project, host, persist, ready, *, recei
             raise ValueError("invalid publication receipt")
         if "audits" not in marker and Path(frozen["identities"]["extract"]["path"]).parent.parent != audits:
             return None
-        if not ready():
-            return False
+        if project.unknown:
+            raise ValueError("cannot recover publication with unknown project scope")
         cutoff = (_stamp(marker["reviewed_at"]) if "reviewed_at" in marker else
                   datetime.fromtimestamp(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mtime, timezone.utc))
+        if not ready():
+            return False
         published = project.folder / filename
-        state = _json(host["_read"](directory, "prepare-" + project.key + ".json", LIMIT), host)
-        if str(state["generation"]).zfill(20) > generation or not published.exists():
+        if not published.exists():
             os.unlink(name, dir_fd=directory)
             return False
         raw, _ = _read(published, host)
         if hashlib.sha256(raw).hexdigest() != marker.get("sha256"):
             warnings.warn("published review changed before acknowledgement; preserving the edited report")
-        acknowledge_scheduled(store, project, frozen, host)
+        acknowledge_scheduled(store, project, frozen, host, allow_superseded=True)
         persist(published, cutoff, frozen["identities"]["report"]["path"])
         os.unlink(name, dir_fd=directory)
         os.fsync(directory)
