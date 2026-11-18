@@ -363,6 +363,10 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                     if last_prefix is None or not line.startswith(last_prefix):
                         match = TIMESTAMP.search(prefix if tool else line)
                         if not match:
+                            if tool is not None and keep_codex:
+                                outer, kind, fields = tool
+                                yield dict(_codex_tool=(kind, *codex_call_row(line, kind, fields, outer == b"response_item")),
+                                           timestamp=None)
                             continue
                         last_prefix = line[:match.end()]
                         last_timestamp = match[1].decode("ascii", "replace")
@@ -377,7 +381,8 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                                 bounds[1] = last_stamp
                     if last_stamp is None:
                         warnings["malformed rows"] += 1
-                        continue
+                        if tool is None or not keep_codex:
+                            continue
                 if tool is not None:
                     if keep_codex:
                         outer, kind, fields = tool
@@ -1181,6 +1186,19 @@ def timeline_call(calls, start, end, seconds, signature, measured, poll=False, s
                       "measured" if measured else "row_gap", poll, session))
 
 
+def contention_intervals(occupancy, local_intervals, local_ends):
+    intervals = []
+    for start, end in occupancy:
+        j = bisect.bisect_right(local_ends, start)
+        while j < len(local_intervals):
+            local_start, local_end = local_intervals[j]
+            if local_start >= end:
+                break
+            intervals.append((max(start, local_start), min(end, local_end)))
+            j += 1
+    return intervals
+
+
 def heavy_timeline(calls, thresholds, samples=(), local_calls=()):
     groups = defaultdict(list)
     local_counts = Counter(local_calls)
@@ -1221,7 +1239,10 @@ def heavy_timeline(calls, thresholds, samples=(), local_calls=()):
     active, previous, local_intervals = 0, None, []
     for stamp, delta in sorted(local_events.items()):
         if active >= 2 and previous is not None:
-            local_intervals.append((previous, stamp))
+            if local_intervals and local_intervals[-1][1] == previous:
+                local_intervals[-1] = (local_intervals[-1][0], stamp)
+            else:
+                local_intervals.append((previous, stamp))
         active += delta
         previous = stamp
     local_ends = [interval[1] for interval in local_intervals]
@@ -1239,17 +1260,7 @@ def heavy_timeline(calls, thresholds, samples=(), local_calls=()):
                 occupancy[-1] = (occupancy[-1][0], max(occupancy[-1][1], c[1]))
             else:
                 occupancy.append((c[0], c[1]))
-        intervals = []
-        i = 0
-        j = bisect.bisect_right(local_ends, occupancy[0][0]) if occupancy else 0
-        while i < len(occupancy) and j < len(local_intervals):
-            a, b = occupancy[i], local_intervals[j]
-            if max(a[0], b[0]) < min(a[1], b[1]):
-                intervals.append((max(a[0], b[0]), min(a[1], b[1])))
-            if a[1] <= b[1]:
-                i += 1
-            else:
-                j += 1
+        intervals = contention_intervals(occupancy, local_intervals, local_ends)
         load = median_load_ratio(samples, intervals) if cohort and not (Counter(cohort) - local_counts) else None
         status = "insufficient" if ratio is None else "unconfirmed" if ratio >= 1.5 else "ok"
         if ratio is not None and ratio >= 1.5 and load is not None:
@@ -1754,7 +1765,7 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
         prior_usage, window = {}, Counter()
 
         bounds = [None, None]
-        pairs, turns, current_cwd = {}, {}, None
+        pairs, disqualified, turns, current_cwd = {}, set(), {}, None
         future_header, scoped_turn = False, False
         # Older session files can contain recent resumes. Keep earlier model
         # metadata, but count only sessions with a token_count in the window.
@@ -1764,26 +1775,30 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
             if "_codex_tool" in row:
                 kind, ident, observation = row["_codex_tool"]
                 stamp = row["timestamp"]
-                if ident is None or (stamp is not None and stamp > friction["until"]):
+                if not isinstance(ident, str) or ident in disqualified:
                     continue
-                if observation is None or stamp is None or stamp < since:
+                if stamp is not None and stamp > friction["until"]:
+                    if ident not in pairs:
+                        disqualified.add(ident)
+                    continue
+                valid = observation is not None and stamp is not None and stamp >= since
+                if valid:
+                    turn = observation["turn_id"]
+                    location = observation.pop("cwd")
+                    if location is None:
+                        location = turns.get(turn, current_cwd) if isinstance(turn, (str, tuple)) else current_cwd
+                    if location is not None:
+                        in_scope = cwd_matches(location, cwd or (), realpaths)
+                        location = canonical_cwd(location, realpaths) if isinstance(location, str) else None
+                        valid = location is not None and (cwd is None or in_scope)
+                    else:
+                        valid = cwd is None
+                if not valid:
+                    # Keep rejected IDs separate from the budget for in-scope pairs.
                     if ident in pairs:
                         pairs[ident] = None
-                    continue
-                turn = observation["turn_id"]
-                location = observation.pop("cwd")
-                if location is None:
-                    location = turns.get(turn, current_cwd) if isinstance(turn, (str, tuple)) else current_cwd
-                if location is not None:
-                    in_scope = cwd_matches(location, cwd or (), realpaths)
-                    location = canonical_cwd(location, realpaths) if isinstance(location, str) else None
-                    if location is None or (cwd is not None and not in_scope):
-                        if ident in pairs:
-                            pairs[ident] = None
-                        continue
-                elif cwd is not None:
-                    if ident in pairs:
-                        pairs[ident] = None
+                    else:
+                        disqualified.add(ident)
                     continue
                 if ident not in pairs:
                     if len(pairs) >= FRICTION_PAIR_LIMIT:

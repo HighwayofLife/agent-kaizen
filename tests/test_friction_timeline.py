@@ -4,6 +4,7 @@ import json
 import os
 from datetime import timedelta
 from pathlib import Path
+import random
 import tempfile
 import tracemalloc
 import unittest
@@ -70,6 +71,64 @@ class TimelineTests(unittest.TestCase):
         with patch.object(bisect, 'bisect_right', wraps=bisect.bisect_right) as search:
             AUDIT['heavy_timeline'](calls, THRESHOLDS, (), calls)
         self.assertEqual(search.call_count, 400)
+
+    def test_contention_interval_visits_scale_with_gapped_cohorts(self):
+        intersect = AUDIT['contention_intervals']
+
+        def visits(count):
+            accessed = 0
+
+            class CountedIntervals:
+                def __init__(self, intervals):
+                    self.intervals = intervals
+
+                def __len__(self):
+                    return len(self.intervals)
+
+                def __getitem__(self, index):
+                    nonlocal accessed
+                    accessed += 1
+                    return self.intervals[index]
+
+            def count_accesses(occupancy, intervals, ends):
+                return intersect(occupancy, CountedIntervals(intervals), ends)
+
+            calls = [call((band * count + i) * 100, (band * count + i) * 100 + 60, signature=str(i))
+                     for band in range(4) for i in range(count) for _ in range(2)]
+            with patch.dict(AUDIT['heavy_timeline'].__globals__, contention_intervals=count_accesses):
+                AUDIT['heavy_timeline'](calls, THRESHOLDS, (), calls)
+            return accessed
+
+        small, large = visits(100), visits(400)
+        self.assertGreater(small, 0)
+        self.assertLess(large, 6 * small, (small, large))
+
+    def test_contention_intersections_match_brute_force(self):
+        rng = random.Random(20261118)
+
+        for _ in range(25):
+            calls = []
+            for i in range(8):
+                signature = str(i)
+                calls.extend(call(i * 400 + j * 100, i * 400 + j * 100 + 60, signature=signature)
+                             for j in range(3))
+                calls.extend(call(start, start + 120, 120, signature=signature)
+                             for start in rng.choices(range(3200, 4000, 40), k=5))
+            rng.shuffle(calls)
+            local = calls if rng.random() < 0.5 else rng.sample(calls, len(calls) - 8)
+            samples = [(stamp, rng.choice((0.5, 0.9, 1.1)), 4) for stamp in range(3200, 4121, 20)]
+            boundaries = sorted({stamp for item in local for stamp in item[:2]})
+            reference_intervals = [(start, end) for start, end in zip(boundaries, boundaries[1:])
+                                   if sum(a <= start < b for a, b, *_ in local) >= 2]
+
+            def brute_force(occupancy, _intervals, _ends):
+                return [(max(a, c), min(b, d)) for a, b in occupancy for c, d in reference_intervals
+                        if max(a, c) < min(b, d)]
+
+            analyze = AUDIT['heavy_timeline']
+            actual = analyze(calls, THRESHOLDS, samples, local)
+            with patch.dict(analyze.__globals__, contention_intervals=brute_force):
+                self.assertEqual(actual, analyze(calls, THRESHOLDS, samples, local))
 
     def test_long_turn_cwds_do_not_accumulate(self):
         from test_friction_codex import row
