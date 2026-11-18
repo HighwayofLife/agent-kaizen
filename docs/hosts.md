@@ -88,3 +88,5 @@ Covered files include those in the host's user config directory, such as `~/.cod
 The project's git-tracked instruction files, including `AGENTS.md`, `.github/copilot-instructions.md` and `.github/instructions/`, and `docs/kaizen/` are not covered. Normal autonomy rules apply; git can restore them.
 
 On other hosts, also skip Claude Code settings edits, `claude ...` commands, `claude plugin ...`, and `kaizen-link`. Say in one line what you skipped, then continue with the rest of the skill. Read this section before acting.
+
+For live host checks, see [host acceptance](testing/host-acceptance.md).

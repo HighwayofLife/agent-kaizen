@@ -36,10 +36,23 @@ kaizen_context() {
     fi
 }
 # --- end host helper ---
+kaizen_tracing=0
+kaizen_input=
+if [[ -f ${CLAUDE_CONFIG_DIR:-${HOME:-}/.claude}/agent-kaizen/host-trace/on ]]; then
+    # shellcheck source=hooks/lib/trace.sh
+    source "$(dirname "${BASH_SOURCE[0]}")/lib/trace.sh"
+    kaizen_input=$(cat)
+    kaizen_trace "$kaizen_input"
+    kaizen_tracing=1
+fi
 command -v jq >/dev/null 2>&1 || exit 0
 home=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 dir=${AUDIT_DIR:-$home/audits}
-cwd=$(jq -r '.cwd // empty' 2>/dev/null)
+if [[ ${kaizen_tracing:-0} == 1 ]]; then
+    cwd=$(jq -r '.cwd // empty' <<<"$kaizen_input" 2>/dev/null)
+else
+    cwd=$(jq -r '.cwd // empty' 2>/dev/null)
+fi
 start=$(cd "${cwd:-$PWD}" 2>/dev/null && pwd -P) || exit 0
 
 root=$start
