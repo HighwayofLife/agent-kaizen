@@ -9,6 +9,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 
@@ -105,10 +106,157 @@ class PreparationTests(unittest.TestCase):
                    since=(self.current - timedelta(days=7)).isoformat(), friction=self.block)))
         self.probe_path = self.write(self.obj.folder / "host-probe-disposable.json", json.dumps(self.probe))
 
-    def run_prepare(self, report=None):
+    def run_prepare(self, report=None, interactive=True):
         return prepare.prepare(self.config / "audits", self.backups, self.obj, report,
                                self.runner["effective"](self.project), "propose-only", self.current + timedelta(seconds=2),
-                               self.runner["action_project"], self.runner["key"])
+                               self.runner["action_project"], self.runner["key"], interactive=interactive)
+
+    def reconcile(self, inputs, actions=None, current=None):
+        return prepare.reconcile(self.config / "audits", self.backups, self.obj, inputs,
+                                 self.runner["effective"](self.project), current or self.current + timedelta(seconds=3),
+                                 self.runner["action_project"], self.runner["key"], actions)
+
+    def actions(self, ids=(), intent="suggest"):
+        return self.write(self.root / "actions.txt", '<!-- kaizen-host-actions ' + json.dumps(
+            dict(v=1, actions=[dict(id=ident, intent=intent) for ident in ids])) + ' -->\n')
+
+    def candidate(self):
+        self.probe["findings"] = [dict(id="low-disk", catalog_id="low-disk", subject="project-volume",
+                                       evidence=dict(free_disk_bytes=1))]
+        self.write_evidence()
+        inputs = self.run_prepare()
+        return inputs, json.loads(inputs.read_text())["actions"][0]["id"]
+
+    def test_interruption_empty_import_and_idempotent_ack(self):
+        first = self.run_prepare()
+        inputs = self.run_prepare()  # An interrupted preparation never advances acknowledgement.
+        receipts = sorted((self.backups / "friction").glob("receipt-*.json"))
+        self.assertEqual(*(json.loads(p.read_text())["comparison"] for p in receipts))
+        with self.assertRaises(ValueError):
+            self.reconcile(inputs)
+        self.assertEqual(self.reconcile(inputs, self.actions()), {})
+        with self.assertRaises(ValueError):
+            self.reconcile(first)
+        self.reconcile(inputs)  # A process can stop after import, then resume here.
+        self.reconcile(inputs)
+        self.assertEqual(self.reconcile(inputs, self.actions()), {})
+        self.assertIsNone(self.run_prepare())
+
+    def test_suggestion_retry_and_cross_project_id(self):
+        inputs, ident = self.candidate()
+        for intent in ("apply", "unexpected"):
+            with self.assertRaises(ValueError):
+                self.reconcile(inputs, self.actions([ident], intent))
+        other = self.root / "other"
+        (other / "docs/kaizen").mkdir(parents=True)
+        host = runpy.run_path(str(PATH.parent / "kaizen_friction_actions.py"))
+        store = host["HostActions"](self.config / "audits", self.backups, self.runner["action_project"], self.runner["key"])
+        copied = store.action_id(other, "low-disk", "project-volume", allowed=("project-volume",))
+        with self.assertRaises(ValueError):
+            self.reconcile(inputs, self.actions([copied]))
+        actions = self.actions([ident])
+        self.assertEqual(self.reconcile(inputs, actions), {ident: "terminal"})
+        self.assertEqual(self.reconcile(inputs, actions), {ident: "terminal"})
+        with self.assertRaises(ValueError):
+            self.reconcile(inputs, self.actions())  # A retry cannot change the selection.
+        self.reconcile(inputs)
+        self.assertEqual(store.scoped(self.project)[0]["status"], "open")
+        self.assertNotIn("pending", store.scoped(self.project)[0])
+        self.assertIsNone(self.run_prepare())
+
+    def test_forged_views_receipts_and_live_changes(self):
+        inputs, ident = self.candidate()
+        actions = self.actions([ident])
+        original = inputs.read_bytes()
+        inputs.write_bytes(original.replace(b'"flags"', b'"forged"'))
+        with self.assertRaises(ValueError):
+            self.reconcile(inputs, actions)
+        inputs.write_bytes(original)
+        receipt = next((self.backups / "friction").glob("receipt-*.json"))
+        frozen = receipt.read_bytes()
+        receipt.write_bytes(frozen.replace(b'"suggest"', b'"apply"'))
+        with self.assertRaises(ValueError):
+            self.reconcile(inputs, actions)
+        receipt.write_bytes(frozen)
+        for path in (self.report, self.extract, self.probe_path):
+            raw = path.read_bytes()
+            path.write_bytes(raw + b"\n")
+            with self.subTest(evidence=path.name), self.assertRaises(ValueError):
+                self.reconcile(inputs, actions)
+            path.write_bytes(raw)
+        inputs = self.run_prepare()
+        with self.assertRaises(ValueError):
+            self.reconcile(inputs, actions, self.current + timedelta(seconds=prepare.PROBE_AGE + 3))
+        self.write(self.project / "docs/kaizen/config.json", '{"hostActions":"off"}')
+        with self.assertRaises(ValueError):
+            self.reconcile(inputs, actions)
+
+    def test_concurrent_generations_disabled_and_scheduled(self):
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            inputs = list(pool.map(lambda _: self.run_prepare(), range(2)))
+        older, latest = sorted(inputs)
+        with self.assertRaises(ValueError):
+            self.reconcile(older, self.actions())
+        self.write(self.project / "docs/kaizen/config.json", '{"friction":"off"}')
+        with self.assertRaises(ValueError):
+            self.reconcile(latest, self.actions())
+        self.write(self.project / "docs/kaizen/config.json", '{}')
+        scheduled = self.run_prepare(interactive=False)
+        with self.assertRaises(ValueError):
+            self.reconcile(scheduled, self.actions())
+        with self.assertRaises(ValueError):
+            self.reconcile(scheduled)
+
+    def test_import_uses_only_the_bounded_wire_block(self):
+        inputs, ident = self.candidate()
+        valid = self.actions([ident]).read_text().strip()
+        for text in ("prose\n" + valid, valid + "\n" + valid, "x" * 8193,
+                     valid.replace('"intent": "suggest"', '"intent": "suggest", "extra": 1'),
+                     self.actions([ident, ident]).read_text()):
+            with self.subTest(size=len(text)), self.assertRaises(ValueError):
+                self.reconcile(inputs, self.write(self.root / "actions.txt", text))
+        with self.assertRaises(ValueError):
+            self.reconcile(inputs)
+
+    def test_pending_scheduled_write_cannot_ack(self):
+        inputs, ident = self.candidate()
+        self.reconcile(inputs, self.actions([ident]))
+        host = runpy.run_path(str(PATH.parent / "kaizen_friction_actions.py"))
+        store = host["HostActions"](self.config / "audits", self.backups, self.runner["action_project"], self.runner["key"])
+        receipt = json.loads(next((self.backups / "friction").glob("receipt-*.json")).read_text())
+        pending = dict(receipt["allowed"][ident], intents=["apply"])
+        block = self.actions([ident], "apply").read_text().strip()
+        store.import_actions(block, {ident: pending}, self.project, "scheduled-write")
+        before = next((self.backups / "friction").glob("prepare-*.json")).read_bytes()
+        with self.assertRaises(ValueError):
+            self.reconcile(inputs)
+        self.assertEqual(next((self.backups / "friction").glob("prepare-*.json")).read_bytes(), before)
+
+    def test_new_generation_invalidates_successful_older_import(self):
+        older = self.run_prepare()
+        self.reconcile(older, self.actions())
+        latest = self.run_prepare()
+        with self.assertRaises(ValueError):
+            self.reconcile(older)
+        self.block["flags"] = []
+        self.write_evidence()
+        with self.assertRaises(ValueError):
+            self.reconcile(latest, self.actions())
+        with self.assertRaises(ValueError):
+            self.reconcile(latest)
+
+    def test_evidence_changed_during_rederivation_is_refused(self):
+        inputs = self.run_prepare()
+        original = prepare._read
+
+        def changing_read(path, *args, **kwargs):
+            result = original(path, *args, **kwargs)
+            if path == self.probe_path:
+                self.report.write_bytes(self.report.read_bytes() + b"\n")
+            return result
+
+        with patch.object(prepare, "_read", side_effect=changing_read), self.assertRaises(ValueError):
+            self.reconcile(inputs, self.actions())
 
     def test_receipt_redaction_generation_and_read_only_ack(self):
         first = self.run_prepare(self.report)
@@ -208,6 +356,7 @@ class PreparationTests(unittest.TestCase):
         self.assertIsNone(self.run_prepare())
 
     def test_installed_runner_prepares_real_disposable_evidence(self):
+        self.candidate()
         plugin = self.root / "plugins/cache/disposable/version"
         shutil.copytree(PATH.parent, plugin / "scripts")
         binary = self.root / "bin"
@@ -224,6 +373,18 @@ class PreparationTests(unittest.TestCase):
                                 env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(pathlib.Path(result.stdout.strip()).read_text())["flags"][0]["value"], 4)
+        inputs = pathlib.Path(result.stdout.strip())
+        ident = json.loads(inputs.read_text())["actions"][0]["id"]
+        for arguments in (("actions", "import", str(self.actions([ident])), "--inputs", str(inputs)),
+                          ("friction", "acknowledge", str(inputs))):
+            result = subprocess.run([sys.executable, str(runner), *arguments, "--for", str(self.project)],
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        stored = json.loads((self.config / "audits/host-actions.json").read_text())
+        self.assertEqual(stored["actions"][ident]["status"], "open")
+        state = json.loads(next((self.backups / "friction").glob("prepare-*.json")).read_text())
+        self.assertEqual(state["acknowledged_generation"], json.loads(inputs.read_text())["generation"])
+        self.assertTrue(state["acknowledged"]["cohorts"])
 
 
 if __name__ == "__main__":
