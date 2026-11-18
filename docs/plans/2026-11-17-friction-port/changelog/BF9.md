@@ -1,0 +1,1 @@
+- Preserve unreadable host actions and reject stale or unregistered worktree scopes; support relative worktree links.

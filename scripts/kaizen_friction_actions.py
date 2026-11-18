@@ -190,6 +190,28 @@ def _unique(pairs):
     return result
 
 
+def _object_values(raw):
+    """Keep the original JSON value text for fields that must remain untouched."""
+    decoder = json.JSONDecoder()
+    pos = raw.index("{") + 1
+    values = {}
+    while True:
+        while raw[pos].isspace() or raw[pos] == ",":
+            pos += 1
+        if raw[pos] == "}":
+            return values
+        name, pos = decoder.raw_decode(raw, pos)
+        while raw[pos].isspace() or raw[pos] == ":":
+            pos += 1
+        start = pos
+        _, pos = decoder.raw_decode(raw, pos)
+        values[name] = raw[start:pos]
+
+
+class _Rows(dict):
+    pass
+
+
 def _text(value, limit, *, path=False):
     return (isinstance(value, str) and 0 < len(value) <= limit
             and not any(c in value for c in ("\0" if path else "\0\r\n")))
@@ -306,10 +328,19 @@ class HostActions:
                                or (state == "pending" and rows[ident]["status"] != "open")
                                for ident, state in receipt.items())):
                     raise ValueError("invalid host-action receipt")
-        rows = {ident: row for ident, row in rows.items() if ident not in skipped}
-        receipts = {project: {generation: {ident: state for ident, state in receipt.items() if ident not in skipped}
-                              for generation, receipt in generations.items()}
-                    for project, generations in receipts.items()}
+        rows = _Rows((ident, row) for ident, row in rows.items() if ident not in skipped)
+        rows.preserved = {}
+        rows.preserved_receipts = {}
+        if skipped:
+            fields = _object_values(raw.decode("utf-8"))
+            row_values = _object_values(fields["actions"])
+            rows.preserved = {ident: row_values[ident] for ident in skipped}
+            receipt_values = _object_values(fields.get("receipts", "{}"))
+            for project, generations in receipts.items():
+                raw_generations = _object_values(receipt_values[project])
+                for generation, receipt in generations.items():
+                    if skipped.intersection(receipt):
+                        rows.preserved_receipts[(project, generation)] = raw_generations[generation]
         return rows, secret, receipts
 
     def _valid_row(self, row, check_key=True):
@@ -333,7 +364,22 @@ class HostActions:
                 and row["eligible"] is False)
 
     def _save(self, directory, rows, receipts):
-        raw = (json.dumps({"v": 1, "actions": rows, "receipts": receipts}, separators=(",", ":")) + "\n").encode("ascii")
+        # Mark preserved values before serializing, then restore their exact original JSON bytes.
+        preserved = {}
+        def marker(value):
+            token = "__kaizen_preserved_" + os.urandom(32).hex()
+            preserved[json.dumps(token)] = value
+            return token
+
+        output_rows = dict(rows)
+        output_rows.update((ident, marker(value)) for ident, value in getattr(rows, "preserved", {}).items())
+        output_receipts = {project: dict(generations) for project, generations in receipts.items()}
+        for (project, generation), value in getattr(rows, "preserved_receipts", {}).items():
+            output_receipts[project][generation] = marker(value)
+        text = json.dumps({"v": 1, "actions": output_rows, "receipts": output_receipts}, separators=(",", ":"))
+        for token, value in preserved.items():
+            text = text.replace(token, value)
+        raw = (text + "\n").encode("utf-8")
         if len(raw) > STORE_LIMIT:
             raise ValueError("host-action store exceeds size limit")
         _replace(directory, self.path.name, raw)
@@ -364,6 +410,8 @@ class HostActions:
         with _directory(self.path.parent, create=True) as directory, _locked(directory, self.path.name):
             rows, secret, receipts = self._load(directory)
             ident = _id(secret or self._secret(create=True), *identity)
+            if ident in getattr(rows, "preserved", {}):
+                raise ValueError("unavailable host-action ID")
             if ident in rows and identity != tuple(rows[ident][k] for k in ID_FIELDS):
                 raise ValueError("host-action ID collision")
             if evidence is not None and ident not in rows:
@@ -420,6 +468,8 @@ class HostActions:
             pending = _pending(generations)
             stamp = datetime.now(timezone.utc).isoformat()
             for ident, (identity, evidence) in candidates.items():
+                if ident in getattr(rows, "preserved", {}):
+                    raise ValueError("unavailable host-action ID")
                 row = rows.setdefault(ident, self._new_row(identity, evidence, stamp))
                 if ident not in pending and row["status"] != "dismissed":
                     if row["status"] == "done" and row["evidence"] and row["evidence"] != evidence:
@@ -511,9 +561,12 @@ class HostActions:
         return results
 
     def mark(self, project, ident, command):
+        original_project = project
         project = str(self._scope(project))
         status = STATES[command]
         with _directory(self.path.parent, create=True) as directory, _locked(directory, self.path.name):
+            if str(self._scope(original_project)) != project:
+                raise ValueError("host-action scope changed; try again")
             rows, _, receipts = self._load(directory)
             row = rows.get(ident)
             if row is None or row["canonical_project"] != project:
