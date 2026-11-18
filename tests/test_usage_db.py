@@ -228,7 +228,7 @@ class IngestTests(UsageDbCase):
         copy = self.codex_file(rows, name='rollout-copy', day='2025/02/09', session_id='sess-1')
         self.ingest()
         self.assertEqual(self.query("SELECT count(*) FROM calls WHERE source = 'codex'"), [(2,)])
-        self.assertEqual(self.query("SELECT value FROM meta WHERE key = 'schema_version'"), [('2',)])
+        self.assertEqual(self.query("SELECT value FROM meta WHERE key = 'schema_version'"), [('3',)])
         self.assertEqual(self.query("SELECT count(*) FROM calls WHERE call_id LIKE 'rollout-%'"), [(0,)])
         self.assertEqual(self.counts(self.ingest().stdout)[2], 0)
         self.assertEqual(self.query('SELECT count(*) FROM calls'), [(3,)])
@@ -243,7 +243,7 @@ class IngestTests(UsageDbCase):
             conn.execute("DELETE FROM calls")
             for stem in ('rollout-one', 'rollout-copy'):
                 conn.execute("INSERT INTO calls VALUES ('codex', ?, '2025-01-01T10:00:00Z', '2025-01-01', 'p', ?, 'main', "
-                             "'gpt-test-sol', 80, 20, 0, 0, 10)", (f'{stem}:2025-01-01T10:00:00Z:110', stem))
+                             "'gpt-test-sol', NULL, 80, 20, 0, 0, 10)", (f'{stem}:2025-01-01T10:00:00Z:110', stem))
             conn.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version'")
         self.ingest()
         self.assertEqual(self.query('SELECT count(*) FROM calls'), [(1,)])
@@ -419,7 +419,7 @@ class QueryTests(UsageDbCase):
         self.codex_file([token_count('2025-01-03T10:00:00Z', 100, 0, 10)], day='2025/01/03')
         self.ingest()
         text = self.run_script('usage-db', 'status').stdout
-        for expected in (str(self.db), 'schema version: 2', 'claude calls: 2', 'codex calls: 1',
+        for expected in (str(self.db), 'schema version: 3', 'claude calls: 2', 'codex calls: 1',
                          'first day: 2025-01-01', 'last day: 2025-01-03'):
             self.assertIn(expected, text)
         self.assertRegex(text, r'last ingest: \d{4}-\d\d-\d\dT')
@@ -507,6 +507,18 @@ class QueryTests(UsageDbCase):
         with sqlite3.connect(self.db) as conn:
             conn.execute("UPDATE calls SET session = NULL WHERE call_id = '0'")
         self.assertIn('unknown', [r['gap'] for r in self.report('--cache')])
+
+    def test_subagent_named_main_has_separate_history(self):
+        usage = dict(input_tokens=20, cache_creation_input_tokens=80)
+        self.main_file([assistant('2025-01-01T00:00:00Z', 'm1', usage=usage),
+                        assistant('2025-01-01T01:00:00Z', 'm2', usage=usage)])
+        sub = self.config / 'projects/alpha/main/subagents/worker.jsonl'
+        jsonl(sub, [assistant('2025-01-01T00:59:00Z', 's1', usage=usage)])
+        write(sub.with_suffix('.meta.json'), json.dumps(dict(agentType='main')))
+        self.ingest()
+        result = self.report('--cache')
+        self.assertEqual({r['gap'] for r in result if r['sequence'] == 'main'}, {'first', 'gt_5m_le_60m'})
+        self.assertEqual([r['gap'] for r in result if r['sequence'] == 'subagent_approximate'], ['first'])
 
     def test_report_matches_usage_series_for_the_same_window(self):
         self.fixtures()

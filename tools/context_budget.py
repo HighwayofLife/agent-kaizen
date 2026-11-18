@@ -14,10 +14,33 @@ def frontmatter(path):
         raise ValueError('{}: malformed frontmatter delimiters'.format(path))
     fields = {}
     for line in lines[1:lines.index('---', 1)]:
+        if not line.strip() or line.lstrip().startswith('#') or line[0].isspace():
+            continue
         match = re.fullmatch(r'([\w-]+):\s*(.*)', line)
         if not match or match.group(1) in fields:
             raise ValueError('{}: malformed frontmatter line: {}'.format(path, line))
         key, value = match.groups()
+        if value.startswith(('[', '{')):
+            stack = []
+            quote = None
+            escaped = False
+            for char in value:
+                if quote:
+                    if escaped:
+                        escaped = False
+                    elif char == '\\' and quote == '"':
+                        escaped = True
+                    elif char == quote:
+                        quote = None
+                elif char in ('"', "'"):
+                    quote = char
+                elif char in '[{':
+                    stack.append(char)
+                elif char in ']}':
+                    if not stack or stack.pop() != {']': '[', '}': '{'}[char]:
+                        raise ValueError('{}: malformed flow value for {}'.format(path, key))
+            if stack or quote:
+                raise ValueError('{}: malformed flow value for {}'.format(path, key))
         if value.startswith(('"', "'")):
             if len(value) < 2 or value[-1] != value[0]:
                 raise ValueError('{}: malformed quoted value for {}'.format(path, key))
@@ -56,10 +79,10 @@ def check(root):
         for group in groups:
             for hook in group['hooks']:
                 command = hook.get('command', '')
-                match = re.search(r'\$\{CLAUDE_PLUGIN_ROOT\}/(hooks/[\w.-]+\.sh)', command)
-                if hook.get('type') != 'command' or not match:
+                matches = re.findall(r'\$\{CLAUDE_PLUGIN_ROOT\}/(hooks/[\w.-]+\.sh)', command)
+                if hook.get('type') != 'command' or not matches:
                     raise ValueError('unsupported registered hook: {}'.format(hook))
-                registered.add(match.group(1))
+                registered.update(matches)
     for name in sorted(registered):
         if name not in inventory:
             errors.append('{}: missing registered-hook inventory entry'.format(name))

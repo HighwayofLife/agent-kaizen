@@ -3,6 +3,8 @@
 import argparse
 from datetime import datetime, timedelta, timezone
 import json
+import os
+import sys
 from pathlib import Path
 
 
@@ -48,22 +50,39 @@ def generate(output):
         row('user', -117, [result('demo-bash-1', 'none'), result('demo-bash-2', 'clean'),
                            result('demo-bash-3', 'ok')]),
     ]
-    project.mkdir(parents=True, exist_ok=True)
     subagents = project / 'synthetic-main' / 'subagents'
+    files = ((project / 'synthetic-main.jsonl', ''.join(json.dumps(item) + '\n' for item in main)),
+             (subagents / 'synthetic-relay.jsonl', ''.join(json.dumps(item) + '\n' for item in relay)),
+             (subagents / 'synthetic-relay.meta.json', json.dumps(dict(agentType='relay')) + '\n'))
+    # Check every existing component before changing anything, including output's parents.
+    for path in (output, project, subagents, *(item[0] for item in files)):
+        for component in (path, *path.parents):
+            if component.is_symlink():
+                raise ValueError('refusing symlink: {}'.format(component))
     subagents.mkdir(parents=True, exist_ok=True)
-    for path, rows in ((project / 'synthetic-main.jsonl', main),
-                       (subagents / 'synthetic-relay.jsonl', relay)):
-        path.write_text(''.join(json.dumps(item) + '\n' for item in rows), encoding='utf-8')
-    (subagents / 'synthetic-relay.meta.json').write_text(
-        json.dumps(dict(agentType='relay')) + '\n', encoding='utf-8')
+    for path, content in files:
+        # Remove an existing regular file, then create a new file exclusively. Never
+        # open a pre-existing link or follow a link inserted at the final component.
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o666)
+        with os.fdopen(fd, 'w', encoding='utf-8') as stream:
+            stream.write(content)
+
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', required=True, type=Path, help='directory for synthetic projects')
     args = parser.parse_args()
-    generate(args.output)
+    try:
+        generate(args.output)
+    except (OSError, ValueError) as exc:
+        print(exc, file=sys.stderr)
+        return 1
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

@@ -50,7 +50,9 @@ class ContextBudgetTest(unittest.TestCase):
 
     def test_malformed_frontmatter(self):
         for text in ('description: no delimiters', '---\ndescription: "broken\n---\n',
-                     '---\ndescription: x\ndescription: y\n---\n'):
+                     '---\ndescription: x\ndescription: y\n---\n',
+                     '---\ndescription: [unterminated\n---\n',
+                     '---\ndescription: x\ninvalid line\n---\n'):
             with self.subTest(text=text):
                 self.write('agents/a.md', text)
                 result = self.run_check()
@@ -70,6 +72,14 @@ class ContextBudgetTest(unittest.TestCase):
         result = self.run_check()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('missing registered-hook inventory entry', result.stderr)
+
+    def test_multiple_hooks_in_command(self):
+        self.write('hooks/hooks.json', json.dumps({'hooks': {'SessionStart': [
+            {'hooks': [{'type': 'command', 'command':
+                        'bash "${CLAUDE_PLUGIN_ROOT}/hooks/a.sh"; bash "${CLAUDE_PLUGIN_ROOT}/hooks/b.sh"'}]}]}}))
+        result = self.run_check()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('hooks/b.sh: missing registered-hook inventory entry', result.stderr)
 
     def test_changed_hook_needs_review(self):
         self.write('hooks/a.sh', '#!/bin/sh\necho changed\n')
