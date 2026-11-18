@@ -274,10 +274,10 @@ def effective(project_dir=None):
     return result
 
 
-def key(path):
-    resolved = Path(path).resolve()
-    slug = re.sub(r"[^a-zA-Z0-9]+", "-", resolved.name).strip("-")[:40] or "root"
-    return slug + "-" + hashlib.sha256(str(resolved).encode()).hexdigest()[:12]
+def key(path, *, resolved=False):
+    path = Path(path) if resolved else Path(path).resolve()
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", path.name).strip("-")[:40] or "root"
+    return slug + "-" + hashlib.sha256(str(path).encode()).hexdigest()[:12]
 
 
 # --json output must stay parseable, so main() sends log lines to stderr then.
@@ -1061,7 +1061,10 @@ def backup_root():
 
 def backup_deny():
     paths = dict.fromkeys(deny_path(backup_root(), resolve=resolve) for resolve in (False, True))
-    return [f"{tool}({path}/**)" for path in paths for tool in ("Read", "Edit", "Write")]
+    private = [path + "/**" for path in paths]
+    for path in dict.fromkeys(deny_path(audits_dir(), resolve=value) for value in (False, True)):
+        private.extend((path + "/host-actions.json", path + "/host-actions.json.*"))
+    return [f"{tool}({path})" for path in private for tool in ("Read", "Edit", "Write")]
 
 
 class LedgerConfigError(ValueError):
@@ -2178,6 +2181,39 @@ def show_config(project_dir=None):
     print(json.dumps(result, indent=2))
 
 
+def action_project(directory):
+    project = canonical_project(directory)
+    if directory.is_relative_to(project):
+        return project
+    listed = _git(project, "worktree", "list", "--porcelain") or ""
+    roots = [Path(line[9:]).resolve() for line in listed.splitlines() if line.startswith("worktree ")]
+    for root in roots:
+        if project.is_relative_to(root) and any(directory.is_relative_to(peer / project.relative_to(root))
+                                                for peer in roots if peer != root):
+            return project
+    raise ValueError("project is outside its registered worktrees")
+
+
+def actions_command(args):
+    try:
+        host = runpy.run_path(str(HERE / "kaizen_friction_actions.py"))["HostActions"]
+        store = host(audits_dir(), backup_root(), action_project, key)
+        project = args.project_dir
+        if args.action != "list":
+            store.mark(project, args.id, args.action)
+        elif args.json:
+            print(json.dumps(store.scoped(project), indent=2))
+        else:
+            for row in store.scoped(project):
+                print(f"{row['id']} {row['status']} {json.dumps(row['subject'])}")
+        return 0
+    except (OSError, RuntimeError):
+        print("actions: project or private host-action files are unavailable", file=sys.stderr)
+    except ValueError as error:
+        print(f"actions: {error}", file=sys.stderr)
+    return 2
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     commands = parser.add_subparsers(dest="command", required=True)
@@ -2197,6 +2233,15 @@ def main(argv=None):
             subparser.add_argument("name", choices=("models", "roster", "whats-new"))
             # Local date, matching experiment-check and the dates people write in the ledger.
             subparser.add_argument("--date", default=datetime.now().date().isoformat())
+    host = commands.add_parser("actions", help="track machine-local host actions")
+    host_commands = host.add_subparsers(dest="action", required=True)
+    for action in ("list", "done", "dismiss", "reopen"):
+        subparser = host_commands.add_parser(action)
+        subparser.add_argument("--for", dest="project_dir", type=Path, required=True)
+        if action == "list":
+            subparser.add_argument("--json", action="store_true")
+        else:
+            subparser.add_argument("id")
     cleanup = commands.add_parser("housekeep", help="delete expired generated audit files")
     cleanup.add_argument("--dry-run", action="store_true", help="preview deletions")
     cleanup.add_argument("--audits", type=Path, help="override the audits folder")
@@ -2222,6 +2267,8 @@ def main(argv=None):
         parser.error("--json requires --dry-run")
     global LOG_TO_STDERR
     LOG_TO_STDERR = getattr(args, "json", False)
+    if args.command == "actions":
+        return actions_command(args)
     if args.command == "auto-audit":
         try:
             run_auto_audit(args)
