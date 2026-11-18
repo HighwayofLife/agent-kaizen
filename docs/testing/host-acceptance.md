@@ -112,6 +112,8 @@ Only trace lines from this host count. Multiple session starts mean several sess
 
 The "Trace combinations" part of the report lists each distinct event, tool name and key set your host sent. Keep it even when everything passes: it records how your host shapes hook payloads.
 
+Local-directory marketplace installs are live: Copilot loads the plugin in place, and `check` reports that location.
+
 ## Troubleshooting VS Code
 
 The Agents app runs a Copilot runtime agent host that loads plugins from `~/.copilot`, while an install from source in VS Code reaches editor chat. VS Code syncs MCP servers to the agent host, not plugins. Install and sign in to the GitHub Copilot CLI, then run the install again for Agents-app sessions.
