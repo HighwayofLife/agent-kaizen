@@ -54,11 +54,14 @@ def generate(output):
     files = ((project / 'synthetic-main.jsonl', ''.join(json.dumps(item) + '\n' for item in main)),
              (subagents / 'synthetic-relay.jsonl', ''.join(json.dumps(item) + '\n' for item in relay)),
              (subagents / 'synthetic-relay.meta.json', json.dumps(dict(agentType='relay')) + '\n'))
-    # Check every existing component before changing anything, including output's parents.
+    # Check every existing component from --output down before changing anything.
+    # Parents of --output are the caller's choice (macOS /var and /tmp are links).
     for path in (output, project, subagents, *(item[0] for item in files)):
         for component in (path, *path.parents):
             if component.is_symlink():
                 raise ValueError('refusing symlink: {}'.format(component))
+            if component == output:
+                break
     subagents.mkdir(parents=True, exist_ok=True)
     for path, content in files:
         # Remove an existing regular file, then create a new file exclusively. Never
