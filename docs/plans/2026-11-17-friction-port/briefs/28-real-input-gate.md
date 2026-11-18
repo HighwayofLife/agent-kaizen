@@ -76,3 +76,11 @@ Read `git show wt/p10:skills/friction/SKILL.md` for intended workflows. Use exis
 ## Report
 
 Report changed files and line counts, exact checks and outcomes, known uncertainty and any blocked verification. Label measurements with baseline/conditions. Redact paths and identifiers from shared output. Leave plugin version and release CHANGELOG to P27. Do not commit or push.
+
+## Delta: P19 review residuals (host-fix, 2026-11-18)
+
+Live host-fix writes stay off under S3. Before this gate reports host-fix live writes as safe to enable, each item below is either fixed in a fail-closed fix packet or recorded as an accepted residual in the gate report:
+
+1. `scripts/host-fix` undo and rollback unlink the quarantine entry by name after the final identity check; a concurrent sync or restore that replaces that entry loses its file (same-UID race on a random quarantine name).
+2. Undo persists `retire-pending` after the last scope check, then renames through the pinned directory FD; a directory moved outside the eligible tree during that write is still mutated (same-UID race).
+3. Identity recovery for a moved directory walks unrelated mounts with blocking filesystem calls; an unavailable network mount can hang undo past the 20-second deadline. Exercise undo with the output directory moved and a slow or unreachable mount present, and confirm it refuses within the deadline instead of hanging.
