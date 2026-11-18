@@ -41,6 +41,7 @@ class HostProbeTests(unittest.TestCase):
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertEqual(second.returncode, 0, second.stderr)
         report = json.loads(first.stdout)
+        self.assertNotIn(str(self.root), first.stdout)
         self.assertEqual(report['v'], 1)
         self.assertIn('generated_at', report)
         self.assertEqual(report['worktrees'], [])
@@ -153,6 +154,8 @@ class HostProbeTests(unittest.TestCase):
                 marker.touch()
             probe.platform = platform
             def command(argv):
+                if argv[0] == 'mdutil':
+                    return 'Indexing enabled.\n'
                 if argv[0] == 'tmutil':
                     self.assertEqual(argv, ['tmutil', 'isexcluded', str(output)])
                     return tm_output
@@ -220,6 +223,91 @@ class HostProbeTests(unittest.TestCase):
         probe.deadline = 0
         self.assertIsNone(probe.size(self.project))
         self.assertIn('budget', probe.warnings)
+
+    def test_config_special_files_and_mixed_entries(self):
+        probe = self.probe()
+        config = self.project / 'docs/kaizen/config.json'
+        config.parent.mkdir(parents=True)
+        trees = [{'path': str(self.project), 'is_main': True}]
+        for kind in ('fifo', 'symlink', 'mixed'):
+            if kind == 'fifo':
+                os.mkfifo(config)
+            elif kind == 'symlink':
+                config.symlink_to(self.project / 'missing')
+            else:
+                config.write_text(json.dumps({'frictionOutputDirs': [1, 'build']}))
+            with mock.patch.object(probe, 'git', return_value=''):
+                self.assertEqual(probe.directories(trees), [])
+            self.assertIn('output_config', probe.warnings)
+            config.unlink()
+            probe.warnings.clear()
+
+    def test_exit_one_semantics(self):
+        probe = self.probe()
+        self.assertEqual(probe.command([sys.executable, '-c', 'raise SystemExit(1)', 'merge-base']), '\0')
+        self.assertEqual(probe.command([sys.executable, '-c', 'raise SystemExit(1)', 'check-ignore']), '')
+        self.assertIsNone(probe.command([sys.executable, '-c', 'raise SystemExit(2)', 'merge-base']))
+
+    def test_unignored_candidate_does_not_abort(self):
+        probe = self.probe()
+        for name in ('build', 'dist'):
+            (self.project / name).mkdir()
+        config = self.project / 'docs/kaizen/config.json'
+        config.parent.mkdir(parents=True)
+        config.write_text(json.dumps({'frictionOutputDirs': ['build', 'dist']}))
+        with mock.patch.object(probe, 'git', side_effect=['', '', '', 'dist/', '']):
+            result = probe.directories([{'path': str(self.project)}])
+        self.assertEqual([d['path'] for d in result], [str(self.project / 'dist')])
+
+    def test_stale_excludes_prunable_and_unmerged_counts(self):
+        probe = self.probe()
+        trees = [{'path': str(self.project), 'is_main': True},
+                 {'path': str(self.root / 'a'), 'is_main': False, 'clean': True, 'merged': True,
+                  'locked': False, 'last_commit_age_days': 30},
+                 {'path': str(self.root / 'b'), 'is_main': False, 'clean': True, 'merged': False,
+                  'locked': False, 'last_commit_age_days': 30}]
+        with mock.patch.object(probe, 'worktrees', return_value=trees), mock.patch.object(probe, 'directories', return_value=[]):
+            facts = probe.run()['facts']
+        self.assertEqual(facts['prunable_worktrees'], 1)
+        self.assertEqual(facts['stale_worktrees'], 1)
+
+    @unittest.skipUnless(os.name == 'posix', 'process groups required')
+    def test_child_pipe_holder_is_killed(self):
+        probe = self.probe()
+        start = time.monotonic()
+        result = probe.command([sys.executable, '-c',
+            'import subprocess, sys; subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])'])
+        self.assertEqual(result, '')
+        self.assertLess(time.monotonic() - start, 2)
+
+    def test_foreign_registered_worktree_is_unknown(self):
+        def git(root, *args):
+            subprocess.run(['git', '-C', str(root), *args], check=True, capture_output=True)
+        git(self.project, 'init', '-q')
+        git(self.project, 'config', 'commit.gpgsign', 'false')
+        git(self.project, 'config', 'user.email', 'test@example.invalid')
+        git(self.project, 'config', 'user.name', 'Test')
+        git(self.project, 'commit', '--allow-empty', '-qm', 'initial')
+        linked = self.root / 'linked'
+        git(self.project, 'worktree', 'add', '-qb', 'linked', str(linked))
+        import shutil
+        shutil.rmtree(linked)
+        linked.mkdir()
+        git(linked, 'init', '-q')
+        probe = self.probe()
+        self.assertIsNone(probe.worktrees())
+        self.assertIn('worktrees_unavailable', probe.warnings)
+
+    def test_spotlight_disabled_or_unknown(self):
+        probe = self.probe('macos')
+        directory = {'path': str(self.project), 'worktree': str(self.project), 'size_bytes': 11 * 1024**3,
+                     'excluded': {'nomedia': False, 'noindex_ancestor': False}}
+        trees = [{'path': str(self.project), 'is_main': True}]
+        for state in ('Indexing disabled.\n', None, 'unexpected'):
+            def command(argv):
+                return state if argv[0] == 'mdutil' else 'mds\n'
+            with mock.patch.object(probe, 'command', side_effect=command), mock.patch.object(probe, 'worktrees', return_value=trees), mock.patch.object(probe, 'directories', return_value=[directory]):
+                self.assertNotIn('spotlight-output', [f['catalog_id'] for f in probe.run()['findings']])
 
     def test_missing_catalog_and_copied_install(self):
         probe = probe_module.Probe(self.project, 'unknown', self.root, self.root / 'missing')
