@@ -36,6 +36,9 @@ elif args == ['app-server']:
         if request.get('id') == 1:
             print(json.dumps({'id': 1, 'result': {}}), flush=True)
         if request.get('id') == 2:
+            if os.environ.get('HOOK_MODE') == 'error':
+                print(json.dumps({'id': 2, 'error': {'code': -32603, 'message': 'failure'}}), flush=True)
+                continue
             names = ['postToolUse', 'sessionStart', 'sessionStart', 'userPromptSubmit']
             if os.environ.get('HOOK_MODE') == 'one': names = names[:1]
             hooks = [{'eventName': n, 'pluginId': 'agent-kaizen@agent-kaizen-tools', 'source': 'plugin'} for n in names]
@@ -141,8 +144,11 @@ class HostProbeTest(unittest.TestCase):
         self.assertEqual(run.returncode, 0)
         self.assertIn('SKIP codex skills hidden:', run.stdout)
         run = self.run_probe('--host', 'codex', HOOK_MODE='exit')
-        self.assertEqual(run.returncode, 0)
-        self.assertIn('SKIP codex hooks discovered:', run.stdout)
+        self.assertEqual(run.returncode, 1)
+        self.assertIn('FAIL codex hooks discovered:', run.stdout)
+        run = self.run_probe('--host', 'codex', HOOK_MODE='error')
+        self.assertEqual(run.returncode, 1)
+        self.assertIn('FAIL codex hooks discovered: JSON-RPC exchange failed: JSON-RPC error:', run.stdout)
         run = self.run_probe('--host', 'codex', HOOK_MODE='one')
         self.assertEqual(run.returncode, 1)
         self.assertIn('FAIL codex hooks discovered:', run.stdout)

@@ -14,7 +14,8 @@ PREAMBLE = ('**Plugin root:** `${CLAUDE_PLUGIN_ROOT}`. If that is still a `${...
             'in Claude Code, and follow its propose-only rule before changing any host configuration.\n')
 AGENT_PREAMBLE = PREAMBLE.replace(
     'the folder that contains `skills/` (this file is `skills/<name>/SKILL.md`)',
-    'the folder that contains `agents/` (this file is `agents/kaizen-auditor.md`)')
+    'the folder that contains `agents/` (this file is `agents/kaizen-auditor.md`)').replace(
+    'wherever this skill uses', 'wherever this agent uses')
 # Tracked and untracked files, minus git-ignored ones (out/, caches, .DS_Store).
 FILES = subprocess.run(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], cwd=ROOT,
                        capture_output=True, text=True, check=True).stdout.split('\0')
