@@ -54,6 +54,12 @@ class RunnerTests(StubCase):
             "autoProjects": {"value": [], "source": "default"},
             "retention": {"value": "auto", "source": "default"},
             "retentionOverrides": {"value": {}, "source": "default"},
+            "friction": {"value": "on", "source": "default"},
+            "frictionSlowCallSeconds": {"value": 120, "source": "default"},
+            "frictionHeavySeconds": {"value": 60, "source": "default"},
+            "frictionOutputDirs": {"value": [], "source": "default"},
+            "frictionSampler": {"value": "on", "source": "default"},
+            "hostActions": {"value": "apply", "source": "default"},
             "projectCommands": {"value": {}, "source": "default"},
             "notesLedger": {"value": {}, "source": "default"},
             "calibrationLadder": {
@@ -68,6 +74,8 @@ class RunnerTests(StubCase):
         self.assertFalse(self.config_dir.exists())
 
     def test_precedence(self):
+        defaults = json.loads(self.config("show").stdout)
+        defaults.pop("reports")
         cases = [
             ({"enabled": False}, {"schedule": "always"}, "schedule", "off", "global"),
             ({"schedule": "active"}, {"schedule": "off"}, "schedule", "off", "project"),
@@ -81,9 +89,13 @@ class RunnerTests(StubCase):
                 write(self.global_path, json.dumps(global_cfg))
                 write(self.project_path, json.dumps(project_cfg))
                 data = self.runner["effective"](self.project)
-                self.assertEqual(data[name], {"value": value, "source": source})
-                if global_cfg.get("enabled") is False:
-                    self.assertEqual(data["enabled"], {"value": False, "source": "global"})
+                expected = dict(defaults)
+                for key, item in global_cfg.items():
+                    expected[key] = {"value": item, "source": "global"}
+                for key, item in project_cfg.items():
+                    expected[key] = {"value": item, "source": "project"}
+                expected[name] = {"value": value, "source": source}
+                self.assertEqual(data, expected)
 
     def test_config_typed_validators(self):
         valid = self.runner["valid_value"]
@@ -324,9 +336,10 @@ class RunnerTests(StubCase):
                 self.assertRegex(key(path), r"^[A-Za-z0-9-]{1,40}-[0-9a-f]{12}$")
                 self.assertTrue(key(path).endswith(hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:12]))
         self.assertEqual(key(self.project / "docs/.."), key(self.project))
+        expected = json.loads(self.config("show").stdout)
+        expected["reports"] = str(self.config_dir / "audits/projects" / key(self.project)) + "/"
         result = self.config("show", "--for", self.project)
-        self.assertEqual(json.loads(result.stdout)["reports"],
-                         str(self.config_dir / "audits/projects" / key(self.project)) + "/")
+        self.assertEqual(json.loads(result.stdout), expected)
 
     def test_paths_are_resolved_at_call_time(self):
         self.assertEqual(self.runner["claude_home"](), self.config_dir)
