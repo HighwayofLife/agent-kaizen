@@ -25,6 +25,11 @@
 
 Backups live in KAIZEN_BACKUP_DIR (default <CLAUDE_CONFIG_DIR or ~/.claude>/kaizen-backups),
 in folders only the owner can read.
+
+Accepted same-UID risks include a filesystem symlink planted under refs/ that
+resolves into refs/kaizen/, and a concurrent move of an undo target's parent
+during the descriptor-bound copy. Undo rechecks the parent before the final
+rename and anchors the rename to the directory descriptor.
 """
 import argparse
 import base64
@@ -445,7 +450,8 @@ def git_snapshot(directory, git_exe):
     common_dir = directory_identity(common)
     if (index.parent / "index.lock").exists():
         raise ValueError("locked Git index")
-    head = git(root, "rev-parse", "--verify", "HEAD^{commit}", git_exe=git_exe).decode("ascii").strip()
+    # Snapshot only the ref ID. Content readers check the object bounds first.
+    head = git(root, "rev-parse", "--verify", "HEAD", git_exe=git_exe).decode("ascii").strip()
     index_state, raw = read_index(index)
     if directory_identity(root) != worktree or directory_identity(common) != common_dir:
         raise ValueError("Git directories changed during capture")
@@ -454,7 +460,7 @@ def git_snapshot(directory, git_exe):
 
 
 def git_identity(directory, git_exe):
-    """Read the live identity using the executable from the trusted capture."""
+    """Read the live identity using the supplied trusted Git executable."""
     return git_snapshot(directory, git_exe)[0]
 
 
@@ -544,6 +550,7 @@ def git_scratch(root):
 
 MAX_GIT_OBJECT_BYTES = 64 * 1024 * 1024
 MAX_GIT_METADATA_BYTES = 8 * 1024 * 1024
+MAX_GIT_DELTA_DEPTH = 50
 
 
 def check_object_packs(root, git_exe):
@@ -565,24 +572,47 @@ def check_object_packs(root, git_exe):
             raise ValueError("Git pack is not a regular file within its size limit")
 
 
-def verify_object(root, kind, oid, git_exe):
+def bounded_object_size(root, kind, oid, git_exe):
     if not re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", oid):
         raise ValueError("invalid Git object ID")
-    kind_bytes = kind.encode("ascii")
     check_object_packs(root, git_exe)
-    fields = "%(objectname) %(objecttype) %(objectsize) %(objectsize:disk) %(deltabase)"
-    metadata = git(root, "cat-file", f"--batch-check={fields}", git_exe=git_exe, input=oid + b"\n").split()
-    if (len(metadata) != 5 or metadata[:2] != [oid, kind_bytes]
-            or not all(value.isdigit() for value in metadata[2:4])):
-        raise ValueError(f"invalid Git {kind} object metadata")
-    # A compressed pack size does not bound the inflated base chain. Refuse all deltas.
-    # Git may still inspect damaged packs or see a pack replaced between the checks and read.
-    if metadata[4] != b"0" * len(oid):
-        raise ValueError("Git delta base chain cannot be bounded")
-    size = int(metadata[2])
     limit = MAX_GIT_OBJECT_BYTES if kind == "blob" else min(MAX_GIT_OBJECT_BYTES, MAX_GIT_METADATA_BYTES)
-    if size > limit or int(metadata[3]) > MAX_GIT_OBJECT_BYTES:
-        raise ValueError("Git object exceeds its size limit")
+    fields = "%(objectsize) %(objectsize:disk) %(deltabase)"
+    zero, current = b"0" * len(oid), oid
+    expanded = disk = size = 0
+    seen = set()
+    # Asking for objecttype here would let Git walk the chain before its depth is checked.
+    # Git can report any copy of a duplicate object. It may also see damaged packs or
+    # a pack replaced between the checks and the read.
+    for depth in range(MAX_GIT_DELTA_DEPTH + 1):
+        metadata = git(root, "cat-file", f"--batch-check={fields}", git_exe=git_exe,
+                       input=current + b"\n").split()
+        if (len(metadata) != 3 or not all(value.isdigit() for value in metadata[:2])
+                or len(metadata[2]) != len(oid) or not re.fullmatch(rb"[0-9a-f]+", metadata[2])):
+            raise ValueError(f"invalid Git {kind} object metadata")
+        inflated, stored = map(int, metadata[:2])
+        expanded += inflated
+        disk += stored
+        if depth == 0:
+            size = inflated
+            if size > limit or disk > MAX_GIT_OBJECT_BYTES:
+                raise ValueError("Git object exceeds its size limit")
+        if max(expanded, disk) > MAX_GIT_OBJECT_BYTES:
+            raise ValueError("Git delta chain exceeds its size limit")
+        seen.add(current)
+        current = metadata[2]
+        if current == zero:
+            return size
+        if current in seen:
+            raise ValueError("Git delta chain contains a cycle")
+    raise ValueError("Git delta chain exceeds its depth limit")
+
+
+def verify_object(root, kind, oid, git_exe):
+    size = bounded_object_size(root, kind, oid, git_exe)
+    kind_bytes = kind.encode("ascii")
+    if git(root, "cat-file", "-t", oid.decode("ascii"), git_exe=git_exe).strip() != kind_bytes:
+        raise ValueError(f"invalid Git {kind} object type")
     command, env = git_command(root, "cat-file", kind, oid.decode("ascii"), git_exe=git_exe)
     deadline = time.monotonic() + 10
     digest = hashlib.new("sha256" if len(oid) == 64 else "sha1", kind_bytes + b" %d\0" % size)
@@ -613,12 +643,14 @@ def verify_object(root, kind, oid, git_exe):
                 proc.kill()
 
 
-def verified_tree(root, tree, git_exe):
+def verified_tree(root, tree, git_exe, *, tree_oids=None):
     entry = re.compile(rb"(40000|100644|100755|120000) ([^/\0]+)\0(.{%d})" % (len(tree) // 2), re.S)
     leaves, pending, budget = {}, [(b"", tree)], MAX_GIT_METADATA_BYTES
     while pending:
         prefix, oid = pending.pop()
         raw, offset, names = verify_object(root, "tree", oid, git_exe), 0, set()
+        if tree_oids is not None:
+            tree_oids.add(oid)
         if prefix and not raw:
             raise ValueError("Git tree contains an explicit empty subtree")
         while offset < len(raw):
@@ -651,12 +683,8 @@ def capture_git_tree(directory, *, baseline=None, edits=None):
     if baseline is not None and dict(state, clean_start=True) != baseline:
         raise ValueError("Git HEAD, root or index differs from the baseline")
     algorithm = "sha256" if len(state["head"]) == 64 else "sha1"
-    if baseline is None:
-        tree = git(root, "ls-tree", "-rz", state["head"], git_exe=git_exe).split(b"\0")[:-1]
-    else:
-        head = verify_object(root, "commit", state["head"].encode("ascii"), git_exe)
-        leaves = verified_tree(root, head.split(b"\n", 1)[0].removeprefix(b"tree "), git_exe)
-        tree = [mode + b" blob " + oid + b"\t" + name for name, (mode, oid) in sorted(leaves.items())]
+    head = verify_object(root, "commit", state["head"].encode("ascii"), git_exe)
+    leaves = verified_tree(root, head.split(b"\n", 1)[0].removeprefix(b"tree "), git_exe)
     # Before Git scans: a file created after Git passes a directory still changes its stamp.
     listing = worktree_listing(root)
     with git_scratch(root) as scratch, open_directory(scratch) as scratch_fd:
@@ -675,7 +703,7 @@ def capture_git_tree(directory, *, baseline=None, edits=None):
         if edits is None and git(root, "ls-files", "--others", "-z", git_exe=git_exe, git_dir=scratch):
             raise ValueError("worktree contains untracked files")
         entries, versions, offset = {}, {}, 0
-        for row in tree:
+        for tree_name, tree_entry in sorted(leaves.items()):
             match = INDEX_ENTRY.match(records, offset)
             if not match:
                 raise ValueError("Git index has missing, hidden or nonstandard entries")
@@ -685,7 +713,7 @@ def capture_git_tree(directory, *, baseline=None, edits=None):
                 versions[path] = file_version(path.lstat())
                 if not matches_blob(path, mode, oid):
                     raise ValueError("worktree differs from HEAD outside the verified files")
-            if row != mode + b" blob " + oid + b"\t" + name:
+            if (name, (mode, oid)) != (tree_name, tree_entry):
                 raise ValueError("index or worktree differs from HEAD")
             entries[path] = (mode, oid)
             offset = match.end()
@@ -866,7 +894,7 @@ def ledger_append(proof, scope, root):
     return ids, before, live
 
 
-def commit_preflight(change, scheduled=None):
+def commit_preflight(change, scheduled=None, *, git_exe=None):
     root_identity = backup_root_identity(BACKUP_ROOT) if scheduled is None else scheduled["root_identity"]
     if scheduled is None:
         with open_handoff(BACKUP_ROOT, change, root_identity) as (fd, identity):
@@ -895,6 +923,8 @@ def commit_preflight(change, scheduled=None):
             raise ValueError("runner-approved change folder or manifest changed")
     if not isinstance(baseline, dict) or baseline.get("clean_start") is not True:
         raise ValueError("no clean-start baseline")
+    if git_exe is not None:  # A journaled transaction can recover with a newly trusted Git.
+        baseline = dict(baseline, git_executable=git_exe)
     root = Path(baseline["root"])
     if not root.is_absolute() or root.resolve(strict=True) != root:
         raise ValueError("repository root must be canonical")
@@ -1054,14 +1084,13 @@ def manifest_stamp(change):
     return data, [list(identity), digest]
 
 
-def ref_scope(record):
+def ref_scope(record, git_exe):
     state = record["state"]
-    root, git_exe = Path(state["root"]), state["git_executable"]
-    verify_git(git_exe)
+    root = Path(state["root"])
     live = git_identity(root, git_exe)
     if any(live[key] != state[key] for key in ("root", "worktree", "common_dir")):
         raise ValueError("Git repository identity changed")
-    return root, git_exe
+    return root
 
 
 def check_git_write_paths(record, *, objects=False, ref=None):
@@ -1090,10 +1119,12 @@ def check_git_write_paths(record, *, objects=False, ref=None):
     return common
 
 
-def loose_symref(path):
+def loose_symref(path, *, refuse_symlink=False):
     try:
         info = path.lstat()
         if stat.S_ISLNK(info.st_mode):
+            if refuse_symlink:
+                raise ValueError(f"loose Git ref is a filesystem symlink: {path}")
             return os.fsencode(os.readlink(path))
         if stat.S_ISREG(info.st_mode):
             with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
@@ -1107,10 +1138,6 @@ def loose_symref(path):
 
 def check_symbolic_refs(root, git_exe, common):
     prefix = b"refs/kaizen/"
-    for row in git(root, "for-each-ref", "--format=%(refname) %(symref)", git_exe=git_exe).splitlines():
-        if row.partition(b" ")[2].lower().startswith(prefix):
-            raise ValueError(f"symbolic ref targets refs/kaizen/: {os.fsdecode(row.partition(b' ')[0])}")
-
     # Git's iterator omits dangling refs and can report the end of a symbolic chain.
     # Inspect loose refs and every HEAD for the immediate target as well.
     worktrees = common / "worktrees"
@@ -1119,13 +1146,21 @@ def check_symbolic_refs(root, git_exe, common):
         refuse_symlinks(directory)
         if loose_symref(directory / "HEAD").lower().startswith(prefix):
             raise ValueError("kaizen ref is checked out or targeted by a symbolic HEAD")
-        for path in (directory / "refs").rglob("*"):
-            if not path.name.endswith(".lock") and loose_symref(path).lower().startswith(prefix):
+        refs = directory / "refs"
+        for path in refs.rglob("*"):
+            if path.name.endswith(".lock"):
+                continue
+            refuse_symlink = path.relative_to(refs).parts[0].lower() in ("heads", "tags")
+            target = loose_symref(path, refuse_symlink=refuse_symlink)
+            if target.lower().startswith(prefix):
                 raise ValueError(f"symbolic ref targets refs/kaizen/: {path}")
+    for row in git(root, "for-each-ref", "--format=%(refname) %(symref)", git_exe=git_exe).splitlines():
+        if row.partition(b" ")[2].lower().startswith(prefix):
+            raise ValueError(f"symbolic ref targets refs/kaizen/: {os.fsdecode(row.partition(b' ')[0])}")
 
 
-def checked_ref(record, records, phase, observing=None):
-    root, git_exe = ref_scope(record)
+def checked_ref(record, records, phase, git_exe, observing=None):
+    root = ref_scope(record, git_exe)
     ref = record["ref"]
     if not re.fullmatch(r"refs/kaizen/\d{4}-\d{2}-\d{2}", ref, re.ASCII):
         raise ValueError("invalid kaizen ref")
@@ -1187,9 +1222,8 @@ def checked_ref(record, records, phase, observing=None):
     return tip
 
 
-def commit_tree(record, oid):
-    state = record["state"]
-    root, git_exe = Path(state["root"]), state["git_executable"]
+def commit_tree(record, oid, git_exe):
+    root = Path(record["state"]["root"])
     raw = verify_object(root, "commit", oid.encode("ascii"), git_exe)
     return verified_tree(root, raw.split(b"\n", 1)[0].removeprefix(b"tree "), git_exe)
 
@@ -1219,10 +1253,10 @@ def effect_message(record, phase):
     return f"kaizen: {subject}\n\nkaizen-backup change: {record['change']}"
 
 
-def verify_effect(record, phase):
+def verify_effect(record, phase, git_exe, *, tree_oids=None):
     effect, state = record[phase], record["state"]
     parent = effect["old"] if effect["old"].strip("0") else state["head"]
-    root, git_exe = Path(state["root"]), state["git_executable"]
+    root = Path(state["root"])
     raw = verify_object(root, "commit", effect["new"].encode("ascii"), git_exe)
     headers, _, message = raw.partition(b"\n\n")
     expected = f"tree {effect['tree']}\nparent {parent}".encode("ascii").splitlines()
@@ -1230,7 +1264,7 @@ def verify_effect(record, phase):
             or headers.count(b"\nparent ") != 1
             or message != os.fsencode(effect_message(record, phase) + "\n")):
         raise ValueError("kaizen commit parent, tree or trailer differs from its record")
-    return verified_tree(root, effect["tree"].encode("ascii"), git_exe)
+    return verified_tree(root, effect["tree"].encode("ascii"), git_exe, tree_oids=tree_oids)
 
 
 def refuse_ref_lock(path):
@@ -1253,6 +1287,20 @@ def sync_ref_dirs(common, ref):
                 raise
 
 
+def sync_object_dirs(common, oids):
+    objects = common / "objects"
+    # Git fsyncs object files. Persist loose fan-outs and any pack entries before the pin.
+    directories = {objects / oid[:2].decode("ascii") for oid in oids}
+    for directory in sorted(directories | {objects / "pack"}):
+        try:
+            with open_directory_walk(directory) as fd:
+                os.fsync(fd)
+        except FileNotFoundError:
+            pass  # A referenced object may only exist in a pack.
+    with open_directory_walk(objects) as fd:
+        os.fsync(fd)
+
+
 def pin_prefix():
     return "refs/kaizen/pending/" + hashlib.sha256(os.fsencode(ROOT)).hexdigest() + "/"
 
@@ -1261,15 +1309,14 @@ def pin_ref(record, phase):
     return pin_prefix() + record_path(Path(record["change"])).name + "-" + phase
 
 
-def change_pin(record, ref, oid, *, remove=False):
+def change_pin(record, ref, oid, git_exe, *, remove=False):
     common = check_git_write_paths(record, ref=ref)
     path = common / ref
     refuse_ref_lock(path)
     if loose_symref(path):
         raise ValueError(f"pending pin is a symbolic ref: {ref}")
-    state = record["state"]
-    options = dict(git_exe=state["git_executable"])
-    root = state["root"]
+    options = dict(git_exe=git_exe)
+    root = record["state"]["root"]
     rows = git(root, "for-each-ref", "--format=%(refname) %(objectname)", ref, **options).splitlines()
     if rows and rows != [f"{ref} {oid}".encode("ascii")]:
         raise ValueError(f"pending pin differs from its ref transaction: {ref}")
@@ -1281,19 +1328,20 @@ def change_pin(record, ref, oid, *, remove=False):
         sync_ref_dirs(common, ref)
 
 
-def cleanup_pins(record, records):
+def cleanup_pins(record, records, git_exe, *, only=None):
     state = record["state"]
     prefix = pin_prefix()
     pending = {pin_ref(other, phase) for other in records.values()
                if other["state"]["common_dir"] == state["common_dir"]
                for phase in ("commit", "inverse") if phase in other
                and not (other[phase]["done"] or other[phase].get("cancelled"))}
-    rows = git(state["root"], "for-each-ref", "--format=%(refname) %(objectname)", prefix,
-               git_exe=state["git_executable"]).splitlines()
+    rows = git(state["root"], "for-each-ref", "--format=%(refname) %(objectname)", only or prefix,
+               git_exe=git_exe).splitlines()
     for row in rows:
         ref, oid = row.decode("ascii").split(" ")
-        if re.fullmatch(re.escape(prefix) + r"r-[a-f0-9]{64}-(commit|inverse)", ref) and ref not in pending:
-            change_pin(record, ref, oid, remove=True)
+        if ((only is None or ref == only) and ref not in pending
+                and re.fullmatch(re.escape(prefix) + r"r-[a-f0-9]{64}-(commit|inverse)", ref)):
+            change_pin(record, ref, oid, git_exe, remove=True)
 
 
 def update_ref(root, git_exe, ref, effect, check, *, verify_only=False):
@@ -1339,28 +1387,34 @@ def update_ref(root, git_exe, ref, effect, check, *, verify_only=False):
             raise ValueError("Git refused the ref transaction")
 
 
-def transact_ref(change, record, records, phase, tip, entries, recheck):
+def transact_ref(change, record, records, phase, tip, entries, recheck, git_exe):
     state = record["state"]
-    root, git_exe = Path(state["root"]), state["git_executable"]
+    root = Path(state["root"])
     effect = record.get(phase)
+    pin = pin_ref(record, phase)
     common = Path(state["common_dir"]["path"])
     if effect is None or tip == effect["old"]:
         refuse_ref_lock(common / record["ref"])
-    for oid in {oid for _, oid in entries.values()}:
+    oids = {oid for _, oid in entries.values()}
+    for oid in oids:
         verify_object(root, "blob", oid, git_exe)
     if effect is None:
         parent = tip if tip.strip("0") else state["head"]
-        if entries == commit_tree(record, parent):
+        if entries == commit_tree(record, parent, git_exe):
             raise ValueError("nothing to commit")
         check_git_write_paths(record, objects=True)
-        tree = write_tree(state, entries)
+        if phase == "inverse":
+            # The previous attempt may have pinned an inverse before saving its journal.
+            cleanup_pins(record, records, git_exe, only=pin)
+        tree = write_tree(dict(state, git_executable=git_exe), entries)
         new = git(root, "-c", "commit.gpgsign=false", "commit-tree", tree, "-p", parent,
                   "-m", effect_message(record, phase), git_exe=git_exe).decode("ascii").strip()
         record[phase] = effect = dict(old=tip, new=new, tree=tree, done=False)
-        if verify_effect(record, phase) != entries:
-            raise ValueError("kaizen commit differs from the verified tree")
-    pin = pin_ref(record, phase)
-    change_pin(record, pin, effect["new"])
+    if verify_effect(record, phase, git_exe, tree_oids=oids) != entries:
+        raise ValueError("kaizen commit differs from the verified tree")
+    oids.add(effect["new"].encode("ascii"))
+    sync_object_dirs(common, oids)
+    change_pin(record, pin, effect["new"], git_exe)
     if tip == effect["old"]:
         recheck()
         save_record(change, record)  # Sync again on retry after an interrupted record write.
@@ -1368,17 +1422,17 @@ def transact_ref(change, record, records, phase, tip, entries, recheck):
 
         def check():
             recheck()
-            if checked_ref(record, records, phase) != tip:
+            if checked_ref(record, records, phase, git_exe) != tip:
                 raise ValueError("kaizen ref moved before update")
 
         update_ref(root, git_exe, record["ref"], effect, check)
-    if checked_ref(record, records, phase) != effect["new"]:
+    if checked_ref(record, records, phase, git_exe) != effect["new"]:
         raise ValueError("kaizen ref moved after update")
-    verify_effect(record, phase)
+    verify_effect(record, phase, git_exe)
     sync_ref_dirs(common, record["ref"])
     effect["done"] = True
     save_record(change, record)
-    change_pin(record, pin, effect["new"], remove=True)
+    change_pin(record, pin, effect["new"], git_exe, remove=True)
 
 
 def write_commit(change, scheduled, key):
@@ -1388,19 +1442,23 @@ def write_commit(change, scheduled, key):
     _, stamp = manifest_stamp(change)
     request = hashlib.sha256(json.dumps(scheduled, sort_keys=True).encode("ascii")).hexdigest()
     record = records.get(change.name)
+    git_exe = None
     if record is not None:
         if ((record["key"], record["request"], record["manifest"]) != (key, request, stamp)
                 or "inverse" in record or record["commit"].get("cancelled")):
             raise ValueError("commit transaction scope differs or was reverted")
-        tip = checked_ref(record, records, "commit")
-        entries = verify_effect(record, "commit")
+        # Keep the captured executable identity in the journal for diagnostics.
+        git_exe = resolve_git()
+        tip = checked_ref(record, records, "commit", git_exe)
+        entries = verify_effect(record, "commit", git_exe)
         if record["commit"]["done"]:
             if tip == record["commit"]["old"]:
-                transact_ref(change, record, records, "commit", tip, entries, lambda: None)
-            cleanup_pins(record, records)
+                transact_ref(change, record, records, "commit", tip, entries, lambda: None, git_exe)
+            cleanup_pins(record, records, git_exe)
             return record
     if record is None or tip == record["commit"]["old"]:
-        state, base, files, check = commit_preflight(change, scheduled)
+        state, base, files, check = commit_preflight(change, scheduled, git_exe=git_exe)
+        git_exe = state["git_executable"]
 
         def recheck():
             check()
@@ -1410,12 +1468,12 @@ def write_commit(change, scheduled, key):
         if record is None:
             record = dict(change=change.name, key=key, request=request, manifest=stamp, state=state,
                           ref=local_ref())
-            tip = checked_ref(record, records, "commit")
-            cleanup_pins(record, records)
-        elif state != record["state"]:
+            tip = checked_ref(record, records, "commit", git_exe)
+            cleanup_pins(record, records, git_exe)
+        elif state != dict(record["state"], git_executable=git_exe):
             raise ValueError("Git baseline differs from the pending commit")
         original = {os.fsencode(path.relative_to(state["root"])): entry for path, entry in base.items()}
-        onto = commit_tree(record, tip) if tip.strip("0") else original
+        onto = commit_tree(record, tip, git_exe) if tip.strip("0") else original
         if any(base.get(path) != onto.get(os.fsencode(path.relative_to(state["root"]))) for path in files):
             raise ValueError("kaizen ref contains an overlapping change")
         check_git_write_paths(record, objects=True)
@@ -1425,27 +1483,28 @@ def write_commit(change, scheduled, key):
         entries = merged
     else:
         recheck = lambda: None
-    transact_ref(change, record, records, "commit", tip, entries, recheck)
-    cleanup_pins(record, records)
+    transact_ref(change, record, records, "commit", tip, entries, recheck, git_exe)
+    cleanup_pins(record, records, git_exe)
     return record
 
 
-def checked_inverse(change, data, record, records, observing=None):
+def checked_inverse(change, data, record, records, git_exe, observing=None):
     original = record["commit"]
     live, stamp = manifest_stamp(change)
     if data != live or record["manifest"] != stamp:
         raise ValueError("commit manifest changed before undo")
     tip = None
     if original["done"]:
-        tip = checked_ref(record, records, "inverse", observing)
+        tip = checked_ref(record, records, "inverse", git_exe, observing)
     elif not original.get("cancelled"):
-        tip = checked_ref(record, records, "commit")
+        tip = checked_ref(record, records, "commit", git_exe)
         if tip != original["old"]:
             raise ValueError("complete the pending commit before undo")
     else:
-        ref_scope(record)
-    after = verify_effect(record, "commit") if original["done"] else None
-    before = commit_tree(record, original["old"] if original["old"].strip("0") else record["state"]["head"])
+        ref_scope(record, git_exe)
+    after = verify_effect(record, "commit", git_exe) if original["done"] else None
+    parent = original["old"] if original["old"].strip("0") else record["state"]["head"]
+    before = commit_tree(record, parent, git_exe)
     root = Path(record["state"]["root"])
     backups = {}
     for entry in data["files"]:
@@ -1457,8 +1516,8 @@ def checked_inverse(change, data, record, records, observing=None):
     if not original["done"]:
         return tip, None, original.get("cancelled"), backups
     inverse = record.get("inverse")
-    entries = overlay(after, before, commit_tree(record, inverse["old"] if inverse else tip))
-    if inverse and verify_effect(record, "inverse") != entries:
+    entries = overlay(after, before, commit_tree(record, inverse["old"] if inverse else tip, git_exe))
+    if inverse and verify_effect(record, "inverse", git_exe) != entries:
         raise ValueError("pending inverse differs from the verified inverse tree")
     applied = inverse and (inverse["done"] or tip == inverse["new"])
     return tip, entries, applied, backups
@@ -1484,7 +1543,8 @@ def commit(args):
                 raise ValueError("invalid scheduled baseline")
             if key is None:
                 state, _, _, _ = commit_preflight(folder, scheduled)
-                checked_ref(dict(change=folder.name, state=state, ref=local_ref()), read_records(), "commit")
+                checked_ref(dict(change=folder.name, state=state, ref=local_ref()), read_records(),
+                            "commit", state["git_executable"])
                 print("commit preflight passed")
                 return
         with ref_lock():
@@ -1813,6 +1873,7 @@ def undo_locked(args, locked):
     if records and not locked:
         raise ValueError("git undo requires the private ref lock")
     observing = next((change.name for change, _ in plan if change.name in records), None)
+    git_exe = resolve_git() if observing is not None else None
     conflicts = []
     backups, versions = {}, {}
     seen = {}  # the plan is newest first: path -> (newer change name, hash of its backup, i.e. the state it began from)
@@ -1822,7 +1883,7 @@ def undo_locked(args, locked):
         if data.get("reverted"):
             if record and record.get("inverse", {}).get("done"):
                 inverse = record["inverse"]
-                if checked_ref(record, records, "inverse") == inverse["old"]:
+                if checked_ref(record, records, "inverse", git_exe) == inverse["old"]:
                     raise ValueError(f"completed inverse ref {record['ref']} is at its previous value; "
                                      f"the reverted backup record expects {inverse['new']}")
             sys.exit(f"kaizen-backup: {change} was already reverted on {data['reverted']}")
@@ -1830,7 +1891,7 @@ def undo_locked(args, locked):
             raise ValueError("undo requires a tool-owned commit record")
         applied = False
         if record:
-            _, _, applied, backups[change] = checked_inverse(change, data, record, records, observing)
+            _, _, applied, backups[change] = checked_inverse(change, data, record, records, git_exe, observing)
         for entry in data["files"]:
             path = validate_entry(change, entry, roots)
             if record:
@@ -1860,7 +1921,7 @@ def undo_locked(args, locked):
     for change, data in plan:  # newest change first
         record = records.get(change.name)
         if record and not record["commit"].get("cancelled"):
-            tip, entries, _, _ = checked_inverse(change, data, record, records)
+            tip, entries, _, _ = checked_inverse(change, data, record, records, git_exe)
 
             def recheck():
                 if manifest_stamp(change)[1] != record["manifest"]:
@@ -1871,17 +1932,17 @@ def undo_locked(args, locked):
             if entries is None:
                 def cancel_prepared():
                     recheck()
-                    if checked_ref(record, records, "commit") != tip:
+                    if checked_ref(record, records, "commit", git_exe) != tip:
                         raise ValueError("kaizen ref moved before cancelling the pending commit")
                     record["commit"]["cancelled"] = True
                     save_record(change, record)
 
-                root, git_exe = ref_scope(record)
+                root = ref_scope(record, git_exe)
                 update_ref(root, git_exe, record["ref"], record["commit"], cancel_prepared, verify_only=True)
             elif not record.get("inverse", {}).get("done") or tip == record["inverse"]["old"]:
-                transact_ref(change, record, records, "inverse", tip, entries, recheck)
+                transact_ref(change, record, records, "inverse", tip, entries, recheck, git_exe)
         if record:
-            cleanup_pins(record, records)
+            cleanup_pins(record, records, git_exe)
         for entry in data["files"]:
             path = validate_entry(change, entry, roots)
             if not record and path in versions and undo_file_snapshot(path) != versions[path]:

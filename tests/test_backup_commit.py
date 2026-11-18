@@ -242,20 +242,39 @@ class BackupCommitTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "pack.*size limit"):
                 verify(self.repo, "blob", oid, executable)
 
-    def test_object_verification_refuses_deltas_before_content(self):
-        verify = self.helpers["verify_object"]
-        executable = self.helpers["resolve_git"]()
-        oid = self.git("rev-parse", "HEAD:tracked").encode("ascii")
-        command = self.helpers["git"]
+    def test_oversized_head_delta_chain_is_refused_before_peel_or_content(self):
+        oid = self.git("rev-parse", "HEAD").encode("ascii")
+        base = b"1" * len(oid)
+        queries = []
+        command = self.helpers["git_command"]
+
+        def only_metadata(root, *args, **kwargs):
+            self.assertFalse(any("^" in arg for arg in args), args)
+            self.assertNotIn(args[0], ("cat-file", "ls-tree"), args)
+            return command(root, *args, **kwargs)
+
+        git = self.helpers["git"]
 
         def delta_metadata(root, *args, **kwargs):
             if args[0] == "cat-file" and "%(deltabase)" in args[1]:
-                return b" ".join((oid, b"blob", b"6", b"30", b"1" * len(oid))) + b"\n"
-            return command(root, *args, **kwargs)
+                query = kwargs["input"].strip()
+                queries.append(query)
+                fields = args[1].partition("=")[2]
+                values = {"%(objectname)": query, "%(objecttype)": b"commit",
+                          "%(objectsize)": b"400", "%(objectsize:disk)": b"40",
+                          "%(deltabase)": base if query == oid else b"0" * len(oid)}
+                return b" ".join(values[field] for field in fields.split()) + b"\n"
+            return git(root, *args, **kwargs)
 
-        with patch.dict(self.helpers, git=delta_metadata):
-            with self.assertRaisesRegex(ValueError, "delta.*cannot be bounded"):
-                verify(self.repo, "blob", oid, executable)
+        cases = ((512, 50, "size", [oid, base]), (1024, 0, "depth", [oid]))
+        for size, depth, limit, expected in cases:
+            with self.subTest(limit=limit), patch.dict(
+                    self.helpers, MAX_GIT_OBJECT_BYTES=size, MAX_GIT_DELTA_DEPTH=depth,
+                    git=delta_metadata, git_command=only_metadata):
+                queries.clear()
+                with self.assertRaisesRegex(ValueError, f"delta chain exceeds its {limit} limit"):
+                    self.helpers["capture_git_tree"](self.repo)
+                self.assertEqual(queries, expected)
 
     def test_unsafe_loose_object_index_is_refused_before_object_writes(self):
         change = self.ready()
@@ -282,6 +301,64 @@ class BackupCommitTests(unittest.TestCase):
         self.git("symbolic-ref", "HEAD", branch)
         self.git("symbolic-ref", branch, "refs/kaizen/unrelated")
         self.assertIn("symbolic ref", self.commit_cli(change, expected=2).stderr)
+
+    def test_filesystem_symlinks_under_heads_and_tags_are_refused(self):
+        change = self.ready()
+        for namespace in ("heads", "tags"):
+            with self.subTest(namespace=namespace):
+                alias = self.repo / ".git/refs" / namespace / "alias"
+                alias.parent.mkdir(exist_ok=True)
+                alias.symlink_to("../kaizen/unrelated")
+                try:
+                    self.assertIn("symlink", self.commit_cli(change, expected=2).stderr)
+                finally:
+                    alias.unlink()
+
+    def test_object_directories_are_synced_before_pinning(self):
+        nested = self.repo / "nested"
+        nested.mkdir()
+        target = nested / self.target.name
+        self.target.rename(target)
+        self.target = target
+        self.git("add", "-A")
+        self.git("commit", "-qm", "nested")
+        change = self.ready()
+        objects = self.repo / ".git/objects"
+        sync, pin = os.fsync, self.helpers["change_pin"]
+        synced = []
+
+        def observe_sync(fd):
+            info = os.fstat(fd)
+            if stat.S_ISDIR(info.st_mode):
+                synced.append((info.st_dev, info.st_ino))
+            return sync(fd)
+
+        def identity(path):
+            info = path.stat()
+            return info.st_dev, info.st_ino
+
+        def check_pin(record, ref, oid, *args, **kwargs):
+            if not kwargs.get("remove"):
+                tree = self.git("rev-parse", oid + "^{tree}")
+                children = [row.split()[2] for row in self.git("ls-tree", "-rt", tree).splitlines()]
+                fanouts = {objects / item[:2] for item in (oid, tree, *children)
+                           if (objects / item[:2] / item[2:]).is_file()}
+                self.assertTrue(fanouts)
+                root_sync = synced.index(identity(objects))
+                for directory in fanouts:
+                    self.assertIn(identity(directory), synced[:root_sync])
+                if packed:
+                    self.assertTrue(list((objects / "pack").glob("*.pack")))
+                    self.assertIn(identity(objects / "pack"), synced[:root_sync])
+            return pin(record, ref, oid, *args, **kwargs)
+
+        with patch.object(os, "fsync", observe_sync):
+            packed = False
+            self.main("commit", change, change_pin=check_pin)
+            self.git("gc", "--aggressive", "--prune=now")
+            synced.clear()
+            packed = True
+            self.main("undo", change, change_pin=check_pin)
 
     def test_ref_directory_is_synced_before_each_effect_is_done(self):
         change = self.ready()
@@ -351,6 +428,88 @@ class BackupCommitTests(unittest.TestCase):
             self.assertTrue(self.git("for-each-ref", pins))
             self.main(command, change)
             self.assertEqual(self.git("for-each-ref", pins), "")
+
+    def test_aggressive_gc_delta_packs_a_pending_commit_and_retry_recovers(self):
+        name = hashlib.shake_256(b"delta fixture").hexdigest(2048)
+        self.git("config", "user.name", name)
+        change = self.ready()
+        save = self.helpers["save_record"]
+
+        def stop_after_pending(folder, record):
+            save(folder, record)
+            raise OSError("interrupted before ref update")
+
+        self.main("commit", change, expected=2, save_record=stop_after_pending)
+        record = json.loads(self.helpers["record_path"](change).read_text())
+        oid = record["commit"]["new"]
+        raw = self.git("cat-file", "commit", oid).encode("ascii") + b"\n"
+        base = subprocess.check_output(["git", "hash-object", "-w", "-t", "commit", "--stdin"],
+                                       input=raw + b"longer base\n" * 20, cwd=self.repo, env=self.env).strip()
+        self.git("update-ref", "refs/tags/delta-base", base.decode("ascii"))
+        self.git("gc", "--aggressive", "--prune=now")
+        delta_base = subprocess.check_output(
+            ["git", "cat-file", "--batch-check=%(deltabase)"], input=oid.encode("ascii") + b"\n",
+            cwd=self.repo, env=self.env).strip()
+        self.assertEqual(delta_base, base)
+        self.main("commit", change)
+        self.assertEqual(self.git("rev-parse", record["ref"]), oid)
+
+    def test_retry_replaces_inverse_pin_left_before_pending_journal(self):
+        change = self.ready()
+        ref = self.commit_cli(change).stdout.split()[-1]
+        original = self.git("rev-parse", ref)
+        journal = self.helpers["record_path"](change)
+        pins = "refs/kaizen/pending/"
+        save = self.helpers["save_record"]
+
+        def stop_before_pending(folder, record):
+            if "inverse" in record:
+                self.assertEqual(self.git("for-each-ref", "--format=%(objectname)", pins),
+                                 record["inverse"]["new"])
+                raise OSError("interrupted between pin and journal")
+            save(folder, record)
+
+        self.assertIn("interrupted between pin and journal",
+                      self.main("undo", change, expected=2, save_record=stop_before_pending))
+        self.assertNotIn("inverse", json.loads(journal.read_text()))
+        self.assertEqual((self.git("rev-parse", ref), self.target.read_text()), (original, "after"))
+        self.git("config", "user.name", "Changed after interruption")
+        self.main("undo", change)
+        self.assertEqual(self.git("rev-parse", ref + "^"), original)
+        self.assertEqual(self.git("for-each-ref", pins), "")
+        self.assertEqual(self.target.read_text(), "before")
+
+    def test_ref_recovery_rechecks_current_git_and_keeps_captured_identity(self):
+        executable, save = self.helpers["git_executable"], self.helpers["save_record"]
+
+        def before_upgrade(path):
+            return dict(executable(path), sha256="0" * 64)
+
+        def stop_after_pending(folder, record):
+            save(folder, record)
+            raise OSError("interrupted before ref update")
+
+        with patch.dict(self.helpers, git_executable=before_upgrade):
+            change = self.begin_in_process("upgrade")
+            self.target.write_text("after")
+            self.script("finish", change)
+            self.main("commit", change, expected=2, save_record=stop_after_pending)
+        journal = self.helpers["record_path"](change)
+        record = json.loads(journal.read_text())
+        captured = record["state"]["git_executable"]
+        self.assertEqual(captured["sha256"], "0" * 64)
+
+        _, untrusted, marker = self.fake_git()
+        untrusted.chmod(0o775)
+        self.assertIn("trusted", self.main("commit", change, expected=2, TRUSTED_GIT=(str(untrusted),)))
+        self.assertFalse(marker.exists())
+        self.main("commit", change)
+        self.assertEqual(self.git("rev-parse", record["ref"]), record["commit"]["new"])
+        self.assertIn("trusted", self.main("undo", change, expected=2, TRUSTED_GIT=(str(untrusted),)))
+        self.assertFalse(marker.exists())
+        self.main("undo", change)
+        self.assertEqual(self.target.read_text(), "before")
+        self.assertEqual(json.loads(journal.read_text())["state"]["git_executable"], captured)
 
     def test_undo_refuses_editor_save_after_temp_sync(self):
         self.check_undo_race(swap=False)
