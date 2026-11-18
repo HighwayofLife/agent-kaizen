@@ -51,6 +51,7 @@ class RunnerTests(StubCase):
             "pendingDays": {"value": 10, "source": "default"},
             "schedule": {"value": "active", "source": "default"},
             "scheduledAutonomy": {"value": "propose", "source": "default"},
+            "maxChangesPerRun": {"value": 3, "source": "default"},
             "autoProjects": {"value": [], "source": "default"},
             "retention": {"value": "auto", "source": "default"},
             "retentionOverrides": {"value": {}, "source": "default"},
@@ -83,6 +84,7 @@ class RunnerTests(StubCase):
             ({"scheduledAutonomy": "propose", "autoProjects": [str(self.project)]},
              {"scheduledAutonomy": "auto"}, "scheduledAutonomy", "auto", "project"),
             ({"schedule": "always"}, {}, "schedule", "always", "global"),
+            ({"maxChangesPerRun": 1}, {"maxChangesPerRun": 0}, "maxChangesPerRun", 0, "project"),
         ]
         for global_cfg, project_cfg, name, value, source in cases:
             with self.subTest(global_cfg=global_cfg, project_cfg=project_cfg):
@@ -96,6 +98,45 @@ class RunnerTests(StubCase):
                     expected[key] = {"value": item, "source": "project"}
                 expected[name] = {"value": value, "source": source}
                 self.assertEqual(data, expected)
+
+    def test_freeze_mutation_config_checks_identity_and_scope(self):
+        project = self.project.resolve()
+        backup = runpy.run_path(str(SCRIPTS / "kaizen-backup"))
+        freeze = self.runner["freeze_mutation_config"]
+        # macOS temporary directories may be addressed through a system symlink.
+        with patch.dict(os.environ, CLAUDE_CONFIG_DIR=str(self.config_dir.resolve())):
+            write(self.global_path, '{"scheduledAutonomy":"auto","maxChangesPerRun":2}')
+            self.assertEqual(freeze(project, backup)[0], 2)
+            write(self.project_path, '{"maxChangesPerRun":0}')
+            before = freeze(project, backup)
+            self.assertEqual(before[0], 0)
+            self.runner["write_config"](self.project_path, {"maxChangesPerRun": 0})
+            self.assertNotEqual(before, freeze(project, backup))
+            for raw in ('{"maxChangesPerRun":1,"maxChangesPerRun":0}', '{"maxChangesPerRun":true}'):
+                write(self.project_path, raw)
+                with self.assertRaises(ValueError):
+                    freeze(project, backup)
+            self.project_path.unlink()
+            self.project_path.symlink_to(self.global_path.resolve())
+            with self.assertRaises(ValueError):
+                freeze(project, backup)
+            with self.assertRaises(ValueError):
+                freeze(project / "docs", backup)
+
+    def test_broker_resolves_only_fixed_installed_helper_names(self):
+        installed = self.root / "copied"
+        installed.mkdir()
+        for name in ("kaizen-scheduled", "kaizen_credentials.py"):
+            shutil.copy2(SCRIPTS / name, installed / name)
+        runner = runpy.run_path(str(installed / "kaizen-scheduled"))
+        options = runner["command_options"](type("Args", (), {"dry_run": True, "token_audit": SCRIPTS / "token-audit",
+                                                             "pricing": SCRIPTS / "pricing.json"})())
+        for operation in ("host-fix", "allow-rule", "worktree-prune"):
+            path = installed / ("kaizen-" + operation)
+            write(path, "")
+            self.assertEqual(runner["broker_command"](options, operation), [options.python, str(path)])
+        with self.assertRaises(KeyError):
+            runner["broker_command"](options, "notes-ledger")
 
     def test_config_typed_validators(self):
         valid = self.runner["valid_value"]
@@ -205,9 +246,10 @@ class RunnerTests(StubCase):
                          {"value": "propose", "source": "default"})
 
     def test_set_global_boolean_and_multiple_settings(self):
-        result = self.config("set", "enabled=false", "schedule=always", "scheduledAutonomy=auto")
+        result = self.config("set", "enabled=false", "schedule=always", "scheduledAutonomy=auto",
+                             "maxChangesPerRun=0")
         self.assertEqual(json.loads(self.global_path.read_text()),
-                         {"enabled": False, "schedule": "always", "scheduledAutonomy": "auto"})
+                         {"enabled": False, "schedule": "always", "scheduledAutonomy": "auto", "maxChangesPerRun": 0})
         data = json.loads(result.stdout)
         self.assertEqual(data["enabled"], {"value": False, "source": "global"})
         self.assertEqual(data["schedule"], {"value": "off", "source": "global"})
@@ -241,6 +283,7 @@ class RunnerTests(StubCase):
         self.assertEqual(list(json.loads(self.project_path.read_text())), list(expected))
         self.assertEqual(json.loads(result.stdout)["scheduledAutonomy"],
                          {"value": "auto", "source": "project"})
+        self.assertEqual(json.loads(result.stdout)["maxChangesPerRun"], {"value": 3, "source": "project"})
         self.assertEqual(json.loads(result.stdout),
                          json.loads(self.config("show", "--for", self.project).stdout))
         self.assertEqual(list(self.project_path.parent.iterdir()), [self.project_path])
@@ -337,6 +380,7 @@ class RunnerTests(StubCase):
                 self.assertTrue(key(path).endswith(hashlib.sha256(str(path.resolve()).encode()).hexdigest()[:12]))
         self.assertEqual(key(self.project / "docs/.."), key(self.project))
         expected = json.loads(self.config("show").stdout)
+        self.assertEqual(expected["maxChangesPerRun"], {"value": 3, "source": "default"})
         expected["reports"] = str(self.config_dir / "audits/projects" / key(self.project)) + "/"
         result = self.config("show", "--for", self.project)
         self.assertEqual(json.loads(result.stdout), expected)
