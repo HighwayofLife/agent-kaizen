@@ -3,6 +3,7 @@ import base64
 import datetime
 import errno
 import hashlib
+import io
 import json
 import os
 import runpy
@@ -38,6 +39,8 @@ class BackupCommitTests(unittest.TestCase):
         self.target.write_text("before")
         self.git("add", ".")
         self.git("-c", "user.name=Test", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "initial")
+        self.git("config", "user.name", "Test")
+        self.git("config", "user.email", "fixture@example.invalid")
         with patch.dict(os.environ, self.env, clear=True):
             helpers = runpy.run_path(str(SCRIPT))
         self.capture, self.handoff = helpers["capture_git_baseline"], helpers["validate_change_handoff"]
@@ -70,6 +73,19 @@ class BackupCommitTests(unittest.TestCase):
                                 env=self.env, cwd=self.repo, capture_output=True, text=True, timeout=10)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result
+
+    def main(self, *args, expected=0, **overrides):
+        err = io.StringIO()
+        with (patch.dict(os.environ, self.env, clear=True), patch.dict(self.helpers, overrides),
+              patch("sys.stdout", io.StringIO()), patch("sys.stderr", err)):
+            self.assertEqual(self.helpers["main"](list(map(str, args))) or 0, expected, err.getvalue())
+        return err.getvalue()
+
+    def ready(self, run="commit"):
+        change = self.begin("--run", run, "--repo", ".")
+        self.target.write_text("after")
+        self.script("finish", change)
+        return change
 
     def test_scheduled_commit_preflight_and_ledger_attestation(self):
         fixture = json.loads(Path(__file__).with_name("fixtures").joinpath("ledger_attestation_v1.json").read_text())
@@ -130,9 +146,18 @@ class BackupCommitTests(unittest.TestCase):
             proof, manifest_ids=[change.name, sibling.name], after_sha256=hashlib.sha256(ledger.read_bytes()).hexdigest())),
                         expected=2)
         extra.unlink()
-        self.assertEqual(self.git("for-each-ref", "refs/heads/kaizen/"), "")
+        self.assertEqual(self.git("for-each-ref", "refs/kaizen/"), "")
         ledger.write_text(fixture["after_utf8"] + "another line\n")
         self.commit_cli(change, attested, expected=2)
+        ledger.write_text(fixture["after_utf8"])
+        keyed = dict(attested, action_id="fa1_" + "a" * 64)
+        first = self.commit_cli(change, keyed).stdout
+        ledger.write_text(fixture["after_utf8"] + "later bookkeeping\n")
+        self.assertEqual(self.commit_cli(change, keyed).stdout, first)
+        for override in ({"action_id": "fa1_" + "b" * 64}, {"run_id": "other"}):
+            self.commit_cli(change, dict(keyed, **override), expected=2)
+        self.assertIn("already bound", self.commit_cli(old, keyed, expected=2).stderr)
+        self.commit_cli(change, expected=2)
         ledger.write_text(fixture["after_utf8"])
         self.git("add", str(ledger))
         self.commit_cli(change, attested, expected=2)
@@ -147,29 +172,16 @@ class BackupCommitTests(unittest.TestCase):
         self.script("finish", change)
         self.git("config", "filter.tripwire.clean", "exit 1")
         self.git("config", "filter.tripwire.required", "true")
-        self.git("config", "user.name", "Test")
-        self.git("config", "user.email", "fixture@example.invalid")
         head, raw_index = self.git("rev-parse", "HEAD"), index.read_bytes()
-        self.commit_cli(change)
-        self.assertEqual(self.git("for-each-ref", "refs/heads/kaizen/"), "")
-        plan = self.helpers["commit_preflight"](change)
-        state, _, _, recheck = plan
-        manifest = change / "manifest.json"
-        before = manifest.read_bytes()
-        manifest.write_bytes(before + b" ")
-        with self.assertRaisesRegex(ValueError, "manifest hash changed"):
-            self.helpers["tree_from_files"](*plan)
-        manifest.write_bytes(before)
-        tree = self.helpers["tree_from_files"](*plan)
-        ref = "kaizen/" + datetime.date.today().isoformat()
-        self.git("worktree", "add", "--no-checkout", "-qb", ref, str(self.tmp / "linked"))
-        with self.assertRaisesRegex(ValueError, "checked out"):
-            self.helpers["write_commit"](state, tree, change.name, recheck)
-        self.git("worktree", "remove", "--force", str(self.tmp / "linked"))
-        with self.assertRaisesRegex(ValueError, "no journaled owner"):
-            self.helpers["write_commit"](state, tree, change.name, recheck)
-        self.git("branch", "-D", ref)
-        new = self.helpers["write_commit"](state, tree, change.name, recheck)
+        ref = "refs/kaizen/" + datetime.date.today().isoformat()
+        self.git("update-ref", ref, head)
+        branch = self.git("symbolic-ref", "HEAD")
+        self.git("symbolic-ref", "HEAD", ref)
+        self.assertIn("checked out", self.commit_cli(change, expected=2).stderr)
+        self.git("symbolic-ref", "HEAD", branch)
+        self.assertIn("no journaled owner", self.commit_cli(change, expected=2).stderr)
+        self.git("update-ref", "-d", ref)
+        new = self.commit_cli(change).stdout.split()[1]
         self.assertEqual(self.git("rev-parse", ref), new)
         self.assertEqual(self.git("show", f"{new}:tracked"), "after")
         self.assertTrue(self.git("show", "-s", "--format=%B", new).endswith(f"kaizen-backup change: {change.name}"))
@@ -193,7 +205,6 @@ class BackupCommitTests(unittest.TestCase):
         extra.touch()
         self.commit_cli(change, expected=2)
         extra.unlink()
-        self.commit_cli(change)
         for kind, spec in (("commit", "HEAD"), ("tree", "HEAD^{tree}"), ("tree", "HEAD:nested")):
             oid = self.git("rev-parse", spec)
             loose = self.repo / ".git" / "objects" / oid[:2] / oid[2:]
@@ -205,6 +216,162 @@ class BackupCommitTests(unittest.TestCase):
                 self.assertIn("commit refused", self.commit_cli(change, expected=2).stderr, kind)
             finally:
                 loose.write_bytes(original)
+        self.commit_cli(change)
+
+    def test_object_size_caps_include_unchanged_blobs(self):
+        unchanged = self.repo / "unchanged"
+        unchanged.write_bytes(b"x" * 1024)
+        self.git("add", ".")
+        self.git("commit", "-qm", "unchanged blob")
+        change = self.ready()
+        verify = self.helpers["verify_object"]
+        executable = self.helpers["resolve_git"]()
+        with patch.dict(self.helpers, MAX_GIT_OBJECT_BYTES=1):
+            for kind, spec in (("commit", "HEAD"), ("tree", "HEAD^{tree}")):
+                with self.assertRaisesRegex(ValueError, "object exceeds its size limit"):
+                    verify(self.repo, kind, self.git("rev-parse", spec).encode("ascii"), executable)
+        self.assertIn("object exceeds its size limit", self.main("commit", change, expected=2,
+                                                                MAX_GIT_OBJECT_BYTES=512))
+
+    def test_checkout_tmpdir_is_never_probed_and_symlink_loop_refuses(self):
+        alias = self.tmp / "scratch-link"
+        alias.symlink_to(self.repo, target_is_directory=True)
+        self.env["TMPDIR"] = str(alias)
+        with patch.object(tempfile, "gettempdir", side_effect=AssertionError("tempdir probe")):
+            change = self.begin_in_process("scratch")
+        self.assertTrue(self.manifest(change)["git"]["clean_start"])
+        self.assertTrue((self.backups / ".kaizen-refs").is_dir())
+        self.target.write_text("after")
+        self.script("finish", change)
+        self.target.unlink()
+        self.target.symlink_to(self.target.name)
+        refusal = self.commit_cli(change, expected=2).stderr
+        self.assertRegex(refusal, "cannot resolve path|through symlink")
+        self.assertNotIn("Traceback", refusal)
+        self.assertRegex(self.main("undo", change, expected=2), "cannot resolve path|through symlink")
+
+    def test_commit_and_inverse_reconcile_across_failures(self):
+        change = self.ready()
+        ref = "refs/kaizen/" + datetime.date.today().isoformat()
+        journal = self.helpers["record_path"](change)
+        save, update = (self.helpers[name] for name in ("save_record", "update_ref"))
+
+        def fail_save(phase, *, done=False, after=False):
+            def injected(folder, record):
+                if record.get(phase, {}).get("done") == done:
+                    if after:
+                        save(folder, record)
+                    raise OSError("interrupted record write")
+                save(folder, record)
+            return injected
+
+        def fail_cas(*args):
+            if cas_happens:
+                update(*args)
+                raise OSError("interrupted CAS")
+
+            def reject_prepared():
+                args[-1]()
+                raise OSError("interrupted CAS")
+
+            update(*args[:-1], reject_prepared)
+
+        self.main("commit", change, expected=2, save_record=fail_save("commit"))
+        self.assertFalse(journal.exists())
+        self.main("commit", change, expected=2, save_record=fail_save("commit", after=True))
+        oid = json.loads(journal.read_text())["commit"]["new"]
+        self.assertEqual(self.git("for-each-ref", ref), "")
+        self.git("update-ref", ref, self.git("rev-parse", "HEAD"))
+        self.assertIn("ref moved", self.main("commit", change, expected=2))
+        self.git("update-ref", "-d", ref)
+        cas_happens = True
+        self.main("commit", change, expected=2, update_ref=fail_cas)
+        self.assertEqual(self.git("rev-parse", ref), oid)
+        self.main("commit", change, expected=2, save_record=fail_save("commit", done=True))
+        self.main("commit", change)
+        self.assertEqual(self.git("rev-parse", ref), oid)
+        cas_happens = False
+        self.main("undo", change, expected=2, update_ref=fail_cas)
+        inverse = json.loads(journal.read_text())["inverse"]["new"]
+        self.assertEqual(self.git("rev-parse", ref), oid)
+        cas_happens = True
+        self.main("undo", change, expected=2, update_ref=fail_cas)
+        self.assertEqual((self.git("rev-parse", ref), self.target.read_text()), (inverse, "after"))
+        self.main("undo", change, expected=2, save_record=fail_save("inverse", done=True))
+        def fail_copy(_, target):
+            target.write_text("incomplete copy")
+            raise OSError("interrupted copy")
+
+        with patch.object(shutil, "copy2", fail_copy):
+            self.main("undo", change, expected=2)
+        self.assertEqual(self.target.read_text(), "after")
+        self.target.write_text("before")  # Files may already have been restored before interruption.
+        self.main("undo", change)
+        self.assertEqual(self.git("rev-parse", ref), inverse)
+
+        abandoned = self.ready("abandoned")
+
+        def edit_before_cas(*args):
+            def edit():
+                self.target.write_text("user edit")
+                args[-1]()
+
+            update(*args[:-1], edit)
+
+        self.main("commit", abandoned, expected=2, update_ref=edit_before_cas)
+        self.assertEqual(self.target.read_text(), "user edit")
+        ref_lock = self.repo / ".git" / (ref + ".lock")
+        ref_lock.touch()
+        self.main("undo", "--force", abandoned, expected=2)
+        self.assertEqual(self.target.read_text(), "user edit")
+        ref_lock.unlink()
+        self.main("undo", "--force", abandoned)
+        self.assertEqual((self.git("rev-parse", ref), self.target.read_text()), (inverse, "before"))
+        self.main("commit", abandoned, expected=2)
+
+    def test_inverse_keeps_later_owned_files_and_rejects_moves_and_forgery(self):
+        first = self.ready()
+        ref = self.commit_cli(first).stdout.split()[-1]
+        original = self.git("rev-parse", ref)
+        self.target.write_text("before")
+        other = self.repo / "other"
+        second = self.script("begin", "--repo", ".", "--skill", "trim", "--ledger", "fixture", "--run", "second", other)
+        other.write_text("later")
+        self.script("finish", second)
+        self.commit_cli(second)
+        tip = self.git("rev-parse", ref)
+        self.target.write_text("after")
+        manifest = first / "manifest.json"
+        raw = manifest.read_bytes()
+        manifest.write_bytes(raw + b" ")
+        self.assertIn("manifest changed", self.main("undo", first, expected=2))
+        manifest.write_bytes(raw)
+        self.git("update-ref", ref, original)
+        self.assertIn("ref moved", self.main("undo", "--force", first, expected=2))
+        self.git("update-ref", ref, tip)
+        self.main("undo", first)
+        self.assertEqual(self.git("diff", "--name-only", tip, ref), self.target.name)
+        self.assertEqual(self.git("show", ref + ":other"), "later")
+
+    def test_ref_storage_and_later_overlap_refuse_without_worktree_changes(self):
+        change = self.ready()
+        external = self.tmp / "external"
+        external.mkdir()
+        redirected = self.repo / ".git" / "refs" / "kaizen"
+        redirected.symlink_to(external, target_is_directory=True)
+        self.assertIn("unsafe Git metadata", self.commit_cli(change, expected=2).stderr)
+        self.assertEqual(list(external.iterdir()), [])
+        redirected.unlink()
+        ref = self.commit_cli(change).stdout.split()[-1]
+        self.target.write_text("before")
+        self.git("merge", "--ff-only", ref)
+        later = self.begin("--run", "overlap", "--repo", ".")
+        self.target.write_text("later")
+        self.script("finish", later)
+        self.commit_cli(later)
+        tip = self.git("rev-parse", ref)
+        self.assertIn("overlapping change", self.main("undo", "--force", change, expected=2))
+        self.assertEqual((self.git("rev-parse", ref), self.target.read_text()), (tip, "later"))
 
     def test_deep_backup_root_can_reserve_a_fallback_slot(self):
         root = self.tmp
