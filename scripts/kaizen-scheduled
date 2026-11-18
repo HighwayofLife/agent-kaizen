@@ -702,7 +702,7 @@ def worktree_paths(directory):
             if dotgit.is_dir():
                 if canonical_path(dotgit) != gitdir:
                     raise ValueError("worktree gitdir mismatch")
-            elif canonical_path(Path(os.fsdecode((gitdir / "gitdir").read_bytes()).removesuffix("\n"))) != dotgit:
+            elif canonical_path(gitdir / os.fsdecode((gitdir / "gitdir").read_bytes()).removesuffix("\n")) != dotgit:
                 raise ValueError("worktree registration mismatch")
         except (OSError, RuntimeError, ValueError):
             complete = False
@@ -779,6 +779,20 @@ def discover(claude_root, codex_root, index, project_dirs=None):
             continue
         worktrees = worktree_paths(directories[0])
         listed, complete = worktrees if worktrees is not None else ([], False)
+        # A copied .git file can point at another worktree's registered admin dir.
+        # Its own checkout root must be among the validated registrations.
+        if listed:
+            valid_directories = []
+            for directory in directories:
+                top = next((path for path in (directory, *directory.parents)
+                            if os.path.lexists(path / ".git")), None)
+                if top not in listed:
+                    add(directory, {directory}, True)
+                else:
+                    valid_directories.append(directory)
+            directories = valid_directories
+            if not directories:
+                continue
         paths = set(directories) | set(listed)
         root = common.parent if common.name == ".git" else listed[0] if listed else None
         try:

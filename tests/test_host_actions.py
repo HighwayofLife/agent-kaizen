@@ -707,6 +707,58 @@ class HostActionsTests(unittest.TestCase):
             self.assertEqual([row["id"] for row in self.store.scoped(self.other)], [good])
         self.assertIn("skipped 1 row(s)", warning.getvalue())
 
+    def test_skipped_row_and_pending_receipt_survive_unrelated_update(self):
+        bad, good = self.record(), self.record(self.other)
+        document = json.loads(self.store.path.read_text())
+        document["actions"][bad]["projects"] = ["legacy-key"]
+        document["receipts"] = {str(self.project): {"generation": {bad: "pending"}}}
+        row_bytes = json.dumps(document["actions"][bad], indent=2)
+        receipt_bytes = json.dumps(document["receipts"][str(self.project)]["generation"], indent=2)
+        encoded = json.dumps(document)
+        encoded = encoded.replace(json.dumps(document["actions"][bad]), row_bytes)
+        encoded = encoded.replace(json.dumps(document["receipts"][str(self.project)]["generation"]), receipt_bytes)
+        self.store.path.write_text(encoded)
+        self.store.mark(self.other, good, "done")
+        saved_text = self.store.path.read_text()
+        self.assertIn(row_bytes, saved_text)
+        self.assertIn(receipt_bytes, saved_text)
+        saved = json.loads(saved_text)
+        self.assertEqual(saved["actions"][bad], document["actions"][bad])
+        self.assertEqual(saved["receipts"][str(self.project)], document["receipts"][str(self.project)])
+        self.assertEqual(saved["actions"][good]["status"], "done")
+
+    def test_mark_refuses_scope_change_after_lock(self):
+        main, (member,) = self.linked("worktree")
+        ident = self.record(member)
+        before = self.store.path.read_bytes()
+        flock = actions.fcntl.flock
+
+        def enroll(fd, operation):
+            flock(fd, operation)
+            (main / "docs/kaizen").mkdir(parents=True, exist_ok=True)
+
+        with patch.object(actions.fcntl, "flock", side_effect=enroll), \
+                self.assertRaisesRegex(ValueError, "scope changed; try again"):
+            self.store.mark(member, ident, "done")
+        self.assertEqual(self.store.path.read_bytes(), before)
+
+    def test_copied_worktree_pointer_scope_is_unknown(self):
+        main, (member,) = self.linked("worktree")
+        (main / "docs/kaizen").mkdir(parents=True)
+        copy = self.root / "copy"
+        shutil.copytree(member.parent, copy)
+        with self.assertRaisesRegex(ValueError, "unknown"):
+            self.store.scoped(copy / " component")
+
+    def test_relative_worktree_pointers_resolve_from_their_files(self):
+        main, (member,) = self.linked("worktree")
+        dotgit = member.parent / ".git"
+        admin = Path(dotgit.read_text().strip().removeprefix("gitdir: "))
+        dotgit.write_text("gitdir: " + os.path.relpath(admin, dotgit.parent) + "\n")
+        (admin / "gitdir").write_text(os.path.relpath(dotgit, admin) + "\n")
+        self.assertEqual(RUNNER["action_project"](member), member)
+        self.assertEqual(self.store.scoped(member), [])
+
     def test_git_location_environment_cannot_change_scope(self):
         _, (canonical, member) = self.linked("a-wt", "z-wt")
         ident = self.record(member)
