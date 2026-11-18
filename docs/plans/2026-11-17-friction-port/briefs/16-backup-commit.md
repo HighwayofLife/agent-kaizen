@@ -56,3 +56,7 @@ Report changed files and line counts, exact checks and outcomes, known uncertain
 - Before the first git use, call P08's `verify_git(baseline["git_executable"])`; refuse on any mismatch. Use only that path.
 - Git does not re-hash loose objects on read, so a forged tree object stored under HEAD's tree id would pass both P08 and the live proof. Before building a commit, verify the HEAD commit object and every tree object it uses hash to their ids (read raw bytes with `cat-file`, hash `<type> <len>\0<bytes>` in Python with the repo's object format).
 - Accepted residuals from P08: a user-owned git in `/opt/homebrew` or `/usr/local` can be replaced before capture (the hash catches a later swap); the macOS `/usr/bin/git` shim's selected developer-dir git is not in the identity record.
+
+## Delta 3 from P08 final review (2026-11-18)
+
+- SHOULD-FIX carried from P08 (`scripts/kaizen-backup:165`): the lock-fallback slot reservation's absolute path can exceed `PATH_MAX` even when the backup and manifest paths fit, aborting an ordinary `begin`. Create the reservation relative to a directory fd of the backup root (`os.mkdir(name, dir_fd=...)`), or keep its name no longer than the manifest temp name; on `ENAMETOOLONG` fall back to an ordinary backup instead of aborting. Add a regression test with a deep backup root.
