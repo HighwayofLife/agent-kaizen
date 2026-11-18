@@ -17,6 +17,7 @@ Codex CLI and GitHub Copilot support: the same plugin installs on Codex CLI and 
 `docs/hosts.md`, `docs/autonomy.md`:
 
 - New docs/hosts.md maps Claude Code, Codex CLI and the Copilot runtime (install, invocation, which features work); on non-Claude hosts, changes to the host's own settings, hooks and agent files stay proposals in every autonomy mode.
+- Clarify that the VS Code Agents app uses the Copilot CLI plugin install, while VS Code chat can install from source.
 
 `skills`:
 

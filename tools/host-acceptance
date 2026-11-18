@@ -60,6 +60,28 @@ def observe(value):
     return name, status.upper(), note
 
 
+def vscode_installs():
+    override = os.environ.get('KAIZEN_VSCODE_DATA_DIRS')
+    if override is not None:
+        roots = [Path(p) for p in override.split(os.pathsep) if p]
+    elif sys.platform == 'darwin':
+        roots = [HOME / 'Library/Application Support' / name for name in ('Code', 'Code - Insiders')]
+    elif sys.platform == 'win32':
+        roots = [Path(os.environ.get('APPDATA') or HOME / 'AppData/Roaming') / name for name in ('Code', 'Code - Insiders')]
+    else:
+        config = Path(os.environ.get('XDG_CONFIG_HOME') or HOME / '.config')
+        roots = [config / name for name in ('Code', 'Code - Insiders')]
+    matches = []
+    for root in roots:
+        for manifest in root.glob('agentPlugins/*/*/.claude-plugin/plugin.json'):
+            try:
+                if json.loads(manifest.read_text()).get('name') == 'agent-kaizen':
+                    matches.append((manifest.stat().st_mtime_ns, manifest.parent.parent, root))
+            except (OSError, ValueError, AttributeError):
+                continue
+    return max(matches, key=lambda item: item[0]) if matches else None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action', required=True)
@@ -98,7 +120,8 @@ def main():
             source = Path(os.environ.get('XDG_CACHE_HOME') or HOME / '.cache') / 'agent-kaizen-acceptance/source'
             export_source(source)
         if manual:
-            print('In VS Code enable chat.plugins.enabled, choose the Copilot session target, and run Chat: Install Plugin from Source using {}.'.format(source))
+            print('VS Code Agents app: The Agents app loads plugins only from the Copilot CLI install (~/.copilot). Install GitHub Copilot CLI (see https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli), sign in, then run install again.')
+            print('VS Code chat: In VS Code enable chat.plugins.enabled, choose the Copilot session target, and run Chat: Install Plugin from Source using {}.'.format(source))
         else:
             if not shutil.which(cli):
                 print('Missing {} CLI; install it and sign in first.'.format(cli), file=sys.stderr)
@@ -123,7 +146,7 @@ def main():
         statefile.write_text(json.dumps(state, indent=2) + '\n')
         nxt = {'codex': 'quit Codex, start a new Codex session in this folder, run /hooks and trust the Agent Kaizen hooks.',
                'copilot-cli': 'quit Copilot CLI and start a new Copilot CLI session in this folder.',
-               'vscode': 'run "Developer: Reload Window" in VS Code, then open a new Copilot chat session.'}[args.host]
+               'vscode': 'start a new Agents app session, or for VS Code chat run "Developer: Reload Window" then open a new chat.'}[args.host]
         print('Phase 1 done. Stop here and tell the human to ' + nxt + ' Then paste the same prompt again to run phase 2.')
         return 0
     return check(args, state, statefile, cli)
@@ -142,10 +165,22 @@ def check(args, state, statefile, cli):
     else:
         add('cli', 'SKIP' if args.host == 'vscode' else 'FAIL', 'CLI not found')
     base = Path(os.environ.get('CODEX_HOME') or HOME / '.codex') / 'plugins/cache/agent-kaizen-tools/agent-kaizen' / VERSION if cli == 'codex' else Path(os.environ.get('COPILOT_HOME') or HOME / '.copilot') / 'installed-plugins/agent-kaizen-tools/agent-kaizen'
+    chat_match = vscode_installs() if args.host == 'vscode' and args.install_dir is None else None
     installed = args.install_dir or base
+    chat_install = False
+    if chat_match and not (base / '.claude-plugin/plugin.json').is_file():
+        installed = chat_match[1]
+        chat_install = True
+    elif args.host == 'vscode' and args.install_dir is not None:
+        chat_install = 'agentPlugins' in installed.parts
+    location = 'VS Code chat: ' + str(chat_match[2] / 'agentPlugins/<install>') if chat_install and chat_match else str(installed)
+    if chat_install and not chat_match:
+        location = str(Path(*installed.parts[:installed.parts.index('agentPlugins') + 1]) / '<install>')
+    if chat_match and not chat_install:
+        location += '; VS Code chat install also found at ' + str(chat_match[2] / 'agentPlugins/<install>')
     try:
         actual = json.loads((installed / '.claude-plugin/plugin.json').read_text())['version']
-        add('installed', 'PASS' if actual == VERSION else 'FAIL', 'installed {}, checkout {}'.format(actual, VERSION))
+        add('installed', 'PASS' if actual == VERSION else 'FAIL', 'installed {}, checkout {}; location: {}'.format(actual, VERSION, location))
     except (OSError, ValueError, KeyError) as exc:
         add('installed', 'FAIL', exc)
     files = list(ROOT.glob('skills/*/SKILL.md')) + list(ROOT.glob('hooks/*.sh')) + list(ROOT.glob('hooks/lib/*.sh')) + [ROOT / 'hooks/hooks.json']
@@ -163,7 +198,7 @@ def check(args, state, statefile, cli):
         except (OSError, subprocess.SubprocessError):
             errors.append(script)
     add('scripts', 'FAIL' if errors else 'PASS', ', '.join(errors) or 'help commands passed')
-    manual = args.host == 'vscode' and (state.get('install') == 'manual' or args.install_dir is not None)
+    manual = args.host == 'vscode' and (state.get('install') == 'manual' or args.install_dir is not None or chat_install)
     try:
         result = run([sys.executable, installed / 'scripts/kaizen-doctor'])
         match = 'Codex: plugin version' if cli == 'codex' else 'Copilot: plugin installed'
@@ -215,6 +250,8 @@ def check(args, state, statefile, cli):
         hint = ('seen: ' + str(seen) if traces else
                 'no {} lines; seen hosts: {}'.format(cli, ', '.join(hosts)) if hosts else
                 'hooks not trusted in /hooks or session started before install' if cli == 'codex' else 'hooks not loaded')
+        if chat_install and not traces and not hosts:
+            hint += '; plugin is installed for VS Code chat only; Agents-app sessions load plugins from ~/.copilot (install the Copilot CLI)'
         detail = 'observed' if found else hint
         if event == 'sessionStart':
             detail += '; {} sessionStart lines{}'.format(sessions, ' (multiple sessions contributed)' if sessions > 1 else '')
