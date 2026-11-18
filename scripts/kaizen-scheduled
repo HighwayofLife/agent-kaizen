@@ -35,6 +35,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import unicodedata
 import uuid
 
 try:
@@ -576,7 +577,37 @@ def _git(directory, *arguments):
                                 capture_output=True, text=True, timeout=STEP_TIMEOUT)
     except (OSError, UnicodeError, subprocess.TimeoutExpired):
         return None
-    return result.stdout.strip() if result.returncode == 0 else None
+    return result.stdout.rstrip("\r\n") if result.returncode == 0 else None
+
+
+def canonical_path(path):
+    path = Path(path).resolve(strict=True)
+    if sys.platform != "darwin":
+        return path
+    # realpath preserves the caller's spelling on case-insensitive macOS volumes.
+    parent = Path(path.anchor)
+    for name in path.parts[1:]:
+        names = os.listdir(parent)
+        if name not in names:
+            folded = unicodedata.normalize("NFD", name).casefold()
+            info = (parent / name).lstat()
+            matches = [entry for entry in names if unicodedata.normalize("NFD", entry).casefold() == folded
+                       and os.path.samestat((parent / entry).lstat(), info)]
+            if len(matches) != 1:
+                raise ValueError("cannot determine canonical path spelling")
+            name = matches[0]
+        parent /= name
+    return parent
+
+
+def enrolled_project(directory):
+    return next((path for path in (directory, *directory.parents) if (path / "docs/kaizen").is_dir()), None)
+
+
+def git_common_dir(directory):
+    # Relative to `directory`; git < 2.31 echoes back --path-format=absolute.
+    common = _git(directory, "rev-parse", "--git-common-dir")
+    return (directory / common).resolve() if common else None
 
 
 def discover(claude_root, codex_root, index, project_dirs=None):
@@ -613,13 +644,14 @@ def discover(claude_root, codex_root, index, project_dirs=None):
     enrolled, not_enrolled = set(), set()
     for candidate in candidates:
         try:
-            directory = Path(candidate).resolve()
-        except (OSError, RuntimeError):
+            directory = canonical_path(candidate)
+        except (OSError, RuntimeError, ValueError):
             continue
         if not directory.is_dir():
             continue
-        ancestors = [directory] if project_dirs is not None else [directory, *directory.parents]
-        project = next((path for path in ancestors if (path / "docs/kaizen").is_dir()), None)
+        project = enrolled_project(directory)
+        if project_dirs is not None and project != directory:
+            project = None
         if project is None:
             not_enrolled.add(str(directory))
         else:
@@ -627,9 +659,7 @@ def discover(claude_root, codex_root, index, project_dirs=None):
 
     groups = {}
     for directory in sorted(enrolled):
-        # Relative to `directory`; --path-format=absolute is not in git < 2.31 (it is echoed back).
-        common = _git(directory, "rev-parse", "--git-common-dir")
-        common = (directory / common).resolve() if common else None
+        common = git_common_dir(directory)
         groups.setdefault(("git", common) if common else ("directory", directory), []).append(directory)
 
     projects = []
@@ -639,7 +669,10 @@ def discover(claude_root, codex_root, index, project_dirs=None):
         worktrees = _git(directories[0], "worktree", "list", "--porcelain")
         for line in (worktrees or "").splitlines():
             if line.startswith("worktree "):
-                path = Path(line[len("worktree "):]).resolve()
+                try:
+                    path = canonical_path(line[len("worktree "):])
+                except (OSError, RuntimeError, ValueError):
+                    continue
                 if path.is_dir():
                     listed.append(path)
                     paths.add(path)
@@ -647,24 +680,35 @@ def discover(claude_root, codex_root, index, project_dirs=None):
                 else listed[0] if kind == "git" and listed else None)
         if root is None:
             projects.append(Project(directories[0], paths))
-        elif (root / "docs/kaizen").is_dir():
-            # The repository root is itself enrolled: it is the project, with every worktree.
-            projects.append(Project(root, paths))
-        else:
-            # Enrolled subdirectories of a larger repository: one project per subdirectory,
-            # grouped with the same subdirectory of the other worktrees.
-            prefixes = {}
-            for directory in directories:
-                prefix = _git(directory, "rev-parse", "--show-prefix")
-                prefixes.setdefault(prefix.rstrip("/") if prefix is not None else None, []).append(directory)
-            for prefix, members in prefixes.items():
-                if prefix is None:
-                    projects.extend(Project(member, {member}) for member in members)
+            continue
+        # Group the same enrolled prefix across worktrees, even when the repository root is enrolled.
+        roots = {root, *listed}
+        prefixes = {}
+        for directory in directories:
+            prefix = "" if directory in roots else _git(directory, "rev-parse", "--show-prefix")
+            prefixes.setdefault(prefix.rstrip("/") if prefix is not None else None, []).append(directory)
+        for prefix, members in prefixes.items():
+            if prefix is None:
+                projects.extend(Project(member, {member}) for member in members)
+                continue
+            peers = {}
+            enrolled_peers = set(members)
+            for worktree in roots:
+                peer = worktree / prefix
+                try:
+                    if not peer.is_dir() or peer.resolve() != peer:
+                        continue
+                    peer = canonical_path(peer)
+                except (OSError, RuntimeError, ValueError):
                     continue
-                same = {path / prefix for path in listed if (path / prefix).is_dir()}
-                main = listed[0] / prefix if listed else None
-                canonical = main if main in same and (main / "docs/kaizen").is_dir() else sorted(members)[0]
-                projects.append(Project(canonical, {*members, *same}))
+                if peer not in enrolled_peers and (peer / "docs/kaizen").is_dir():
+                    if git_common_dir(peer) != common:
+                        continue
+                    enrolled_peers.add(peer)
+                peers[worktree] = peer
+            main = peers.get(root)
+            canonical = main if main in enrolled_peers else min(enrolled_peers)
+            projects.append(Project(canonical, {*members, *peers.values()}))
     return sorted(projects, key=lambda project: project.canonical), sorted(not_enrolled)
 
 
@@ -2181,17 +2225,25 @@ def show_config(project_dir=None):
     print(json.dumps(result, indent=2))
 
 
-def action_project(directory):
-    project = canonical_project(directory)
-    if directory.is_relative_to(project):
-        return project
-    listed = _git(project, "worktree", "list", "--porcelain") or ""
-    roots = [Path(line[9:]).resolve() for line in listed.splitlines() if line.startswith("worktree ")]
-    for root in roots:
-        if project.is_relative_to(root) and any(directory.is_relative_to(peer / project.relative_to(root))
-                                                for peer in roots if peer != root):
-            return project
-    raise ValueError("project is outside its registered worktrees")
+def action_project(directory, *, selector=None):
+    directory = canonical_path(Path(directory).expanduser())
+    if not directory.is_dir():
+        raise ValueError("expected a project directory")
+    member = enrolled_project(directory)
+    if member is None:
+        raise ValueError("host actions require an enrolled project")
+    (project,), _ = discover(None, None, {}, [member])
+    if selector is None:
+        return project.canonical
+
+    target = canonical_path(member / selector)
+    owner = enrolled_project(target if target.is_dir() else target.parent)
+    if owner not in project.paths:
+        raise ValueError("action target is outside the enrolled project")
+    target = canonical_path(project.canonical / target.relative_to(owner))
+    if enrolled_project(target if target.is_dir() else target.parent) != project.canonical:
+        raise ValueError("action target is outside the canonical project")
+    return project.canonical, target
 
 
 def actions_command(args):

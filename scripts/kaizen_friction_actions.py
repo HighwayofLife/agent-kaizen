@@ -1,5 +1,5 @@
 """Machine-local identity and manual state for scoped host actions."""
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 import hashlib
 import hmac
@@ -8,7 +8,6 @@ import os
 from pathlib import Path
 import re
 import stat
-import tempfile
 
 try:
     import fcntl
@@ -24,15 +23,7 @@ ROW_FIELDS = set("canonical_project catalog_id selector_key subject projects sta
 ID_FIELDS = ("canonical_project", "catalog_id", "selector_key")
 
 
-def _identity(scope, catalog_id, value, path, allowed):
-    """Use an in-scope path, a closed literal, or a validated redacted flag key."""
-    if path:
-        target = (scope / value).resolve(strict=True)
-        if not target.is_relative_to(scope):
-            raise ValueError("action target is outside the project")
-        value = str(target)
-    elif not isinstance(value, str) or isinstance(allowed, str) or value not in allowed:
-        raise ValueError("unknown action selector")
+def _identity(scope, catalog_id, value):
     if not (_text(str(scope), 4096) and _text(value, 4096)
             and _text(catalog_id, 64) and CATALOG_ID.fullmatch(catalog_id)):
         raise ValueError("invalid host-action identity")
@@ -44,26 +35,59 @@ def _id(secret, project, catalog_id, selector):
     return "fa1_" + hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def _directory(path, create=False, private=False):
-    if create:
-        path.mkdir(mode=0o700, parents=True, exist_ok=True)
-    info = path.lstat()
-    mask = 0o077 if private else 0o022
-    if (not stat.S_ISDIR(info.st_mode) or (hasattr(os, "geteuid") and
-            (info.st_uid != os.geteuid() or info.st_mode & mask))):
+def _check_directory(fd, owner=False, private=False):
+    info = os.fstat(fd)
+    uid = os.geteuid()
+    # A root-owned sticky ancestor (such as /tmp) protects each verified child from unlink or rename.
+    sticky = not owner and info.st_uid == 0 and info.st_mode & stat.S_ISVTX
+    if (info.st_uid not in ((uid,) if owner else (0, uid))
+            or (info.st_mode & (0o077 if private else 0o022) and not sticky)):
         raise ValueError("unsafe host-action directory")
 
 
 @contextmanager
-def _private_file(path, flags=os.O_RDONLY):
-    if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "geteuid"):
-        path.lstat()  # Preserve the missing-file case on unsupported platforms.
-        raise ValueError("private host-action files are unavailable")
-    fd = os.open(path, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600)
+def _directory(path, create=False, private=False):
+    if create and fcntl is None:
+        raise ValueError("host-action writes require file locking")
+    if not all(hasattr(os, name) for name in ("O_DIRECTORY", "O_NOFOLLOW", "geteuid")):
+        raise ValueError("private host-action directories are unavailable")
+    path = path.absolute()
+    if ".." in path.parts:
+        raise ValueError("unsafe host-action directory")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(path.anchor, flags)
+    try:
+        _check_directory(fd, owner=path.parent == path, private=private and path.parent == path)
+        for index, name in enumerate(path.parts[1:], 1):
+            try:
+                child = os.open(name, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                try:
+                    os.mkdir(name, 0o700, dir_fd=fd)
+                except FileExistsError:  # Another writer created the directory.
+                    pass
+                else:
+                    os.fsync(fd)
+                child = os.open(name, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+            remaining = len(path.parts) - index - 1
+            _check_directory(fd, owner=remaining == 0 or (private and remaining == 1),
+                             private=private and remaining == 0)
+        yield fd
+    finally:
+        os.close(fd)
+
+
+@contextmanager
+def _private_file(directory, name, flags=os.O_RDONLY, replaced=False):
+    fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
     try:
         info = os.fstat(fd)
         # A reader can hold the previous inode after an atomic replacement.
-        links = (0, 1) if flags == os.O_RDONLY else (1,)
+        links = (0, 1) if replaced else (1,)
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
                 or info.st_mode & 0o077 or info.st_nlink not in links):
             raise ValueError("unsafe host-action file")
@@ -72,8 +96,8 @@ def _private_file(path, flags=os.O_RDONLY):
         os.close(fd)
 
 
-def _read(path, limit):
-    with _private_file(path) as fd, os.fdopen(fd, "rb", closefd=False) as stream:
+def _read(directory, name, limit, replaced=False):
+    with _private_file(directory, name, replaced=replaced) as fd, os.fdopen(fd, "rb", closefd=False) as stream:
         raw = stream.read(limit + 1)
     if len(raw) > limit:
         raise ValueError("host-action file exceeds size limit")
@@ -81,27 +105,27 @@ def _read(path, limit):
 
 
 @contextmanager
-def _locked(path):
-    if fcntl is None:
-        raise ValueError("host-action writes require file locking")
-    _directory(path.parent, create=True)
-    with _private_file(path.with_name(path.name + ".lock"), os.O_RDWR | os.O_CREAT) as fd:
+def _locked(directory, name):
+    with _private_file(directory, name + ".lock", os.O_RDWR | os.O_CREAT) as fd:
         fcntl.flock(fd, fcntl.LOCK_EX)
         yield
 
 
-def _replace(path, raw):
-    temporary = None
+def _replace(directory, name, raw):
+    temporary = name + "." + os.urandom(16).hex()
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
     try:
-        with tempfile.NamedTemporaryFile(dir=path.parent, prefix=path.name + ".", delete=False) as stream:
-            temporary = Path(stream.name)
+        with os.fdopen(fd, "wb") as stream:
             stream.write(raw)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        os.replace(temporary, name, src_dir_fd=directory, dst_dir_fd=directory)
+        os.fsync(directory)
     finally:
-        if temporary is not None:
-            temporary.unlink(missing_ok=True)
+        try:
+            os.unlink(temporary, dir_fd=directory)
+        except FileNotFoundError:
+            pass
 
 
 def _unique(pairs):
@@ -136,23 +160,25 @@ class HostActions:
         return self.canonical_project(path)
 
     def _secret(self, create=False):
-        _directory(self.friction.parent, create)
-        _directory(self.friction, create, private=True)
-        path = self.friction / "machine.key"
-        if create:
+        with _directory(self.friction, create, private=True) as directory:
+            name = "machine.key"
             # Called after validating the store. Separate stores can share one key.
-            with _locked(path):
-                if not os.path.lexists(path):
-                    _replace(path, os.urandom(32))
-        secret = _read(path, 32)
+            if create:
+                with _locked(directory, name):
+                    try:
+                        secret = _read(directory, name, 32)
+                    except FileNotFoundError:
+                        secret = os.urandom(32)
+                        _replace(directory, name, secret)
+            else:
+                secret = _read(directory, name, 32)
         if len(secret) != 32:
             raise ValueError("invalid host-action machine key")
         return secret
 
-    def _load(self):
+    def _load(self, directory):
         try:
-            _directory(self.path.parent)
-            raw = _read(self.path, STORE_LIMIT)
+            raw = _read(directory, self.path.name, STORE_LIMIT, replaced=True)
         except FileNotFoundError:
             return {}, None
         try:
@@ -183,11 +209,11 @@ class HostActions:
                 and row["done_by"] == ("user" if status == "done" else None)
                 and row["eligible"] is False)
 
-    def _save(self, rows):
+    def _save(self, directory, rows):
         raw = (json.dumps({"v": 1, "actions": rows}, separators=(",", ":")) + "\n").encode("ascii")
         if len(raw) > STORE_LIMIT:
             raise ValueError("host-action store exceeds size limit")
-        _replace(self.path, raw)
+        _replace(directory, self.path.name, raw)
 
     def action_id(self, project, catalog_id, value, *, path=False, allowed=()):
         return self.record(project, catalog_id, value, path=path, allowed=allowed)
@@ -196,10 +222,19 @@ class HostActions:
         """Return a candidate ID and record it ineligible when evidence is supplied."""
         if evidence is not None and not isinstance(evidence, str):
             raise ValueError("invalid host-action evidence")
-        identity = _identity(self._scope(project), catalog_id, value, path, allowed)
+        if path:
+            if not isinstance(value, (str, os.PathLike)):
+                raise ValueError("invalid action path selector")
+            scope, target = self.canonical_project(project, selector=value)
+            value = str(target)
+        else:
+            if not isinstance(value, str) or isinstance(allowed, str) or value not in allowed:
+                raise ValueError("unknown action selector")
+            scope = self._scope(project)
+        identity = _identity(scope, catalog_id, value)
         project, catalog_id, selector = identity
-        with _locked(self.path):
-            rows, secret = self._load()
+        with _directory(self.path.parent, create=True) as directory, _locked(directory, self.path.name):
+            rows, secret = self._load(directory)
             ident = _id(secret or self._secret(create=True), *identity)
             if ident in rows and identity != tuple(rows[ident][k] for k in ID_FIELDS):
                 raise ValueError("host-action ID collision")
@@ -209,20 +244,25 @@ class HostActions:
                                    subject=selector, projects=[self.project_key(project, resolved=True)], status="open",
                                    first_seen=stamp, updated_at=stamp, evidence=evidence[:EVIDENCE_LIMIT],
                                    eligible=False, done_by=None)
-                self._save(rows)
+                self._save(directory, rows)
             return ident
 
     def scoped(self, project):
         project = str(self._scope(project))
-        rows, _ = self._load()
+        with ExitStack() as stack:
+            try:
+                directory = stack.enter_context(_directory(self.path.parent))
+            except FileNotFoundError:
+                return []
+            rows, _ = self._load(directory)
         return [dict(row, id=ident) for ident, row in sorted(rows.items())
                 if row["canonical_project"] == project]
 
     def mark(self, project, ident, command):
         project = str(self._scope(project))
         status = STATES[command]
-        with _locked(self.path):
-            rows, _ = self._load()
+        with _directory(self.path.parent, create=True) as directory, _locked(directory, self.path.name):
+            rows, _ = self._load(directory)
             row = rows.get(ident)
             if row is None or row["canonical_project"] != project:
                 raise ValueError("unknown host-action ID in this project")
@@ -230,4 +270,4 @@ class HostActions:
                 return
             row.update(status=status, updated_at=datetime.now(timezone.utc).isoformat(),
                        done_by="user" if status == "done" else None)
-            self._save(rows)
+            self._save(directory, rows)

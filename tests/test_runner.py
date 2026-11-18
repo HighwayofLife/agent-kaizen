@@ -1165,6 +1165,29 @@ class ExecutionTests(DiscoveryCase):
                     self.assertEqual(allowed, self.runner.REVIEW_TOOLS)
                 self.assertNotIn('bypassPermissions', argv)
 
+    def test_review_denies_host_action_store_and_machine_key_namespace(self):
+        backup = self.root / 'real-backups'
+        backup.mkdir()
+        backup_alias = self.root / 'backup-alias'
+        backup_alias.symlink_to(backup)
+        self.cfg.mkdir(exist_ok=True)
+        config_alias = self.root / 'config-alias'
+        config_alias.symlink_to(self.cfg)
+        project = self.project('sandbox')
+        options = self.runner.command_options(type('Args', (), {'dry_run': True})())
+        with patch.dict(os.environ, KAIZEN_BACKUP_DIR=str(backup_alias), CLAUDE_CONFIG_DIR=str(config_alias)):
+            for mode in ('propose-only', 'auto'):
+                with self.subTest(mode=mode):
+                    argv = self.runner.review_command(options, mode, 'report.md', 'session', project)
+                    denied = set(self.values(argv, '--disallowedTools')[0].split(','))
+                    private = [f'{base}/**' for base in (backup, backup_alias)]
+                    private += [f'{base}/audits/host-actions.json{suffix}'
+                                for base in (self.cfg, config_alias) for suffix in ('', '.*')]
+                    self.assertTrue({f'{tool}(/{path})' for path in private
+                                     for tool in ('Read', 'Edit', 'Write')} <= denied)
+                    allowed = self.values(argv, '--allowedTools')[0]
+                    self.assertNotIn('kaizen-scheduled', allowed)
+
     def test_permission_config_rules_resolve_missing_homes_and_default_user_config(self):
         self.assertFalse(self.cfg.exists())
         self.assertFalse(self.cx.exists())
