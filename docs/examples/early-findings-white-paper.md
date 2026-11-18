@@ -4,7 +4,7 @@ subtitle: Early findings
 author: David Lewis
 handle: "@HighwayofLife on X"
 date: 2026-11-17
-version: 0.3
+version: 0.4
 ---
 
 # Executive summary
@@ -35,12 +35,15 @@ The orchestrator made about 1.7 times as many main calls per day after the chang
 | Measure | Before | After | Reading |
 |---|---|---|---|
 | Verifier spawns per merge (risk-tagged batch review) | 1.37 | 0.40 | down; whether batch review catches what per-packet review did is not yet verified |
-| Sol engineer sessions (Terra as the coding default) | 144 (Oct 30 to Nov 2) | 0 in 14 days to Nov 17 | down, but the Codex lane also ended about Nov 6 |
-| Orchestrator turns triggered by tool results, per merge | 40 | 24.6 | down 39% |
-| Merges since the last green full batch | 66 | 38 | better, still over the threshold of 20 |
-| Slot-wait p90 for Unity checks | 2,903 s | 4,592 s over 14 days | worse on peak days, better at normal load |
+| Sol sessions per active day (Terra as the coding default) | 68.7 | 16.8 | down 76%; Sol engineer sessions 38.3 to 5.7 per day (−85%), not zero; the Codex lane also ended about Nov 6 |
+| Orchestrator turns triggered by tool results, per merge | about 40 | about 26 | down about 36%; 38.6 if merges are counted by git date |
+| Raw test commands per day (stale test commands fixed) | 169.7 | 1.86 | down 99%; `run_tests` calls held at 86 to 89 per day |
+| Merges since the last green full batch | 66 | 52 | better, still over the threshold of 20 |
+| Slot-wait p90 for Unity checks | 2,903 s | 5,399 s over 14 days | worse; Unity-slot contention from Astra and visual packets, not the runner |
 
-The orchestrator's average context stayed at 109k to 132k per call after compaction moved to 180k. What got worse: engineering drifted from Codex to Claude, and the most expensive engineer, opus-engineer, took 26% of 14-day spend. The batch-review catch rate, the packet outcome log and the full-batch trigger all have gaps. Section 7 has the detail, and the proposals from the 2026-11-17 cycle are recorded as proposals, not results.
+The orchestrator's average context stayed at 109k to 132k per call after compaction moved to 180k. Of the eight ledger rows measured on 2026-11-17, five are Keep, one is Mixed, one is Improved but not kept up, and one (the planner `context.md`) is Inconclusive. What got worse: engineering drifted from Codex to Claude, and the most expensive engineer, opus-engineer, took 21% of spend since Nov 4 and 36% of the last three days; Claude cost per main call doubled after Nov 10. The batch-review catch rate, the packet outcome log and the full-batch trigger all have gaps. Section 7 has the detail, and the proposals are recorded as proposals, not results.
+
+**The plugin (0.10.0 and 0.11.0, 2026-11-17).** Two releases that day added a flow report, an experiments register and, in 0.11.0, a no-write first scan. Running every new command on the real install and a full local Python 3.9 CI before tagging caught 2 false warnings and 5 test failures that unit tests and per-packet checks had missed (section 7.9).
 
 **What did not help.** A tool-call budget for planning agents did not reduce exploration (median calls rose from 93 to 116). The symbol index reached only 2.9% of code searches in the clean split. A "swarm lead" agent added to cut wake-ups became a large new cost of its own.
 
@@ -527,10 +530,11 @@ The clean split in 5.1 covers 2026-10-20 to 2026-10-30. Later changes were measu
 |---|---|---|---|
 | Compaction at 180k (Nov 3) | Average / peak orchestrator context | 161k / 367k | 123k / 217k (weekly review); 109k to 132k average through Nov 17 |
 | Risk-tagged batch verification (Nov 3) | Verifier spawns per merge | 1.37 | 0.40 |
-| Terra as coding default (Nov 3) | Sol engineer sessions | 144 in four days | 0 in 14 days (confounded) |
-| Packet runner and landing (Nov 4) | Tool-result turns per merge | 40 | 24.6 |
-| Dotnet-only batch, 20-merge cadence (Nov 4) | Merges since last green | 66 | 38 |
-| Packet runner and slot policy (Nov 4) | Slot-wait p90 | 2,903 s | 4,592 s |
+| Terra as coding default (Nov 3) | Sol engineer sessions per active day | 38.3 | 5.7 (confounded by the Codex lane ending) |
+| Stale test commands fixed (Nov 3) | Raw test commands per day | 169.7 | 1.86 |
+| Packet runner and landing (Nov 4) | Tool-result turns per merge | about 40.3 | about 25.7 (38.6 on 116 merges) |
+| Dotnet-only batch, 20-merge cadence (Nov 4) | Merges since last green | 66 | 52 |
+| Packet runner and slot policy (Nov 4) | Slot-wait p90 | 2,903 s | 5,399 s |
 | Haiku for exact-change fix items (Nov 10) | First-pass rate | n/a | 21 of 22 items |
 | Reading and diff budgets (Nov 4) | `sed -n` calls per planner run; diff characters per verifier spawn | 12.7; 21.6k | 13.8; 29.5k (no effect) |
 
@@ -601,7 +605,7 @@ It cannot show:
 
 > **Key takeaway:** The same loop applied to a second round of problems gave a mixed result. Verification and orchestrator turns got cheaper; routing drifted back toward the expensive engineer, waiting for Unity slots peaked, and the safety nets that depend on a person remembering were late. Everything here is one setup over short, unequal windows.
 
-The first measurement ended on 2026-10-30. Later audits (2026-11-02, 2026-11-04, a weekly review on 2026-11-06 and a project cycle on 2026-11-17) found new problems, mostly in the game project's pipeline rather than in the orchestrator's context. Figures 22 to 30 are drawn from the notes behind this paper and the project's outcome log, not from the clean split. Windows differ between figures and several changes landed together, so none of them shows cause. Costs are API-equivalent list prices.
+The first measurement ended on 2026-10-30. Later audits (2026-11-02, 2026-11-04, a weekly review on 2026-11-06 and a project cycle on 2026-11-17, whose measurements were finished that evening and are folded in here from version 0.4) found new problems, mostly in the game project's pipeline rather than in the orchestrator's context. Figures 22 to 31 are drawn from the notes behind this paper and the project's outcome log, not from the clean split. Windows differ between figures and several changes landed together, so none of them shows cause. Costs are API-equivalent list prices.
 
 ## 7.1 Context stayed low
 
@@ -615,27 +619,27 @@ Compaction moved from 250k to 180k on 2026-11-03. The weekly review compared fiv
 
 On 2026-11-02 the audit found Sol, the expensive Codex model, in 257 sessions between Oct 30 and Nov 2: 144 engineer sessions and 104 per-packet diff reviews. The cause was the planners, not the dispatcher. Recent plans named Sol 826 times and Terra 52 times, because the routing text still listed state and data-model work as a Sol reason, and in a simulation game almost every packet touches state. The fix of 2026-11-03 had three parts: a ladder that starts with a Haiku engineer and Terra and uses Sol only with a named reason; a risk tag per packet so that only high-risk packets are reviewed one by one and the rest in batches of three or four; and one final audit per plan.
 
-![Two panels. Sol sessions: engineer 144 before and 0 after; diff review 104 before and 4 after. Verifier spawns per merge: 1.37 before, 0.40 after against a target of 0.5 or less. The Codex lane also ended in this period.](charts/23-routing-verification.png)
+![Two panels. Sol sessions per active day, before and after: all Sol 68.7 to 16.8; engineer 38.3 to 5.7; diff review 28 to 10.7. Verifier spawns per merge: 1.37 before, 0.40 after against a target of 0.5 or less. The Codex lane also ended in this period.](charts/23-routing-verification.png)
 
-*Figure 23. Sol engineer sessions gone; verifier spawns per merge 1.37 to 0.40. Terra became the coding default and verification became risk-tagged and batched. Catch rate of batch review is not yet verified.*
+*Figure 23. Sol sessions per day fell 76%; verifier spawns per merge 1.37 to 0.40. Terra became the coding default and verification became risk-tagged and batched. Sol engineer sessions fell 85% per day, not to zero. Catch rate of batch review is not yet verified.*
 
-Verifier spawns per merge fell from 1.37 to 0.40 (68 spawns over 169 merges; the target was 0.5 or less). Sol engineer sessions fell to zero in 14 days, with four Sol diff-review sessions. Terra packets ran about 1.9 times faster than Sol. Two caveats apply. First, the Codex lane itself ended about Nov 6 (the owner ran a Claude-only window on Nov 10 while Codex was unavailable), so the zero is not clean evidence that the rule worked. Second, batch review has not been checked against per-packet review. The shadow review that would do so has not started, 24 batch-review fix packets and 5 final-audit fix packets were needed, and any fix that names a packet counts against it in the calibration report. A later rule made `codex-dispatch` refuse Sol without a `Sol reason:` line, because the weekly review still found 219 Sol engineer sessions after the Terra-default rule.
+The 2026-11-17 measurement (the game project only, per active day; baseline 3 active days and 136 merges, after 6 to 7 active days and 175 merges) marks the routing row Keep. Sol sessions fell from 68.7 to 16.8 per day (−76%). Sol engineer sessions fell from 38.3 to 5.7 per day (−85%) while Terra engineer sessions rose from 23 to 152 in total, and Sol tokens per day fell from 194M to 51M (−74%). Version 0.3 said Sol engineer sessions had fallen to zero. That was wrong, probably because the earlier scan did not read compressed Codex logs; the newer scan, which counts every model and decompresses them, finds 5.7 a day. The Sol high and xhigh share also rose, from 62 of 206 sessions at baseline to 73 of 101, so a named reason is not yet a high-risk reason. Verification is marked Keep too: verifier spawns per merge fell from 1.37 to 0.40 (70 spawns over 175 merges; 0.60 if the 116 merges counted by git date are used; the target was 0.5 or less), and Sol diff-review sessions fell from 28 to 10.7 per day (−62%). Terra packets ran about 1.9 times faster than Sol. Merges per active day fell from 45 to 29, mostly because the work changed (the first proof of concept is nearly done and Unity and visual packets dominate), not because of routing. Packet median wall time has no pre-change baseline; it was 133 minutes from Nov 3 to 6 (n=107) and 182 minutes from Nov 7 to 17 (n=42). Two caveats apply. First, the Codex lane itself ended about Nov 6 (the owner ran a Claude-only window on Nov 10 while Codex was unavailable), so the drop is not clean evidence that the rule worked. Second, batch review has not been checked against per-packet review. The shadow review that would do so has not started. Review batches do catch defects: 24 batch-review fix packets and 5 final-audit fix packets were needed (19.5% of landed packets, and 31% of those fixes needed another fix), but their severity is not logged, and any fix that names a packet counts against it in the calibration report. A later rule made `codex-dispatch` refuse Sol without a `Sol reason:` line, because the weekly review still found 219 Sol engineer sessions after the Terra-default rule.
 
 ## 7.3 Pipeline speed: fewer turns, uneven waits
 
 On 2026-11-04 Fable, the most capable model, reviewed the changes and proposed tooling; all of it was built in one plan. The tooling chains a packet from worktree to dispatch to check to landing with one report, tests outside the landing lock, skips the Unity stage for simulation-only changes, runs a .NET-only batch when idle with the full batch every 20 merges, and writes an outcome log per packet. A final audit of that build found 12 more problems (two lock races, a visual-gate bypass, a lost landing output), all fixed in five packets. Two lessons became planner rules: speed packets carry a before/after measurement, and tooling plans end with a real end-to-end run.
 
-![Two panels. Orchestrator turns triggered by tool results per merge fell from 40 to 24.6. Merges since the last green batch fell from 66 to 38, still above the threshold of 20.](charts/24-pipeline-speed.png)
+![Two panels. Orchestrator turns triggered by tool results per merge fell from about 40 to about 26. Merges since the last green batch fell from 66 to 52, still above the threshold of 20.](charts/24-pipeline-speed.png)
 
-*Figure 24. Pipeline tooling cut orchestrator turns per merge by 39%. Fewer orchestrator turns per merge. The batch is still overdue: 38 merges since the last green run, over the threshold of 20.*
+*Figure 24. Pipeline tooling cut orchestrator turns per merge by about 36%. Fewer orchestrator turns per merge, with a denominator caveat. The batch is still overdue: 52 merges since the last green run, over the threshold of 20.*
 
-Orchestrator turns triggered by tool results per merge fell from 40 to 24.6 (−39%). In a fixture benchmark, optimistic landing cut the landing lock hold from 5.9 s to 1.3 s (3-run medians); the real-repo effect is not yet measured. Merges since the last green full batch fell from 66 to 38, still above the threshold of 20. The last full batch ran on 2026-11-06, so the trigger that should have prompted the next one did not.
+Orchestrator turns triggered by tool results per merge fell from about 40.3 (3,745 turns over 93 merges) to about 25.7 (4,491 over 175), down about 36%; the 2026-11-17 measurement marks the row Keep with a denominator caveat, because against the 116 merges counted by git date the after figure is 38.6. The earlier cut of 40 to 24.6 used a different window. In a fixture benchmark, optimistic landing cut the landing lock hold from 5.9 s to 1.3 s (3-run medians); the real-repo effect is not yet measured. Merges since the last green full batch fell from 66 to 52, still above the threshold of 20, with the last full green run 283 hours before the measurement. That row is Improved, but the 20-merge cadence is not kept: the last full batch ran on 2026-11-06, so the trigger that should have prompted the next one did not.
 
-![Bars of the 90th percentile Unity slot wait in seconds: baseline 2,903; Nov 5 5,420; Nov 6 8,331; Nov 10 1,264; Nov 11 2,054; all 14 days 4,592. Peak days are worse than baseline, normal days are better.](charts/25-slot-wait.png)
+![Bars of the 90th percentile Unity slot wait in seconds: baseline 2,903; Nov 5 5,420; Nov 6 8,331; Nov 10 1,264; Nov 11 2,054; newest 14-day run 5,399. Peak days are worse than baseline, normal days are better.](charts/25-slot-wait.png)
 
-*Figure 25. Slot waits got worse on peak days and better at normal load. 55 of the 67.7 slot-hours fell on Nov 5–6. Nov 10–11 were better than baseline. The Unity slot cap is the constraint.*
+*Figure 25. Slot waits got worse on peak days and better at normal load. Nov 5–6 were the worst days and Nov 10–11 were better than baseline, but the newest 14-day p90 is 5,399 s. The cause is Unity-slot contention from Astra and visual packets, not the runner.*
 
-Waiting for a Unity slot got worse on peak days and better at normal load. Over 14 days the slot wait had p50 677 s and p90 4,592 s, with 67.7 hours in total across 147 checks, against a 2,903 s p90 baseline. Of those hours, 55 fell on Nov 5 and 6. Slot wait is still a lottery: the slot lock is a polling loop with no queue order. Fable's ideation pass added an observation with a caveat: 135 packets summed to about 740 hours of wall time, of which 67.7 hours was slot wait, about 21 hours PlayMode and about 3 hours .NET. That points at waiting between steps (for a review, a brief or a landing) as the likely largest share. Per-state times are not logged, so that share is an estimate, and the first proposal is to log them.
+Waiting for a Unity slot got worse. The packet runner row is Mixed. The newest 14-day run of `speed_report` gives p50 918 s and p90 5,399 s (n=108, maximum 11,791 s, 57.3 hours in total), against a 2,903 s p90 baseline; the 3-day window was idle, with a p90 of 0 s (n=3). An earlier run over a slightly different window had given p50 677 s, p90 4,592 s and 67.7 hours across 147 checks, and the per-day bars in figure 25 come from it. In that run, 55 of the hours fell on Nov 5 and 6 and Nov 10 to 11 were better than baseline. Both runs are worse than baseline. The cause is Unity-slot contention from Astra and visual packets (PlayMode p50 884 s), not the runner. Slot wait is still a lottery: the slot lock is a polling loop with no queue order. Fable's ideation pass added an observation with a caveat: 135 packets summed to about 740 hours of wall time, of which 67.7 hours was slot wait, about 21 hours PlayMode and about 3 hours .NET. That points at waiting between steps (for a review, a brief or a landing) as the likely largest share. Per-state times are not logged, so that share is an estimate, and the first proposal is to log them.
 
 ## 7.4 The weekly review: where the cost went
 
@@ -671,24 +675,68 @@ A propose-only cycle on the game project over 14 days found $836 of list-price c
 
 *Figure 29. What got worse: opus-engineer is 26% of 14-day spend. Engineering moved from Codex to Claude after Nov 6 and opus-engineer took a quarter of spend. Whether the routing rule was ignored or Codex was unavailable is still open.*
 
-Opus-engineer drift is the clearest regression. The Nov 6 rule asked for briefs naming the lower rungs that had missed, yet opus-engineer runs rose: 58 spawns since Nov 10, 33 of them on Nov 17, at a median of 61 minutes with 16 over two hours, and about $3.8 per spawn against about $0.7 for a Sonnet engineer. Part of the cause is the Claude-only window on Nov 10. Fourteen parallel Fable critics on Nov 17 (about $75) were apparently requested by the owner. Whether the routing rule is simply being skipped is open; the first proposal is to restore the ladder and then check that opus-engineer stays below ten spawns a week.
+Opus-engineer drift is the clearest regression. The Nov 6 rule asked for briefs naming the lower rungs that had missed, yet opus-engineer runs rose: 58 spawns since Nov 4, 33 of them in the last three days, at a median of 61 minutes with 16 over two hours, and about $3.8 per spawn against about $0.7 for a Sonnet engineer. A fresh audit later that day (the game project, Nov 4 to 17) priced the period at about $1,061: opus-engineer was 21.2% of it, and in the last three days (about $271) opus-engineer was 35.9% and fable-architect 30.2%, with 33 opus-engineer spawns against 2 for the Sonnet engineer. Fable architect had 15 spawns in those three days, against a cap of 2 per session without the owner's agreement. Part of the cause is the Claude-only window on Nov 10. Fourteen parallel Fable critics on Nov 17 (about $75) were apparently requested by the owner. Whether the routing rule is simply being skipped is open; the first proposal is to restore the ladder and then check that opus-engineer stays below ten spawns a week.
 
 The cycle also measured the reading and diff budgets from the Nov 4 audit and found no effect: `sed -n` calls per planner run were 12.7 before and 13.8 after, and `git diff` characters per verifier spawn rose from 21.6k to 29.5k, although planner tokens per run fell from 17.5M to 13.2M on four runs. Other findings, each recorded as a proposal and not yet applied:
 
 - The outcome log has gaps: Opus and Sonnet packets log zero input tokens, model labels are split, 7 landed packets show checks failing, and per-stage timestamps are missing.
-- The overdue batch (38 merges since green) and the unstarted shadow review.
+- The overdue batch (52 merges since green) and the unstarted shadow review.
 - Slot-wait peaks, to be capped by limiting concurrent Unity dispatches to the slot count and replacing polling loops.
 - Fable's ideation pass produced 46 ideas, none applied. Its top ten: a packet timeline and then a conveyor that advances packets without waking the orchestrator; a visual gate in the dispatch loop; a look-sweep rig; a Unity slot priority queue; a severity gate with honest calibration; a nightly batch; check-failure triage; a balance lab and bot zoo; cache-aware wake-ups; selecting journeys per packet. Several conflict with owner rules and need a decision.
 
-## 7.7 The plugin, 0.6.0 to 0.9.1
+## 7.7 The plugin, 0.6.0 to 0.11.0
 
-![Bar chart of Agent Kaizen releases by date: six on Oct 29, two on Oct 30, one on Oct 31, three on Nov 4, one on Nov 6 and two on Nov 10, labelled with version ranges.](charts/30-plugin-releases.png)
+![Bar chart of Agent Kaizen releases by date: six on Oct 29, two on Oct 30, one on Oct 31, three on Nov 4, one on Nov 6, two on Nov 10 and two on Nov 17, labelled with version ranges.](charts/30-plugin-releases.png)
 
-*Figure 30. Fifteen plugin releases in 13 days, 0.1.0 to 0.9.1. Releases track what the audits and reviews found: usage-series (0.6.0), the port and scheduled-run hardening (0.7.x), the 2026-11-06 review fixes (0.8.0), a full review and usage database (0.9.x).*
+*Figure 30. Seventeen plugin releases in 20 days, 0.1.0 to 0.11.0. Releases track what the audits and reviews found: usage-series (0.6.0), the port and scheduled-run hardening (0.7.x), the 2026-11-06 review fixes (0.8.0), a full review and usage database (0.9.x), the flow report and first-five-minutes scan (0.10.0 and 0.11.0).*
 
-Agent Kaizen went from 0.1.0 to 0.9.1 in 13 days, 15 releases. Releases after the first week were mostly hardening: usage-series and usage-compare (0.6.0); the port of the owner's private scripts, the packet outcome report with calibration proposals, a ledger tool and rules-lint (0.7.0); planner and verifier budgets (0.7.2); the require-change and Sol-reason guards and the bash-burst hook from the weekly review (0.8.0); a full review, a usage database that keeps per-call history after Claude Code deletes old transcripts, and auto mode only for listed projects (0.9.0); and recovery after a hard kill, plus backup pruning (0.9.1). After the port, the drift check reported 0 drifted and 0 broken scripts (10 intended local differences) and 0 stale-rule hits on 2026-11-16. In progress, not released: version 0.10.0 (a flow report, an experiments register, honesty fixes to the packet report, a brief lint and a due-check reminder), and continuous integration moving to tag-only runs.
+Agent Kaizen went from 0.1.0 to 0.11.0 in 20 days, 17 releases. Releases after the first week were mostly hardening: usage-series and usage-compare (0.6.0); the port of the owner's private scripts, the packet outcome report with calibration proposals, a ledger tool and rules-lint (0.7.0); planner and verifier budgets (0.7.2); the require-change and Sol-reason guards and the bash-burst hook from the weekly review (0.8.0); a full review, a usage database that keeps per-call history after Claude Code deletes old transcripts, and auto mode only for listed projects (0.9.0); and recovery after a hard kill, plus backup pruning (0.9.1). After the port, the drift check reported 0 drifted and 0 broken scripts (10 intended local differences) and 0 stale-rule hits on 2026-11-16. Version 0.10.0 and 0.11.0, both released on 2026-11-17, are in section 7.9.
 
-## 7.8 Data caveats for this period
+## 7.8 The ledger rows, measured
+
+![Two panels. Raw test commands per day: 169.7 before Nov 4 and 1.86 after. Claude cost per main call: $0.152 before Nov 4, $0.156 after Nov 4 and $0.284 after Nov 10.](charts/31-ledger-results.png)
+
+*Figure 31. Raw test commands fell 99%; cost per main call doubled after Nov 10. The stale test commands fix worked as intended. Cost per main call doubled after Nov 10 as expensive subagents took work from the main session and from Codex.*
+
+The 2026-11-17 cycle measured the eight ledger rows that were still pending after 13 to 14 days, against a limit of 10. Baseline is the 2026-11-02 audit window (Oct 30 to Nov 1, 3 active days); after is Nov 4 to 17 (6 to 7 active days, many quiet days). The scope is the game project including its worktrees, and every rate is per active day.
+
+| Ledger row (date) | Metric | Baseline | Measured | Verdict |
+|---|---|---|---|---|
+| Engineer routing to Terra, Sol needs a reason (Nov 3) | Sol sessions per day | 68.7 | 16.8 | Keep |
+| Verification by risk tag (Nov 3) | Verifier spawns per merge | 1.37 | 0.40 | Keep |
+| Stale test commands fixed (Nov 3) | Raw test commands per day | 169.7 | 1.86 | Keep |
+| Packet runner (Nov 4) | Slot-wait p90, 14 days | 2,903 s | 5,399 s | Mixed |
+| Packet runner (Nov 4) | Tool-result turns per merge | about 40 | about 26 | Keep |
+| Dotnet-only batch and 20-merge cadence (Nov 4) | Merges since last full green | 66 | 52 | Improved, cadence not kept |
+| Review batches (Nov 4) | Verifier spawns per merge | 1.37 | 0.40 | Keep |
+| Outcome log and calibration (Nov 4) | Packet report | none | 149 packets in 15 days | Keep the log; its data is poor |
+| Planner `context.md` (Nov 4) | sonnet-planner spawns, median duration | 28 spawns, 12 min | 23 spawns, 15.5 min (19.4 min in the last 3 days) | Inconclusive |
+
+The planner row is Inconclusive because there are fewer spawns but each is slower, and the plans got larger (13-packet gaps in the first proof of concept, and Europe). The codex-planner, the default for small plans, had no Agent spawns.
+
+The packet report covers 149 packets from Nov 4 to 18. First-pass rates were 39.1% for Terra medium (n=69), 0% for Terra high (11), 5.9% for Astra medium (17), 0% for Astra high (10), 6.7% for Opus medium (15) and 0% for Sol high (7). The calibration proposal is to move Terra medium and Terra high up one rung. This paper does not act on it: resume rounds count as misses even when the cause is a queue timeout or a merge-only round, so the first-pass rate may be understated, and a rung up would undo much of the routing saving. Seven packets landed with failing checks, two of them since Nov 10. The data quality is poor: cost is missing for all 149 packets, severity is unknown for all 29 fixes, the dispatch model is known for none, 24 packets have zero input tokens and 9 have an unknown model. The flow report could not run because the packet-event logger never landed from its worktree.
+
+The usage comparison shows volume and cost falling sharply: main calls per day 1,428 to 802, average context 217k to 123k, Claude cost per day $217.57 to $125.48, tokens per commit 5.61M to 3.40M. Since Nov 10 the Claude cost per main call has doubled, from $0.156 to $0.284 (figure 31), because expensive subagents (opus-engineer and fable-architect) took over work from the main session and from Codex. After Nov 10 the Claude and Codex cost together was about $109 per day, $2.07 per commit. Codex tokens per merge were about 6.26M at baseline and 5.64M after (−10%).
+
+Token audit since Nov 4 (about $1,061): cache reads $367, cache writes $363, output $283 and uncached input $50. Claude made 16,753 calls at about 99k context each; Codex ran 373 sessions. Sol used 93% of Codex tokens with a third of the sessions. The orchestrator read no images (0 image reads; the image hook works). Stuck turns were 4 of 497 (0.3%). Two repeat failures remain: an Edit before a Read (3 sessions, 7 times) and a lowercase `bash` tool name (3 sessions, 7 times).
+
+Three caveats. The merge counts disagree: `git rev-list --merges --since=2026-11-04` gives 116 and the per-day count gives 175, so ratios are quoted against both where it matters. The pricing file has no rows for the newest Sol and Astra models, so their cost after the switch is understated, and `token-audit` did not read the compressed Codex logs until they were decompressed by hand. And the ledger itself is not updated: all eight rows are overdue, and the review pass that records these verdicts has not run.
+
+## 7.9 Plugin releases 0.10.0 and 0.11.0
+
+Both releases shipped on 2026-11-17, from the 2026-11-17 cycle and a 46-idea ideation pass. 0.10.0 added a packet-event log and flow report (lead time, time per state, waits, work in progress), an experiments register that checks metrics and review dates, due-check notices, a brief lint with an opt-in preflight in `codex-dispatch`, and packet-report fixes for model labels and missing data. Continuous integration now runs only on version tags and by hand, to spend minutes once per release. It pinned the Python 3.9 job to ubuntu-24.04 after the first tag run failed, because the default runner image had no Python 3.9 build; the 0.10.0 release was published by hand.
+
+0.11.0 is the "first five minutes" release: a new user can install the plugin and see something useful without spending a token or writing a file. It added a no-write first scan (with a demo mode on synthetic data), a read-only install doctor, a no-write audit mode, a format canary for transcript drift, a cache-write report, a usage regression guard in the session notice, an audit started when a session begins, an opt-in agent tier guard and a context budget for model-visible text. It was built in 13 packets, all on Codex (Terra for routine packets, Sol high for the three risky ones: the tier guard, the session audit and the regression guard). The tag run passed first time on 2026-11-17.
+
+The process lesson is the useful part. Review and gates caught problems at three stages:
+
+- **Review.** Sol reviews found 13 issues; 12 were fixed and one kept by design. The first review of one packet found 5, including an unbounded scan that took 10.3 s on a million-call fixture against a 2 s hook deadline.
+- **Real-input gates.** The plan ended with gates that run each new command on the real installed setup, following the 2026-11-04 rule that tooling plans end with an end-to-end run. Two of seven gates found bugs the synthetic tests had missed. The format canary reported drift that was not there, because the newest Claude Code and Codex versions write record types it did not know yet. The install doctor warned on every normal database that had an empty write-ahead log file. Both were fixed before release, and the drift line now names the top five unknown record types.
+- **A full local CI on Python 3.9.** With CI on tags only, this run is the main safety net. The first run took 644 s and failed 5 tests, all test-harness assumptions: a new config key broke two tests that pin config output, and macOS cache files and Python bytecode broke three read-only snapshot tests. The packet that added the key had run only its own tests. The second run was green (900 tests, 2 skipped, 769 s).
+
+So the two false warnings and the five test failures are things that unit tests and per-packet checks missed. Gate timings on the real install were small: first scan 6.7 s, doctor 0.3 s, regression guard 0.6 to 0.7 s against its 2 s deadline. The rule this adds: a packet that adds a config key or a default runs the tests that pin config output, not only its own, and a verifier report is checked against the commit it reviewed before it is acted on. A fix that landed after that commit made one such report stale.
+
+## 7.10 Data caveats for this period
 
 Claude Code and Codex delete old session logs. The early rows of the daily series were kept as exported; later rows hold what the transcripts still show, with Nov 2 to 3 and Nov 12 to 15 empty, and the usage database supplies calls, tokens and cost where logs are gone. Codex costs before Nov 4 come from the earlier exports only. Several figures above come from audits with different windows, a different project mix (the all-project audits include other repositories) and small samples.
 
@@ -703,6 +751,7 @@ Claude Code and Codex delete old session logs. The early rows of the daily serie
 - **Verifier effort.** `sonnet-verifier` median calls went from 22 to 28.
 - **Wake-up count.** Batching did not reduce the number of wake-ups per day (about 163 to about 193). Each became smaller instead.
 - **Trimming connectors.** Done, but no saving was measured.
+- **The planner `context.md` (2026-11-17).** Fewer planner spawns (28 to 23) but each is slower (12 to 15.5 minutes); the verdict is Inconclusive.
 - **Reading and diff budgets (2026-11-17).** Planner `sed -n` calls per run were 12.7 before and 13.8 after; verifier diff characters per spawn rose from 21.6k to 29.5k. The templates were changed; agent behaviour was not.
 
 ## 8.2 Rules that never reached the agents
@@ -730,11 +779,12 @@ In the later audit, 29 of 2,254 turns (1.3%) were stuck: the same failure three 
 
 ## 8.6 What got worse in weeks three and four
 
-- **Opus-engineer drift.** After a rule to make it rare, it took 26% of 14-day spend (section 7.6).
-- **Slot-wait peaks.** The 90th percentile of Unity slot wait was 4,592 s over 14 days against 2,903 s; 55 of 67.7 hours fell on two days.
-- **Safety nets that depend on memory.** The full batch was 38 merges overdue against a threshold of 20, and a three-week shadow review had no rows two weeks in. A tool that merely exists does not close the loop; the trigger needs wiring.
+- **Opus-engineer drift.** After a rule to make it rare, it took 26% of 14-day spend and 36% of the last three days (section 7.6).
+- **Slot-wait peaks.** The 90th percentile of Unity slot wait was 5,399 s over 14 days in the newest run (4,592 s in an earlier one) against 2,903 s.
+- **Safety nets that depend on memory.** The full batch was 52 merges overdue against a threshold of 20, and a three-week shadow review had no rows two weeks in. A tool that merely exists does not close the loop; the trigger needs wiring.
 - **An unproven saving.** Fewer verifier spawns per merge is measured; that batch review catches what per-packet review did is not.
 - **An outcome log that misleads.** The calibration report proposes moving every Terra row up a rung because any fix naming a packet counts against it, and Opus and Sonnet packets log no tokens.
+- **A wrong figure in 0.3.** Version 0.3 said Sol engineer sessions had fallen to zero; a scan that reads compressed Codex logs finds 5.7 a day (section 7.2).
 - **A measurement trap.** A plain refresh of the daily series dropped early days and the Codex costs, because Claude Code and Codex had deleted the logs. The refreshed numbers were lower for reasons unrelated to the setup.
 
 # 9. What it saved, honestly
@@ -943,7 +993,7 @@ The default mode is propose. Auto mode applies changes but backs each one up, ve
 
 ## 12.5 Releases since the launch
 
-From 0.6.0 to 0.9.1 (2026-10-31 to 2026-11-10) the plugin added a published usage series and comparison (0.6.0), a private-script linker with drift check, a packet outcome report with calibration proposals, a project report, a ledger tool and rules-lint (0.7.0), reading budgets (0.7.2), guards against empty and expensive dispatches and a bash-burst warning (0.8.0), a usage database, scheduled-run hardening and backup pruning (0.9.x). See section 7.7 and the plugin's CHANGELOG.md. Version 0.10.0 is being planned and has not been released.
+From 0.6.0 to 0.11.0 (2026-10-31 to 2026-11-17) the plugin added a published usage series and comparison (0.6.0), a private-script linker with drift check, a packet outcome report with calibration proposals, a project report, a ledger tool and rules-lint (0.7.0), reading budgets (0.7.2), guards against empty and expensive dispatches and a bash-burst warning (0.8.0), a usage database, scheduled-run hardening and backup pruning (0.9.x), a flow report, an experiments register and tag-only CI (0.10.0), and a no-write first scan, doctor, format canary, cache-write report and regression guard (0.11.0). See sections 7.7 and 7.9 and the plugin's CHANGELOG.md.
 
 ## 12.6 Install
 
@@ -970,7 +1020,7 @@ Then `/agent-kaizen:audit` and `/agent-kaizen:roster`. It needs `jq` and Python 
 - **Cost is a weighting.** API list prices, slightly understated, applied to flat subscriptions.
 - **Missing data.** Codex logs before 2026-10-26 are gone.
 - **Transcript formats are not a stable public API.** The audit's parser may need updating after a release.
-- **Weeks three and four.** Windows of 3 to 14 days, one project, one confounder in common: the Codex lane ended about Nov 6, so Sol, Astra and total Codex numbers after that date say little about the rules. Packet counts are small (n = 2 to 19 per effort group).
+- **Weeks three and four.** Windows of 3 to 14 days, one project, one confounder in common: the Codex lane ended about Nov 6, so Sol, Astra and total Codex numbers after that date say little about the rules. Packet counts are small (n = 2 to 69 per model and effort group). The ledger measurements of 2026-11-17 compare 3 baseline days with 6 to 7 active days, and the merge count depends on how it is taken (116 or 175).
 - **Lost logs.** Nov 2 to 3 and Nov 12 to 15 have no Claude transcripts; Codex costs before Nov 4 and Claude Code logs older than their retention are partial.
 - **Headroom is reported, not measured.** That sessions rarely reach the limits now is David's experience. Subscription limit accounting is not published.
 
@@ -992,7 +1042,7 @@ Also open:
 - Find out why planners still explore past their budget, and whether the code-map share keeps rising.
 - Measure the total size of agent and skill descriptions as a per-turn cost.
 
-Proposed on 2026-11-17 and not yet applied: restore the engineer routing ladder; fix the outcome log; run the overdue batch and wire its trigger; cap slot-wait peaks; start the shadow review and hold the Terra calibration. Fable's 46 ideas are also proposals; the first is a per-packet state timeline so the share of wall time spent waiting can be measured instead of estimated.
+Proposed on 2026-11-17 and not yet applied: restore the engineer routing ladder; fix the outcome log; run the overdue batch and wire its trigger; cap slot-wait peaks; start the shadow review and hold the Terra calibration. The measurement cycle added proposals ranked by what they would save: require a `Rungs-missed:` line in opus-engineer briefs, enforce the Fable spawn cap with a counter, land or drop the packet-event logger, record model, cost and severity in the packet log, price the newest Sol and Astra models, and run the overdue batch. Fable's 46 ideas are also proposals; the first is a per-packet state timeline so the share of wall time spent waiting can be measured instead of estimated.
 
 We will update this paper as the ledger fills in.
 
@@ -1077,17 +1127,21 @@ Weeks three and four (windows differ; see section 7):
 | Metric | Before | After |
 |---|---|---|
 | Average / peak orchestrator context (180k compaction) | 161k / 367k | 123k / 217k |
-| Verifier spawns per merge | 1.37 | 0.40 (68 of 169) |
-| Sol engineer sessions | 144 (Oct 30 to Nov 2) | 0 (14 days to Nov 17) |
-| Sol diff-review sessions | 104 | 4 |
-| Tool-result turns per merge | 40 | 24.6 |
-| Merges since last green full batch | 66 | 38 |
-| Slot-wait p90 (14 days; p50 677 s; 67.7 h) | 2,903 s | 4,592 s |
+| Verifier spawns per merge | 1.37 | 0.40 (70 of 175; 0.60 on the git-date count of 116) |
+| Sol sessions per active day (game project) | 68.7 | 16.8 |
+| Sol engineer sessions per active day | 38.3 | 5.7 |
+| Sol diff-review sessions per active day | 28 | 10.7 |
+| Raw test commands per day | 169.7 | 1.86 |
+| Tool-result turns per merge | about 40.3 | about 25.7 (38.6 on 116 merges) |
+| Merges since last green full batch | 66 | 52 |
+| Slot-wait p90 (newest 14-day run; p50 918 s; 57.3 h; n=108) | 2,903 s | 5,399 s |
 | Landing lock held (fixture, 3-run medians) | 5.9 s | 1.3 s |
 | Weekly cost per day (Oct 30 to Nov 6, before vs after Nov 4) | $273 | $362 |
 | Astra first-pass rate (medium effort, n = 19) | n/a | 10.5% |
 | Haiku exact-change items, first pass | n/a | 21 of 22 |
 | opus-engineer share of 14-day spend | n/a | 26% ($220 of $836) |
+| opus-engineer share of cost, Nov 4 to 17 and last 3 days | n/a | 21.2% of about $1,061; 35.9% of about $271 |
+| Claude cost per main call (before Nov 4, after Nov 4, after Nov 10) | $0.152 | $0.156, then $0.284 |
 | `sed -n` calls per planner run | 12.7 | 13.8 |
 | Verifier `git diff` characters per spawn | 21.6k | 29.5k |
 
@@ -1172,6 +1226,13 @@ To do the same in your setup: run the audit once as a baseline; make your change
 - [ ] One change at a time (or a few), logged.
 - [ ] Re-measure at the next audit; compare rates, not totals.
 - [ ] Keep, tune or revert. Write down what did not work.
+
+# Changes in 0.4
+
+- **Ledger rows measured (2026-11-17 cycle).** New section 7.8 with figure 31 and a table of the eight rows: five Keep, one Mixed, one Improved but not kept up, one Inconclusive. Sections 7.2, 7.3 and 7.6 carry the updated numbers: Sol sessions per day 68.7 to 16.8, raw test commands 169.7 to 1.86 per day, tool-result turns per merge about 40 to about 26, merges since the last green batch 52, slot-wait p90 5,399 s over 14 days, and the opus-engineer share of cost since Nov 4.
+- **Correction.** Version 0.3 said Sol engineer sessions fell to zero in 14 days. A scan that reads compressed Codex logs finds 5.7 per active day (down from 38.3).
+- **New section 7.9** on plugin releases 0.10.0 and 0.11.0, with the process lesson from the real-input gates and the full local Python 3.9 CI. Section 7.7 now covers 0.6.0 to 0.11.0 (figure 30 redrawn: 17 releases in 20 days). The data caveats moved to 7.10.
+- **Figures 23, 24, 25 and 29 redrawn** with the new values; figure 31 is new. Executive summary, 8.1, 8.6, 12.5, 13 and Appendix B updated.
 
 # Changes in 0.3
 
