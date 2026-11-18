@@ -8,7 +8,7 @@ Harden LocalSearch marker apply, rollback and undo. This packet is part of the A
 - **Risk** — high. Get a per-packet verifier and Sol high review before merge. Obtain security review before landing.
 - **Group / dependencies** — F. After P15.
 - **Size target** — ~390 changed lines including focused tests.
-- Sol reason: Marker apply/undo must recover safely around partial effects and replacement.
+Sol reason: Marker apply/undo must recover safely around partial effects and replacement.
 - Changelog: Harden LocalSearch marker apply, rollback and undo.
 
 ## Context

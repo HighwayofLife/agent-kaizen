@@ -8,7 +8,7 @@ Harden local commit and inverse-ref recovery. This packet is part of the Agent K
 - **Risk** — high. Get a per-packet verifier and Sol high review before merge. Obtain security review before landing.
 - **Group / dependencies** — F. After P16.
 - **Size target** — ~390 changed lines including focused tests.
-- Sol reason: Ref compare-and-swap and interrupted reversal must recover without duplicate commits.
+Sol reason: Ref compare-and-swap and interrupted reversal must recover without duplicate commits.
 - Changelog: Harden local commit and inverse-ref recovery.
 
 ## Context

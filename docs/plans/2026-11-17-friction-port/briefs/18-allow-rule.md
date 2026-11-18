@@ -8,7 +8,7 @@ Add and revoke evidence-backed exact Claude project allow rules. This packet is 
 - **Risk** — high. Get a per-packet verifier and Sol high review before merge. Obtain security review before landing.
 - **Group / dependencies** — E. After P05.
 - **Size target** — ~380 changed lines including focused tests.
-- Sol reason: Persistent permissions require live exact matching and user acceptance provenance.
+Sol reason: Persistent permissions require live exact matching and user acceptance provenance.
 - Changelog: Add and revoke evidence-backed exact Claude project allow rules.
 
 Owner decision O1 and live gate S2 apply before writes become live.

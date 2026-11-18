@@ -8,7 +8,7 @@ Bound and harden sampler process snapshots. This packet is part of the Agent Kai
 - **Risk** — high. Get a per-packet verifier and Sol high review before merge.
 - **Group / dependencies** — D. After P01b, P14.
 - **Size target** — ~255 changed lines including focused tests.
-- Sol reason: Rate claims across concurrent hooks and process teardown must preserve the sampling deadline.
+Sol reason: Rate claims across concurrent hooks and process teardown must preserve the sampling deadline.
 - Changelog: Bound and harden sampler process snapshots.
 
 Sampler release gate S1 applies before default-on registration.

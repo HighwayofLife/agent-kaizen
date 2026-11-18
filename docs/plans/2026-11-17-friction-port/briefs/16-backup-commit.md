@@ -8,7 +8,7 @@ Commit and revert only verified backup files on a local kaizen ref. This packet 
 - **Risk** — high. Get a per-packet verifier and Sol high review before merge. Obtain security review before landing.
 - **Group / dependencies** — E. After P08.
 - **Size target** — ~365 changed lines including focused tests.
-- Sol reason: Trusted handoff and Git plumbing must preserve the worktree and user index.
+Sol reason: Trusted handoff and Git plumbing must preserve the worktree and user index.
 - Changelog: Commit and revert only verified backup files on a local kaizen ref.
 
 ## Context

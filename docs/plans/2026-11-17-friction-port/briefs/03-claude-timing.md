@@ -8,7 +8,7 @@ Add bounded Claude timing to the audit extract. This packet is part of the Agent
 - **Risk** — normal. Use green checks and the integration batch review.
 - **Group / dependencies** — A1. No friction dependencies.
 - **Size target** — ~365 changed lines including focused tests.
-- Sol reason: A one-pass scan change must preserve bounded parsing, existing metrics and scan speed.
+Sol reason: A one-pass scan change must preserve bounded parsing, existing metrics and scan speed.
 - Changelog: Add bounded Claude timing to the audit extract.
 
 ## Context

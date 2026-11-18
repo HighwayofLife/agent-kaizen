@@ -8,7 +8,7 @@ Capture opt-in clean Git baselines for local backup commits. This packet is part
 - **Risk** — high. Get a per-packet verifier and Sol high review before merge. Obtain security review before landing.
 - **Group / dependencies** — B. No friction dependencies.
 - **Size target** — ~245 changed lines including focused tests.
-- Sol reason: The clean-start capture and identity boundary authorize later Git writes.
+Sol reason: The clean-start capture and identity boundary authorize later Git writes.
 - Changelog: Capture opt-in clean Git baselines for local backup commits.
 
 ## Context

@@ -8,7 +8,7 @@ Track machine-local host actions and manual state changes. This packet is part o
 - **Risk** — high. Get a per-packet verifier and Sol high review before merge.
 - **Group / dependencies** — C. After P01b, P02.
 - **Size target** — ~350 changed lines including focused tests.
-- Sol reason: Stable scoped IDs and concurrent private-store writes are the action trust boundary.
+Sol reason: Stable scoped IDs and concurrent private-store writes are the action trust boundary.
 - Changelog: Track machine-local host actions and manual state changes.
 
 ## Context

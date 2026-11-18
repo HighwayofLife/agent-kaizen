@@ -8,7 +8,7 @@ Harden prune journals, undo and late-change refusals. This packet is part of the
 - **Risk** — high. Get a per-packet verifier and Sol high review before merge. Obtain security review before landing.
 - **Group / dependencies** — E. After P12.
 - **Size target** — ~385 changed lines including focused tests.
-- Sol reason: Recovery and compare-before-remove must handle late writes and forged records.
+Sol reason: Recovery and compare-before-remove must handle late writes and forged records.
 - Changelog: Harden prune journals, undo and late-change refusals.
 
 ## Context

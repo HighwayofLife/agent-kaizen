@@ -8,7 +8,7 @@ Run eligible scheduled friction actions outside Claude's tool grants. This packe
 - **Risk** — high. Get a per-packet verifier and Sol high review before merge. Obtain security review before landing.
 - **Group / dependencies** — L. After P12b, P18b, P19, P23, P24b.
 - **Size target** — ~395 changed lines including focused tests.
-- Sol reason: The broker must make one recoverable effect across interruption without broadening Claude grants.
+Sol reason: The broker must make one recoverable effect across interruption without broadening Claude grants.
 - Changelog: Run eligible scheduled friction actions outside Claude's tool grants.
 
 Owner decisions O1–O2 apply to the two corresponding broker operations. Other operations can be implemented and tested independently.

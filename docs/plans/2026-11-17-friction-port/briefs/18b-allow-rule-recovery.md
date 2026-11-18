@@ -8,7 +8,7 @@ Harden exact grant transactions and removal-only undo. This packet is part of th
 - **Risk** — high. Get a per-packet verifier and Sol high review before merge. Obtain security review before landing.
 - **Group / dependencies** — F. After P18.
 - **Size target** — ~390 changed lines including focused tests.
-- Sol reason: Locked settings transactions and ownership-preserving undo change persistent permissions.
+Sol reason: Locked settings transactions and ownership-preserving undo change persistent permissions.
 - Changelog: Harden exact grant transactions and removal-only undo.
 
 Owner decision O1 and live gate S2 apply before writes become live.

@@ -8,7 +8,7 @@ Permit verified local kaizen commits after a successful scheduled review. This p
 - **Risk** — high. Get a per-packet verifier and Sol high review before merge. Obtain security review before landing.
 - **Group / dependencies** — M. After P16b, P24.
 - **Size target** — ~385 changed lines including focused tests.
-- Sol reason: Brokered commits must bind trusted pre-review Git state to current-run backups.
+Sol reason: Brokered commits must bind trusted pre-review Git state to current-run backups.
 - Changelog: Permit verified local kaizen commits after a successful scheduled review.
 
 ## Context

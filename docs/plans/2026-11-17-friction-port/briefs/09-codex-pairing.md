@@ -8,7 +8,7 @@ Pair Codex calls and outputs within the existing scan. This packet is part of th
 - **Risk** — normal. Use green checks and the integration batch review.
 - **Group / dependencies** — C. After P03.
 - **Size target** — ~340 changed lines including focused tests.
-- Sol reason: Codex call/output admission shares the single-pass format and accounting fast path.
+Sol reason: Codex call/output admission shares the single-pass format and accounting fast path.
 - Changelog: Pair Codex calls and outputs within the existing scan.
 
 ## Context

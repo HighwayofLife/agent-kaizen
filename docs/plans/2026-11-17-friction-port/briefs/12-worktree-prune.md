@@ -8,7 +8,7 @@ Remove and recreate eligible clean, merged Git worktrees. This packet is part of
 - **Risk** — high. Get a per-packet verifier and Sol high review before merge. Obtain security review before landing.
 - **Group / dependencies** — C. After P04.
 - **Size target** — ~360 changed lines including focused tests.
-- Sol reason: Clean, merged worktree preflight must refuse hidden changes and unsafe topology.
+Sol reason: Clean, merged worktree preflight must refuse hidden changes and unsafe topology.
 - Changelog: Remove and recreate eligible clean, merged Git worktrees.
 
 ## Context

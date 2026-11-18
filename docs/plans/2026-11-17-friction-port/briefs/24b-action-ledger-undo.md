@@ -8,7 +8,7 @@ Record brokered effects and resolve undo by scoped action ID. This packet is par
 - **Risk** — high. Get a per-packet verifier and Sol high review before merge. Obtain security review before landing.
 - **Group / dependencies** — K. After P24a, P23.
 - **Size target** — ~365 changed lines including focused tests.
-- Sol reason: Ledger recovery and fixed undo lookup must never adopt forged state.
+Sol reason: Ledger recovery and fixed undo lookup must never adopt forged state.
 - Changelog: Record brokered effects and resolve undo by scoped action ID.
 
 Owner decisions O1–O2 apply to the two corresponding broker operations. Other operations can be implemented and tested independently.

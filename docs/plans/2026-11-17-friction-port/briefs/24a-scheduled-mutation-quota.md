@@ -8,7 +8,7 @@ Prove the scheduled mutation budget from runner-owned evidence. This packet is p
 - **Risk** — high. Get a per-packet verifier and Sol high review before merge. Obtain security review before landing.
 - **Group / dependencies** — G. After P02, P08.
 - **Size target** — ~395 changed lines including focused tests.
-- Sol reason: Independent tool accounting and trusted config decide whether any scheduled mutation is permitted.
+Sol reason: Independent tool accounting and trusted config decide whether any scheduled mutation is permitted.
 - Changelog: Prove the scheduled mutation budget from runner-owned evidence.
 
 Owner decisions O1–O2 apply to the two corresponding broker operations. Other operations can be implemented and tested independently.

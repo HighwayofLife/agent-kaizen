@@ -8,7 +8,7 @@ Apply and undo eligible LocalSearch output markers. This packet is part of the A
 - **Risk** — high. Get a per-packet verifier and Sol high review before merge. Obtain security review before landing.
 - **Group / dependencies** — E. After P10, P11.
 - **Size target** — ~370 changed lines including focused tests.
-- Sol reason: No-follow directory operations and path revalidation protect the marker target.
+Sol reason: No-follow directory operations and path revalidation protect the marker target.
 - Changelog: Apply and undo eligible LocalSearch output markers.
 
 ## Context

@@ -8,7 +8,7 @@ Sample Bash timing and host load in a bounded asynchronous hook. This packet is 
 - **Risk** — high. Get a per-packet verifier and Sol high review before merge.
 - **Group / dependencies** — B. After P00, P02.
 - **Size target** — ~300 changed lines including focused tests.
-- Sol reason: Concurrent writers must preserve private file identity, cap and hook deadline.
+Sol reason: Concurrent writers must preserve private file identity, cap and hook deadline.
 - Changelog: Sample Bash timing and host load in a bounded asynchronous hook.
 
 Sampler release gate S1 applies before default-on registration.

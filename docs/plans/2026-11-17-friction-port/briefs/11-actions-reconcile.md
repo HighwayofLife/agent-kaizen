@@ -8,7 +8,7 @@ Import evidence-backed host actions and verify outcomes. This packet is part of 
 - **Risk** — high. Get a per-packet verifier and Sol high review before merge.
 - **Group / dependencies** — D. After P05, P07.
 - **Size target** — ~375 changed lines including focused tests.
-- Sol reason: Strict wire validation and an atomic import receipt are required for retry after interruption.
+Sol reason: Strict wire validation and an atomic import receipt are required for retry after interruption.
 - Changelog: Import evidence-backed host actions and verify outcomes.
 
 ## Context

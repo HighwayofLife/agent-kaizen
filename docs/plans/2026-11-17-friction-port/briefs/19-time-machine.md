@@ -8,7 +8,7 @@ Support verified sticky Time Machine exclusion and reversal. This packet is part
 - **Risk** — high. Get a per-packet verifier and Sol high review before merge. Obtain security review before landing.
 - **Group / dependencies** — G. After P15b.
 - **Size target** — ~365 changed lines including focused tests.
-- Sol reason: The native path-based operation must stay bound to one eligible directory through apply and undo.
+Sol reason: The native path-based operation must stay bound to one eligible directory through apply and undo.
 - Changelog: Support verified sticky Time Machine exclusion and reversal.
 
 Owner decision O2 and live gate S3 apply before native exclusions become live.
