@@ -165,6 +165,12 @@ if ! out=$(jq -n --arg c "$msg" '{hookSpecificOutput:{hookEventName:"SessionStar
     [ -n "$regression_marker" ] && rm -f "$regression_marker"
     exit 0
 fi
-printf '%s\n' "$out"
-emitted=1
+if printf '%s\n' "$out"; then
+    emitted=1
+else
+    [ -n "$audit_marker" ] && rm -f "$audit_marker"
+    [ -n "$experiment_marker" ] && rm -f "$experiment_marker"
+    [ -n "$regression_marker" ] && rm -f "$regression_marker"
+    emitted=1
+fi
 exit 0

@@ -2,6 +2,13 @@
 from contextlib import closing
 from datetime import date, timedelta
 import json
+import importlib.util
+from importlib.machinery import SourceFileLoader
+import io
+from contextlib import redirect_stdout
+import subprocess
+import time
+from unittest.mock import patch
 import sqlite3
 
 from test_hooks import ROOT, run_raw
@@ -29,6 +36,22 @@ class UsageGuardTests(UsageDbCase):
     def guard(self, *args):
         return self.run_script('usage-db', 'guard', '--pricing', self.prices, *args).stdout.splitlines()
 
+    def guard_module(self):
+        loader = SourceFileLoader('guard_equivalence', str(ROOT / 'scripts/usage-db'))
+        module = importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader))
+        loader.exec_module(module)
+        return module
+
+    def compare_unrestricted(self, *extra):
+        module = self.guard_module()
+        args = module.build_parser().parse_args(['guard', '--db', str(self.db), '--pricing', str(self.prices), *extra])
+        output = io.StringIO()
+        original = module.guard_days
+        with redirect_stdout(output), patch.object(module, 'guard_days',
+                                                 side_effect=lambda conn, args, bound=None: original(conn, args)):
+            module.guard(args)
+        self.assertEqual(self.guard(*extra), output.getvalue().splitlines())
+
     def findings(self, *args):
         return [line for line in self.guard(*args) if line.startswith('REGRESSION ')]
 
@@ -41,6 +64,7 @@ class UsageGuardTests(UsageDbCase):
         lines = self.guard()
         self.assertEqual(lines, ['insufficient data agent_cost_share.worker (0/17 active UTC days)',
                                  'insufficient data full_rewrite_share (0/17 active UTC days)'])
+        self.compare_unrestricted()
 
     def test_active_day_windows_strict_boundary_and_unscaled_mad(self):
         for i in range(31):
@@ -96,6 +120,82 @@ class UsageGuardTests(UsageDbCase):
         for i in range(15, 18):
             self.call(i, 'cross-day', input_=2000, write=8000, session='spanning')
         self.assertEqual(self.findings(), ['REGRESSION full_rewrite_share 0.5 vs 0'])
+        self.compare_unrestricted()
+
+    def test_bounded_rewrites_keep_only_needed_predecessors(self):
+        self.call(0, 'predecessor', session='spanning')
+        self.call(1, 'first-write', session='spanning', input_=0, write=10000)
+        self.call(1, 'new-session', session='new', input_=0, write=10000)
+        self.call(1, 'second-write', session='new', time='00:00:00.001', write=1000)
+        self.call(2, 'no-write', session='another')
+        self.call(2, 'later-write', session='another', time='00:00:01', write=1000)
+        module = self.guard_module()
+        with closing(sqlite3.connect(self.db)) as conn:
+            # The first spanning write counts; a new session's first write does not.
+            self.assertEqual(module.guard_rewrites(conn, 'is_subagent', '2025-01-03'),
+                             {'2025-01-03': 0.5, '2025-01-05': 0.0})
+            self.assertEqual(module.guard_rewrites(conn, 'is_subagent', '2025-01-05'),
+                             {'2025-01-05': 0.0})
+
+    def test_aliases_and_unknown_origin(self):
+        prices = json.loads(self.prices.read_text())
+        prices['aliases'] = {'opus': 'claude-opus-test', 'fable': 'claude-opus-test'}
+        self.prices.write_text(json.dumps(prices))
+        for i in range(17):
+            self.call(i, 'main', input_=10000 if i < 14 else 13000)
+            self.call(i, 'unknown', input_=10000, subagent=None)
+        self.assertIn('REGRESSION main_avg_context 13000 vs 10000', self.findings())
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("DELETE FROM calls WHERE is_subagent IS NULL")
+        for i in range(14, 17):
+            for j, model in enumerate(('opus', 'fable', 'opus')):
+                self.call(i, f'alias-{j}', subagent=1, model=model)
+        self.assertIn('REGRESSION expensive_agent_calls 3 vs 0', self.findings())
+
+    def test_cost_share_rounding_avoids_invisible_regression(self):
+        for i in range(17):
+            self.call(i, 'main', input_=100000000)
+            self.call(i, 'agent', input_=100000000 + (i >= 14), subagent=1)
+        self.assertFalse(any('agent_cost_share' in line for line in self.findings(
+            '--relative-threshold', '0', '--mad-multiplier', '0', '--minimum', 'agent_cost_share=0')))
+
+    def test_bounded_matches_unrestricted_sparse_families(self):
+        for i in range(40):
+            self.call(i, 'main', input_=12000 if i > 35 else 10000, source='codex', subagent=None)
+            if i % 3 != 0:
+                self.call(i, 'claude', session='spanning')
+                self.call(i, 'write', session='spanning', time='00:00:01', write=1000)
+            if i % 2 == 0:
+                self.call(i, 'agent', subagent=1)
+            if i < 4:
+                self.call(i, 'old-agent', subagent=1)
+                with sqlite3.connect(self.db) as conn:
+                    conn.execute("UPDATE calls SET agent='oldworker' WHERE call_id=?", (f'{i}-old-agent',))
+            if i % 7 == 0:
+                self.call(i, 'unknown', model='claude-unknown')
+        self.compare_unrestricted()
+        self.compare_unrestricted('--minimum', 'output_per_call=0')
+
+    def test_large_database_guard_speed(self):
+        start = time.monotonic()
+        def rows():
+            for i in range(200000):
+                day = (date(2025, 1, 1) + timedelta(days=i % 60)).isoformat()
+                agent = (i // 60) % 10 == 0
+                yield ('claude', str(i), day + 'T12:00:00Z', day, 'session-' + str(i % 100),
+                       'worker' if agent else 'main', 'claude-opus-test', int(agent), 10000,
+                       100 if (i // 60) % 100 == 1 else 0, 10)
+        with sqlite3.connect(self.db) as conn:
+            conn.executemany('INSERT INTO calls (source, call_id, ts, day, session, agent, model, is_subagent, '
+                             'input, cache_write_5m, output) VALUES (?,?,?,?,?,?,?,?,?,?,?)', rows())
+        if time.monotonic() - start > 20:
+            self.skipTest('building the synthetic database took over 20 seconds')
+        start = time.monotonic()
+        result = subprocess.run([str(ROOT / 'scripts/usage-db'), 'guard', '--db', str(self.db),
+                                 '--pricing', str(self.prices)], capture_output=True, text=True)
+        elapsed = time.monotonic() - start
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 1.0, f'guard took {elapsed:.3f} seconds')
 
     def test_rejects_nonfinite_thresholds(self):
         for args in (('--relative-threshold', 'nan'), ('--mad-multiplier', '-1'),

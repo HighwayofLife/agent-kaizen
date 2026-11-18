@@ -610,51 +610,83 @@ GUARD_MINIMUMS = dict(main_avg_context=1000, expensive_agent_calls=2, agent_cost
                       output_per_call=100, full_rewrite_share=0.05)
 
 
-def guard_rewrites(conn, origin):
+def guard_rewrites(conn, origin, bound=None):
     # stamp() stores UTC ISO times. Removing the final Z sorts whole seconds
     # before fractions of that second. Keep the predecessor across UTC days.
+    where = "source = 'claude' AND " + origin + " = 0 AND session != ''"
+    # Sort just the bounded calls and keep LAG's predecessor while streaming.
+    # First calls without a cache write cannot affect the rewrite metric.
+    window_where = where + (' AND day >= ?' if bound else '')
     rows = conn.execute(f"""
-        SELECT day, ts, LAG(ts) OVER (PARTITION BY session ORDER BY rtrim(ts, 'Z'), call_id),
-               cache_write_5m + cache_write_1h, input + cache_read + cache_write_5m + cache_write_1h
-        FROM calls WHERE source = 'claude' AND {origin} = 0 AND session != ''
-    """)
+        SELECT day, ts, cache_write_5m + cache_write_1h,
+               input + cache_read + cache_write_5m + cache_write_1h, session
+        FROM calls WHERE {window_where}
+        ORDER BY session, rtrim(ts, 'Z'), call_id
+    """, (bound,) if bound else ())
     daily = defaultdict(Counter)
-    for date, current, previous, write, context in rows:
-        if previous is None or write <= 0 or context <= 0:
-            continue
+    pending = {}
+
+    def add(date, current, previous, write, context):
         try:
             gap = AUDIT.cache_bucket(AUDIT.date_time(previous), AUDIT.date_time(current))
         except (TypeError, ValueError, OverflowError):
-            continue
+            return
         if gap != 'unknown':
             AUDIT.cache_add(daily, date, write, context)
+
+    last_session, previous = None, None
+    for date, current, write, context, session in rows:
+        if session != last_session:
+            previous = None
+            last_session = session
+        if write > 0 and context > 0:
+            if previous is not None:
+                add(date, current, previous, write, context)
+            elif bound:
+                pending[session] = (date, current, write, context)
+        previous = current
+    if pending:
+        # Only first-in-window writes need an earlier predecessor. The call id
+        # breaks timestamp ties, which cannot change the predecessor's time.
+        for session, previous in conn.execute(f"""
+            SELECT session, MAX(rtrim(ts, 'Z')) FROM calls
+            WHERE day < ? AND {where} GROUP BY session
+        """, (bound,)):
+            if session in pending:
+                date, current, write, context = pending[session]
+                add(date, current, previous, write, context)
     return {date: row['full_rewrites'] / row['writes'] for date, row in daily.items()}
 
 
-def guard_days(conn, args):
+def guard_days(conn, args, bound=None):
     origin = 'is_subagent' if 'is_subagent' in {row[1] for row in conn.execute('PRAGMA table_info(calls)')} else 'NULL'
     days = {metric: {} for metric in GUARD_MINIMUMS}
-    totals, agents = defaultdict(Counter), defaultdict(Counter)
+    totals, agents = defaultdict(Counter), defaultdict(lambda: defaultdict(list))
+    state = pricing_state(args)
+    costs = defaultdict(list)
     for (date, subagent, agent), source, model, calls, tokens, _, cost, unpriced in priced_rows(
-            conn, pricing_state(args), [], [], ['day', origin, 'agent']):
+            conn, state, ['day >= ?'] if bound else [], [bound] if bound else [], ['day', origin, 'agent']):
         row = totals[date]
-        row.update(calls=calls, output=tokens[4], cost=cost, unpriced=unpriced)
+        row.update(calls=calls, output=tokens[4], unpriced=unpriced)
+        costs[date].append(cost)
         if source != 'claude':
             continue
         if subagent == 0:
             row.update(main=calls, context=sum(tokens[:4]))
         elif subagent == 1:
             row['claude_agent_calls'] += calls
-            if re.fullmatch(r'claude-(?:opus|fable)(?:[-\[].*)?', model, re.IGNORECASE):
+            if re.fullmatch(r'claude-(?:opus|fable)(?:[-\[].*)?',
+                            AUDIT.pricing_key(state['_pricing'], model) or model, re.IGNORECASE):
                 row['expensive'] += calls
             if agent and agent != 'unknown' and re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_-]{0,63}', agent):
-                agents[agent][date] += cost
+                agents[agent][date].append(cost)
             if model == 'unknown':
                 row['unknown_tier'] += calls
         else:
             row['unknown_origin'] += calls
 
     for date, row in totals.items():
+        row['cost'] = math.fsum(costs[date])
         days['output_per_call'][date] = row['output'] / row['calls']
         if row['main']:
             days['main_avg_context'][date] = row['context'] / row['main']
@@ -662,19 +694,34 @@ def guard_days(conn, args):
             days['expensive_agent_calls'][date] = row['expensive']
     for agent, costs in agents.items():
         days['agent_cost_share.' + agent] = {
-            date: cost / totals[date]['cost'] for date, cost in costs.items()
+            date: round(math.fsum(cost) / totals[date]['cost'], 6) for date, cost in costs.items()
             if not (totals[date]['unpriced'] or totals[date]['unknown_origin']) and totals[date]['cost'] > 0
         }
     if agents:
         del days['agent_cost_share']
-    days['full_rewrite_share'] = guard_rewrites(conn, origin)
+    days['full_rewrite_share'] = guard_rewrites(conn, origin, bound)
     return days
 
 
 def guard(args):
     with closing(open_read(db_path(args))) as conn:
         conn.execute('BEGIN')
-        days = guard_days(conn, args)
+        dates = [row[0] for row in conn.execute('SELECT DISTINCT day FROM calls ORDER BY day DESC')]
+        # Old-only agents still need their own history (including zero eligible days).
+        origin_exists = 'is_subagent' in {row[1] for row in conn.execute('PRAGMA table_info(calls)')}
+        agent_names = set()
+        if origin_exists:
+            agent_names = {row[0] for row in conn.execute(
+                "SELECT DISTINCT agent FROM calls WHERE source = 'claude' AND is_subagent = 1")
+                if row[0] and row[0] != 'unknown' and re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_-]{0,63}', row[0])}
+        size = min(17, len(dates))
+        while True:
+            bound = dates[size - 1] if size and size < len(dates) else None
+            days = guard_days(conn, args, bound)
+            missing_agent = any('agent_cost_share.' + agent not in days for agent in agent_names)
+            if bound is None or (not missing_agent and all(len(values) >= 17 for values in days.values())):
+                break
+            size = min(len(dates), size * 2)
     minimums = dict(GUARD_MINIMUMS, **dict(args.minimum))
     regressions, insufficient = [], []
     for metric, values in sorted(days.items()):
@@ -765,7 +812,8 @@ def build_parser():
         'on days with known Claude origin and subagent tier. Output is per stored call across sources. '
         'Agent cost share uses days that agent ran and the total daily list-price cost when fully priced '
         'and positive. Full-rewrite share uses positive-context Claude main cache writes with a known '
-        'preceding call, and counts writes of at least 80% of context.')
+        'preceding call, and counts writes of at least 80% of context. On a quiet day every session start '
+        'runs the checker, bounded by 2 seconds.')
     for priced_parser in (report_parser, guard_parser):
         priced_parser.add_argument('--pricing', type=Path, default=Path(__file__).resolve().with_name('pricing.json'),
                                    help='price file (default: pricing.json next to this script)')

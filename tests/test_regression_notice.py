@@ -92,3 +92,14 @@ class RegressionNoticeTests(unittest.TestCase):
             self.assertEqual(self.notice(PATH=binpath + os.pathsep + self.env['PATH']), '')
         self.assertEqual(self.markers(), [])
         self.assertIn(self.finding, self.notice())
+
+    def test_markers_are_released_if_stdout_fails(self):
+        self.checker.write_text(f'print({self.finding!r})\n')
+        self.checker.with_name('experiment-check').write_text('print("synthetic check")\nraise SystemExit(1)\n')
+        with open(os.devnull, 'r') as closed_output:
+            result = subprocess.run(['bash', str(HOOKS / 'audit-notice.sh')], text=True,
+                                    input=json.dumps({'cwd': str(self.project)}),
+                                    stdout=closed_output, stderr=subprocess.PIPE, env=self.env, timeout=6)
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(list(self.audits.glob('*.noticed-*')), [])
+        self.assertIn(self.finding, self.notice())
