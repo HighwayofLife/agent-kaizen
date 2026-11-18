@@ -2,9 +2,14 @@
 """Prepare an evidence-backed exact Claude project allow rule."""
 import argparse
 from datetime import datetime, timedelta, timezone
+import errno
+from functools import lru_cache, partial
 import hashlib
+import hmac
 import json
+import os
 from pathlib import Path
+import re
 import runpy
 import stat
 import sys
@@ -15,11 +20,28 @@ MAX_AGE = timedelta(days=7)
 EXTRACT_LIMIT = 8 * 1024 * 1024
 SETTINGS_LIMIT = 1024 * 1024
 HERE = Path(__file__).resolve().parent
-regular_bytes = runpy.run_path(str(HERE / "kaizen_worktree_facts.py"))["regular_bytes"]
+WRITES_ENABLED = False  # S2 requires live Claude matching and scheduled boundary proof.
+PENDING = "settings writes are disabled pending live Claude proof"
+RECORD = re.compile(r"(?:direct_|fa1_)[0-9a-f]{64}")
+STATE = "allow-rules.json"
+WITNESS = "allow-rules.started"
+OWNER_ATTR = "user.kaizen.allow-rule"
 
 
 class Refused(Exception):
     pass
+
+
+class Parser(argparse.ArgumentParser):
+    def error(self, message):
+        self.exit(2, "kaizen-allow-rule: invalid arguments. Use --help.\n")
+
+
+@lru_cache(maxsize=None)
+def helper(*names):
+    if not all((HERE / name).is_file() for name in names):
+        raise Refused("required companion script is missing")
+    return runpy.run_path(str(HERE / names[0]))
 
 
 def unique_object(pairs):
@@ -39,36 +61,55 @@ def project_scope(directory, runner):
     if not path.is_dir() or member is None:
         raise Refused("an enrolled project directory is required")
     projects, _ = runner["discover"](None, None, {}, [member])
-    if len(projects) != 1 or projects[0].unknown:
+    if (len(projects) != 1 or projects[0].unknown
+            or runner["git_common_dir"](path) != runner["git_common_dir"](member)):
         raise Refused("project scope is unknown")
     return projects[0]
 
 
 def find_extract(audits, project, now):
-    """Select the newest exact scope in the primary store before the legacy store."""
+    """Select the latest scoped audit across both stores, with no fallback."""
     members = {str(path) for path in project.paths}
     cutoff = (now - MAX_AGE).timestamp()
+    candidates = []
     for directory in (audits / "extracts", audits / "projects" / project.key):
-        candidates = []
         for path in directory.glob("*.extract.json"):
             info = path.lstat()
             if stat.S_ISREG(info.st_mode) and cutoff <= info.st_mtime <= now.timestamp():
                 candidates.append((info.st_mtime_ns, path))
                 if len(candidates) > 512:
                     raise Refused("too many recent audit extracts")
-        for stamp, path in sorted(candidates, reverse=True):
-            try:
-                raw = regular_bytes(path, EXTRACT_LIMIT)
-                data = json.loads(raw)
-            except (OSError, ValueError, RecursionError):
-                continue
-            scope = data.get("scope") if isinstance(data, dict) else None
-            roots = scope.get("cwd") if isinstance(scope, dict) else None
-            if (isinstance(roots, list) and roots
-                    and all(isinstance(root, str) and root in members for root in roots)):
-                # Once scoped, a newer invalid or negative extract cannot fall back.
-                return json.loads(raw, object_pairs_hook=unique_object), stamp / 1e9
+    regular_bytes = helper("kaizen_worktree_facts.py")["regular_bytes"]
+    latest, tied = None, False
+    for stamp, path in sorted(candidates, reverse=True):
+        modified = datetime.fromtimestamp(stamp / 1e9, timezone.utc)
+        if latest is not None and modified < latest[0]:
+            break
+        try:
+            raw = regular_bytes(path, EXTRACT_LIMIT)
+            data = json.loads(raw)
+        except (OSError, ValueError, RecursionError):
+            continue
+        scope = data.get("scope") if isinstance(data, dict) else None
+        roots = scope.get("cwd") if isinstance(scope, dict) else None
+        if isinstance(roots, list) and roots and all(isinstance(root, str) and root in members for root in roots):
+            audited = audit_time(data, modified) or modified
+            if latest is None or audited > latest[0]:
+                latest, tied = (audited, modified, raw), False
+            elif audited == latest[0]:
+                tied = True
+    if latest is not None and not tied:
+        return json.loads(latest[2], object_pairs_hook=unique_object), latest[1]
     raise Refused("no recent audit extract with an exact project cwd scope")
+
+
+def audit_time(extract, modified):
+    try:
+        stamp = datetime.fromisoformat(extract["friction"]["audited_at"])
+        if stamp.tzinfo is not None and stamp <= modified:
+            return stamp
+    except (KeyError, ValueError, TypeError):
+        pass
 
 
 def check_evidence(extract, stamp, literal, now):
@@ -79,7 +120,10 @@ def check_evidence(extract, stamp, literal, now):
             or len(set(roots)) != len(roots)):
         raise Refused("unsupported or filtered audit extract")
     since = datetime.fromisoformat(extract["since"])
-    if since.tzinfo is None or not now - MAX_AGE <= since <= datetime.fromtimestamp(stamp, timezone.utc):
+    audited = audit_time(extract, stamp)
+    if audited is None:
+        raise Refused("run a fresh scoped audit with a bounded evidence window")
+    if since.tzinfo is None or not now - MAX_AGE <= since <= audited <= now:
         raise Refused("audit evidence must start within the last seven days; run a fresh scoped audit with --days 6")
     summary = friction.get("summary")
     rows = friction.get("permission_acceptance")
@@ -105,13 +149,8 @@ def check_evidence(extract, stamp, literal, now):
     return accepted
 
 
-def load_permissions(target):
-    if target.parent.is_symlink() or (target.parent.exists() and not target.parent.is_dir()):
-        raise Refused("expected a real .claude directory")
-    try:
-        data = json.loads(regular_bytes(target, SETTINGS_LIMIT), object_pairs_hook=unique_object)
-    except FileNotFoundError:
-        data = {}
+def read_settings(raw):
+    data = json.loads(raw, object_pairs_hook=unique_object) if raw is not None else {}
     permissions = data.get("permissions", {}) if isinstance(data, dict) else None
     if not isinstance(permissions, dict):
         raise Refused("expected a settings object with a permissions object")
@@ -119,42 +158,370 @@ def load_permissions(target):
         entries = permissions.get(field, [])
         if not isinstance(entries, list) or any(not isinstance(entry, str) for entry in entries):
             raise Refused("permission rules must be lists of strings")
-    return permissions
+    return data, permissions
 
 
-def prepare_add(directory, literal):
+def load_permissions(target):
+    if target.parent.is_symlink() or (target.parent.exists() and not target.parent.is_dir()):
+        raise Refused("expected a real .claude directory")
+    try:
+        regular_bytes = helper("kaizen_worktree_facts.py")["regular_bytes"]
+        raw = regular_bytes(target, SETTINGS_LIMIT)
+    except FileNotFoundError:
+        raw = None
+    return read_settings(raw)[1]
+
+
+def runner_for():
+    helper("kaizen_worktree_facts.py")
+    runner = helper("kaizen-scheduled", "kaizen_credentials.py")
+    runner["discover"].__globals__["_git"] = partial(runner["_git"], trusted_path=True)
+    return runner
+
+
+def grant_rule(literal):
     if literal not in LITERALS:
         raise Refused("expected one exact command: ls, ls -a, or ls -l")
-    runner = runpy.run_path(str(HERE / "kaizen-scheduled"))
-    project = project_scope(directory, runner)
+    return f"Bash({literal})"
+
+
+def evidence(runner, project, literal):
     now = datetime.now(timezone.utc)
     extract, stamp = find_extract(runner["audits_dir"](), project, now)
-    accepted = check_evidence(extract, stamp, literal, now)
-    target = project.canonical / TARGET
-    permissions = load_permissions(target)
-    rule = f"Bash({literal})"
+    return check_evidence(extract, stamp, literal, now)
+
+
+def check_conflicts(permissions, rule):
     # Catch direct conflicts locally. Effective matching remains a live Claude gate.
-    conflicts = {"Bash", "Bash(*)", "Bash(ls:*)", rule, f"Bash({literal}:*)"}
+    conflicts = {"Bash", "Bash(*)", "Bash(ls:*)", rule, rule[:-1] + ":*)"}
     for field in ("deny", "ask"):
         if conflicts.intersection(permissions.get(field, [])):
             raise Refused(f"conflicting local permissions.{field} rule")
+
+
+def prepare_add(directory, literal):
+    rule = grant_rule(literal)
+    runner = runner_for()
+    project = project_scope(directory, runner)
+    accepted = evidence(runner, project, literal)
+    target = project.canonical / TARGET
+    permissions = load_permissions(target)
+    check_conflicts(permissions, rule)
     return dict(operation="add", project=project.canonical, target=target, rule=rule,
                 accepted=accepted, present=rule in permissions.get("allow", []))
 
 
+def json_bytes(value):
+    return (json.dumps(value, allow_nan=False, indent=2) + "\n").encode("ascii")
+
+
+def version(info):
+    return [info.st_dev, info.st_ino, getattr(info, "st_birthtime", None),
+            info.st_ctime_ns, info.st_mtime_ns, info.st_mode, info.st_size]
+
+
+def linux_owner(fd):
+    try:
+        return os.getxattr(fd, OWNER_ATTR).hex()
+    except OSError as error:
+        if error.errno != errno.ENODATA:
+            raise
+
+
+def snapshot(directory, name=TARGET.name):
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+    except FileNotFoundError:
+        return None, None
+    with os.fdopen(fd, "rb") as stream:
+        info = os.fstat(fd)
+        if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or info.st_uid != os.geteuid()
+                or info.st_mode & 0o022):
+            raise Refused("unsafe settings file")
+        helper("kaizen_friction_actions.py")["_check_acl"](fd, "settings file")
+        raw = stream.read(SETTINGS_LIMIT + 1)
+        stamp = version(info)
+        if len(raw) > SETTINGS_LIMIT or stamp != version(os.stat(name, dir_fd=directory, follow_symlinks=False)):
+            raise Refused("settings file changed during read or exceeds its limit")
+        if sys.platform == "linux":
+            stamp[2] = linux_owner(fd)
+    return raw, stamp
+
+
+def effect_id(raw, stamp):
+    return [stamp[:3], stamp[5], hashlib.sha256(raw).hexdigest()] if stamp is not None else None
+
+
+def preimage(raw, stamp):
+    return [stamp, effect_id(raw, stamp)]
+
+
+def stage(directory, name, raw, mode):
+    fd = os.open(name, os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW | os.O_WRONLY, 0o600, dir_fd=directory)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            owner = None
+            if sys.platform == "linux":
+                owner = os.urandom(16)
+                os.setxattr(fd, OWNER_ATTR, owner)
+            stream.write(raw)
+            stream.flush()
+            os.fchmod(fd, stat.S_IMODE(mode))
+            os.fsync(fd)
+            stamp = version(os.fstat(fd))
+            if stat.S_IMODE(stamp[5]) != stat.S_IMODE(mode):
+                raise Refused("staged settings mode changed")
+            if owner is not None:
+                stamp[2] = owner.hex()
+        os.fsync(directory)
+    except BaseException:
+        os.unlink(name, dir_fd=directory)
+        raise
+    return effect_id(raw, stamp)
+
+
+def write_effect(directory, path, pending, open_dir):
+    temporary = pending["temp"]
+    with open_dir(path) as live:
+        if (not os.path.samestat(os.fstat(directory), os.fstat(live))
+                or (temporary and effect_id(*snapshot(live, temporary)) != pending["after"])
+                or preimage(*snapshot(live)) != pending["before"]):
+            raise Refused("settings or staged write changed before publication")
+        # POSIX does not offer a conditional replace against a verified inode.
+        if temporary is None:
+            os.unlink(TARGET.name, dir_fd=live)
+        else:
+            os.replace(temporary, TARGET.name, src_dir_fd=live, dst_dir_fd=live)
+        os.fsync(live)
+
+
+def live_writes():
+    host = os.getenv("KAIZEN_HOST")
+    return WRITES_ENABLED and (host == "claude" or (
+        host is None and os.getenv("CLAUDECODE") == "1"
+        and not (os.getenv("PLUGIN_ROOT") or os.getenv("COPILOT_PLUGIN_ROOT"))))
+
+
+def transact(directory, literal=None, *, record=None, action_id=None):
+    """A broker passes its action ID only through this fixed internal entry point."""
+    undo = record is not None
+    if not live_writes():
+        raise Refused(PENDING)
+    if "KAIZEN_RUN_ID" in os.environ:
+        raise Refused("scheduled sessions cannot change settings directly")
+    if ((undo and (action_id is not None or not RECORD.fullmatch(record)))
+            or (action_id is not None and not (RECORD.fullmatch(action_id) and action_id.startswith("fa1_")))):
+        raise Refused("invalid transaction identifier")
+    rule = None if undo else grant_rule(literal)
+    runner = runner_for()
+    project = project_scope(directory, runner)
+    identity = project.canonical.stat()
+    root = str(project.canonical)
+    lib = helper("kaizen_friction_actions.py")
+    open_dir, read, replace = (lib[name] for name in ("_directory", "_read", "_replace"))
+    store = lib["HostActions"](runner["audits_dir"](), runner["backup_root"](), runner["action_project"], runner["key"])
+    state_path = store.friction
+    if state_path.resolve().is_relative_to(project.canonical):
+        raise Refused("transaction state must be outside the project")
+    with open_dir(project.canonical) as project_fd, open_dir(state_path, create=not undo, private=True) as state:
+        lib["fcntl"].flock(project_fd, lib["fcntl"].LOCK_EX)
+        if not os.path.samestat(identity, os.fstat(project_fd)):
+            raise Refused("project directory was replaced")
+        with lib["_locked"](state, "allow-rules"):
+            def read_journal():
+                with open_dir(state_path, private=True) as live:
+                    if not os.path.samestat(os.fstat(state), os.fstat(live)):
+                        raise Refused("transaction state directory was replaced")
+                try:
+                    return read(state, STATE, EXTRACT_LIMIT)
+                except FileNotFoundError:
+                    return None
+
+            previous = read_journal()
+            started = os.path.lexists(state_path / WITNESS)
+            if previous is None and (undo or started):
+                raise Refused("transaction journal is missing")
+            key = store._secret(create=previous is None)
+
+            def seal(data):
+                return hmac.digest(key, b"allow-rules-v1\0" + json_bytes(data), "sha256").hex()
+
+            journal = dict(projects={}, records={})
+            if previous is not None:
+                journal = json.loads(previous, object_pairs_hook=unique_object)
+                if not hmac.compare_digest(journal.pop("mac"), seal(journal)):
+                    raise Refused("transaction journal authentication failed")
+
+            def verify():
+                if read_journal() != previous:
+                    raise Refused("transaction journal changed")
+
+            def save():
+                nonlocal previous
+                raw = json_bytes(dict(journal, mac=seal(journal)))
+                if len(raw) > EXTRACT_LIMIT:
+                    raise Refused("transaction journal exceeds its limit")
+                verify()
+                replace(state, STATE, raw)
+                previous = raw
+
+            def mark():
+                if not started:
+                    replace(state, WITNESS, b"1")
+                verify()
+
+            records = journal["records"]
+            ident = record or action_id
+            prior = records.get(ident)
+            if undo:
+                if prior is None:
+                    raise Refused("unknown managed rule record")
+                rule = prior[1]
+            if prior is not None and prior[:2] != [root, rule]:
+                raise Refused("transaction key is bound to another scope or rule")
+            entry = journal["projects"].get(root)
+            root_id = version(os.fstat(project_fd))[:3]
+            if entry is not None and root_id != entry["bound"][0]:
+                raise Refused("project directory was replaced")
+            if prior is not None and prior[2] == "undone":
+                if undo:
+                    return dict(status="undone", record=ident)
+                raise Refused("transaction was already revoked")
+            target_dir = project.canonical / TARGET.parent
+            def authorize():
+                live = project_scope(directory, runner)
+                if (live.canonical != project.canonical or live.paths != project.paths
+                        or not os.path.samestat(identity, live.canonical.stat())):
+                    raise Refused("project evidence scope changed")
+                evidence(runner, live, literal)
+
+            try:
+                local = os.stat(TARGET.parent.name, dir_fd=project_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                if entry is not None:
+                    if undo and entry["pending"] is None and prior[2] == "applied":
+                        prior[2] = "undone"
+                        save()
+                        return dict(status="undone", record=ident)
+                    raise Refused("recorded settings directory is missing")
+                authorize()
+                with open_dir(project.canonical) as live:
+                    if not os.path.samestat(os.fstat(project_fd), os.fstat(live)):
+                        raise Refused("project directory was replaced")
+                    os.mkdir(TARGET.parent.name, 0o700, dir_fd=project_fd)
+                    local = os.stat(TARGET.parent.name, dir_fd=project_fd, follow_symlinks=False)
+                    os.fsync(project_fd)
+            with open_dir(target_dir) as settings:
+                if not os.path.samestat(local, os.fstat(settings)):
+                    raise Refused("settings directory was replaced")
+                bound = [root_id, version(os.fstat(settings))[:3]]
+                if entry is None:
+                    entry = journal["projects"][root] = dict(bound=bound, file=None, created=False, pending=None)
+                if bound != entry["bound"]:
+                    raise Refused("project settings directory was replaced")
+                return update_rule(settings, target_dir, entry, records, ident, root, rule, undo, action_id,
+                                   authorize, open_dir, save, mark)
+
+
+def update_rule(settings, path, entry, records, ident, root, rule, undo, action_id, authorize, open_dir, save, mark):
+    raw, stamp = snapshot(settings)
+    current = effect_id(raw, stamp)
+    data, permissions = read_settings(raw)
+    allow = permissions.get("allow", [])
+    pending = entry["pending"]
+    if pending is None:
+        if not undo:
+            check_conflicts(permissions, rule)
+        active = next((key for key, value in records.items() if value == [root, rule, "applied"]), None)
+        if not undo and rule in allow:
+            if action_id is not None and active != action_id:
+                raise Refused("already present without a matching transaction")
+            if current[0] == entry["file"] and active is not None and allow.count(rule) == 1:
+                return dict(status="applied", record=active)
+            if action_id is None:
+                return dict(status="already-present")
+            raise Refused("managed rule ownership cannot be verified")
+        if not undo and action_id in records:
+            raise Refused("managed rule was revoked")
+        if undo and (active != ident or (rule in allow and (current[0] != entry["file"] or allow.count(rule) != 1))):
+            raise Refused("managed rule ownership cannot be verified")
+        if not undo and active is not None:
+            raise Refused("managed rule was revoked")
+        ident = ident or "direct_" + os.urandom(32).hex()
+        if undo and rule not in allow:  # Revocation already happened.
+            records[ident][2] = "undone"
+            save()
+            return dict(status="undone", record=ident)
+        if not undo:
+            authorize()
+        for value in records.values():
+            if value[0] == root and value[2] == "applied":
+                count = allow.count(value[1])
+                if count and (current[0] != entry["file"] or count != 1):
+                    raise Refused("managed rule ownership cannot be verified")
+                if not count:
+                    value[2] = "undone"
+        delete = undo and entry["created"] and data == {"permissions": {"allow": [rule]}}
+        temporary = None if delete else "settings.kaizen-" + os.urandom(16).hex() + ".json"
+        if sys.platform == "linux" and temporary:
+            linux_owner(settings)  # Refuse unsupported filesystems before reserving an effect.
+        entry["pending"] = pending = dict(id=ident, rule=rule, undo=undo,
+                                           before=[stamp, current], after=None, temp=temporary)
+        if not undo:
+            records[ident] = [root, rule, "pending"]
+            if current is None or current[0] != entry["file"]:
+                entry["created"] = current is None
+        save()
+    elif pending["rule"] != rule or pending["undo"] != undo or (ident or pending["id"]) != pending["id"]:
+        raise Refused("another settings transaction is pending")
+    elif ident is None and not pending["id"].startswith("direct_"):
+        raise Refused("a broker transaction is pending")
+
+    temporary = pending["temp"]
+    if (temporary and pending["after"] is None) or current != pending["after"]:
+        if [stamp, current] != pending["before"]:
+            raise Refused("settings changed since the pending transaction")
+        if not undo:
+            authorize()
+        mark()  # A missing journal after this point must never initialize a new one.
+        if temporary and pending["after"] is None:
+            # The reservation precedes staging so an interrupted copy is recoverable.
+            if snapshot(settings, temporary)[1] is not None:
+                os.unlink(temporary, dir_fd=settings)
+            allow = data.setdefault("permissions", {}).setdefault("allow", [])
+            allow.remove(rule) if undo else allow.append(rule)
+            pending["after"] = stage(settings, temporary, json_bytes(data), stamp[5] if stamp else 0o600)
+            save()
+        write_effect(settings, path, pending, open_dir)
+    with open_dir(path) as live:
+        if (not os.path.samestat(os.fstat(settings), os.fstat(live))
+                or effect_id(*snapshot(live)) != pending["after"]):
+            raise Refused("settings transaction could not be verified")
+    os.fsync(settings)
+    entry.update(file=pending["after"][0] if pending["after"] else None, pending=None)
+    status = "undone" if undo else "applied"
+    records[pending["id"]][2] = status
+    save()
+    return dict(status=status, record=pending["id"])
+
+
 def main():
-    parser = argparse.ArgumentParser(prog="kaizen-allow-rule", description=__doc__)
+    parser = Parser(prog="kaizen-allow-rule", description=__doc__)
     commands = parser.add_subparsers(dest="operation", required=True)
     add = commands.add_parser("add", help="prepare an exact rule proposal")
     add.add_argument("--project", required=True, metavar="DIR")
     add.add_argument("--command", required=True)
-    undo = commands.add_parser("undo", help="reserved for managed-rule revocation")
+    undo = commands.add_parser("undo", help="revoke a managed rule by record identifier")
     undo.add_argument("record")
     undo.add_argument("--project", required=True, metavar="DIR")
     args = parser.parse_args()
     try:
         if args.operation == "undo":
-            raise Refused("undo is disabled pending live Claude proof and recovery")
+            print(json.dumps(transact(args.project, record=args.record)))
+            return 0
+        if live_writes() and "KAIZEN_RUN_ID" not in os.environ:
+            print(json.dumps(transact(args.project, args.command)))
+            return 0
         operation = prepare_add(args.project, args.command)
         print(json.dumps(dict(operation=operation["operation"], target=str(TARGET),
                               rule=operation["rule"], accepted=operation["accepted"],
