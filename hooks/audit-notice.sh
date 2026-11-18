@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+trap '' PIPE
 # SessionStart: show daily audit, experiment and usage regression notices; never fail the session.
 # AUDIT_DIR overrides the audits directory; CLAUDE_CONFIG_DIR selects the config directory.
 # KAIZEN_NOTICE_ALL=1 also enables notices outside enrolled projects.
@@ -165,7 +166,6 @@ if ! out=$(jq -n --arg c "$msg" '{hookSpecificOutput:{hookEventName:"SessionStar
     [ -n "$regression_marker" ] && rm -f "$regression_marker"
     exit 0
 fi
-trap '' PIPE
 if printf '%s\n' "$out"; then
     emitted=1
 else

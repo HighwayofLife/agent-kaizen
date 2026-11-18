@@ -33,6 +33,14 @@ class FormatCanaryTests(unittest.TestCase):
         self.assertEqual(dict(counts['unknown']), dict(records=3, missing_usage=1))
         self.assertNotIn('private prompt', repr(counts))
 
+    def test_non_string_types_are_unknown(self):
+        counts = defaultdict(Counter)
+        for kind in (['x'], {'a': 1}):
+            row = dict(type=kind, timestamp='2026-01-01T00:00:00Z')
+            AUDIT['canary_row'](json.dumps(row).encode(), SINCE, counts, False, None)
+        self.assertEqual(dict(counts['unknown']),
+                         {'records': 2, 'unknown_records': 2, ('unknown_type', '<other>'): 2})
+
     def test_invalid_versions_and_old_rows(self):
         counts = defaultdict(Counter)
         with tempfile.TemporaryDirectory() as tmp:

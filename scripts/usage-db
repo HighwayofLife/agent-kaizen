@@ -649,16 +649,24 @@ def guard_rewrites(conn, origin, bound=None):
     if pending:
         # Only first-in-window writes need an earlier predecessor. The call id
         # breaks timestamp ties, which cannot change the predecessor's time.
-        sessions = list(pending)
-        for offset in range(0, len(sessions), 500):
-            chunk = sessions[offset:offset + 500]
-            placeholders = ','.join('?' for _ in chunk)
-            for session, previous in conn.execute(f"""
-                SELECT session, MAX(rtrim(ts, 'Z')) FROM calls
-                WHERE day < ? AND session IN ({placeholders}) AND {where} GROUP BY session
-            """, (bound, *chunk)):
-                date, current, write, context = pending[session]
-                add(date, current, previous, write, context)
+        conn.execute('CREATE TEMP TABLE IF NOT EXISTS guard_pending_sessions (id TEXT PRIMARY KEY) WITHOUT ROWID')
+        conn.execute('DELETE FROM guard_pending_sessions')
+        conn.executemany('INSERT INTO guard_pending_sessions VALUES (?)', ((session,) for session in pending))
+        query = f"""
+            SELECT calls.session, MAX(rtrim(ts, 'Z')) FROM calls {{hint}}
+            JOIN guard_pending_sessions AS pending ON calls.session = pending.id
+            WHERE day < ? AND {where} GROUP BY calls.session
+        """
+        try:
+            rows = conn.execute(query.format(hint='INDEXED BY calls_day'), (bound,)).fetchall()
+        except sqlite3.OperationalError as exc:
+            # A database without the schema's day index still gets a correct answer.
+            if 'no such index' not in str(exc):
+                raise
+            rows = conn.execute(query.format(hint=''), (bound,)).fetchall()
+        for session, previous in rows:
+            date, current, write, context = pending[session]
+            add(date, current, previous, write, context)
     return {date: row['full_rewrites'] / row['writes'] for date, row in daily.items()}
 
 
@@ -680,12 +688,13 @@ def guard_days(conn, args, bound=None):
         elif subagent == 1:
             row['claude_agent_calls'] += calls
             family = re.match(r'claude-(opus|fable|sonnet|haiku)(?:[-\[].*)?$', model, re.IGNORECASE)
-            tier_model = model if family else (AUDIT.pricing_key(state['_pricing'], model) or model)
+            price_key = None if family else AUDIT.pricing_key(state['_pricing'], model)
+            tier_model = model if family else (price_key or model)
             if re.fullmatch(r'claude-(?:opus|fable)(?:[-\[].*)?', tier_model, re.IGNORECASE):
                 row['expensive'] += calls
             if agent and agent != 'unknown' and re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_-]{0,63}', agent):
                 agents[agent][date].append(cost)
-            if model == 'unknown':
+            if not family and not price_key:
                 row['unknown_tier'] += calls
         else:
             row['unknown_origin'] += calls
@@ -736,7 +745,10 @@ def guard(args):
             severity = (now - center) / (limit or GUARD_MINIMUMS[kind])
             regressions.append((-severity, metric, now, center))
     for _, metric, now, center in sorted(regressions):
-        print(f'REGRESSION {metric} {now:.6g} vs {center:.6g}')
+        current, baseline = f'{now:.6g}', f'{center:.6g}'
+        if current == baseline and now != center:
+            current, baseline = repr(now), repr(center)
+        print(f'REGRESSION {metric} {current} vs {baseline}')
     for line in insufficient:
         print(line)
     if not (regressions or insufficient):
@@ -807,7 +819,8 @@ def build_parser():
         f'Use the {GUARD_LOOKBACK_DAYS} UTC days ending on the newest database day. '
         'Reports and insufficient data exit 0.',
         epilog='Context is per Claude main call. Expensive calls count Claude Opus and Fable subagent calls '
-        'on days with known Claude origin and subagent tier. Output is per stored call across sources. '
+        'on days with known Claude origin and subagent tier. Days containing unclassifiable subagent models '
+        'are excluded from the expensive-call baseline and recent window. Output is per stored call across sources. '
         'Agent cost share uses days that agent ran and the total daily list-price cost when fully priced '
         'and positive. Full-rewrite share uses positive-context Claude main cache writes with a known '
         'preceding call, and counts writes of at least 80% of context. On a quiet day every session start '

@@ -91,12 +91,20 @@ class DoctorTests(unittest.TestCase):
         self.assertIn('PASS usage database ingest within 7 days', self.doctor())
         wal.unlink()
         with sqlite3.connect(self.db) as conn:
-            conn.execute('PRAGMA journal_mode=WAL')
             conn.execute("UPDATE files SET ingested_at='2000-01-01T00:00:00+00:00'")
             conn.commit()
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute('PRAGMA wal_autocheckpoint=0')
             conn.execute('INSERT INTO files VALUES (?)', (datetime.now(timezone.utc).isoformat(),))
             conn.commit()
             self.assertGreater(wal.stat().st_size, 0)
+            with sqlite3.connect(self.db.as_uri() + '?immutable=1', uri=True) as immutable:
+                self.assertEqual(immutable.execute('SELECT MAX(ingested_at) FROM files').fetchone()[0],
+                                 '2000-01-01T00:00:00+00:00')
+            self.assertIn('PASS usage database ingest within 7 days', self.doctor())
+            link = self.home / 'linked.db'
+            link.symlink_to(self.db)
+            self.env['KAIZEN_USAGE_DB'] = str(link)
             self.assertIn('PASS usage database ingest within 7 days', self.doctor())
 
     def test_stale_cache_and_hooks(self):
