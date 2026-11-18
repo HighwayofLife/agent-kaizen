@@ -686,15 +686,14 @@ class DiscoveryTests(DiscoveryCase):
         self.assertIn("config: enabled=true (default); autoAudit=true (default); pendingDays=10 (default); schedule=always (project); scheduledAutonomy=propose (default)", output)
         self.assertIn("gate: due (schedule always)", output)
         self.assertFalse(self.record.exists())
-        with patch.object(self.runner.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")) as run:
+        with patch.object(self.runner.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, b"", b"")) as run:
             self.discover()
         self.assertTrue(run.called)
         for call in run.call_args_list:
             self.assertEqual(call.args[0][0], "git")
             kwargs = dict(call.kwargs)
             self.assertFalse(set(kwargs.pop("env")) & set(self.runner.GIT_LOCATION_ENV))
-            self.assertEqual(kwargs, {"capture_output": True, "encoding": "utf-8", "errors": "surrogateescape",
-                                      "timeout": 600})
+            self.assertEqual(kwargs, {"capture_output": True, "timeout": 600})
 
 
 class GateTests(DiscoveryCase):
