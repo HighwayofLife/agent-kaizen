@@ -41,6 +41,37 @@ class HostProbeTests(unittest.TestCase):
                 self.assertIsNone(self.probe().worktrees()[1]['clean'])
                 git(linked, 'config', '--unset', key)
 
+    def test_submodule_hidden_index_and_ignore_values(self):
+        def git(root, *args):
+            return subprocess.run(['git', '-C', str(root), *args], check=True, capture_output=True)
+
+        sub = self.root / 'sub'
+        sub.mkdir()
+        for root in (sub, self.project):
+            git(root, 'init', '-q')
+            (root / 'tracked').write_text('original')
+            git(root, 'add', 'tracked')
+            git(root, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                '-c', 'commit.gpgsign=false', 'commit', '-qm', 'initial')
+        git(self.project, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', str(sub), 'module')
+        git(self.project, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+            '-c', 'commit.gpgsign=false', 'commit', '-qam', 'submodule')
+        linked = self.root / 'linked'
+        git(self.project, 'worktree', 'add', '-qb', 'linked', str(linked))
+        git(linked, '-c', 'protocol.file.allow=always', 'submodule', 'update', '--init', '-q')
+        for key in ('submodule.module.ignore', 'diff.ignoreSubmodules'):
+            for value, expected in (('none', True), ('dirty', None), ('DiRtY', None)):
+                with self.subTest(key=key, value=value):
+                    git(linked, 'config', key, value)
+                    probe = self.probe()
+                    self.assertIs(probe.worktrees()[1]['clean'], expected)
+                    if expected:
+                        self.assertEqual(probe.run()['facts']['prunable_worktrees'], 1)
+            git(linked, 'config', '--unset', key)
+        git(linked / 'module', 'update-index', '--assume-unchanged', 'tracked')
+        (linked / 'module' / 'tracked').write_text('modified')
+        self.assertIsNone(self.probe().worktrees()[1]['clean'])
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)

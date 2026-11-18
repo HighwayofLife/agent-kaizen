@@ -152,6 +152,14 @@ def invalid_json_constant(value):
     raise ValueError(value)
 
 
+def bounded_turn_id(value):
+    if value is None or isinstance(value, str) and len(value) <= 256:
+        return value
+    # A tagged digest cannot collide with an ordinary string ID.
+    encoded = json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(',', ':')).encode('ascii')
+    return (hashlib.sha256(encoded).digest(),)
+
+
 def codex_call_row(line, kind, fields, wrapped):
     ident = None
     try:
@@ -171,7 +179,8 @@ def codex_call_row(line, kind, fields, wrapped):
             return ident, None
         if not isinstance(ident, str) or not 0 < len(ident) <= 256:
             return None, None
-        location = {key: call.get(key, record.get(key)) for key in ("cwd", "turn_id")}
+        location = dict(cwd=call.get("cwd", record.get("cwd")),
+                        turn_id=bounded_turn_id(call.get("turn_id", record.get("turn_id"))))
         if kind in CODEX_OUTPUT_TYPES:
             return ident, dict(location, **codex_output(call), fingerprint=hash(line))
         args = call.get("arguments")
@@ -1442,9 +1451,9 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                     pairs[ident] = None
                     continue
                 turn = observation["turn_id"]
-                location = observation["cwd"]
+                location = observation.pop("cwd")
                 if location is None:
-                    location = turns.get(turn, current_cwd) if isinstance(turn, str) else current_cwd
+                    location = turns.get(turn, current_cwd) if isinstance(turn, (str, tuple)) else current_cwd
                 if location is not None:
                     in_scope = cwd_matches(location, cwd or (), realpaths)
                     location = realpaths.get(location) if isinstance(location, str) else None
@@ -1455,7 +1464,7 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                     pairs[ident] = None
                     continue
                 slot = int(kind in CODEX_OUTPUT_TYPES)
-                value = (kind, stamp, location, observation)
+                value = (kind, stamp, bounded_turn_id(location), observation)
                 if pair[slot] is None and (slot or pair[1] is None):
                     pair[slot] = value
                 elif pair[slot] != value:
@@ -1470,6 +1479,7 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                     current_cwd = location
                 turn = payload.get("turn_id")
                 if isinstance(turn, str) and len(turns) < FRICTION_PAIR_LIMIT:
+                    turn = bounded_turn_id(turn)
                     turns[turn] = current_cwd
             if row.get("type") == "turn_context" and effort is None:
                 effort = payload.get("effort") or payload.get("reasoning_effort") or "n/a"
