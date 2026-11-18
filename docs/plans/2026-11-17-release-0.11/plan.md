@@ -67,7 +67,15 @@ Packet 10's owner-run commands and expected outcomes are mandatory: scan, doctor
 
 ### Results
 
-Pending packet 10.
+| Real-input gate | Status |
+|---|---|
+| First scan and elapsed time | pending (orchestrator) |
+| Doctor | pending (orchestrator) |
+| Cache report | pending (orchestrator) |
+| Regression guard | pending (orchestrator) |
+| Audit format canary | pending (orchestrator) |
+| Tier guard fixture | pending (orchestrator) |
+| SessionStart fixture | pending (orchestrator) |
 
 ## Risks and mitigations
 

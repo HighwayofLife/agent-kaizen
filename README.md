@@ -92,7 +92,7 @@ Or install it straight from GitHub, without a clone:
 /plugin install agent-kaizen@agent-kaizen-tools
 ```
 
-To update: `git pull` in the clone (or `/plugin marketplace update` for a GitHub install), then `/reload-plugins` or start a new session. Releases bump `version` in `plugin.json` (see [CHANGELOG.md](CHANGELOG.md)); a GitHub install only picks up a new version. Re-run `install-schedule --apply` after updating to refresh the scheduled scripts. See the [0.4.0 migration note](docs/scheduling.md#03x-migration).
+To update: `git pull` in the clone (or `/plugin marketplace update` for a GitHub install), then `/reload-plugins` or start a new session. Releases bump `version` in `plugin.json` (see [CHANGELOG.md](CHANGELOG.md)); a GitHub install only picks up a new version. If you installed OS jobs, re-run `install-schedule --apply` after updating to refresh the scheduled scripts. See the [0.4.0 migration note](docs/scheduling.md#03x-migration).
 
 ### 2. Scan recent usage
 
@@ -131,7 +131,7 @@ In every mode, each applied change is backed up (to `KAIZEN_BACKUP_DIR`, or `kai
 
 ### 3. Make it periodic
 
-Run `/agent-kaizen:schedule`. It finds the plugin path and asks before it installs anything. Or run `scripts/install-schedule` from the plugin or your clone; the plugin path varies by install.
+SessionStart runs an audit when the last successful audit is over 3 days old. An OS schedule is optional and useful for fixed schedules or infrequent sessions. Run `/agent-kaizen:schedule` to install one. It finds the plugin path and asks before it installs anything. Or run `scripts/install-schedule` from the plugin or your clone; the plugin path varies by install.
 
 ```bash
 scripts/install-schedule --apply                  # audit about every 3 days, no tokens
