@@ -431,9 +431,10 @@ class GroupPopen(subprocess.Popen):
     """A child in its own session; kill() takes down its whole process group, so a step's helpers
     do not outlive a timeout or a signal. Used only through run_group (subprocess.run calls kill())."""
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, terminate_grace=False, **kwargs):
         kwargs.setdefault("start_new_session", True)
         self.grouped = kwargs["start_new_session"]
+        self.terminate_grace = terminate_grace
         self.group_killed = False
         if SIGNALS.get("watchdog") is not None:
             reader, lease = SIGNALS["watchdog"]
@@ -455,6 +456,9 @@ class GroupPopen(subprocess.Popen):
             if self.group_killed:
                 return  # KILL was already delivered; never target a dying/reused group twice
             try:
+                if self.terminate_grace and self.poll() is None:
+                    os.killpg(self.pid, signal.SIGTERM)
+                    time.sleep(0.15)  # Let Git release a prepared ref lock.
                 os.killpg(self.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
@@ -1140,7 +1144,8 @@ def broker_command(options, operation):
     """Resolve a fixed broker entry point from the runner installation."""
     names = {"host-fix": ("kaizen-host-fix", "host-fix"),
              "allow-rule": ("kaizen-allow-rule", "allow-rule"),
-             "worktree-prune": ("kaizen-worktree-prune", "worktree-prune")}
+             "worktree-prune": ("kaizen-worktree-prune", "worktree-prune"),
+             "local-commit": ("kaizen-backup",)}
     path = sibling(None, *names[operation])
     if path.resolve() != path:
         raise ValueError("broker helper must be installed beside the runner")
@@ -2227,16 +2232,25 @@ def scheduled_budget(audits, project, options, command, root, prepared, started,
                     info = path.lstat()
                     if stat.S_ISDIR(info.st_mode) and canonical_path(path) == path:
                         targets[ident] = [info.st_dev, info.st_ino]
-        return broker, version[1], proof, targets
+        commit_id = None
+        if config[0]:
+            host = runpy.run_path(str(HERE / "kaizen_friction_actions.py"))
+            store = host["HostActions"](audits, root, action_project, key)
+            commit_id = store.action_id(project, broker["LOCAL_COMMIT"], run_id, allowed=(run_id,))
+        return broker, version[1], proof, targets, commit_id
     except (OSError, RuntimeError, ValueError, subprocess.SubprocessError):
         return None
 
 
 def scheduled_action_refusal(catalog_id):
-    if catalog_id != "linux-localsearch":
+    if catalog_id not in ("linux-localsearch", "local-commit"):
         return "operation is proposal-only"
     runtime = runpy.run_path(str(HERE / "kaizen_friction_apply.py"))
     return runtime["scheduled_marker_refusal"]()
+
+
+def commit_generation(generation, run_id):
+    return f"scheduled-local:{generation}:{run_id}"
 
 
 def recover_scheduled_suggestions(store, host, project):
@@ -2258,7 +2272,9 @@ def recover_scheduled_suggestions(store, host, project):
             try:
                 os.stat("broker-" + ident + ".json", dir_fd=state, follow_symlinks=False)
             except FileNotFoundError:
-                reason = scheduled_action_refusal(rows[ident]["catalog_id"])
+                catalog = rows[ident]["catalog_id"]
+                reason = ("commit was never reserved" if catalog == "local-commit"
+                          else scheduled_action_refusal(catalog))
                 if reason:
                     suggestions[ident] = reason
         if suggestions:
@@ -2293,6 +2309,7 @@ def run_scheduled_broker(audits, project, options, *, receipt=None, attempt=None
     broker_path = HERE / "kaizen_friction_apply.py"
     runtime = runpy.run_path(str(broker_path))
     broker = runtime["BrokerLedger"]
+    local_commit = runtime["LOCAL_COMMIT"]
     helper_env = dict(HOME=str(canonical_path(Path.home())), CLAUDE_CONFIG_DIR=str(canonical_path(claude_home())),
                       KAIZEN_BACKUP_DIR=str(root), PATH="/usr/bin:/bin")
     slots = 0
@@ -2314,6 +2331,20 @@ def run_scheduled_broker(audits, project, options, *, receipt=None, attempt=None
             raise ValueError("native marker transaction is unavailable or ambiguous")
         return result.stdout.strip()
 
+    def commit_helper(folder, operation, payload):
+        python, helper = broker_command(options, local_commit)
+        return run_group([str(Path(python).resolve()), "-I", helper, "commit", operation, str(folder)],
+                         input=payload, cwd="/", env=dict(helper_env, KAIZEN_BROKER_LEASE_FD=str(ledger.lease)),
+                         timeout=30, stoppable=True, terminate_grace=True,
+                         capture_output=True, text=True, pass_fds=(ledger.lease,))
+
+    def finish_commit(record):
+        result = commit_helper(record["tool_record"], "--scheduled-recovery-stdin",
+                               json.dumps([record["id"], record["request"], str(project_path)]))
+        if result.returncode:
+            raise ValueError("native commit transaction is unavailable or ambiguous")
+        return ledger.finish_commit(record, result.stdout.strip())
+
     with broker.locked(host, store, project_path) as ledger, host["_locked"](ledger.state, "prepare"), \
             host["_directory"](store.path.parent) as directory, host["_locked"](directory, store.path.name):
         rows, _, receipts = store._load(directory)
@@ -2321,8 +2352,9 @@ def run_scheduled_broker(audits, project, options, *, receipt=None, attempt=None
         pending = sorted(host["_pending"](generations))
         generation = "scheduled:" + receipt["generation"] if receipt else None
         current = generations.get(generation, {})
+        commit = None
         if attempt is not None:
-            slots, run_id, targets, frozen_config = attempt
+            slots, run_id, targets, frozen_config, commit = attempt
             state = json.loads(host["_read"](ledger.state, "prepare-" + project.key + ".json", 1 << 20))
             if (state["project"] != str(project_path) or state["generation"] != int(receipt["generation"])
                     or generation not in generations or config != frozen_config):
@@ -2339,17 +2371,24 @@ def run_scheduled_broker(audits, project, options, *, receipt=None, attempt=None
         unresolved = set()
         action_errors = (OSError, RuntimeError, ValueError, KeyError, TypeError, subprocess.SubprocessError)
         for ident in pending:
+            if commit and ident == commit[0]:
+                continue
             phase, reason = None, None
             try:
                 catalog = rows[ident]["catalog_id"]
                 record = ledger.load(ident)
                 if record is None:
-                    reason = scheduled_action_refusal(catalog)
+                    reason = "commit was never reserved" if catalog == local_commit else scheduled_action_refusal(catalog)
                 elif record["phase"] == "cancelled":
                     reason = record["reason"]
                 elif record["phase"] == "reverted":
                     authorize()
                     phase = ledger.reconcile(ident)
+                elif catalog == local_commit and record["operation"] == local_commit and record.get("reservation"):
+                    bound = commit_generation(record["generation"], record["reservation"])
+                    if rows[ident]["selector_key"] != record["reservation"] or generations.get(bound, {}).get(ident) != "pending":
+                        raise ValueError("commit receipt does not match its reservation")
+                    phase = finish_commit(record)
                 elif record.get("reservation"):
                     authorize()
                     if ledger.cancel_unstarted_marker(record):
@@ -2365,7 +2404,30 @@ def run_scheduled_broker(audits, project, options, *, receipt=None, attempt=None
                 log(f"friction: broker action {ident} resolved as a suggestion ({reason})")
             elif phase:
                 terminal(ident, applied=phase == "recorded")
-        if attempt is not None:
+        if attempt is not None and not any(rows.get(ident, {}).get("catalog_id") == local_commit for ident in unresolved):
+            if slots and commit:
+                ident, folder, handoff = commit
+                try:
+                    bound = commit_generation(receipt["generation"], run_id)
+                    if (generations.get(bound) != {ident: "pending"} or rows[ident]["catalog_id"] != local_commit
+                            or rows[ident]["selector_key"] != run_id or unresolved):
+                        raise ValueError("scheduled commit authority changed")
+                    payload = json.dumps(handoff, sort_keys=True)
+                    digest = hashlib.sha256(payload.encode("ascii")).hexdigest()
+                    record = ledger.reserve_commit(ident, folder, digest,
+                                                   (run_id, receipt["generation"], receipt["scope"]["cwd"],
+                                                    runtime["policy_digest"](config)))
+                except action_errors:
+                    terminal(ident, applied=False)
+                    log("friction: local commit resolved as a suggestion")
+                else:
+                    slots -= 1
+                    if scheduled_action_refusal(local_commit) or config != freeze_mutation_config(project_path, backup):
+                        ledger.cancel_reservation(record, "scheduled commit policy changed")
+                        terminal(ident, applied=False)
+                    else:
+                        commit_helper(folder, "--scheduled-baseline-stdin", json.dumps(dict(handoff, action_id=ident)))
+                        terminal(ident, applied=finish_commit(record) == "recorded")
             for ident in pending:
                 if not slots or current.get(ident) != "pending" or ident not in targets or ident in unresolved:
                     continue
@@ -2507,7 +2569,11 @@ def _run_review(audits, project_dirs, options, clock, safety):
                             if observation is None:
                                 result = run_group(command, stdout=output, **launch)
                             else:
-                                broker, version, proof, _ = observation
+                                broker, version, proof, _, commit_id = observation
+                                if commit_id:
+                                    command[2] += (f"\nIf this review made a verified backed-up file change, you may "
+                                                   f"request a local commit with action ID {commit_id} and intent "
+                                                   "apply in the kaizen-host-actions comment. Use only that ID.")
                                 result, rendered, calls = broker["observe_review"](
                                     run_group, command, version, backup=proof["backup"], scope=proof["scope"],
                                     project=project.canonical, **launch)
@@ -2565,18 +2631,23 @@ def _run_review(audits, project_dirs, options, clock, safety):
                 attempt = None
                 if prepared:
                     try:
+                        commit_id = commit = None
                         if observation is not None:
-                            broker, _, proof, targets = observation
+                            broker, _, proof, targets, commit_id = observation
                             with guard.locked():
                                 config = freeze_mutation_config(project.canonical, proof["backup"])
-                                slots, _ = broker["prove_budget"](calls, **proof, config_after=config)
+                                slots, attestation, verified = broker["prove_budget"](calls, **proof, config_after=config)
                             if slots is None:
                                 raise ValueError("scheduled mutation budget is unknown")
-                            if slots and targets:
-                                attempt = (slots, run_id, targets, config)
-                        terminal = reconcile_scheduled(
+                            commit = broker["commit_tuple"](proof, attestation, verified)
+                        terminal, requested = reconcile_scheduled(
                             audits, project, temporary, prepared[1], acknowledge=False, rendered=rendered,
+                            commit_id=commit_id, commit_run=run_id if commit_id and commit and slots else None,
                             authorize=lambda: scheduled_authority(audits, project.canonical, options, command, root))
+                        if observation is not None and slots:
+                            local = (commit_id, *commit) if requested and commit else None
+                            if local or targets:
+                                attempt = (slots, run_id, targets, config, local)
                         imported = True
                     except (OSError, RuntimeError, ValueError, RecursionError, KeyError, TypeError, AttributeError):
                         log("friction: review output could not be reconciled")
@@ -2821,7 +2892,9 @@ def actions_command(args):
                 if operation != "allow-rule":
                     path = Path(record)
                     record = str(canonical_path(path.parent) / path.name)
-                result = run_group([python, "-I", helper, "undo", record, "--project", str(project)], stoppable=True,
+                operands = (["--scheduled-action", args.id, record] if operation == "local-commit"
+                            else [record, "--project", str(project)])
+                result = run_group([python, "-I", helper, "undo", *operands], stoppable=True,
                                    cwd="/", env=helper_env, timeout=30, stdin=subprocess.DEVNULL,
                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if result.returncode:
@@ -2862,7 +2935,8 @@ def friction_prepare(audits, project, report, options, cfg, mode, clock, *, inte
 
 
 
-def reconcile_scheduled(audits, project, output, receipt, *, acknowledge=True, rendered=None, authorize=None):
+def reconcile_scheduled(audits, project, output, receipt, *, acknowledge=True, rendered=None, authorize=None,
+                        commit_id=None, commit_run=None):
     """Import one validated action line, then acknowledge only terminal requests."""
     module = runpy.run_path(str(HERE / "kaizen_friction_prepare.py"))
     host = runpy.run_path(str(HERE / "kaizen_friction_actions.py"))
@@ -2875,7 +2949,8 @@ def reconcile_scheduled(audits, project, output, receipt, *, acknowledge=True, r
         raise ValueError("expected one action comment")
     block = matches[0].rstrip("\r\n")
     requests = host["_requests"](block)
-    downgraded = False
+    commit_intent = requests.pop(commit_id, None)
+    downgraded = commit_intent is not None
     for ident, intent in requests.items():
         if intent != "apply":
             continue
@@ -2893,11 +2968,29 @@ def reconcile_scheduled(audits, project, output, receipt, *, acknowledge=True, r
     store = host["HostActions"](audits, backup_root(), action_project, key)
     imported = module["import_scheduled"](audits, backup_root(), project, receipt,
                                           effective(project.canonical), now(), action_project, key, block)
+    reserved = commit_run is not None and commit_intent == "apply"
+    if reserved:
+        # The public catalogue import has already revalidated the preparation.
+        # Persist the private intent before publishing or reserving any effect.
+        with host["_directory"](store.friction, private=True) as state, host["_locked"](state, "prepare"), \
+                host["_directory"](store.path.parent) as directory, host["_locked"](directory, store.path.name):
+            current = json.loads(host["_read"](state, "prepare-" + project.key + ".json", 1 << 20))
+            rows, secret, receipts = store._load(directory)
+            generations = receipts[str(project.canonical)]
+            bound = commit_generation(receipt["generation"], commit_run)
+            identity = (str(project.canonical), "local-commit", commit_run)
+            if (current["project"] != identity[0] or current["generation"] != int(receipt["generation"])
+                    or generations.get("scheduled:" + receipt["generation"]) != imported or commit_id in rows
+                    or bound in generations or host["_id"](secret or store._secret(), *identity) != commit_id):
+                raise ValueError("local commit request does not match the current preparation")
+            rows[commit_id] = store._new_row(identity, "Verified scheduled review backup", now().isoformat())
+            generations[bound] = {commit_id: "pending"}
+            store._save(directory, rows, receipts)
     output.write_text("".join(line for line in lines if line != matches[0]), encoding="utf-8")
-    terminal = all(value == "terminal" for value in imported.values())
+    terminal = not reserved and all(value == "terminal" for value in imported.values())
     if terminal and acknowledge:
         module["acknowledge_scheduled"](store, project, receipt)
-    return terminal
+    return terminal, reserved
 
 
 def recover_scheduled_publication(audits, project, receipt=None, proposal=None, output=None, *, options=None):

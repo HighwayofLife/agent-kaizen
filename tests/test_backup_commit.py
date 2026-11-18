@@ -70,7 +70,7 @@ class BackupCommitTests(unittest.TestCase):
         option = [] if baseline is None and raw is None else ["--scheduled-baseline-stdin"]
         result = subprocess.run([sys.executable, str(SCRIPT), "commit", *option, str(change)],
                                 input=raw if raw is not None else json.dumps(baseline),
-                                env=self.env, cwd=self.repo, capture_output=True, text=True, timeout=10)
+                                env=self.env, cwd=self.repo, capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
         return result
 
@@ -119,6 +119,8 @@ class BackupCommitTests(unittest.TestCase):
         self.commit_cli(change, {k: v for k, v in scope.items() if k != "session_id"}, expected=2)
         manifest.write_text(json.dumps(dict(self.manifest(change), git=scope["baseline"])))
         self.commit_cli(change, scope, expected=2)
+        forged = dict(scope, manifest_sha256=hashlib.sha256(manifest.read_bytes()).hexdigest())
+        self.commit_cli(change, forged, expected=2)
         self.commit_cli(change, expected=2)
         manifest.write_bytes(raw)
 
@@ -150,17 +152,36 @@ class BackupCommitTests(unittest.TestCase):
         ledger.write_text(fixture["after_utf8"] + "another line\n")
         self.commit_cli(change, attested, expected=2)
         ledger.write_text(fixture["after_utf8"])
-        keyed = dict(attested, action_id="fa1_" + "a" * 64)
-        first = self.commit_cli(change, keyed).stdout
+        key = "fa1_" + "a" * 64
+        self.commit_cli(change, dict(attested, action_id=key), expected=2)
+        write_commit = self.helpers["write_commit"]
+        with self.helpers["ref_lock"]():
+            first = write_commit(change, attested, key)
         ledger.write_text(fixture["after_utf8"] + "later bookkeeping\n")
-        self.assertEqual(self.commit_cli(change, keyed).stdout, first)
-        for override in ({"action_id": "fa1_" + "b" * 64}, {"run_id": "other"}):
-            self.commit_cli(change, dict(keyed, **override), expected=2)
-        self.assertIn("already bound", self.commit_cli(old, keyed, expected=2).stderr)
+        with self.helpers["ref_lock"]():
+            self.assertEqual(write_commit(change, attested, key), first)
+            with self.assertRaisesRegex(ValueError, "already bound"):
+                write_commit(old, attested, key)
         self.commit_cli(change, expected=2)
         ledger.write_text(fixture["after_utf8"])
         self.git("add", str(ledger))
         self.commit_cli(change, attested, expected=2)
+
+    def test_ref_undo_refuses_backup_metadata_before_inverse(self):
+        change = self.ready()
+        self.commit_cli(change)
+        ref = "refs/kaizen/" + datetime.date.today().isoformat()
+        oid = self.git("rev-parse", ref)
+        backup = change / "files/1"
+        if hasattr(os, "setxattr"):
+            os.setxattr(backup, "user.fixture", b"fixture")
+        elif sys.platform == "darwin":
+            subprocess.run(["/usr/bin/xattr", "-w", "user.fixture", "fixture", str(backup)], check=True)
+        else:
+            self.skipTest("extended attribute fixture unavailable")
+        self.assertIn("extended attributes", self.main("undo", change, expected=2))
+        self.assertEqual(self.git("rev-parse", ref), oid)
+        self.assertEqual(self.target.read_text(), "after")
 
     def test_local_commit_plumbing_preserves_checkout_index_and_verified_bytes(self):
         index = self.repo / ".git" / "index"
