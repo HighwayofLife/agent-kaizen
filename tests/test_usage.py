@@ -85,6 +85,30 @@ class UsageTests(StubCase):
             v=1, file=Path(data['extract_path']).name)) + ' -->')
         self.assertNotIn('extract', json.loads(lines[index][len('<!-- token-audit-headline '):-len(' -->')]))
 
+    def test_cache_headline_and_sequence(self):
+        project = self.home / '.claude/projects/example'
+        def call(ts, ident, usage):
+            return dict(type='assistant', timestamp=ts, message=dict(id=ident, model='test', content=[], usage=usage))
+        usage = dict(input_tokens=20, cache_creation_input_tokens=80)
+        jsonl(project / 'main.jsonl', [
+            call('2025-01-01T00:00:00Z', 'a', usage),
+            call('2025-01-01T00:05:00Z', 'b', usage),
+            call('2025-01-01T01:05:00.000001Z', 'c', usage),
+            call('2025-01-01T01:05:00.000001Z', 'd', dict(input_tokens=0, output_tokens=1)),
+            call('2025-01-01T01:05:01Z', 'e', usage)])
+        data = json.loads(self.run_script('token-audit', '--since', '2025-01-01', '--json').stdout)
+        gaps = data['cache_writes']['main']
+        self.assertEqual(gaps['unknown']['writes'], 1)
+        self.assertEqual(gaps['le_5m']['writes'], 2)
+        self.assertEqual(gaps['gt_60m']['writes'], 1)
+        self.assertEqual(gaps['le_5m']['full_rewrites'], 2)
+        self.assertIn('Claude cache writes: 4 calls; 320 tokens; 4 full rewrites',
+                      Path(data['report_path']).read_text())
+        self.assertEqual(AUDIT['cache_bucket'](None, datetime.now(timezone.utc), first=True), 'first')
+        counter = Counter()
+        AUDIT['cache_add']({'unknown': counter}, 'unknown', 0, 0)
+        self.assertEqual(counter['full_rewrites'], 0)
+
     def test_extract_defaults_override_and_privacy(self):
         pricing = self.fixture()
         for config in (None, self.root / 'config'):
