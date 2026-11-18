@@ -305,6 +305,26 @@ class TimelineCollectionTests(claude.StubCase):
                 self.assertFalse(data['friction']['regressions'])
         self.assertEqual(data['friction']['regressions'][0]['ratio'], 1.5)
 
+    def test_rejected_transcript_cannot_create_regression_baseline(self):
+        rows = []
+        for ident in range(3):
+            rows += [start(str(ident), 1), end(str(ident), 61, toolUseResult=dict(durationMs=60000))]
+        jsonl(self.session, rows)
+        rejected = self.project / 'unsafe.jsonl'
+        jsonl(rejected, rows)
+        rejected.chmod(0o666)
+        args = ('token-audit', '--json', '--since', '2025-01-01')
+        first = json.loads(self.run_script(*args).stdout)
+        self.assertNotIn('token-audit-friction-mac', Path(first['report_path']).read_text())
+        self.assertEqual(first['friction']['comparisons'][0]['count'], 3)
+        rejected.unlink()
+        rows = []
+        for ident in range(3):
+            rows += [start(str(ident), 1), end(str(ident), 91, toolUseResult=dict(durationMs=90000))]
+        jsonl(self.session, rows)
+        second = json.loads(self.run_script(*args).stdout)
+        self.assertFalse(second['friction']['regressions'])
+
     def test_cli_regression_rejects_replaced_report_and_extract(self):
         rows = []
         for ident in range(3):
