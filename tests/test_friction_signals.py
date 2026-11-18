@@ -132,9 +132,10 @@ class FrictionSignalTests(FrictionClaudeTests):
 
     def test_bounded_replay_and_nonliteral_calls(self):
         fingerprint = AUDIT['replay_fingerprint']
-        self.assertEqual(fingerprint('a' * 100000), fingerprint('a' * 99999 + 'b'))
+        self.assertNotEqual(fingerprint('a' * 100000), fingerprint('a' * 99999 + 'b'))
+        self.assertNotEqual(fingerprint([1, 23]), fingerprint([12, 3]))
         self.assertNotEqual(fingerprint('a' * 100000), fingerprint('a' * 100001))
         state = dict(cwd={str(self.work.resolve())}, permissions={}, capped=False)
         block = start('id', 0, 'echo ' + 'x' * 100000, cwd=str(self.work.resolve()))
-        AUDIT['permission_observation'](state, ('s', 'id'), block, block['message']['content'][0], True, [])
+        AUDIT['permission_observation'](state, ('s', 'id'), block, block['message']['content'][0], True, 0)
         self.assertEqual(state['permissions'], {})

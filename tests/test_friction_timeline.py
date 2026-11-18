@@ -1,6 +1,7 @@
 """Synthetic timeline boundaries, bounded sweeps and private report comparisons."""
 from copy import deepcopy
 import json
+import os
 from datetime import timedelta
 from pathlib import Path
 import tempfile
@@ -76,6 +77,15 @@ class TimelineTests(unittest.TestCase):
         self.assertTrue(AUDIT['is_polling']('while true; do sleep 5; done'))
         self.assertFalse(AUDIT['is_polling']('echo private-sleep'))
 
+    def test_polling_wait_and_overlap_must_belong_to_one_session(self):
+        calls = [call(0, 350, poll=True), call(350, 700, poll=True, session='other'),
+                 call(0, 120, 120)]
+        self.assertFalse(AUDIT['polling_summary'](calls, 120)['flagged'])
+        calls[1] = call(100, 800, poll=True, session='other')
+        self.assertFalse(AUDIT['polling_summary'](calls, 120)['flagged'])
+        calls.append(call(100, 220, 120, session='other'))
+        self.assertTrue(AUDIT['polling_summary'](calls, 120)['flagged'])
+
     def test_measured_occupancy_cannot_include_idle_gap_or_extend_pair(self):
         calls = []
         record = AUDIT['timeline_call']
@@ -135,6 +145,16 @@ class TimelineTests(unittest.TestCase):
             invalid = deepcopy(previous)
             invalid['friction']['summary']['capped'] = True
             self.assertFalse(compare(invalid)['regressions'])
+            newer = root / 'token-audit-newer.md'
+            newer.write_text(header)
+            os.utime(newer, (2_000_000_000, 2_000_000_000))
+            self.assertEqual(compare(previous)['regressions'][0]['ratio'], 1.5)
+            newer.write_text(completed.replace('token-audit-old.extract', 'token-audit-newer.extract'))
+            incomparable = deepcopy(previous)
+            incomparable['report'] = newer.name
+            incomparable['friction']['comparisons'][0]['signature'] = 'npm test'
+            (root / 'token-audit-newer.extract.json').write_text(json.dumps(incomparable))
+            self.assertEqual(compare(previous)['regressions'][0]['ratio'], 1.5)
             extract.write_text('{broken')
             AUDIT['apply_regression'](dict(friction=deepcopy(friction)), root / 'new.md', scope, root)
 

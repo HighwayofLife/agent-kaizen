@@ -43,6 +43,13 @@ class FrictionClaudeTests(StubCase):
         with patch.dict('os.environ', {'CLAUDE_CONFIG_DIR': str(self.root / 'empty')}):
             return AUDIT['collect']([self.project], self.root / 'absent', SINCE, {}, None, OPTIONS, **kwargs)
 
+    def test_scan_decodes_claude_rows_once(self):
+        jsonl(self.session, [start('one', 0), end('one', 3)])
+        with patch.object(json, 'loads', wraps=json.loads) as loads:
+            self.assertEqual(self.collect()['friction']['summary']['samples'], 1)
+        self.assertEqual(sum(b'private fixture output' in entry.args[0] for entry in loads.call_args_list
+                             if isinstance(entry.args[0], bytes)), 1)
+
     def test_pairs_replays_conflicts_and_timing_basis(self):
         prompt = dict(source='user_permanent', decision='accept')
         rows = [
@@ -83,6 +90,23 @@ class FrictionClaudeTests(StubCase):
         self.assertEqual(data['warnings']['malformed rows'], 1)
         without_friction = {k: v for k, v in data.items() if k not in ('friction', 'warnings')}
         self.assertEqual({k: v for k, v in self.collect(friction=False).items() if k != 'warnings'}, without_friction)
+
+    def test_uuidless_batch_builds_one_event_identity(self):
+        batch = end('0', 3, toolUseResult=dict(timedOutAfterMs=3))
+        starts = [start(str(i), 0) for i in range(20)]
+        batch['message']['content'].extend(end(str(i), 3)['message']['content'][0]
+                                           for i in range(1, len(starts)))
+        jsonl(self.session, [*starts, batch])
+        original = AUDIT['finalize_friction']
+
+        def finalize(state, *args):
+            events = [pair[1][-1] for pair in state['pairs'].values()]
+            self.assertEqual(len(events), len(starts))
+            self.assertTrue(all(event is events[0] for event in events))
+            return original(state, *args)
+
+        with patch.dict(AUDIT['collect'].__globals__, finalize_friction=finalize):
+            self.assertEqual(self.collect()['friction']['signals']['timeouts'], 1)
 
     def test_multi_result_metadata_is_not_measured_and_background_is_excluded(self):
         result = end('first', 200, toolUseResult=dict(durationMs=1234))

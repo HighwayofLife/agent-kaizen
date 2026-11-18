@@ -40,7 +40,7 @@ class FrictionCodexTests(unittest.TestCase):
                     input='text(await tools.exec_command({cmd:"cargo test --lib"}))')
         end = row('response_item', 5, type='custom_tool_call_output', call_id='private-id',
                   output=[dict(type='input_text', text='Script completed\nWall time 125.5 seconds\nOutput:\n'
-                               + 'private-body' * 2000 + ' upper limit on inotify watches reached')])
+                               + 'private-body' * 1000 + ' upper limit on inotify watches reached')])
         usage = dict(input_tokens=7, output_tokens=3, total_tokens=10)
         jsonl(self.rollout, [self.meta, row('turn_context', -1, model='example', effort='medium'),
                              start, end, start, end,
@@ -48,13 +48,11 @@ class FrictionCodexTests(unittest.TestCase):
         original_open = Path.open
         original_loads = json.loads
 
-        def loads(raw, *args, **kwargs):
-            if isinstance(raw, bytes):
-                self.assertNotIn(b'private-body', raw)
-            return original_loads(raw, *args, **kwargs)
-
-        with patch.object(Path, 'open', autospec=True, side_effect=original_open) as opened, patch.object(json, 'loads', loads):
+        with patch.object(Path, 'open', autospec=True, side_effect=original_open) as opened, patch.object(
+                json, 'loads', wraps=original_loads) as loads:
             on = self.collect(cwd=[self.work])
+        self.assertEqual(sum(b'private-body' in entry.args[0] for entry in loads.call_args_list
+                             if isinstance(entry.args[0], bytes)), 2)
         self.assertEqual(sum(entry.args[0] == self.rollout for entry in opened.call_args_list), 1)
         off = self.collect(cwd=[self.work], friction=False)
         friction = on.pop('friction')
@@ -95,9 +93,9 @@ class FrictionCodexTests(unittest.TestCase):
         jsonl(self.rollout, [self.meta, first, legacy, second, call('b', 4, turn_id='b'),
                              result('a', output='Wall time 150 seconds', turn_id='a'),
                              result('b', output='Wall time NaN seconds\nProcess exited with code 124\n'
-                                    'waiting for the lock\nupper limit on inotify watches reached'),
+                                    'Stderr: waiting for the lock\nupper limit on inotify watches reached'),
                              result('b', output='Wall time NaN seconds\nProcess exited with code 124\n'
-                                    'waiting for the lock\nupper limit on inotify watches reached')])
+                                    'Stderr: waiting for the lock\nupper limit on inotify watches reached')])
         data = self.collect(cwd=[self.work])
         friction = data['friction']
         self.assertEqual(friction['summary']['measured'], 1)
@@ -105,3 +103,61 @@ class FrictionCodexTests(unittest.TestCase):
         self.assertEqual((friction['signals']['timeout_hints'], friction['signals']['lock_phrases'],
                           friction['signals']['inotify']), (1, 1, 1))
         self.assertEqual(data['unknown_types'], {'function_call': 1})
+
+    def test_scalar_payloads_are_skipped_in_both_modes(self):
+        malformed = [dict(call('unused'), payload=value, note='_call') for value in ('function_call', 42, None)]
+        jsonl(self.rollout, [self.meta, *malformed, call('good'), result('good')])
+        on = self.collect()
+        self.assertEqual(on.pop('friction')['summary']['measured'], 1)
+        self.assertEqual(on, self.collect(friction=False))
+
+    def test_scope_uses_canonical_path_components(self):
+        outside = str(self.root / 'elsewhere')
+        Path(self.work).mkdir()
+        Path(outside).mkdir()
+        alias = Path(self.work) / 'alias'
+        alias.symlink_to(outside, target_is_directory=True)
+        for foreign in (self.work + '/../elsewhere', self.work + '-other', str(alias)):
+            with self.subTest(foreign=foreign):
+                jsonl(self.rollout, [self.meta, call('outside', cwd=foreign), result('outside', cwd=foreign),
+                                     call('inside', cwd=self.work + '/child/..'), result('inside', cwd=self.work)])
+                self.assertEqual(self.collect(cwd=[self.work])['friction']['summary']['measured'], 1)
+
+    def test_output_requires_valid_bounded_json(self):
+        prefix = 'Wall time: 150 seconds\nOutput:\n'
+        jsonl(self.rollout, [self.meta, call('invalid'), call('oversized'),
+                             result('oversized', output=prefix + 'x' * 70000)])
+        with self.rollout.open('a') as stream:
+            invalid = json.dumps(result('invalid', output=prefix + 'x' * 600))
+            stream.write(invalid.replace('xxxx', r'\qxx', 1) + '\n')
+        self.assertEqual(self.collect()['friction']['summary']['measured'], 0)
+
+    def test_output_scope_fields_after_output(self):
+        other = str(self.root / 'elsewhere')
+        context = row('turn_context', 0, cwd=other, turn_id='old')
+
+        def trailing(ident, output, **fields):
+            event = result(ident, output=output)
+            event['payload'].update(fields)
+            return event
+
+        jsonl(self.rollout, [self.meta, context, row('turn_context', 1, cwd=self.work),
+                             call('good'), trailing('good', 'Wall time: 120 seconds', cwd=self.work),
+                             call('foreign'), trailing('foreign', 'Wall time: 121 seconds', turn_id='old'),
+                             call('large'), trailing('large', 'Wall time: 122 seconds\n' + 'x' * 70000,
+                                                     cwd=other)])
+        friction = self.collect(cwd=[self.work])['friction']
+        self.assertEqual(friction['summary']['measured'], 1)
+        self.assertEqual(friction['summary']['slow_calls'][0]['seconds_total'], 120)
+
+    def test_lock_requires_failure_and_error_text(self):
+        outputs = ['Process exited with code 0\nStderr: database is locked',
+                   'Process exited with code 1\nOutput:\ndatabase is locked',
+                   'Output:\nProcess exited with code 1\nStderr: database is locked',
+                   'Process exited with code 1\nStderr: database is locked']
+        events = [event for i, output in enumerate(outputs)
+                  for event in (call(str(i)), result(str(i), output=output))]
+        events += [call('status'), result('status', output='database is locked', status='error'),
+                   call('stderr'), result('stderr', output='stdout', status='error', stderr='database is locked')]
+        jsonl(self.rollout, [self.meta, *events])
+        self.assertEqual(self.collect()['friction']['signals']['lock_phrases'], 2)
