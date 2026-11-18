@@ -5,11 +5,13 @@ import datetime
 import json
 import os
 import re
+import signal
 from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 
 ROOT = Path(__file__).resolve().parent.parent
 HOME = Path.home()
@@ -175,16 +177,40 @@ def check(args, state, statefile, cli):
             'manual install; kaizen-doctor checks the Copilot CLI location only' if manual else exc)
     errors = []
     with tempfile.TemporaryDirectory() as tmp:
+        # Copilot's session hook detaches the scheduler. Keep this offline
+        # fixture read-only so it cannot race temporary-directory cleanup.
+        (Path(tmp) / 'agent-kaizen.json').write_text('{"autoAudit": false}\n')
         env = {k: v for k, v in os.environ.items() if not k.startswith(('KAIZEN_', 'CLAUDE_', 'CODEX_', 'COPILOT_'))}
         env.update(HOME=tmp, TMPDIR=tmp, CODEX_HOME=tmp, COPILOT_HOME=tmp,
-                   CLAUDE_CONFIG_DIR=tmp, PLUGIN_ROOT=str(installed), KAIZEN_HOST=cli)
+                   CLAUDE_CONFIG_DIR=tmp, PLUGIN_ROOT=str(installed), KAIZEN_HOST=cli,
+                   PYTHONDONTWRITEBYTECODE='1')
         if cli == 'copilot':
             env.update(COPILOT_PLUGIN_ROOT=str(installed), CLAUDE_PLUGIN_ROOT=str(installed))
         for fixture in sorted((ROOT / 'tests/fixtures/hooks').glob(cli + '_*.json')):
             scripts = ('audit-notice.sh', 'session-audit.sh') if 'sessionstart' in fixture.name else ('bash-burst.sh',)
             for script in scripts:
                 try:
-                    result = run(['bash', installed / 'hooks' / script], input=fixture.read_text(), env=env)
+                    if cli == 'copilot' and script == 'session-audit.sh':
+                        # The hook detaches its scheduler; keep the fixture home
+                        # until every process in its group has exited.
+                        proc = subprocess.Popen(['bash', str(installed / 'hooks' / script)],
+                                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                                stderr=subprocess.PIPE, text=True, env=env,
+                                                start_new_session=True)
+                        stdout, stderr = proc.communicate(fixture.read_text(), timeout=60)
+                        deadline = time.monotonic() + 60
+                        while True:
+                            try:
+                                os.killpg(proc.pid, 0)
+                            except ProcessLookupError:
+                                break
+                            if time.monotonic() >= deadline:
+                                os.killpg(proc.pid, signal.SIGKILL)
+                                raise subprocess.TimeoutExpired(proc.args, 60)
+                            time.sleep(0.01)
+                        result = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+                    else:
+                        result = run(['bash', installed / 'hooks' / script], input=fixture.read_text(), env=env)
                     data = json.loads(result.stdout) if result.stdout.strip() else {}
                     if result.returncode or not isinstance(data, dict) or (data and not (('additionalContext' if cli == 'copilot' else 'hookSpecificOutput') in data)):
                         errors.append(fixture.name + ':' + script)

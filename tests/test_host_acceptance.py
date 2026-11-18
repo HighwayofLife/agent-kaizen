@@ -110,7 +110,9 @@ class AcceptanceTests(unittest.TestCase):
         statefile.parent.mkdir(parents=True)
         statefile.write_text(json.dumps({'install': 'manual', 'installed_at': '2020-01-01T00:00:00+00:00', 'report': '/etc/passwd'}))
         self.assertIn('Phase 2', self.command('status', '--host', 'vscode').stdout)
-        self.command('check', '--host', 'vscode', '--install-dir', str(ROOT), '--observe', 'skill_invoked=pass')
+        result = self.command('check', '--host', 'vscode', '--install-dir', str(ROOT), '--observe', 'skill_invoked=pass')
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertIn('RESULT:', result.stdout, result.stderr)
         report = max((ROOT / 'out/host-acceptance').glob('vscode-*.json'), key=lambda p: p.stat().st_mtime_ns)
         rows = {r['id']: r for r in json.loads(report.read_text())['checks']}
         self.assertEqual(rows['doctor']['status'], 'SKIP')
