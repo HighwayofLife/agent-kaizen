@@ -1,0 +1,3 @@
+- Keep displaced broker ledgers in private storage outside the Git worktree and bind ledger exchanges to validated directories.
+- Preserve individual action receipts on update, replay completed imports, and prune superseded empty and acknowledged receipts.
+- Refuse unsafe macOS ancestor ACLs. Verify Linux output markers across worktrees and check inotify against the tracked-file count.

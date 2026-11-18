@@ -284,17 +284,55 @@ class BrokerLedgerTests(unittest.TestCase):
         editor.write_text(updated)
         with self.locked() as journal, journal.table(ident) as (lines, _, _, _, _, write):
             lines.append("\nBroker wrote here.\n")
-            exchange = journal.allow_rule["rename_effect"]
+            exchange = apply.swap_ledger_entries
 
             def save_after_exchange(*args, **kwargs):
                 exchange(*args, **kwargs)
                 if editor.exists():
                     editor.replace(self.ledger)
 
-            with patch.dict(journal.allow_rule, rename_effect=save_after_exchange):
+            with patch.object(apply, "swap_ledger_entries", side_effect=save_after_exchange):
                 with self.assertRaisesRegex(ValueError, "ledger changed"):
                     write()
             self.assertEqual(self.ledger.read_text(), updated)
+
+    def test_replaced_backup_directory_cannot_redirect_ledger_exchange(self):
+        ident = "fa1_" + "1" * 64
+        updated = self.table + "\nBroker wrote here.\n"
+        moved = self.root / "moved-backups"
+        with self.locked() as journal, journal.table(ident) as (lines, _, _, _, _, write):
+            lines.append(updated[len(self.table):])
+            exchange = journal.exchange_ledger
+
+            def replace_backup_directory(*args):
+                staged, = self.root.rglob(f"{ident}-*.md")
+                staged.parent.rename(moved)
+                staged.parent.mkdir(mode=0o700)
+                staged.write_text("decoy")
+                return exchange(*args)
+
+            with patch.object(journal, "exchange_ledger", side_effect=replace_backup_directory), \
+                    self.assertRaisesRegex(ValueError, "ledger.*changed"):
+                write()
+        saved, = moved.iterdir()
+        self.assertEqual(self.ledger.read_text(), updated)
+        self.assertEqual(saved.read_text(), self.table)
+        decoy, = (path for path in self.root.rglob(f"{ident}-*.md") if path != saved)
+        self.assertEqual(decoy.read_text(), "decoy")
+
+    def test_ledger_publication_leaves_no_untracked_git_files(self):
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(self.project), *args], text=True)
+
+        git("init", "-q")
+        git("add", str(apply.LEDGER))
+        with self.locked() as journal, journal.table("fa1_" + "1" * 64) as (lines, _, _, _, _, write):
+            lines.append("\nBroker wrote here.\n")
+            write()
+        git("add", str(apply.LEDGER))
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--no-gpg-sign",
+            "-qm", "ledger")
+        self.assertEqual(git("status", "--porcelain", "--untracked-files=all"), "")
 
     def ledger_effect(self, journal):
         self.signed_extract([self.project])
@@ -335,14 +373,14 @@ class BrokerLedgerTests(unittest.TestCase):
         edited = self.table + "\nEditor saved before the swap.\n"
         with self.locked() as journal:
             ident = self.ledger_effect(journal)
-            exchange = journal.allow_rule["rename_effect"]
+            exchange = apply.swap_ledger_entries
 
             def crash_after_exchange(*args, **kwargs):
                 self.ledger.write_text(edited)
                 exchange(*args, **kwargs)
                 raise OSError("after ledger exchange")
 
-            with patch.dict(journal.allow_rule, rename_effect=crash_after_exchange):
+            with patch.object(apply, "swap_ledger_entries", side_effect=crash_after_exchange):
                 with self.assertRaisesRegex(OSError, "after ledger exchange"):
                     journal.reconcile(ident)
             self.assertEqual(journal.load(ident)["phase"], "effect-verified")
@@ -829,8 +867,10 @@ for index, event in enumerate(events):
                 env.pop(name, None)
 
             def command(path, *args, code=0, **extra_env):
+                # A review can run commit and recovery helpers with separate 30-second limits.
+                # Include time for preparation and bookkeeping around both helpers.
                 result = subprocess.run([sys.executable, "-I", str(path), *map(str, args)], env=dict(env, **extra_env),
-                                        cwd=root, capture_output=True, text=True, timeout=30)
+                                        cwd=root, capture_output=True, text=True, timeout=90)
                 self.assertEqual(result.returncode, code, result.stdout + result.stderr)
 
             command(scripts / "install-schedule", "--apply", "--scheduler", "cron")
