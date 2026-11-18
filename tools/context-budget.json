@@ -2,9 +2,9 @@
   "budget_bytes": 1024,
   "hooks": {
     "hooks/audit-notice.sh": {
-      "literal_bytes": 353,
-      "sha256": "fcc5bee5e1588e321d56675dd8bfc5b1327a88e1abb00887cf4a5186db8eec18",
-      "literal_text": "An unreviewed usage audit exists: . A propose-only review is ready too: . When there is a pause, run /agent-kaizen:review (read the headline and flagged sections, not the whole file), propose changes to the user, then touch .reviewed.\n\nExperiments need attention in this project (docs/kaizen/LEDGER.md):\n\nWhen there is a pause, run /agent-kaizen:review."
+      "literal_bytes": 392,
+      "sha256": "e23177ae011bf1e4ecbd66f0bb5991236754cd8100b80225f910e33df3bbd890",
+      "literal_text": "An unreviewed usage audit exists: . A propose-only review is ready too: . When there is a pause, run /agent-kaizen:review (read the headline and flagged sections, not the whole file), propose changes to the user, then touch .reviewed.\n\nExperiments need attention in this project (docs/kaizen/LEDGER.md):\n\nWhen there is a pause, run /agent-kaizen:review.\n\nREGRESSION expensive_agent_calls  vs "
     },
     "hooks/bash-burst.sh": {
       "literal_bytes": 157,
