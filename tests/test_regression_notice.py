@@ -104,6 +104,15 @@ class RegressionNoticeTests(unittest.TestCase):
         self.assertEqual(list(self.audits.glob('*.noticed-*')), [])
         self.assertIn(self.finding, self.notice())
 
+    def test_quiet_session_with_closed_pipe(self):
+        read_fd, write_fd = os.pipe()
+        os.close(read_fd)
+        with os.fdopen(write_fd, 'w') as output:
+            result = subprocess.run(['bash', str(HOOKS / 'audit-notice.sh')], text=True,
+                                    input=json.dumps({'cwd': str(self.project)}), stdout=output,
+                                    stderr=subprocess.PIPE, env={**self.env, 'AUDIT_DIR': str(self.project)}, timeout=6)
+        self.assertEqual(result.returncode, 0)
+
     def test_closed_pipe_releases_markers(self):
         self.checker.write_text(f'print({self.finding!r})\n')
         read_fd, write_fd = os.pipe()

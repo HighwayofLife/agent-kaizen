@@ -145,11 +145,11 @@ def main():
         emit('WARN', 'pricing date missing, invalid, or over 60 days old', 'kaizen-link --apply --replace-prefixed after updating pricing.json')
 
     try:
-        db = Path(os.environ.get('KAIZEN_USAGE_DB') or HOME / 'kaizen-usage.db').expanduser()
+        db = Path(os.environ.get('KAIZEN_USAGE_DB') or HOME / 'kaizen-usage.db').expanduser().resolve()
         wal = Path(str(db) + '-wal')
         live_wal = wal.exists() and wal.stat().st_size > 0
         query = '?mode=ro' if live_wal else '?mode=ro&immutable=1'
-        with sqlite3.connect(db.resolve().as_uri() + query, uri=True, timeout=1) as conn:
+        with sqlite3.connect(db.as_uri() + query, uri=True, timeout=1) as conn:
             conn.set_progress_handler(lambda: 1, 100000)
             value = conn.execute('SELECT max(ingested_at) FROM files').fetchone()[0]
         stamp = datetime.fromisoformat(value.replace('Z', '+00:00'))

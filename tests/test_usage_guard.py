@@ -159,6 +159,22 @@ class UsageGuardTests(UsageDbCase):
         self.assertTrue(any('agent_cost_share' in line for line in self.findings(
             '--relative-threshold', '0', '--mad-multiplier', '0', '--minimum', 'agent_cost_share=0')))
 
+    def test_small_regression_values_are_distinguishable(self):
+        for i in range(17):
+            self.call(i, 'main', input_=100000000)
+            self.call(i, 'agent', input_=100000000 + (i >= 14), subagent=1)
+        line = next(line for line in self.findings('--relative-threshold', '0', '--mad-multiplier', '0',
+                                                   '--minimum', 'agent_cost_share=0')
+                    if 'agent_cost_share' in line)
+        self.assertNotEqual(line.split()[2], line.split()[4])
+
+    def test_unclassifiable_model_excludes_day_from_expensive_metric(self):
+        for i in range(17):
+            self.call(i, 'main')
+            self.call(i, 'agent', subagent=1, model='claude-mystery' if i == 5 else 'claude-sonnet-test')
+        self.assertIn('insufficient data expensive_agent_calls (16/17 active UTC days)', self.guard())
+        self.assertIn('unclassifiable subagent models', self.run_script('usage-db', 'guard', '--help').stdout)
+
     def test_cost_share_does_not_cross_threshold_due_to_rounding(self):
         for i in range(17):
             self.call(i, 'main', input_=66666651 if i < 14 else 60000000)
@@ -192,7 +208,26 @@ class UsageGuardTests(UsageDbCase):
             conn.set_progress_handler(progress, 1000)
             result = self.guard_module().guard_rewrites(conn, 'is_subagent', '2025-01-03')
         self.assertEqual(result, {'2025-01-03': 1.0})
-        self.assertLess(steps[0], 1500000)
+        # The join scans the older calls once, even when no sessions match.
+        self.assertLess(steps[0], 2500000)
+
+    def test_many_pending_sessions_guard_speed(self):
+        start = time.monotonic()
+        with sqlite3.connect(self.db) as conn:
+            sql = ('INSERT INTO calls (source, call_id, ts, day, session, is_subagent, input, cache_write_5m) '
+                   'VALUES (?, ?, ?, ?, ?, 0, 1000, ?)')
+            conn.executemany(sql, (('claude', f'history-{i}', '2024-01-01T00:00:00Z', '2024-01-01',
+                                    f'session-{i % 3000}', 0) for i in range(250000)))
+            conn.executemany(sql, (('claude', f'pending-{i}', '2025-01-01T00:00:00Z', '2025-01-01',
+                                    f'session-{i}', 1000) for i in range(3000)))
+        if time.monotonic() - start > 20:
+            self.skipTest('building the synthetic database took over 20 seconds')
+        start = time.monotonic()
+        result = subprocess.run([str(ROOT / 'scripts/usage-db'), 'guard', '--db', str(self.db),
+                                 '--pricing', str(self.prices)], capture_output=True, text=True)
+        elapsed = time.monotonic() - start
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertLess(elapsed, 1.5, f'guard took {elapsed:.3f} seconds')
 
     def test_bounded_matches_unrestricted_sparse_families(self):
         for i in range(40):

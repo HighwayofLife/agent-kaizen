@@ -112,7 +112,7 @@ def canary_row(line, since, counts, codex, session_version):
         kind = row.get("type")
         entry = counts[version]
         entry["records"] += 1
-        if kind not in known:
+        if not isinstance(kind, str) or kind not in known:
             entry["unknown_records"] += 1
             name = kind if isinstance(kind, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", kind) else "<other>"
             entry[("unknown_type", name)] += 1
