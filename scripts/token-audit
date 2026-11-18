@@ -2399,7 +2399,20 @@ def describe(scope):
     return "window " + scope["window"] + ", " + projects
 
 
-def regression_cohorts(path, scope, extract_dir, friction):
+def audit_machine_key(*, create=False):
+    helper = Path(__file__).resolve().with_name("kaizen_friction_actions.py")
+    if helper.is_file():
+        actions = runpy.run_path(str(helper))["HostActions"]
+        backups = Path(os.environ.get("KAIZEN_BACKUP_DIR") or claude_home() / "kaizen-backups").expanduser()
+        return actions(claude_home().absolute() / "audits", backups, None, None)._secret(create=create)
+
+
+def regression_binding_mac(secret, report_name, binding):
+    payload = json.dumps([report_name, binding], sort_keys=True, separators=(",", ":")).encode("ascii")
+    return hmac.digest(secret, b"friction-regression-binding-v1\0" + payload, "sha256").hex()
+
+
+def regression_cohorts(path, scope, extract_dir, friction, secret):
     try:
         if path.stat().st_size > 1024 * 1024:
             return
@@ -2417,6 +2430,10 @@ def regression_cohorts(path, scope, extract_dir, friction):
         binding = json.loads(bindings[0])
         size = binding.get("size")
         if type(size) is not int or not 0 < size <= 8 * 1024 * 1024:
+            return
+        macs = re.findall(r"^<!-- token-audit-friction-mac (.*?) -->$", report_text, re.M)
+        if (len(macs) != 1 or not re.fullmatch(r"[0-9a-f]{64}", macs[0])
+                or not hmac.compare_digest(macs[0], regression_binding_mac(secret, path.name, binding))):
             return
         extract = extract_dir.expanduser() / name
         if extract.stat().st_size != size:
@@ -2453,11 +2470,17 @@ def apply_regression(data, out, scope, extract_dir):
     current = {(row["signature"], row["basis"]): row for row in friction["comparisons"] if row["count"] >= 3}
     if not current:
         return
+    try:
+        secret = audit_machine_key()
+    except (OSError, ValueError):
+        return
+    if secret is None:
+        return
     indexed = None
 
     def eligible(path):
         nonlocal indexed
-        indexed = regression_cohorts(path, scope, extract_dir, friction)
+        indexed = regression_cohorts(path, scope, extract_dir, friction, secret)
         return indexed is not None and any(key in current and row["p50"] > 0 for key, row in indexed.items())
 
     match, _ = previous_audit(out, scope, eligible)
@@ -2476,7 +2499,7 @@ def apply_regression(data, out, scope, extract_dir):
                                       basis=row["basis"], detail="Comparable median timing grew by at least 1.5 times."))
 
 
-def report(data, out, scope, extract_binding=None):
+def report(data, out, scope, extract_binding=None, extract_mac=None):
     h = data["headline"]
     headline = [f"Claude: {h['claude_calls']:,} calls; {h['claude_context']:,} context tokens; {h['claude_output']:,} output tokens.",
                 f"Codex: {h['codex_sessions']:,} sessions; {h['codex_tokens']:,} tokens."]
@@ -2616,6 +2639,8 @@ def report(data, out, scope, extract_binding=None):
         extra += friction_sections(data["friction"])
     if extract_binding is not None:
         extra.append("<!-- token-audit-friction " + json.dumps(extract_binding) + " -->")
+    if extract_mac is not None:
+        extra.append("<!-- token-audit-friction-mac " + extract_mac + " -->")
     return "\n".join(lines + extra + ["<!-- token-audit-complete -->"]) + "\n", headline + headlines
 
 
@@ -2655,16 +2680,13 @@ def write_extract(data, out, directory, scope, now=None):
                 and scope.get("cwd") and scope.get("project") is None and not scope.get("project_dirs")):
             # A standalone audit can still emit an extract. Only an install with
             # the machine key helper can attest counters for a settings write.
-            helper = Path(__file__).resolve().with_name("kaizen_friction_actions.py")
-            if helper.is_file():
-                try:
-                    actions = runpy.run_path(str(helper))["HostActions"]
-                    backups = Path(os.environ.get("KAIZEN_BACKUP_DIR") or claude_home() / "kaizen-backups").expanduser()
-                    secret = actions(audits, backups, None, None)._secret(create=True)
+            try:
+                secret = audit_machine_key(create=True)
+                if secret is not None:
                     payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
                     value["allow_rule_mac"] = hmac.digest(secret, b"allow-rule-extract-v2\0" + payload, "sha256").hex()
-                except (OSError, ValueError):
-                    print("token-audit: could not authenticate allow-rule evidence", file=sys.stderr)
+            except (OSError, ValueError):
+                print("token-audit: could not authenticate allow-rule evidence", file=sys.stderr)
         raw = (json.dumps(value) + "\n").encode("ascii")
         candidate = ".extract-" + os.urandom(16).hex()
         fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd)
@@ -2781,11 +2803,18 @@ def main():
         apply_regression(data, out, scope, args.extract_out)
         for warning in data["parser_warnings"]:
             print(warning, file=sys.stderr)
-        extract_path = binding = None
+        extract_path = binding = extract_mac = None
         if not args.no_write:
             out.parent.mkdir(parents=True, exist_ok=True)
             extract_path, binding = write_extract(data, out, args.extract_out, scope, now) or (None, None)
-        text, headline = report(data, out, scope, binding)
+            if binding is not None and data.get("friction", {}).get("comparisons"):
+                try:
+                    secret = audit_machine_key(create=True)
+                    if secret is not None:
+                        extract_mac = regression_binding_mac(secret, out.name, binding)
+                except (OSError, ValueError):
+                    print("token-audit: could not authenticate regression evidence", file=sys.stderr)
+        text, headline = report(data, out, scope, binding, extract_mac)
         if not args.no_write:
             out.write_text(text)
         if args.json:

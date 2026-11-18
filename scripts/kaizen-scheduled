@@ -2250,24 +2250,26 @@ def recover_scheduled_suggestions(store, host, project):
         rows, _, receipts = store._load(directory)
         generations = receipts.get(str(project), {})
         pending = host["_pending"](generations)
-        suggestions = set()
+        suggestions = {}
         for ident in sorted(pending):
-            if ident not in rows or rows[ident]["catalog_id"] == "linux-localsearch":
+            if ident not in rows:
                 continue
             # Scheduled reservations take both locks before creating a record.
             try:
                 os.stat("broker-" + ident + ".json", dir_fd=state, follow_symlinks=False)
             except FileNotFoundError:
-                suggestions.add(ident)
+                reason = scheduled_action_refusal(rows[ident]["catalog_id"])
+                if reason:
+                    suggestions[ident] = reason
         if suggestions:
             for imported in generations.values():
-                for ident in suggestions.intersection(imported):
+                for ident in suggestions.keys() & imported.keys():
                     if imported[ident] == "pending":
                         imported[ident] = "terminal"
             store._save(directory, rows, receipts)
-            for ident in sorted(suggestions):
-                log(f"friction: broker action {ident} resolved as a suggestion (operation is proposal-only)")
-        return bool(pending - suggestions)
+            for ident, reason in suggestions.items():
+                log(f"friction: broker action {ident} resolved as a suggestion ({reason})")
+        return bool(pending - suggestions.keys())
 
 
 def run_scheduled_broker(audits, project, options, *, receipt=None, attempt=None):
