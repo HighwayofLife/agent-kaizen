@@ -1,0 +1,306 @@
+#!/usr/bin/env -S python3 -I
+"""Check a scoped LocalSearch output marker."""
+import os
+import sys
+
+if __name__ == '__main__' and not sys.flags.isolated:
+    os.execv(sys.executable, [sys.executable, '-I', os.path.abspath(__file__), *sys.argv[1:]])
+
+import argparse
+from contextlib import contextmanager
+from fnmatch import fnmatchcase
+from functools import partial
+import json
+from pathlib import Path
+import runpy
+import stat
+import time
+
+HERE = Path(__file__).resolve().parent
+CATALOG_ID = 'linux-localsearch'
+MARKER = '.nomedia'
+PENDING = 'marker writes are disabled pending recovery and Linux compatibility checks'
+PROTECTED_ROOTS = {'.git', '.ssh', '.aws', '.gnupg', '.config', '.kube', '.docker', '.azure', '.claude', '.codex'}
+DIR_FLAGS = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
+LIMIT = 1024 * 1024
+PLATFORM = sys.platform
+
+if __name__ == '__main__':
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, str(HERE))
+from kaizen_friction_actions import HostActions, _unique
+from kaizen_worktree_facts import GIT_PATHS, file_id, git, records, regular_bytes
+
+
+class Refused(Exception):
+    pass
+
+
+def sibling(*names):
+    for name in names:
+        if (HERE / name).is_file():
+            return HERE / name
+    raise Refused('required host-fix sibling is unavailable')
+
+
+def marker_catalog(catalog_id):
+    if catalog_id != CATALOG_ID or PLATFORM != 'linux':
+        raise Refused('unknown marker or wrong platform')
+    # Resolve the installed probe alongside its catalogue. Probe reports cannot authorize a write.
+    sibling('kaizen-host-probe', 'host-probe')
+    catalog = json.loads(regular_bytes(sibling('kaizen-friction-catalog.json', 'friction-catalog.json'), LIMIT),
+                         object_pairs_hook=_unique)
+    entries = [entry for entry in catalog['actions'] if entry['id'] == catalog_id]
+    if (type(catalog['v']) is not int or catalog['v'] != 1 or len(entries) != 1
+            or entries[0]['automatable'] != 'marker' or entries[0]['os'] != ['linux']
+            or entries[0]['needs_research'] is not False):
+        raise Refused('invalid LocalSearch catalogue entry')
+    names, cloud = catalog['output_dir_names'], catalog['cloud_sync_names']
+    if any(not isinstance(items, list) or not all(isinstance(item, str) and item for item in items)
+           for items in (names, cloud)):
+        raise Refused('invalid output or cloud names')
+    return names, cloud
+
+
+def exact_path(value, base=None):
+    path = Path(value)
+    if not path.is_absolute():
+        path = (base or Path.cwd()) / path
+    if '..' in path.parts or path.resolve(strict=True) != path:
+        raise Refused('path has traversal or a symlink component')
+    return path
+
+
+@contextmanager
+def checked_directory(path, expected=None):
+    fd = os.open(path.anchor, DIR_FLAGS)
+    try:
+        for part in path.parts[1:]:
+            child = os.open(part, DIR_FLAGS, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        if expected is not None and file_id(os.fstat(fd)) != file_id(expected):
+            raise Refused('output directory identity changed')
+        yield fd
+    finally:
+        os.close(fd)
+
+
+def read_config(path):
+    path = path.absolute()
+    if '..' in path.parts:
+        raise Refused('invalid config path')
+    try:
+        with checked_directory(path.parent) as parent:
+            fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+            with os.fdopen(fd, 'rb') as stream:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise Refused('config is not a regular file')
+                raw = stream.read(LIMIT + 1)
+    except FileNotFoundError:
+        return {}
+    if len(raw) > LIMIT:
+        raise Refused('config exceeds size limit')
+    config = json.loads(raw, object_pairs_hook=_unique)
+    if not isinstance(config, dict):
+        raise Refused('invalid config object')
+    return config
+
+
+def sensitive(part):
+    folded = part.casefold()
+    return ((part.startswith('.') and part != '.gradle')
+            or folded in {'secrets', 'credentials', 'private'}
+            or folded.endswith(('.key', '.pem')) or folded.startswith(('id_rsa', 'id_ed25519')))
+
+
+def check_policy(global_path, members, name, names, valid_paths):
+    configs = [(None, global_path)]
+    configs.extend((member, member / 'docs/kaizen/config.json') for member in sorted(members))
+    output_lists = []
+    for member, config_path in configs:
+        config = read_config(config_path)
+        if config.get('friction', 'on') != 'on' or config.get('hostActions', 'apply') != 'apply':
+            raise Refused('project policy does not allow host actions')
+        if member is None or 'frictionOutputDirs' not in config:
+            continue
+        outputs = config['frictionOutputDirs']
+        if not valid_paths(outputs) or any(
+                sensitive(part) or member.joinpath(*entry.split('/')[:i]).is_symlink()
+                for entry in outputs for i, part in enumerate(entry.split('/'), 1)):
+            raise Refused('invalid project output directories')
+        output_lists.append(members[member].as_posix() in outputs)
+    if name not in names and (not output_lists or not all(output_lists)):
+        raise Refused('path is not a recognized output directory')
+
+
+def check_contents(directory, deadline):
+    budget = 20000
+
+    def visit(fd, depth):
+        nonlocal budget
+        info = os.fstat(fd)
+        if depth > 64 or info.st_dev != device or info.st_uid != os.geteuid():
+            raise Refused('output contains an unsafe directory')
+        git_names = set()
+        with os.scandir(fd) as entries:
+            for entry in entries:
+                budget -= 1
+                if budget < 0 or time.monotonic() >= deadline:
+                    raise Refused('output traversal exceeds limits')
+                name = entry.name
+                if name.casefold() == '.git':
+                    raise Refused('output contains Git metadata')
+                if name in {'HEAD', 'objects', 'refs'}:
+                    git_names.add(name)
+                if entry.is_dir(follow_symlinks=False):
+                    child = os.open(name, DIR_FLAGS, dir_fd=fd)
+                    try:
+                        visit(child, depth + 1)
+                    finally:
+                        os.close(child)
+        if len(git_names) == 3:
+            raise Refused('output contains a bare Git repository')
+
+    device = os.fstat(directory).st_dev
+    visit(directory, 0)
+
+
+def git_output(run, directory, *args):
+    result = run(directory, *args)
+    if result is None or result[0]:
+        raise Refused('Git check failed')
+    return result[1]
+
+
+def eligible_path(run, project, path, cloud):
+    entries = records(run, project)
+    if not entries or any(b'bare' in entry or b'prunable' in entry for entry in entries):
+        raise Refused('Git worktree registration is incomplete')
+    roots = {exact_path(os.fsdecode(entry[b'worktree'])) for entry in entries}
+    owners = {root for root in roots if root in path.parents}
+    active = Path.cwd().resolve()
+    if (len(roots) != len(entries) or not owners or path in {active, *roots}
+            or path in active.parents or any(path in root.parents for root in roots)
+            or (path / 'docs/kaizen').is_dir()):
+        raise Refused('path is a root, contains a worktree or is outside the project')
+    root = max(owners, key=lambda item: len(item.parts))
+    top = Path(os.fsdecode(git_output(run, project, 'rev-parse', '--show-toplevel').removesuffix(b'\n')))
+    if top not in roots or (project not in roots and project not in path.parents):
+        raise Refused('path is outside the selected project')
+    relative = path.relative_to(root)
+    home = Path.home().resolve()
+    if (any(sensitive(part) for owner in owners for part in path.relative_to(owner).parts)
+            or any(part.casefold() in PROTECTED_ROOTS for part in (*path.parts, *project.parts))
+            or any(fnmatchcase(part.casefold(), pattern.casefold()) for part in path.parts for pattern in cloud)
+            or path == home or any(owner in (home, Path(owner.anchor)) for owner in owners | {top})):
+        raise Refused('sensitive output path')
+    owner_top = git_output(run, path, 'rev-parse', '--show-toplevel').removesuffix(b'\n')
+    if Path(os.fsdecode(owner_top)) != root:
+        raise Refused('path is inside a foreign repository')
+    common = [(directory / os.fsdecode(git_output(run, directory, 'rev-parse', '--git-common-dir')
+                                       .removesuffix(b'\n'))).resolve(strict=True)
+              for directory in {project, path, *owners}]
+    if len(set(common)) != 1:
+        raise Refused('path belongs to a foreign Git worktree')
+    if (run(root, 'check-ignore', '-q', '--', relative.as_posix() + '/') != (0, b'')
+            or git_output(run, root, '--literal-pathspecs', 'ls-files', '-z', '--', relative.as_posix())):
+        raise Refused('output must be ignored and contain no tracked files')
+    outermost = min(owners, key=lambda item: len(item.parts))
+    members = {parent: path.relative_to(parent) for parent in path.parents
+               if parent == outermost or outermost in parent.parents}
+    members.update(dict.fromkeys(owners | {top}, relative))
+    members.setdefault(project, path.relative_to(project) if project in path.parents else relative)
+    return members
+
+
+def marker_identity(info):
+    return (*file_id(info), info.st_ctime_ns)
+
+
+def marker_stamp():
+    return b'Agent Kaizen marker v1 ' + os.urandom(32).hex().encode('ascii') + b'\n'
+
+
+def marker_present(directory):
+    try:
+        os.stat(MARKER, dir_fd=directory, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def create_marker(directory, stamp):
+    try:
+        fd = os.open(MARKER, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory)
+    except FileExistsError:
+        return None
+    with os.fdopen(fd, 'wb') as stream:
+        os.fchmod(fd, 0o600)
+        stream.write(stamp)
+        stream.flush()
+        os.fsync(fd)
+        return marker_identity(os.fstat(fd))
+
+
+def apply(args):
+    names, cloud = marker_catalog(args.catalog_id)
+    project = exact_path(args.project)
+    path = exact_path(args.path, project)
+    info = path.lstat()
+    executable = next((name for name in GIT_PATHS if os.access(name, os.X_OK)), None)
+    deadline = time.monotonic() + 20
+    run = partial(git, executable, deadline=deadline)
+    runner = runpy.run_path(str(sibling('kaizen-scheduled')))
+    scope = runner['action_project']
+
+    # Use P11's enrollment and ID rules with the same restricted Git as the live path checks.
+    def scope_git(directory, *arguments):
+        return os.fsdecode(git_output(run, directory, *arguments)).removesuffix('\n')
+
+    scope.__globals__['_git'] = scope_git
+    store = HostActions(runner['audits_dir'](), runner['backup_root'](), scope, runner['key'])
+    with checked_directory(path, info) as directory:
+        members = eligible_path(run, project, path, cloud)
+        canonical, subject = scope(project, selector=path)
+        members[canonical] = subject.relative_to(canonical)
+        check_policy(runner['global_config_path'](), members, path.name, names, runner['valid_relative_paths'])
+        check_contents(directory, deadline)
+        if not any(
+                row['catalog_id'] == CATALOG_ID and row['selector_key'] == str(subject)
+                and row['status'] == 'open' and row['evidence'] and row.get('flaps', 0) < 2
+                for row in store.scoped(canonical)):
+            raise Refused('no open eligible action for this output')
+        with checked_directory(path, info):
+            if marker_present(directory):
+                print('host-fix: already present')
+                return
+    raise Refused('eligible output. ' + PENDING)
+
+
+def undo(args):
+    raise Refused(PENDING)
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='command', required=True)
+    add, remove = (commands.add_parser(name) for name in ('apply', 'undo'))
+    for command in (add, remove):
+        command.add_argument('--project', required=True)
+    add.add_argument('--catalog-id', required=True)
+    add.add_argument('--path', required=True)
+    add.set_defaults(handler=apply)
+    remove.add_argument('record')
+    remove.set_defaults(handler=undo)
+    args = parser.parse_args(argv)
+    try:
+        args.handler(args)
+    except Refused as error:
+        parser.exit(2, f'host-fix: refused: {error}\n')
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, AttributeError):
+        parser.exit(2, 'host-fix: refused: cannot safely read project, policy or action state\n')
+
+
+if __name__ == '__main__':
+    main()
