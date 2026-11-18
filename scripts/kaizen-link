@@ -31,6 +31,7 @@ SCRIPTS = {
     "kaizen_credentials.py": "kaizen_credentials.py",
     "pricing.json": "pricing.json", "kaizen-pricing.json": "pricing.json",
     "rules-lint.patterns": "rules-lint.patterns", "install-schedule": "install-schedule",
+    "kaizen-demo-fixtures": "kaizen-demo-fixtures",
     "usage-series": "usage-series", "usage-compare": "usage-compare", "usage-db": "usage-db",
     "rules-lint": "rules-lint", "packet-report": "packet-report",
     "kaizen-project-report": "kaizen-project-report", "notes-ledger": "notes-ledger",
