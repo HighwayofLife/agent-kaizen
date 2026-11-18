@@ -25,7 +25,7 @@ def load_sibling(name, file):
 
 
 AUDIT = load_sibling('kaizen_token_audit', 'token-audit')
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 BATCH = 2000
 BUSY_SECONDS = 30
@@ -36,7 +36,7 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID;
 CREATE TABLE files (path TEXT PRIMARY KEY, source TEXT, size INTEGER, mtime_ns INTEGER, ingested_at TEXT);
 CREATE TABLE calls (
     source TEXT NOT NULL, call_id TEXT NOT NULL, ts TEXT NOT NULL, day TEXT NOT NULL,
-    project TEXT, session TEXT, agent TEXT, model TEXT,
+    project TEXT, session TEXT, agent TEXT, model TEXT, is_subagent INTEGER,
     input INTEGER NOT NULL DEFAULT 0, cache_read INTEGER NOT NULL DEFAULT 0,
     cache_write_5m INTEGER NOT NULL DEFAULT 0, cache_write_1h INTEGER NOT NULL DEFAULT 0,
     output INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (source, call_id)) WITHOUT ROWID;
@@ -107,7 +107,8 @@ def migrate(conn):
 
     Rows whose file still exists are renamed. A row that would collide with an already renamed one is
     a copy of the same call (the same session read under another file name), so it is dropped."""
-    paths = [Path(row[0]) for row in conn.execute("SELECT path FROM files WHERE source = 'codex'")]
+    version = int(conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0])
+    paths = [Path(row[0]) for row in conn.execute("SELECT path FROM files WHERE source = 'codex'")] if version < 2 else []
     stems = Counter(path.stem for path in paths)
     for path in paths:
         stem = path.stem
@@ -119,6 +120,10 @@ def migrate(conn):
                      "WHERE source = 'codex' AND call_id >= ? AND call_id < ?",
                      (session + ':', len(low) + 1, low, high))
         conn.execute("DELETE FROM calls WHERE source = 'codex' AND call_id >= ? AND call_id < ?", (low, high))
+    if "is_subagent" not in {row[1] for row in conn.execute("PRAGMA table_info(calls)")}:
+        conn.execute("ALTER TABLE calls ADD COLUMN is_subagent INTEGER")
+        # Older rows do not identify transcript origin. Reingest available files.
+        conn.execute("DELETE FROM files WHERE source = 'claude'")
     conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),))
 
 
@@ -250,7 +255,7 @@ def codex_calls(path, session, warnings):
 
 # --- ingest ---
 
-def store_file(conn, path, source, size, mtime_ns, calls, project, session, agent, warnings):
+def store_file(conn, path, source, size, mtime_ns, calls, project, session, agent, warnings, is_subagent=None):
     """Insert one file's calls and its files row in one transaction; return calls added."""
     before = conn.total_changes
     unreadable = warnings['unreadable files']
@@ -258,9 +263,12 @@ def store_file(conn, path, source, size, mtime_ns, calls, project, session, agen
     try:
         batch = []
         insert = ('INSERT OR IGNORE INTO calls (source, call_id, ts, day, project, session, agent, model, input, '
-                  'cache_read, cache_write_5m, cache_write_1h, output) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+                  'cache_read, cache_write_5m, cache_write_1h, output, is_subagent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
         for call in calls:
-            batch.append((source, call[0], call[1], call[2], project, session, agent) + call[3:])
+            if source == 'claude':
+                conn.execute('UPDATE calls SET is_subagent = ? WHERE source = ? AND call_id = ? AND is_subagent IS NULL',
+                             (is_subagent, source, call[0]))
+            batch.append((source, call[0], call[1], call[2], project, session, agent) + call[3:] + (is_subagent,))
             if len(batch) >= BATCH:
                 conn.executemany(insert, batch)
                 batch.clear()
@@ -322,7 +330,7 @@ def ingest(args):
             calls = codex_calls(file, identity or file.stem, warnings)
         try:
             stats['added'] += store_file(conn, file, source, info.st_size, info.st_mtime_ns, calls,
-                                         project, session, agent, warnings)
+                                         project, session, agent, warnings, None if main is None else int(not main))
         except OSError:
             continue
     conn.close()
@@ -478,7 +486,8 @@ REPORT_COLUMNS = ['key', 'calls', 'input', 'cache_read', 'cache_write', 'output'
 def cache_report(conn, args):
     # Fetch full histories before date and project filtering; SQLite text ordering
     # does not sort timestamps with different fractional precision correctly.
-    rows = list(conn.execute("SELECT source, session, agent, call_id, ts, day, project, input, cache_read, "
+    origin = "is_subagent" if "is_subagent" in {row[1] for row in conn.execute("PRAGMA table_info(calls)")} else "NULL"
+    rows = list(conn.execute("SELECT source, session, agent, " + origin + ", call_id, ts, day, project, input, cache_read, "
                              "cache_write_5m + cache_write_1h FROM calls"))
     def parsed(value):
         try:
@@ -486,22 +495,22 @@ def cache_report(conn, args):
         except (ValueError, TypeError, OverflowError):
             return None
     histories = {}
-    for source, session, agent, ident, ts, day_, project, input_, read, write in rows:
-        key = (source, session, agent)
+    for source, session, agent, is_subagent, ident, ts, day_, project, input_, read, write in rows:
+        key = (source, session, is_subagent, agent)
         histories.setdefault(key, []).append((parsed(ts), ident, day_, project, input_, read, write))
     result = {}
-    for (source, session, agent), calls in histories.items():
+    for (source, session, is_subagent, agent), calls in histories.items():
         calls.sort(key=lambda row: (row[0] is None, row[0] or EPOCH, row[1]))
         previous = None
         for index, (ts, ident, day_, project, input_, read, write) in enumerate(calls):
             bucket = (AUDIT.cache_bucket(previous, ts, first=index == 0)
-                      if session and agent else 'unknown')
+                      if session and agent and is_subagent is not None else 'unknown')
             previous = ts
             if (not write or (args.source and source != args.source)
                     or (args.project and args.project.lower() not in (project or '').lower())
                     or (args.since and day_ < args.since) or (args.until and day_ > args.until)):
                 continue
-            kind = 'main' if agent == 'main' else 'subagent_approximate'
+            kind = 'main' if is_subagent == 0 else 'subagent_approximate'
             entry = result.setdefault((source, kind, bucket), Counter())
             AUDIT.cache_add({bucket: entry}, bucket, write, input_ + read + write)
     columns = ['source', 'sequence', 'gap', 'writes', 'write_tokens', 'full_rewrites']

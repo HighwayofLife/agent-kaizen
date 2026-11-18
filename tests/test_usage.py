@@ -98,7 +98,7 @@ class UsageTests(StubCase):
             call('2025-01-01T01:05:01Z', 'e', usage)])
         data = json.loads(self.run_script('token-audit', '--since', '2025-01-01', '--json').stdout)
         gaps = data['cache_writes']['main']
-        self.assertEqual(gaps['unknown']['writes'], 1)
+        self.assertEqual(gaps['first']['writes'], 1)
         self.assertEqual(gaps['le_5m']['writes'], 2)
         self.assertEqual(gaps['gt_60m']['writes'], 1)
         self.assertEqual(gaps['le_5m']['full_rewrites'], 2)
@@ -108,6 +108,17 @@ class UsageTests(StubCase):
         counter = Counter()
         AUDIT['cache_add']({'unknown': counter}, 'unknown', 0, 0)
         self.assertEqual(counter['full_rewrites'], 0)
+
+    def test_cache_predecessor_before_window(self):
+        project = self.home / '.claude/projects/example'
+        usage = dict(input_tokens=20, cache_creation_input_tokens=80)
+        def call(ts, ident):
+            return dict(type='assistant', timestamp=ts, message=dict(id=ident, model='test', content=[], usage=usage))
+        jsonl(project / 'main.jsonl', [call('2025-01-01T23:59:00Z', 'a'),
+                                      call('2025-01-02T00:01:00Z', 'b')])
+        gaps = json.loads(self.run_script('token-audit', '--since', '2025-01-02', '--json').stdout)['cache_writes']['main']
+        self.assertEqual(gaps['le_5m']['writes'], 1)
+        self.assertEqual(gaps['first']['writes'], 0)
 
     def test_extract_defaults_override_and_privacy(self):
         pricing = self.fixture()

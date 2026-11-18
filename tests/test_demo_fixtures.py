@@ -41,6 +41,18 @@ class DemoFixtureTests(StubCase):
         self.assertEqual(data['bash']['relay'], {'rg TODO': 1, 'git status': 1, 'ls src': 1})
         self.assertEqual(data['tool_counts'], {'Agent:relay': 1, 'Read': 1})
 
+    def test_refuses_output_symlink(self):
+        root = self.root / 'demo'
+        self.run_script('kaizen-demo-fixtures', '--output', root)
+        target = self.root / 'outside'
+        target.write_text('unchanged')
+        path = root / 'projects/synthetic-demo/synthetic-main.jsonl'
+        path.unlink()
+        path.symlink_to(target)
+        result = self.run_script('kaizen-demo-fixtures', '--output', root, code=1)
+        self.assertIn('symlink', result.stderr)
+        self.assertEqual(target.read_text(), 'unchanged')
+
     def test_repeat_and_output_boundary(self):
         self.run_script('kaizen-demo-fixtures', '--help')
         self.run_script('kaizen-demo-fixtures', code=2)

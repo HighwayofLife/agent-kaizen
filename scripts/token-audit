@@ -138,6 +138,7 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
     """Timestamp and record-type gates run before decoding large content."""
     cutoff = since.strftime("%Y-%m-%dT%H:%M:%S")
     saved_shape, saved_deltas, before_user = None, [], False
+    saved_call = None
     last_prefix, last_timestamp, last_stamp = None, None, None
     session_version = None
     try:
@@ -187,6 +188,8 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                     old = (timestamp[:19] < cutoff if timestamp.endswith(("Z", "+00:00"))
                            else date_time(timestamp) < since)
                     if old and keep_tools:
+                        if b'"usage"' in line and b'"assistant"' in prefix:
+                            saved_call = (line, timestamp)
                         if metadata:
                             if b'"api-request-shape"' in prefix:
                                 saved_shape = (line, timestamp)
@@ -199,12 +202,18 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                         continue
                     if old and not (keep_model and (b'"model"' in line or b'"token_count"' in prefix or b'"user_message"' in prefix or b'"role":"user"' in prefix or b'"role": "user"' in prefix or (bounds is not None and b'"turn_context"' in prefix))):
                         continue
-                    if keep_tools and (saved_shape or saved_deltas or before_user):
+                    if keep_tools and (saved_shape or saved_deltas or before_user or saved_call):
                         for saved, ts in ([saved_shape] if saved_shape else []) + saved_deltas:
                             try:
                                 yield dict(metadata_row(saved, ts), _before_window=True)
                             except (ValueError, UnicodeError):
                                 warnings["malformed rows"] += 1
+                        if saved_call:
+                            try:
+                                yield dict(json.loads(saved_call[0]), _before_window=True)
+                            except (ValueError, UnicodeError):
+                                warnings["malformed rows"] += 1
+                            saved_call = None
                         if before_user:
                             yield dict(type="user", message={}, _before_window=True)
                         saved_shape, saved_deltas, before_user = None, [], False
@@ -540,12 +549,21 @@ def scan_claude(path, agent, since, data, seen_messages, project):
                     used=set(), prompts=0, cwd=None, active=False)
     turn = None
     cache_previous = None
+    cache_seen = False
     for row in rows(path, since, data["warnings"], keep_tools=True, canary=data["format_canary"]):
         if row.get("type") in ("api-request-shape", "attachment"):
             tool_metadata(row, observed)
             continue
         observed["cwd"] = row.get("cwd") or observed["cwd"]
         if row.get("_before_window"):
+            message = row.get("message") or {}
+            usage = message.get("usage") if isinstance(message, dict) else None
+            if row.get("type") == "assistant" and isinstance(usage, dict) and usage and not empty_synthetic(message, usage):
+                try:
+                    cache_previous = date_time(row.get("timestamp", ""))
+                except (ValueError, TypeError, OverflowError):
+                    cache_previous = None
+                cache_seen = True
             raw = (row.get("message") or {}).get("content", "")
             if (row.get("type") == "user" and not row.get("isMeta")
                     and "<task-notification>" not in str(raw)):
@@ -604,8 +622,9 @@ def scan_claude(path, agent, since, data, seen_messages, project):
             write = usage.get("cache_creation_input_tokens", 0) or 0
             if write > 0:
                 cache_add(data["cache_writes"]["main" if main else "subagent"],
-                          cache_bucket(cache_previous, cache_time), write, context(usage))
+                          cache_bucket(cache_previous, cache_time, first=not cache_seen), write, context(usage))
             cache_previous = cache_time
+            cache_seen = True
             add(data["models"][model], usage)
             add(counter, usage)
             cost = price(data, model, agent or "main", usage)
