@@ -68,7 +68,11 @@ def main():
     neutral_fix = "update the plugin with your host's plugin command (see docs/hosts.md)"
     if versions:
         if version in versions:
-            emit('PASS', 'Codex: plugin installed (version {})'.format(version))
+            others = [v for v in versions if v != version]
+            detail = 'Codex: plugin version {} is in the cache'.format(version)
+            if others:
+                detail += ' (also cached: {})'.format(', '.join(others))
+            emit('PASS', detail)
         else:
             emit('WARN', 'Codex: installed version(s) {} differ from plugin root {}'.format(', '.join(versions), version),
                  'codex plugin add {}@{}'.format(plugin_name, marketplace))

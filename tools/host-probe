@@ -129,8 +129,8 @@ def main():
                         if extra:
                             detail += '; unexpected: ' + ', '.join(sorted(extra.elements()))
                         add('FAIL' if missing or extra else 'PASS', 'codex', 'hooks discovered', detail)
-                    except (OSError, ValueError, KeyError, IndexError, TypeError, queue.Empty) as exc:
-                        add('SKIP', 'codex', 'hooks discovered', 'JSON-RPC exchange failed: {}'.format(str(exc) or 'timeout'))
+                    except (OSError, ValueError, KeyError, IndexError, TypeError, AttributeError, queue.Empty) as exc:
+                        add('FAIL', 'codex', 'hooks discovered', 'JSON-RPC exchange failed: {}'.format(str(exc) or 'timeout'))
                     finally:
                         if process is not None:
                             process.kill()
