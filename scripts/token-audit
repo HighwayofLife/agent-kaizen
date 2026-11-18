@@ -7,6 +7,7 @@ from functools import lru_cache
 from itertools import chain
 import json
 import hashlib
+import heapq
 import math
 import os
 from pathlib import Path
@@ -194,7 +195,7 @@ def codex_call_row(line, kind, fields, wrapped):
             match = CODEX_COMMAND.match(call["input"])
             command = match[1] if match else None
         signature = friction_signature(command) if isinstance(command, str) else "(tool)"
-        return ident, dict(location, signature=signature, fingerprint=hash(line))
+        return ident, dict(location, signature=signature, poll=is_polling(command), fingerprint=hash(line))
     except (ValueError, TypeError, RecursionError):
         return ident, None
 
@@ -836,7 +837,7 @@ def friction_block(state, row, block, start, content):
         # private arguments collapse to the same public signature.
         private_input = command if name == "Bash" else json.dumps(tool_input, sort_keys=True)
         fingerprint = hash((name, private_input)) if isinstance(private_input, str) else None
-        value = (stamp, identity, signature, skipped, fingerprint, name)
+        value = (stamp, identity, signature, skipped, fingerprint, name, is_polling(command))
     else:
         details = row.get("toolUseResult")
         details = details if isinstance(details, dict) else {}
@@ -874,14 +875,99 @@ def friction_basis(measured, estimated):
     return "mixed" if measured and estimated else "measured" if measured else "row_gap" if estimated else "none"
 
 
+def is_polling(command):
+    return isinstance(command, str) and bool(re.search(
+        r"(?:^|&&|[;\n|])\s*sleep\s+\d|\b(?:while|until|for)\b[^\n]*\bsleep\s+", command[:1024]))
+
+
+def timeline_call(calls, start, end, seconds, signature, measured, poll=False, session=None):
+    # Timing duration and occupancy are different evidence. A measured wall time
+    # is anchored at the result, bounded by the paired timestamps. Row gaps can
+    # include time outside execution and must not inflate measured waiting.
+    if measured:
+        start = max(start, end - timedelta(seconds=seconds))
+    if len(calls) < FRICTION_PAIR_LIMIT and end > start:
+        calls.append((start.timestamp(), end.timestamp(), seconds, signature,
+                      "measured" if measured else "row_gap", poll, session))
+
+
+def heavy_timeline(calls, thresholds):
+    groups = defaultdict(list)
+    for call in calls:
+        if not call[5] and call[2] > 0:
+            groups[(call[3], call[4])].append(call)
+    heavy = {key for key, group in groups.items() if len(group) >= 3
+             and statistics.median(call[2] for call in group) >= thresholds["heavy_seconds"]}
+    ordered = sorted(call for key in heavy for call in groups[key])
+    active, unmarked, overlapped = [], set(), set()
+    peak = 0
+    for ident, call in enumerate(ordered):
+        while active and active[0][0] <= call[0]:
+            _, expired = heapq.heappop(active)
+            unmarked.discard(expired)
+        if active:
+            overlapped.add(ident)
+            overlapped.update(unmarked)
+            unmarked.clear()
+        else:
+            unmarked.add(ident)
+        heapq.heappush(active, (call[1], ident))
+        peak = max(peak, len(active))
+    cohorts = defaultdict(lambda: ([], []))
+    for ident, call in enumerate(ordered):
+        cohorts[(call[3], call[4])][0 if ident in overlapped else 1].append(call[2])
+    contention = []
+    for (signature, basis), (over, alone) in sorted(cohorts.items()):
+        ratio = None
+        if len(over) >= 3 and len(alone) >= 3 and statistics.median(alone) > 0:
+            ratio = statistics.median(over) / statistics.median(alone)
+        contention.append(dict(signature=signature, basis=basis, overlapped_n=len(over), alone_n=len(alone),
+                               ratio=round(ratio, 3) if ratio is not None else None,
+                               status="insufficient" if ratio is None else "unconfirmed" if ratio >= 1.5 else "ok"))
+    # P17 owns trusted same-host load ingestion. Concurrency alone is never an
+    # actionable CPU contention signal, including on a small collector host.
+    return contention, dict(peak=peak, status="unconfirmed" if peak >= 2 else "ok",
+                            load_ratio_median=None)
+
+
+def polling_summary(calls, slow_seconds):
+    # Merge waiting intervals: fan-out must not multiply elapsed waiting time.
+    polls, siblings = [], defaultdict(lambda: ([], []))
+    for start, end, seconds, _, _, poll, session in calls:
+        if poll:
+            polls.append((start, end))
+            siblings[session][0].append((start, end))
+        elif seconds >= slow_seconds:
+            siblings[session][1].append((start, end))
+    merged = []
+    for start, end in sorted(polls):
+        if merged and start <= merged[-1][1]:
+            merged[-1] = (merged[-1][0], max(end, merged[-1][1]))
+        else:
+            merged.append((start, end))
+    overlap = False
+    for waiting, slow in siblings.values():
+        slow.sort()
+        index = 0
+        for start, end in sorted(waiting):
+            while index < len(slow) and slow[index][1] <= start:
+                index += 1
+            if index < len(slow) and slow[index][0] < end:
+                overlap = True
+    seconds = sum(end - start for start, end in merged)
+    return dict(count=len(polls), seconds=round(seconds, 3), slow_overlap=overlap,
+                flagged=seconds >= 600 and overlap)
+
+
 def finalize_friction(state, thresholds, window):
     grouped = state["codex_calls"]
     signals = state["codex_signals"]
+    calls = state.get("timeline", [])
     question_wait = []
-    for pair in state["pairs"].values():
+    for key, pair in state["pairs"].items():
         if pair is None or None in pair:
             continue
-        (start, _, signature, skipped, _, name), (end, _, measured, prompted, background, _, _,
+        (start, _, signature, skipped, _, name, poll), (end, _, measured, prompted, background, _, _,
                                                   timeout, hint, interrupted, lock) = pair
         signals["timeouts"] += int(timeout)
         signals["timeout_hints"] += int(hint and not timeout)
@@ -893,6 +979,9 @@ def finalize_friction(state, thresholds, window):
             continue
         seconds = measured if measured is not None else (end - start).total_seconds()
         grouped[signature].append((seconds, measured is not None))
+        if len(calls) >= FRICTION_PAIR_LIMIT:
+            state["capped"] = True
+        timeline_call(calls, start, end, seconds, signature, measured is not None, poll, ("claude", key[0]))
     rows, flags = [], []
     measured = samples = 0
     for signature, group in grouped.items():
@@ -917,7 +1006,21 @@ def finalize_friction(state, thresholds, window):
         if row["heavy"]:
             flags.append(dict(id="heavy-calls", subject=row["signature"], value=row["p50"],
                               detail=f"Median timing was {row['p50']:g} seconds."))
+    contention, parallel = heavy_timeline(calls, thresholds)
+    polling = polling_summary(calls, thresholds["slow_call_seconds"])
+    if polling["flagged"]:
+        flags.append(dict(id="polling", subject="", value=polling["seconds"],
+                          detail="At least ten minutes waiting overlapped slow work."))
+    comparison = []
+    for signature, group in sorted(grouped.items()):
+        for measured_basis in (True, False):
+            values = [seconds for seconds, measured in group if measured == measured_basis]
+            if len(values) >= 3:
+                comparison.append(dict(signature=signature, basis="measured" if measured_basis else "row_gap",
+                                       count=len(values), p50=statistics.median(values)))
     return dict(v=1, thresholds=thresholds, window=window, basis=friction_basis(measured, samples - measured),
+                contention=contention, parallel_heavy=parallel, polling=polling,
+                comparisons=comparison, regressions=[],
                 summary=dict(samples=samples, measured=measured, estimated=samples - measured,
                              capped=state["capped"], slow_calls=rows[:50]), flags=flags,
                 permission_acceptance=permission_rows(state),
@@ -945,6 +1048,13 @@ def friction_sections(friction):
         lines.append(f"Inotify limit hints: {signals['inotify']}.")
     if summary["capped"]:
         lines.append("Timing reached its pair limit. Counts and percentiles cover retained pairs.")
+    if "parallel_heavy" in friction:
+        parallel, polling = friction["parallel_heavy"], friction["polling"]
+        lines.append(f"Parallel heavy peak: {parallel['peak']} ({parallel['status']}); "
+                     f"polling: {polling['seconds']:g}s; regressions: {len(friction['regressions'])}.")
+        for row in friction["contention"][:5]:
+            if row["ratio"] is not None and row["ratio"] >= 1.5:
+                lines.append(f"Contention {row['signature']} ({row['basis']}): {row['ratio']:g}x, {row['status']}.")
     if summary["slow_calls"]:
         lines += ["Signature | p50 (s) | p90 (s) | Samples | Basis", "--- | --- | --- | --- | ---"]
         lines += [" | ".join(str(row[key]) for key in ("signature", "p50", "p90", "count", "basis"))
@@ -1286,7 +1396,7 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                     window.update(delta)
                     price(data, model, "codex", delta, codex=True)
         if friction is not None:
-            finish_codex_pairs(pairs, friction)
+            finish_codex_pairs(pairs, friction, str(path))
         first, last = bounds
         if seen_usage:
             if brief is not None:
@@ -1305,7 +1415,7 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                          output=window["output_tokens"], tokens=tokens)
 
 
-def finish_codex_pairs(pairs, friction):
+def finish_codex_pairs(pairs, friction, session=None):
     signals = friction["codex_signals"]
     for pair in pairs.values():
         if pair is None or pair[1] is None:
@@ -1324,6 +1434,10 @@ def finish_codex_pairs(pairs, friction):
                 continue
             friction["codex_samples"] += 1
             friction["codex_calls"][start[3]["signature"]].append((result["seconds"], True))
+            if len(friction["timeline"]) >= FRICTION_PAIR_LIMIT:
+                friction["capped"] = True
+            timeline_call(friction["timeline"], start[1], end, result["seconds"],
+                          start[3]["signature"], True, start[3].get("poll", False), ("codex", session))
 
 
 def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=None, *,
@@ -1336,7 +1450,7 @@ def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=No
     if friction:
         data["_friction"] = dict(pairs={}, capped=False, since=since, usage_limits=set(),
                                  cwd=set(cwd or ()), permissions={}, codex_calls=defaultdict(list),
-                                 codex_signals=Counter(), codex_samples=0)
+                                 codex_signals=Counter(), codex_samples=0, timeline=[])
     data["cache_writes"] = {kind: {bucket: Counter(writes=0, write_tokens=0, full_rewrites=0) for bucket in CACHE_BUCKETS}
                             for kind in ("main", "subagent")}
     data.update(cost=dict(total=0, by_agent=Counter(), by_model=Counter(), components=Counter(),
@@ -1802,6 +1916,59 @@ def describe(scope):
     return "window " + scope["window"] + ", " + projects
 
 
+def apply_regression(data, out, scope, extract_dir):
+    friction = data.get("friction")
+    if friction is None or friction["summary"]["capped"]:
+        return
+    match, _ = previous_audit(out, scope)
+    if match is None:
+        return
+    try:
+        path = match[0]
+        if path.stat().st_size > 1024 * 1024:
+            return
+        report_text = path.read_text()
+        if not report_text.endswith("<!-- token-audit-complete -->\n"):
+            return
+        metadata = next(line for line in report_text.splitlines() if line.startswith("<!-- token-audit-extract "))
+        ref = json.loads(metadata[len("<!-- token-audit-extract "):-4])
+        name = path.stem + ".extract.json"
+        if ref != dict(v=1, file=name):
+            return
+        extract = extract_dir.expanduser() / name
+        if extract.stat().st_size > 8 * 1024 * 1024:
+            return
+        previous = json.loads(extract.read_text())
+        old = previous["friction"]
+        if (type(previous["v"]) is not int or previous["v"] != 1
+                or previous["scope"] != scope or previous["report"] != path.name
+                or type(old["v"]) is not int or old["v"] != friction["v"] or old["thresholds"] != friction["thresholds"]
+                or old["window"] != friction["window"] or old["basis"] != friction["basis"]
+                or old["summary"]["capped"]):
+            return
+        indexed = {}
+        for row in old["comparisons"]:
+            key = (row["signature"], row["basis"])
+            if (key in indexed or not isinstance(key[0], str) or key[1] not in ("measured", "row_gap")
+                    or type(row["count"]) is not int or row["count"] < 3
+                    or type(row["p50"]) not in (int, float) or not math.isfinite(row["p50"]) or row["p50"] < 0):
+                return
+            indexed[key] = row
+        regressions = []
+        for row in friction["comparisons"]:
+            before = indexed.get((row["signature"], row["basis"]))
+            if before and row["count"] >= 3 and before["p50"] > 0 and row["p50"] >= 1.5 * before["p50"]:
+                regressions.append(dict(signature=row["signature"], basis=row["basis"], count=row["count"],
+                                        previous_count=before["count"], p50=row["p50"], previous_p50=before["p50"],
+                                        ratio=round(row["p50"] / before["p50"], 3)))
+        friction["regressions"] = regressions
+        for row in regressions:
+            friction["flags"].append(dict(id="regression", subject=row["signature"], value=row["p50"],
+                                          detail="Comparable median timing grew by at least 1.5 times."))
+    except (OSError, ValueError, TypeError, KeyError, AttributeError, StopIteration, OverflowError, RecursionError):
+        return
+
+
 def report(data, out, scope):
     h = data["headline"]
     headline = [f"Claude: {h['claude_calls']:,} calls; {h['claude_context']:,} context tokens; {h['claude_output']:,} output tokens.",
@@ -1940,7 +2107,7 @@ def report(data, out, scope):
     extra, headlines = measurement_sections(data)
     if "friction" in data:
         extra += friction_sections(data["friction"])
-    return "\n".join(lines + extra) + "\n", headline + headlines
+    return "\n".join(lines + extra + ["<!-- token-audit-complete -->"]) + "\n", headline + headlines
 
 
 def write_extract(data, out, directory, scope):
@@ -2061,6 +2228,7 @@ def main():
                        friction_window=friction_window)
         data["cost"]["pricing_warning"] = pricing_age_warning(pricing, now)
         data["scope"] = scope
+        apply_regression(data, out, scope, args.extract_out)
         for warning in data["parser_warnings"]:
             print(warning, file=sys.stderr)
         text, headline = report(data, out, scope)
