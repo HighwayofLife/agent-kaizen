@@ -111,7 +111,7 @@ def read_manifest(path):
     return parse_manifest(path, raw)
 
 
-def read_manifest_snapshot(change_fd):
+def read_manifest_snapshot(change_fd, *, sync=False):
     path = "manifest.json"
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     try:
@@ -121,6 +121,8 @@ def read_manifest_snapshot(change_fd):
                 raise ValueError("expected a nonempty regular manifest within 1 MiB")
             raw = stream.read(info.st_size + 1)
             data = parse_manifest(path, raw)
+            if sync:
+                os.fsync(stream.fileno())
             live = os.stat(path, dir_fd=change_fd, follow_symlinks=False)
             if len(raw) != info.st_size or file_version(live) != file_version(info):
                 raise ValueError("manifest was replaced or edited during validation")
@@ -263,11 +265,19 @@ def open_directory(path, *, dir_fd=None):
 
 
 @contextmanager
-def open_directory_walk(path):
-    fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+def open_directory_walk(path, *, create=False):
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    fd = os.open(path.anchor, flags)
     try:
         for part in path.parts[1:]:
-            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            try:
+                child = os.open(part, flags, dir_fd=fd)
+            except FileNotFoundError:
+                if not create:
+                    raise
+                os.mkdir(part, dir_fd=fd)
+                os.fsync(fd)
+                child = os.open(part, flags, dir_fd=fd)
             os.close(fd)
             fd = child
         yield fd
@@ -958,7 +968,10 @@ def commit_preflight(change, scheduled=None, *, git_exe=None):
                 raise ValueError("manifest file changed after finish")
             if entry["created"] and (entry.get("backup") is not None or live[0] != b"100644"):
                 raise ValueError("new files must be non-executable and have no before backup")
-            files[path] = (None if entry["created"] else folder / entry["backup"]), live
+            backup = None if entry["created"] else folder / entry["backup"]
+            if backup is not None:
+                check_backup_mode(entry, backup.lstat().st_mode, live[2][2])
+            files[path] = backup, live
             if folder == change:
                 edits[path] = live
     state, entries, check = capture_git_tree(root, baseline=baseline, edits=edits)
@@ -1086,6 +1099,46 @@ def manifest_stamp(change):
     if not re.fullmatch(r"[^\r\n\0/]+", change.name):
         raise ValueError("invalid commit trailer ID")
     return data, [list(identity), digest]
+
+
+def check_backup_mode(entry, mode, live_mode=None):
+    # Legacy manifests can only verify permissions against the existing worktree file.
+    expected = entry.get("before_mode", None if live_mode is None else stat.S_IMODE(live_mode))
+    if type(expected) is not int or stat.S_IMODE(mode) != expected:
+        raise ValueError(f"undo backup mode cannot be verified: {entry['path']}")
+
+
+def sync_commit_backup(change, stamp):
+    with open_handoff(BACKUP_ROOT, change, backup_root_identity(BACKUP_ROOT)) as (change_fd, identity):
+        data, digest = read_manifest_snapshot(change_fd, sync=True)
+        if [list(identity), digest] != stamp:
+            raise ValueError("commit manifest changed before backup sync")
+        parents = set()
+        for entry in data["files"]:
+            if entry["created"]:
+                continue
+            path = change / entry["backup"]
+            if change not in path.parents or ".." in path.parts:
+                raise ValueError("commit backup must be inside its change directory")
+            flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+            with open_directory_walk(path.parent) as fd:
+                with os.fdopen(os.open(path.name, flags, dir_fd=fd), "rb") as backup:
+                    info = os.fstat(backup.fileno())
+                    if not stat.S_ISREG(info.st_mode):
+                        raise ValueError("commit backup must be a regular file")
+                    if "before_mode" in entry:
+                        check_backup_mode(entry, info.st_mode)
+                    os.fsync(backup.fileno())
+                    if live_file_version(path.name, fd) != file_version(info):
+                        raise ValueError("commit backup changed during sync")
+            parents.update(parent for parent in path.parents if change in parent.parents)
+        for parent in sorted(parents, key=lambda path: len(path.parts), reverse=True):
+            with open_directory_walk(parent) as fd:
+                os.fsync(fd)
+        os.fsync(change_fd)
+    for parent in (change.parent, change.parent.parent):
+        with open_directory_walk(parent) as fd:
+            os.fsync(fd)
 
 
 def ref_scope(record, git_exe):
@@ -1418,6 +1471,8 @@ def transact_ref(change, record, records, phase, tip, entries, recheck, git_exe)
         raise ValueError("kaizen commit differs from the verified tree")
     oids.add(effect["new"].encode("ascii"))
     sync_object_dirs(common, oids)
+    if phase == "commit" and tip == effect["old"]:
+        sync_commit_backup(change, record["manifest"])
     change_pin(record, pin, effect["new"], git_exe)
     if tip == effect["old"]:
         recheck()
@@ -1630,12 +1685,15 @@ def scheduled_commit_authority(folder, key, request, project, run_id=None):
 
 def begin(args):
     # Preflight every input before copying anything or creating a change folder.
+    paths = []
     for name in args.files:
-        if is_credential(name):
+        # User paths may use a symlinked home or /tmp. Keep the checked canonical target.
+        path = resolved_path(Path(name).expanduser())
+        if is_credential(name) or is_credential(str(path)):
             raise ValueError(f"refusing to back up credential path: {name}")
-        path = Path(name).expanduser().resolve()
         if path.exists() and not path.is_file():
             sys.exit(f"kaizen-backup: {path} is not a regular file")
+        paths.append(path)
     # Serialize numbering and baseline capture across simultaneous begins. Any lock
     # problem drops only the clean-start stamp; the ordinary backup always proceeds.
     with ExitStack() as stack:
@@ -1647,8 +1705,8 @@ def begin(args):
             lock_exclusive(lock_fd)
         except (OSError, ValueError) as error:
             stack.close()
-            return write_backup(args, reason=f"backup lock unavailable: {error}")
-        return write_backup(args, root_fd, lock_fd)
+            return write_backup(args, paths, reason=f"backup lock unavailable: {error}")
+        return write_backup(args, paths, root_fd, lock_fd)
 
 
 LOCK_WAIT_SECONDS = 10
@@ -1671,7 +1729,24 @@ def capture_reason(error):
     return str(error) or type(error).__name__
 
 
-def write_backup(args, root_fd=None, lock_fd=None, reason=None):
+def copy_backup(path, destination):
+    with ExitStack() as stack:
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+        try:
+            fd = stack.enter_context(open_directory_walk(path.parent))
+            source = stack.enter_context(os.fdopen(os.open(path.name, flags, dir_fd=fd), "rb"))
+        except FileNotFoundError:
+            return None
+        info = os.fstat(source.fileno())
+        if not stat.S_ISREG(info.st_mode):
+            raise ValueError(f"{path} is not a regular file")
+        with destination.open("wb") as backup:
+            shutil.copyfileobj(source, backup)
+        shutil.copystat(source.fileno(), destination)
+        return stat.S_IMODE(info.st_mode)
+
+
+def write_backup(args, paths, root_fd=None, lock_fd=None, reason=None):
     created_at = datetime.datetime.now(datetime.timezone.utc).isoformat()
     run_id = args.run or os.environ.get("KAIZEN_RUN_ID") or datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     session_id = os.environ.get("KAIZEN_SESSION_ID")
@@ -1698,13 +1773,12 @@ def write_backup(args, root_fd=None, lock_fd=None, reason=None):
                 baseline, reason = None, capture_reason(error)
         (change / "files").mkdir(mode=0o700)
         entries = []
-        for index, name in enumerate(args.files, 1):
-            # User paths may use a symlinked home or /tmp; store their canonical target.
-            path = Path(name).expanduser().resolve()
-            entry = {"path": str(path), "backup": None, "created": not path.exists(), "after_sha256": None}
-            if path.is_file():
-                entry["backup"] = f"files/{index}"
-                shutil.copy2(path, change / entry["backup"])
+        for index, path in enumerate(paths, 1):
+            backup = f"files/{index}"
+            mode = copy_backup(path, change / backup)
+            entry = {"path": str(path), "backup": None, "created": mode is None, "after_sha256": None}
+            if mode is not None:
+                entry.update(backup=backup, before_mode=mode)
             if baseline is not None and path.is_relative_to(repo):
                 try:
                     blob = blobs.get(path)
@@ -1870,6 +1944,8 @@ def undo_file_hash(name, fd, version, *, restoring=False, replacement=None):
         if not stat.S_ISREG(info.st_mode) or file_version(info) != version:
             raise ValueError("working file changed during undo")
         if restoring:
+            if info.st_nlink != 1:
+                raise ValueError("cannot replace a working file with hard links")
             check_restore_metadata(stream.fileno(), replacement, label="working file")
         else:
             check_inode_flags(stream.fileno(), "working file")
@@ -1887,10 +1963,20 @@ def undo_file_hash(name, fd, version, *, restoring=False, replacement=None):
 
 
 def undo_file_snapshot(path, *, restoring=False):
-    with open_directory_walk(path.parent) as fd:
+    with ExitStack() as stack:
+        try:
+            fd = stack.enter_context(open_directory_walk(path.parent))
+        except FileNotFoundError:
+            return None, None, None
         parent = os.fstat(fd)
         version = live_file_version(path.name, fd)
         return (parent.st_dev, parent.st_ino), version, undo_file_hash(path.name, fd, version, restoring=restoring)
+
+
+def undo_snapshot_matches(path, expected):
+    live = undo_file_snapshot(path)
+    # An earlier restore may have created a shared parent. The target must still be absent.
+    return live == expected or (expected[0] is None and live[1] is None)
 
 
 def darwin_provenance(fd, label):
@@ -1974,11 +2060,14 @@ def check_restore_metadata(fd, replacement=None, *, label="undo backup"):
     return info
 
 
-def restore_ref_file(change, entry, path, snapshot, blob):
+def restore_ref_file(change, entry, path, snapshot, blob, before_hash):
     parent, version, digest = snapshot
-    with open_directory_walk(path.parent) as fd:
+    if parent is None and entry["created"] and undo_file_snapshot(path) == snapshot:
+        return snapshot
+    with open_directory_walk(path.parent, create=parent is None and not entry["created"]) as fd:
         info = os.fstat(fd)
-        if (info.st_dev, info.st_ino) != parent or live_file_version(path.name, fd) != version:
+        identity = info.st_dev, info.st_ino
+        if (parent is not None and identity != parent) or live_file_version(path.name, fd) != version:
             raise ValueError("working file or parent directory changed during undo")
 
         def recheck(replacement=None):
@@ -1994,6 +2083,7 @@ def restore_ref_file(change, entry, path, snapshot, blob):
             recheck()
             if version is not None:
                 os.unlink(path.name, dir_fd=fd)
+            restored = None
         else:
             temporary = ".kaizen-restore-" + os.urandom(16).hex()
             flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
@@ -2003,39 +2093,54 @@ def restore_ref_file(change, entry, path, snapshot, blob):
                 read_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
                 with os.fdopen(temp_fd, "wb") as stream, os.fdopen(os.open(source, read_flags), "rb") as backup:
                     metadata = check_restore_metadata(backup.fileno(), temp_fd)
+                    live_mode = version[2] if version is not None else None
+                    check_backup_mode(entry, metadata.st_mode, live_mode)
                     shutil.copyfileobj(backup, stream)
                     stream.flush()
                     os.fchmod(temp_fd, stat.S_IMODE(metadata.st_mode))
                     os.utime(temp_fd, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
                     os.fsync(temp_fd)
-                    if (live_file_version(temporary, fd) != file_version(os.fstat(temp_fd))
-                            or not matches_blob(temporary, *blob, dir_fd=fd)):
+                    written = file_version(os.fstat(temp_fd))
+                    check_backup_mode(entry, written[2], live_mode)
+                    if not matches_blob(temporary, *blob, dir_fd=fd):
                         raise ValueError("undo backup changed during restore")
                     # POSIX rename has no conditional-on-inode variant. Check immediately
                     # before replacing and keep both names anchored to the verified parent.
                     recheck(temp_fd)
+                    if live_file_version(temporary, fd) != written:
+                        raise ValueError("undo backup changed during restore")
                     os.replace(temporary, path.name, src_dir_fd=fd, dst_dir_fd=fd)
+                    # Rename can change ctime. Take it from our file descriptor, even
+                    # if an editor has already replaced the name with a different file.
+                    restored = (*written[:-1], os.fstat(temp_fd).st_ctime_ns)
             finally:
                 try:
                     os.unlink(temporary, dir_fd=fd)
                 except FileNotFoundError:
                     pass
         os.fsync(fd)
+        return identity, restored, before_hash if restored is not None else None
 
 
 def undo_locked(args, locked):
-    plan = targets(args.target)
+    plan = [(change_dir(change), data) for change, data in targets(args.target)]
     roots = plugin_roots()
-    records = read_records() if any(os.path.lexists(record_path(change)) for change, _ in plan) else {}
-    if records and not locked:
-        raise ValueError("git undo requires the private ref lock")
+    records = read_records()
+    if records:
+        owners = {tuple(record["manifest"][0]): name for name, record in records.items()}
+        for change, _ in plan:
+            info = change.stat()
+            owner = owners.get((info.st_dev, info.st_ino))
+            if owner is not None and owner != change.name:
+                raise ValueError(f"journaled backup was renamed; restore its folder name to {owner}")
     observing = next((change.name for change, _ in plan if change.name in records), None)
+    if observing is not None and not locked:
+        raise ValueError("git undo requires the private ref lock")
     git_exe = resolve_git() if observing is not None else None
     conflicts = []
-    backups, versions = {}, {}
+    backups, versions, before_hashes = {}, {}, {}
     seen = {}  # the plan is newest first: path -> (newer change name, hash of its backup, i.e. the state it began from)
     for change, data in plan:
-        change = change_dir(change)
         record = records.get(change.name)
         if args.scheduled_action is not None and (record is None or record["key"] != args.scheduled_action):
             raise ValueError("undo does not match the scheduled action")
@@ -2057,13 +2162,14 @@ def undo_locked(args, locked):
         for entry in data["files"]:
             path = validate_entry(change, entry, roots)
             if record:
-                if entry.get("backup"):
-                    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-                    with os.fdopen(os.open(change / entry["backup"], flags), "rb") as source:
-                        check_restore_metadata(source.fileno())
                 if path not in versions:
                     versions[path] = undo_file_snapshot(path, restoring=not entry["created"])
                 _, version, live_hash = versions[path]
+                if entry.get("backup"):
+                    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                    with os.fdopen(os.open(change / entry["backup"], flags), "rb") as source:
+                        metadata = check_restore_metadata(source.fileno())
+                        check_backup_mode(entry, metadata.st_mode, version[2] if version is not None else None)
                 blob = backups[change][path]
                 if path not in seen and version and (not stat.S_ISREG(version[2]) or
                         bool(version[2] & stat.S_IXUSR) != (blob is not None and blob[0] == b"100755")):
@@ -2071,6 +2177,7 @@ def undo_locked(args, locked):
             else:
                 live_hash = sha(path) if path not in seen else None
             before = sha(change / entry["backup"]) if entry.get("backup") else None
+            before_hashes[change, path] = before
             if not data.get("finished"):
                 if entry["created"] and path.exists():
                     conflicts.append(f"{entry['path']} was created by {change.name}, which was never finished")
@@ -2092,7 +2199,7 @@ def undo_locked(args, locked):
             def recheck():
                 if manifest_stamp(change)[1] != record["manifest"]:
                     raise ValueError("commit manifest changed before inverse update")
-                if any(undo_file_snapshot(path) != versions[path] for path in backups[change]):
+                if any(not undo_snapshot_matches(path, versions[path]) for path in backups[change]):
                     raise ValueError("working file changed before inverse update")
 
             if entries is None:
@@ -2103,21 +2210,31 @@ def undo_locked(args, locked):
             cleanup_pins(record, records, git_exe)
         for entry in data["files"]:
             path = validate_entry(change, entry, roots)
-            if not record and path in versions and undo_file_snapshot(path) != versions[path]:
+            before = before_hashes[change, path]
+            shared = not record and path in versions
+            if shared and not undo_snapshot_matches(path, versions[path]):
                 raise ValueError("working file changed during undo")
+            expected_mode = None
             if record:
-                restore_ref_file(change, entry, path, versions[path], backups[change][path])
+                versions[path] = restore_ref_file(change, entry, path, versions[path], backups[change][path], before)
                 print(f"{'removed created' if entry['created'] else 'restored'} {path}")
             elif entry["created"]:
                 if path.exists() and (args.force or sha(path) == entry["after_sha256"]):
                     path.unlink()
                     print(f"removed created {path}")
             else:
+                source = change / entry["backup"]
+                if shared:
+                    expected_mode = stat.S_IMODE(source.stat().st_mode)
                 path.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(change / entry["backup"], path)
+                shutil.copy2(source, path)
                 print(f"restored {path}")
-            if path in versions:
-                versions[path] = undo_file_snapshot(path)
+            if shared:
+                snapshot = undo_file_snapshot(path)
+                mode = None if snapshot[1] is None else stat.S_IMODE(snapshot[1][2])
+                if snapshot[2] != (None if entry["created"] else before) or mode != expected_mode:
+                    raise ValueError("working file changed during undo")
+                versions[path] = snapshot
         for act in data["actions"]:
             print(f"ACTION to reverse by hand (not run): {act['undo']}   # was: {act['did']}")
         data["reverted"] = datetime.date.today().isoformat()

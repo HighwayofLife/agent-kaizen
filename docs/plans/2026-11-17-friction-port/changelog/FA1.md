@@ -1,0 +1,5 @@
+- Back up the credential-checked path even if its symlink changes while waiting for Git or a lock.
+- Sync rollback files and the finished manifest before publishing a local commit.
+- Verify Git-backed restore permissions and preserve intervening editor saves on shared paths in the same run.
+- Refuse undo of renamed transaction folders and hard-linked restore targets.
+- Let forced Git-backed undo recreate missing parent directories.
