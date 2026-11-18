@@ -135,6 +135,32 @@ class HookTests(unittest.TestCase):
                     self.assertEqual(run_raw('bash-burst.sh', reset, env).stdout, '')
                     self.assertIsNone(run('bash-burst.sh', payload, env))
 
+    def test_host_trace_opt_in(self):
+        for host in ('claude', 'codex', 'copilot'):
+            fixture_host = 'codex' if host == 'claude' else host
+            for fixture in sorted((ROOT / 'tests/fixtures/hooks').glob(fixture_host + '_*.json')):
+                payload = json.loads(fixture.read_text())
+                names = ('audit-notice.sh', 'session-audit.sh') if 'sessionstart' in fixture.name else ('bash-burst.sh',)
+                for name in names:
+                    with self.subTest(host=host, fixture=fixture.name, hook=name):
+                        config = self.tmp / (host + fixture.stem + name)
+                        trace = config / 'agent-kaizen/host-trace'
+                        env = {'CLAUDE_CONFIG_DIR': str(config), 'KAIZEN_HOST': host,
+                               'KAIZEN_BASH_BURST': '999999', 'TMPDIR': str(self.tmp)}
+                        off = run_raw(name, payload, env)
+                        self.assertFalse((trace / 'trace.jsonl').exists())
+                        trace.mkdir(parents=True)
+                        (trace / 'on').touch()
+                        on = run_raw(name, payload, env)
+                        self.assertEqual((on.stdout, on.returncode), (off.stdout, off.returncode))
+                        lines = (trace / 'trace.jsonl').read_text().splitlines()
+                        self.assertEqual(len(lines), 1)
+                        data = json.loads(lines[0])
+                        self.assertEqual(data['host'], host)
+                        self.assertEqual(data['event'], payload.get('hook_event_name'))
+                        self.assertEqual(data['tool'], payload.get('tool_name'))
+                        self.assertEqual(data['keys'], sorted(payload))
+
     def test_host_helpers_identical(self):
         helpers = []
         for name in ('audit-notice.sh', 'session-audit.sh', 'bash-burst.sh'):

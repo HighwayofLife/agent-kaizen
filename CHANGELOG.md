@@ -24,6 +24,7 @@ Codex CLI and GitHub Copilot support: the same plugin installs on Codex CLI and 
 
 `hooks`:
 
+- Opt-in host tracing is enabled by the host-trace/on file and records only event names, tool names and key names.
 - Hooks are host-aware: on Codex the notice says $agent-kaizen:review, on Copilot output uses top-level additionalContext, the Bash-burst nudge also accepts the lowercase bash tool name on Copilot, and the background audit detaches itself on Copilot. Claude Code output is unchanged. Codex users must trust the plugin hooks in /hooks, and trust is asked again after an update that changes a hook script.
 
 `kaizen-doctor`, `kaizen-scan`, `token-audit`:
