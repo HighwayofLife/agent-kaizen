@@ -1,13 +1,16 @@
 """Best-effort Claude Bash sampler for an asynchronous PostToolUse command."""
 
 from contextlib import ExitStack, contextmanager
+import ctypes
 from datetime import datetime, timezone
+import errno
 import json
 import math
 import os
 from pathlib import Path
 import re
 import select
+import signal
 import stat
 import sys
 import time
@@ -20,7 +23,9 @@ except ImportError:
 
 INPUT_LIMIT = 1024 * 1024
 DAY_LIMIT = 5 * 1024 * 1024
+ROW_LIMIT = 4096
 BUDGET = 0.250
+LOCK_RETRY_BUDGET = 0.020
 LOCK_NAME = ".lock"
 NOFOLLOW = os.O_NOFOLLOW | os.O_NONBLOCK if fcntl is not None else 0
 
@@ -70,7 +75,7 @@ def read_event(fd, deadline):
 
 
 def sample_id(value):
-    return re.sub(r"[^A-Za-z0-9_-]", "", value)[:512] if isinstance(value, str) else ""
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,64}", value) else ""
 
 
 def metrics():
@@ -79,6 +84,24 @@ def metrics():
     except OSError:
         load = math.nan
     return str(load) if math.isfinite(load) and load >= 0 else "", str(os.cpu_count() or "")
+
+
+def has_extended_acl(fd):
+    # Darwin's fd-based ACL API checks the pinned inode without spawning a subprocess.
+    libc = ctypes.CDLL(None, use_errno=True)
+    get_acl = libc.acl_get_fd_np
+    get_acl.argtypes = (ctypes.c_int, ctypes.c_int)
+    get_acl.restype = ctypes.c_void_p
+    free_acl = libc.acl_free
+    free_acl.argtypes = (ctypes.c_void_p,)
+    acl = get_acl(fd, 0x100)  # ACL_TYPE_EXTENDED in sys/acl.h
+    if acl:
+        free_acl(acl)
+        return True
+    error = ctypes.get_errno()
+    if error != errno.ENOENT:  # Darwin returns ENOENT for an inode without an ACL.
+        raise OSError(error, "cannot verify sample ACL")
+    return False
 
 
 @contextmanager
@@ -112,6 +135,8 @@ def storage(path, deadline):
         info = os.fstat(fd)
         if info.st_uid != uid or stat.S_IMODE(info.st_mode) != 0o700:
             raise PermissionError("unsafe sample directory")
+        if sys.platform == "darwin" and has_extended_acl(fd):
+            raise PermissionError("extended ACL on sample directory")
         yield fd
 
 
@@ -134,19 +159,55 @@ def state_file(directory, name, flags):
         os.close(fd)
 
 
+def lock_exclusive(fd, deadline):
+    retry_until = min(deadline, time.monotonic() + LOCK_RETRY_BUDGET)
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except OSError as error:
+            remaining = retry_until - time.monotonic()
+            if error.errno not in (errno.EAGAIN, errno.EACCES) or remaining <= 0:
+                raise
+            time.sleep(min(0.001, remaining))
+
+
+def repair_tail(fd, size):
+    """Discard any incomplete row left by an interrupted writer, under both locks."""
+    end = size
+    while end:
+        start = max(0, end - ROW_LIMIT)
+        tail = os.pread(fd, end - start, start)
+        if len(tail) != end - start:
+            raise OSError("sample file changed during tail check")
+        newline = tail.rfind(b"\n")
+        if newline >= 0:
+            end = start + newline + 1
+            break
+        end = start
+    if end < size:
+        os.ftruncate(fd, end)
+    return end
+
+
 def append(path, day, row, deadline):
-    if len(row) >= 4096 or time.monotonic() >= deadline:
+    if len(row) >= ROW_LIMIT or time.monotonic() >= deadline:
         return
     with storage(path, deadline) as directory:
         with state_file(directory, LOCK_NAME, os.O_RDWR) as lock:
             file_info(directory, LOCK_NAME, lock)
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_exclusive(lock, deadline)
             name = day + ".tsv"
-            with state_file(directory, name, os.O_WRONLY | os.O_APPEND) as fd:
+            with state_file(directory, name, os.O_RDWR | os.O_APPEND) as fd:
                 # Keep cap checks and rollback serialized even if the lock name is replaced.
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                lock_exclusive(fd, deadline)
                 file_info(directory, LOCK_NAME, lock)
                 size = file_info(directory, name, fd).st_size
+                if sys.platform == "darwin" and has_extended_acl(fd):
+                    raise PermissionError("extended ACL on sample file")
+                if size > DAY_LIMIT:
+                    return
+                size = repair_tail(fd, size)
                 if size + len(row) <= DAY_LIMIT and time.monotonic() < deadline:
                     if os.write(fd, row) != len(row):
                         os.ftruncate(fd, size)  # Roll back a partial row before unlocking.
@@ -176,11 +237,24 @@ def sample(fd):
     append(audits / "samples", day, ("\t".join(fields) + "\n").encode("ascii"), deadline)
 
 
+def deadline_expired(_signum, _frame):
+    raise RuntimeError("sampler deadline expired")
+
+
 def main():
+    if fcntl is None:
+        return
+    previous = signal.signal(signal.SIGALRM, deadline_expired)
     try:
-        sample(sys.stdin.fileno())
+        try:
+            signal.setitimer(signal.ITIMER_REAL, BUDGET)
+            sample(sys.stdin.fileno())
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
     except (OSError, ValueError, RuntimeError):
         pass
+    finally:
+        signal.signal(signal.SIGALRM, previous)
 
 
 if __name__ == "__main__":
