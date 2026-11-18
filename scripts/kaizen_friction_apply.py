@@ -30,8 +30,10 @@ RECEIPT_LIMIT = 64 << 10
 UNWRITABLE_FLAGS = stat.UF_IMMUTABLE | stat.UF_APPEND | stat.SF_IMMUTABLE | stat.SF_APPEND
 LEDGER = Path("docs/kaizen/LEDGER.md")
 LEDGER_BACKUPS = ".ledger-displaced"
+LOCAL_COMMIT = "local-commit"
 HEADER = "date|change|why (which audit finding)|expected effect|measured effect|keep/revert|metric command|review date".split("|")
 OPERATIONS = {
+    LOCAL_COMMIT: ("Commit verified review edits", "Verified review backup", "Local Git history for the changes"),
     "host-fix": ("Mark regenerable output", "LocalSearch output activity", "Less indexing of generated output"),
     "allow-rule": ("Add an exact allow rule", "Repeated accepted calls", "Fewer permission prompts"),
     "worktree-prune": ("Remove a merged worktree", "Clean merged worktree", "Less disk space used"),
@@ -45,6 +47,19 @@ def require(condition):
 
 def policy_digest(snapshot):
     return hashlib.sha256(repr(snapshot).encode("utf-8")).hexdigest()
+
+
+def commit_tuple(proof, ledger_attestation, verified):
+    if verified is None:
+        return None
+    folder, (identity, digest) = verified
+    scope = proof["scope"]
+    names, inodes = scope["before"]
+    return folder, dict(v=1, baseline=proof["baseline"], root_identity=scope["root_identity"],
+                        run_id=scope["run_id"], session_id=scope["session_id"],
+                        started_at=scope["started"].isoformat(), before=[sorted(map(str, names)), sorted(inodes)],
+                        change_id=folder.name, change_identity=list(identity), manifest_sha256=digest,
+                        ledger_attestation=ledger_attestation)
 
 
 def marker_tool():
@@ -171,6 +186,18 @@ class BrokerLedger:
         if len(raw) > RECEIPT_LIMIT:
             raise ValueError("private broker record exceeds size limit")
         self.host["_replace"](self.state, self.record_name(record["id"]), raw)
+
+    def require_lease(self, fd):
+        require(fd > 2)
+        with self.host["_private_file"](self.state, self.lock_name) as lease:
+            require(os.path.samestat(os.fstat(lease), os.fstat(fd)))
+            lock = self.host["fcntl"]
+            try:
+                lock.flock(lease, lock.LOCK_EX | lock.LOCK_NB)
+            except BlockingIOError:
+                lock.flock(fd, lock.LOCK_EX | lock.LOCK_NB)
+                return
+        raise ValueError("broker reservation lock is not held")
 
     @cached_property
     def allow_rule(self):
@@ -576,10 +603,35 @@ class BrokerLedger:
                     pass
                 else:
                     return False
-            record["reason"] = "native journal never started"
-            del record["reservation"]
-            self.save(record, "cancelled")
+            self.cancel_reservation(record, "native journal never started")
         return True
+
+    def cancel_reservation(self, record, reason):
+        record["reason"] = reason
+        del record["reservation"]
+        self.save(record, "cancelled")
+
+    def reserve_commit(self, ident, folder, digest, attempt):
+        run_id, generation, roots, policy = attempt
+        require(self.host["_id"](self.secret, str(self.project), LOCAL_COMMIT, run_id) == ident)
+        self.preflight(ident, LOCAL_COMMIT, evidence_scope=roots)
+        record = dict(id=ident, operation=LOCAL_COMMIT, tool_record=str(folder), request=digest,
+                      reservation=run_id, generation=generation, evidence_scope=sorted(roots), policy=policy,
+                      scope=self.identity, count=1, date=date.today().isoformat(), absolute_metric=True)
+        self.save(record, "commit-pending")
+        return record
+
+    def finish_commit(self, record, result):
+        if result in ("absent", "cancelled") and record["phase"] == "commit-pending":
+            self.cancel_reservation(record, "native commit did not reach the ref")
+            return "cancelled"
+        require(re.fullmatch(r"verified (?:[a-f0-9]{40}|[a-f0-9]{64})", result))
+        verification = hashlib.sha256(result.encode("ascii")).hexdigest()
+        if record["phase"] == "commit-pending":
+            record["verification"] = verification
+            self.save(record, "effect-verified")
+        require(record["verification"] == verification)
+        return self.reconcile(record["id"])
 
     def scheduled_marker(self, ident, target, bound, invoke, *, attempt=None):
         """Verify old work first. An absent native journal permits a fresh attempt."""
@@ -633,7 +685,7 @@ class BrokerLedger:
 
     def undo(self, ident, inverse):
         record = self.load(ident)
-        if record is None or record["phase"] in ("apply-pending", "marker-pending", "no-effect", "cancelled"):
+        if record is None or record["phase"] in ("apply-pending", "marker-pending", "commit-pending", "no-effect", "cancelled"):
             raise ValueError("no verified broker effect in this project")
         self.recover_ledger_backups(ident, record)
         expected = self.row(record, legacy_metric=not record.get("absolute_metric"))
@@ -912,7 +964,7 @@ def prove_budget(calls, *, backup, root, scope, project, baseline, ledger_before
                 json.loads(raw, object_pairs_hook=backup["unique_fields"], parse_constant=reject_constant)
                 skill, description, paths, written = active
                 require(data["finished"] is True and data["verification"] == "passed" and data["reverted"] is None
-                        and "committed" not in data and "git" not in data and data["actions"] == []
+                        and not {"committed", "git", "git_reason"} & data.keys() and data["actions"] == []
                         and (data["skill"], data["ledger"]) == (skill, description)
                         and [entry["path"] for entry in data["files"]] == list(map(str, paths))
                         and set(paths) == written and not written.intersection(edits))
@@ -923,7 +975,7 @@ def prove_budget(calls, *, backup, root, scope, project, baseline, ledger_before
                     require(hashlib.sha256(live[1]).hexdigest() == entry["after_sha256"]
                             and not (entry["created"] and entry["backup"] is not None))
                     edits[path] = live
-                    originals[path] = None if entry["created"] else folder / entry["backup"]
+                    originals[path] = folder, None if entry["created"] else folder / entry["backup"]
                 finished[folder] = identity, digest
                 active = None
         require(active is None and folders_after - scope["before"][0] == finished.keys())
@@ -932,11 +984,14 @@ def prove_budget(calls, *, backup, root, scope, project, baseline, ledger_before
         if ledger_written:
             proof, edits[ledger] = ledger_proof(backup, scope, project, ledger_before, [f.name for f in finished])
         _, entries, check = backup["capture_git_tree"](project, baseline=baseline, edits=edits)
-        for path, old in originals.items():
+        changed = set()
+        for path, (folder, old) in originals.items():
             blob = entries.get(path)
             require((old is None and blob is None and edits[path][0] == b"100644")
                     or (old is not None and blob is not None and edits[path][0] == blob[0]
                         and backup["matches_blob"](old, *blob)))
+            if blob is None or backup["object_id"]("blob", edits[path][1], len(blob[1])) != blob[1]:
+                changed.add(folder)
         if proof is not None:
             mode, oid = entries[ledger]
             require(mode == edits[ledger][0] and backup["object_id"]("blob", ledger_before, len(oid)) == oid)
@@ -945,9 +1000,36 @@ def prove_budget(calls, *, backup, root, scope, project, baseline, ledger_before
                                             identity=identity, manifest_sha256=digest)
         backup["check_backup_root"](root, stamp)
         require(backup["still_clean"](*check))
-        return max(0, config_before[0] - charge), proof
+        verified = None
+        if len(changed) == 1:
+            folder = next(iter(changed))
+            verified = folder, finished[folder]
+        return max(0, config_before[0] - charge), proof, verified
     except (AttributeError, KeyError, OSError, RecursionError, RuntimeError, TypeError, ValueError):
-        return None, None
+        return None, None, None
+
+
+def commit_authority(folder, ident, request, project, backup, run_id=None):
+    """Authenticate the inherited broker lease and native handoff binding."""
+    lease = int(os.environ.get("KAIZEN_BROKER_LEASE_FD", "-1"))
+    here = Path(__file__).resolve().parent
+    runner = runpy.run_path(str(here / "kaizen-scheduled"))
+    host = runpy.run_path(str(here / "kaizen_friction_actions.py"))
+    store = host["HostActions"](runner["audits_dir"](), backup["ROOT"], runner["action_project"], runner["key"])
+    ledger = BrokerLedger(host, store, Path(project))
+    with host["_directory"](store.friction, private=True) as ledger.state:
+        ledger.require_lease(lease)
+        record = ledger.load(ident)
+    require(record and (record["operation"], record["tool_record"], record["request"])
+            == (LOCAL_COMMIT, str(folder), request) and record.get("reservation"))
+    if run_id is not None:
+        require(record["phase"] == "commit-pending" and run_id == record["reservation"])
+
+    def recheck():
+        require(not scheduled_marker_refusal()
+                and policy_digest(runner["freeze_mutation_config"](Path(project), backup)) == record["policy"])
+
+    return recheck
 
 
 def marker_main():
@@ -970,15 +1052,8 @@ def marker_main():
         with tool["_directory"](store.friction, private=True) as ledger.state:
             reservation = ledger.load(args.id)
             if args.phase == "apply":
-                require(args.target is None and args.identity is None and args.lease_fd is not None and args.lease_fd > 2)
-                with tool["_private_file"](ledger.state, ledger.lock_name) as lease:
-                    require(os.path.samestat(os.fstat(lease), os.fstat(args.lease_fd)))
-                    try:
-                        tool["fcntl"].flock(lease, tool["fcntl"].LOCK_EX | tool["fcntl"].LOCK_NB)
-                    except BlockingIOError:
-                        pass  # The inherited runner lease holds the project lock.
-                    else:
-                        raise ValueError("broker reservation lock is not held")
+                require(args.target is None and args.identity is None and args.lease_fd is not None)
+                ledger.require_lease(args.lease_fd)
                 require(reservation and reservation["phase"] == "marker-pending"
                         and reservation["operation"] == "host-fix" and reservation.get("reservation")
                         and reservation["tool_record"] == ledger.tool_record(args.id, "host-fix"))

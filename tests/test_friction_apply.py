@@ -8,6 +8,7 @@ import io
 import json
 import os
 from pathlib import Path
+import re
 import runpy
 import shlex
 import shutil
@@ -112,7 +113,7 @@ class MutationEvidenceTests(unittest.TestCase):
                     calls, backup=backup, root=root, scope=scope, project=project, baseline=baseline,
                     ledger_before=ledger_before, config_before=(quota,), config_after=config_after or (quota,),
                     backup_script=script, notes_script=notes_script, python=sys.executable,
-                    notes_add=notes["add"], notes_before=notes_before)
+                    notes_add=notes["add"], notes_before=notes_before)[:2]
 
             script = SCRIPTS / "kaizen-backup"
 
@@ -471,7 +472,7 @@ class BrokerLedgerTests(unittest.TestCase):
     def test_undo_resolves_relative_state_paths(self):
         self.copied_install_undo_and_bookkeeping_recovery(relative_state=True)
 
-    def scheduled_marker_crashes(self, installed, command, env):
+    def scheduled_marker_crashes(self, installed, command, env, *, commit_only=False):
         runner, runtime = (installed / name for name in ("kaizen-scheduled", "kaizen_friction_apply.py"))
         fix = installed / "kaizen-host-fix"
         # Exercise the copied transactions with a disposable marker on either Unix test host.
@@ -500,14 +501,13 @@ targets = [str(pathlib.Path(project) / name) for name in ('build', 'dist')
     regenerable_dirs=[dict(path=target, size_bytes=1) for target in targets])))
 """)
         claude = installed / "fixture-claude"
-        claude.write_text("#!" + sys.executable + "\n" + r"""import json, os, pathlib, sys, time
+        claude.write_text("#!" + sys.executable + "\n" + r"""import json, os, pathlib, re, shlex, subprocess, sys, time
 if sys.argv[1:] == ['--version']:
     print('99.0.0 (Claude Code)')
     sys.exit()
 prompt = sys.argv[sys.argv.index('-p') + 1]
-inputs = pathlib.Path(json.loads(prompt.split(' friction-inputs=', 1)[1]))
+inputs = pathlib.Path(json.loads(prompt.splitlines()[0].split(' friction-inputs=', 1)[1]))
 actions = [dict(id=row['id'], intent='apply') for row in json.loads(inputs.read_text())['actions']]
-line = '<!-- kaizen-host-actions ' + json.dumps(dict(v=1, actions=actions)) + ' -->'
 session = sys.argv[sys.argv.index('--session-id') + 1]
 fault = os.getenv('FIXTURE_FAULT')
 if fault == 'timeout':
@@ -517,19 +517,55 @@ if fault == 'invalid':
 if fault == 'target':
     pathlib.Path('build').rename('old-build')
     pathlib.Path('build').mkdir()
-if fault == 'malformed':
-    line = '<!-- kaizen-host-actions invalid -->'
 events = [
     dict(type='system', subtype='init', claude_code_version='99.0.0', cwd=os.getcwd()),
     dict(type='assistant', parent_tool_use_id=None, message=dict(role='assistant',
          content=[dict(type='text', text='Review')])),
-    dict(type='result', subtype='success', is_error=False, result='Review\n' + line + '\n'),
 ]
 if fault == 'unbacked':
     events[1]['message']['content'].append(dict(type='tool_use', id='tool', name='Write',
         input=dict(file_path=os.path.join(os.getcwd(), 'unbacked'), content='fixture')))
     events.insert(2, dict(type='user', parent_tool_use_id=None, message=dict(
         role='user', content=[dict(type='tool_result', tool_use_id='tool')])))
+case = os.getenv('FIXTURE_COMMIT')
+candidate = re.search(r'local commit with action ID (fa1_[0-9a-f]{64})', prompt)
+if case and candidate:
+    actions.append(dict(id=candidate[1], intent='apply'))
+    def dispatch(name, **arguments):
+        ident = str(len(events))
+        for role, block in [('assistant', dict(type='tool_use', id=ident, name=name, input=arguments)),
+                            ('user', dict(type='tool_result', tool_use_id=ident))]:
+            events.append(dict(type=role, parent_tool_use_id=None, message=dict(role=role, content=[block])))
+    def backup(*args):
+        argv = [str(pathlib.Path(sys.argv[0]).with_name('kaizen-backup')), *args]
+        output = subprocess.check_output(argv, text=True).strip()
+        dispatch('Bash', command=shlex.join(argv))
+        return output
+    if case != 'empty':
+        target = pathlib.Path.cwd() / 'tracked'
+        folder = backup('begin', '--skill', 'trim', '--ledger', 'Fixture', str(target))
+        target.write_text('after')
+        dispatch('Edit', file_path=str(target))
+        backup('finish', folder)
+        if case == 'valid' or case.startswith('proof-'):
+            fixture = json.loads(os.environ['FIXTURE_LEDGER'])
+            ledger = pathlib.Path.cwd() / fixture['valid']['ledger_relpath']
+            ledger.write_text(fixture['after_utf8'].replace(fixture['valid']['manifest_ids'][0], pathlib.Path(folder).name))
+            dispatch('Edit', file_path=str(ledger))
+        if case == 'index':
+            subprocess.run(['git', 'add', 'tracked'], check=True)
+        if case == 'head':
+            subprocess.run(['git', 'commit', '--allow-empty', '-qm', 'moved'], check=True)
+        if case == 'ambiguous':
+            other = target.with_name('other')
+            second = backup('begin', '--skill', 'trim', '--ledger', 'Fixture', str(other))
+            other.write_text('other edit')
+            dispatch('Write', file_path=str(other))
+            backup('finish', second)
+line = '<!-- kaizen-host-actions ' + json.dumps(dict(v=1, actions=actions)) + ' -->'
+if fault == 'malformed':
+    line = '<!-- kaizen-host-actions invalid -->'
+events.append(dict(type='result', subtype='success', is_error=False, result='Review\n' + line + '\n'))
 for index, event in enumerate(events):
     print(json.dumps(dict(event, session_id=session, uuid=str(index))))
 """)
@@ -551,6 +587,10 @@ for index, event in enumerate(events):
                          "commit", "--no-gpg-sign", "-qm", "fixture")):
                 subprocess.run(["git", "-C", str(project), *args], check=True, env=env)
             return project, ledger
+
+        if commit_only:
+            self.scheduled_local_commits(installed, command, env, runtime_source, init_project)
+            return
 
         for crash in ("timeout", "invalid", "target", "malformed", "unbacked", "takeover", "effect", "row", "policy"):
             policy.write_text(enabled)
@@ -682,7 +722,95 @@ for index, event in enumerate(events):
                 self.assertEqual(ledger.read_text().count("[action:"), expected)
         (config / "agent-kaizen.json").unlink()
 
-    def copied_install_undo_and_bookkeeping_recovery(self, *, relative_state=False):
+    def scheduled_local_commits(self, installed, command, env, runtime_source, init_project):
+        runner, runtime, claude, backup = (installed / name for name in (
+            "kaizen-scheduled", "kaizen_friction_apply.py", "fixture-claude", "kaizen-backup"))
+        policy = installed.parent / "agent-kaizen.json"
+        fixture = (Path(__file__).parent / "fixtures/ledger_attestation_v1.json").read_text()
+        cases = ("closed", "propose", "dirty", "empty", "budget", "head", "index", "ambiguous", "valid",
+                 "proof-missing", "proof-forged", "proof-mismatch", "timeout", "before-journal", "after-cas", "after-row")
+        for case in cases:
+            with self.subTest(commit=case):
+                project, ledger = init_project("commit-" + case, ("build",))
+                (project / "tracked").write_text("before")
+                if case == "valid" or case.startswith("proof-"):
+                    ledger.write_bytes(base64.b64decode(json.loads(fixture)["valid"]["before_b64"]))
+
+                def git(*args):
+                    return subprocess.check_output(["git", "-C", str(project), *args], env=env, text=True).strip()
+
+                git("add", ".")
+                git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "tracked")
+                git("config", "user.name", "Fixture")
+                git("config", "user.email", "fixture@example.invalid")
+                if case == "dirty":
+                    (project / "tracked").write_text("user edit")
+                quota = {"budget": 1, "ambiguous": 3}.get(case, 2)
+                policy.write_text(json.dumps(dict(scheduledAutonomy="propose-only" if case == "propose" else "auto",
+                                                 schedule="always", maxChangesPerRun=quota)))
+                review = ("review", "--force", "--project-dir", project, "--claude", claude)
+                backup = installed / "kaizen-backup"
+                native = backup.read_text()
+                runner_source = runner.read_text()
+                if case == "closed":
+                    runtime.write_text((SCRIPTS / runtime.name).read_text())
+                elif case.startswith("proof-"):
+                    invalid = json.loads(fixture)["invalid_overrides"]
+                    expression = {"proof-missing": "None", "proof-forged":
+                                  f'dict(handoff["ledger_attestation"], **{invalid["forged_prefix"]!r})',
+                                  "proof-mismatch": f'dict(handoff["ledger_attestation"], **{invalid["wrong_session"]!r})'}[case]
+                    statement = '                    payload = json.dumps(handoff, sort_keys=True)'
+                    runner.write_text(runner_source.replace(statement, f'                    handoff["ledger_attestation"] = {expression}\n' + statement))
+                elif case == "before-journal":
+                    statement = '                    record = ledger.reserve_commit('
+                    runner.write_text(runner_source.replace(statement, '                    os._exit(77)\n' + statement))
+                elif case == "timeout":
+                    statement = '                         timeout=30, stoppable=True, terminate_grace=True,'
+                    runner.write_text(runner_source.replace(statement, statement.replace("30", "15")))
+                    statement = '                exchange("commit\\n", b"commit: ok\\n")'
+                    backup.write_text(native.replace(statement, '                time.sleep(60)\n' + statement))
+                elif case == "after-cas":
+                    statement = '    if checked_ref(record, records, phase, git_exe) != effect["new"]:'
+                    backup.write_text(native.replace(statement, '    if phase == "commit":\n        os._exit(77)\n' + statement))
+                    statement = '                    terminal(ident, applied=finish_commit(record) == "recorded")'
+                    runner.write_text(runner_source.replace(statement, '                    os._exit(77)'))
+                elif case == "after-row":
+                    statement = '        self.save(record, "recorded")'
+                    runtime.write_text(runtime_source.replace(statement, statement +
+                        '\n        if record["operation"] == LOCAL_COMMIT:\n            os._exit(77)', 1))
+                interrupted = case.startswith(("before-", "after-"))
+                command(runner, *review, code=77 if interrupted else 0,
+                        FIXTURE_COMMIT=case, FIXTURE_LEDGER=fixture, KAIZEN_SKIP_CHECKS="1")
+                backup.write_text(native)
+                runner.write_text(runner_source)
+                runtime.write_text(runtime_source)
+                refs = git("for-each-ref", "--format=%(refname)", "refs/kaizen/2*")
+                if case == "timeout":
+                    self.assertTrue(git("for-each-ref", "refs/kaizen/pending/"))
+                if interrupted or case == "timeout":
+                    command(runner, *review, KAIZEN_SKIP_CHECKS="1")
+                    self.assertEqual(git("for-each-ref", "--format=%(refname)", "refs/kaizen/2*"), refs)
+                    self.assertEqual(git("for-each-ref", "refs/kaizen/pending/"), "")
+                if case not in ("valid", "after-cas", "after-row"):
+                    self.assertEqual(refs, "")
+                    if case in ("closed", "propose"):
+                        self.assertEqual((project / "tracked").read_text(), "before")
+                    continue
+                oid = git("rev-parse", refs)
+                self.assertEqual(git("rev-parse", refs), oid)
+                self.assertEqual(git("diff", "--name-only", "HEAD", refs), "tracked")
+                self.assertEqual(ledger.read_text().count("[action:"), 1)
+                if case == "valid":
+                    ident = re.search(r"\[action:(fa1_[a-f0-9]{64})\]", ledger.read_text())[1]
+                    undo = ("actions", "undo", ident, "--for", project)
+                    command(runner, *undo)
+                    command(runner, *undo)
+                    self.assertEqual((project / "tracked").read_text(), "before")
+                    self.assertEqual(git("diff", "--name-only", "HEAD", refs), "")
+    def test_scheduled_local_commits(self):
+        self.copied_install_undo_and_bookkeeping_recovery(commit_only=True)
+
+    def copied_install_undo_and_bookkeeping_recovery(self, *, relative_state=False, commit_only=False):
         from test_schedule import CRONTAB
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -711,7 +839,9 @@ for index, event in enumerate(events):
             runtime = installed / "kaizen_friction_apply.py"
             self.assertFalse(runtime.is_symlink())
             if not relative_state:
-                self.scheduled_marker_crashes(installed, command, env)
+                self.scheduled_marker_crashes(installed, command, env, commit_only=commit_only)
+            if commit_only:
+                return
             broker = runpy.run_path(str(runtime))["BrokerLedger"]
             host = runpy.run_path(str(installed / "kaizen_friction_actions.py"))
             runner = installed / "kaizen-scheduled"

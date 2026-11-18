@@ -33,7 +33,9 @@ rename and anchors the rename to the directory descriptor.
 """
 import argparse
 import base64
+import ctypes
 import datetime
+import errno
 import hashlib
 import json
 import os
@@ -943,6 +945,8 @@ def commit_preflight(change, scheduled=None, *, git_exe=None):
         if (data.get("finished") is not True or data.get("verification") != "passed"
                 or data.get("reverted") is not None or "committed" in data or not data["files"]):
             raise ValueError("expected a verified, finished, unreverted file manifest")
+        if scheduled is not None and ("git" in data or "git_reason" in data or data["actions"]):
+            raise ValueError("scheduled commit requires an ordinary file backup")
         for entry in data["files"]:
             path = validate_entry(folder, entry, plugin_roots())
             if (not path.is_relative_to(root) or ".git" in path.relative_to(root).parts
@@ -1435,11 +1439,14 @@ def transact_ref(change, record, records, phase, tip, entries, recheck, git_exe)
     change_pin(record, pin, effect["new"], git_exe, remove=True)
 
 
-def write_commit(change, scheduled, key):
+def write_commit(change, scheduled, key, authorize=lambda: None):
+    authorize()
     records = read_records()
     if key and any(other["key"] == key and other["change"] != change.name for other in records.values()):
         raise ValueError("action ID is already bound to another backup")
     _, stamp = manifest_stamp(change)
+    if scheduled is not None and stamp != [scheduled["change_identity"], scheduled["manifest_sha256"]]:
+        raise ValueError("runner-approved change folder or manifest changed")
     request = hashlib.sha256(json.dumps(scheduled, sort_keys=True).encode("ascii")).hexdigest()
     record = records.get(change.name)
     git_exe = None
@@ -1453,7 +1460,7 @@ def write_commit(change, scheduled, key):
         entries = verify_effect(record, "commit", git_exe)
         if record["commit"]["done"]:
             if tip == record["commit"]["old"]:
-                transact_ref(change, record, records, "commit", tip, entries, lambda: None, git_exe)
+                transact_ref(change, record, records, "commit", tip, entries, authorize, git_exe)
             cleanup_pins(record, records, git_exe)
             return record
     if record is None or tip == record["commit"]["old"]:
@@ -1461,6 +1468,7 @@ def write_commit(change, scheduled, key):
         git_exe = state["git_executable"]
 
         def recheck():
+            authorize()
             check()
             if manifest_stamp(change)[1] != stamp:
                 raise ValueError("commit manifest changed")
@@ -1486,6 +1494,46 @@ def write_commit(change, scheduled, key):
     transact_ref(change, record, records, "commit", tip, entries, recheck, git_exe)
     cleanup_pins(record, records, git_exe)
     return record
+
+
+def recover_commit(change, action_id, request, project):
+    """Resolve a reserved commit through its native journal without starting a ref effect."""
+    records = read_records()
+    record = records.get(change.name)
+    if record is None:
+        return "absent"
+    if ((record["key"], record["request"], record["state"]["root"]) != (action_id, request, project)
+            or "inverse" in record or manifest_stamp(change)[1] != record["manifest"]):
+        raise ValueError("commit journal does not match the broker reservation")
+    git_exe = resolve_git()
+    effect = record["commit"]
+    pin = pin_ref(record, "commit")
+    if effect.get("cancelled"):
+        ref_scope(record, git_exe)
+        cleanup_pins(record, records, git_exe, only=pin)
+        return "cancelled"
+    tip = checked_ref(record, records, "commit", git_exe)
+    entries = verify_effect(record, "commit", git_exe)
+    if tip == effect["old"]:
+        if effect["done"]:
+            raise ValueError("completed commit ref moved to its previous value")
+        cancel_commit(change, record, records, tip, git_exe)
+    elif not effect["done"]:
+        transact_ref(change, record, records, "commit", tip, entries, lambda: None, git_exe)
+    cleanup_pins(record, records, git_exe, only=pin)
+    return "cancelled" if effect.get("cancelled") else f"verified {effect['new']}"
+
+
+def cancel_commit(change, record, records, tip, git_exe, recheck=lambda: None):
+    def cancel_prepared():
+        recheck()
+        if checked_ref(record, records, "commit", git_exe) != tip:
+            raise ValueError("kaizen ref moved before cancelling the pending commit")
+        record["commit"]["cancelled"] = True
+        save_record(change, record)
+
+    root = ref_scope(record, git_exe)
+    update_ref(root, git_exe, record["ref"], record["commit"], cancel_prepared, verify_only=True)
 
 
 def checked_inverse(change, data, record, records, git_exe, observing=None):
@@ -1527,6 +1575,21 @@ def commit(args):
     try:
         folder = Path(os.path.abspath(Path(args.change).expanduser()))
         scheduled, key = None, None
+        if args.scheduled_recovery_stdin:
+            raw = sys.stdin.buffer.read(8193)
+            if len(raw) > 8192:
+                raise ValueError("scheduled commit recovery binding exceeds its size limit")
+            binding = json.loads(raw)
+            if not isinstance(binding, list) or len(binding) != 3:
+                raise ValueError("invalid scheduled commit recovery binding")
+            action_id, request, project = binding
+            if (not re.fullmatch(r"fa1_[0-9a-f]{64}", action_id) or not SHA256.fullmatch(request)
+                    or not isinstance(project, str) or folder.parent != ROOT):
+                raise ValueError("invalid scheduled commit recovery binding")
+            scheduled_commit_authority(folder, action_id, request, project)
+            with ref_lock():
+                print(recover_commit(folder, action_id, request, project))
+            return
         if args.scheduled_baseline_stdin:
             limit = 2 * MAX_LEDGER_BYTES
             raw = sys.stdin.buffer.read(limit + 1)
@@ -1548,10 +1611,21 @@ def commit(args):
                 print("commit preflight passed")
                 return
         with ref_lock():
-            record = write_commit(folder, scheduled, key)
+            if key is None:
+                record = write_commit(folder, scheduled, key)
+            else:
+                request = hashlib.sha256(json.dumps(scheduled, sort_keys=True).encode("ascii")).hexdigest()
+                authorize = scheduled_commit_authority(folder, key, request, scheduled["baseline"]["root"],
+                                                       scheduled["run_id"])
+                record = write_commit(folder, scheduled, key, authorize)
         print(f"committed {record['commit']['new']} on {record['ref']}")
     except (OSError, ValueError, KeyError, TypeError, IndexError, RuntimeError, subprocess.SubprocessError) as error:
         raise ValueError(f"commit refused: {capture_reason(error)}") from None
+
+
+def scheduled_commit_authority(folder, key, request, project, run_id=None):
+    runtime = runpy.run_path(str(Path(__file__).resolve().with_name("kaizen_friction_apply.py")))
+    return runtime["commit_authority"](folder, key, request, project, globals(), run_id)
 
 
 def begin(args):
@@ -1787,7 +1861,7 @@ def live_file_version(name, fd):
         return None
 
 
-def undo_file_hash(name, fd, version):
+def undo_file_hash(name, fd, version, *, restoring=False, replacement=None):
     if version is None:
         return None
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
@@ -1795,6 +1869,8 @@ def undo_file_hash(name, fd, version):
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or file_version(info) != version:
             raise ValueError("working file changed during undo")
+        if restoring:
+            check_restore_metadata(stream.fileno(), replacement, label="working file")
         digest = hashlib.sha256()
         remaining = info.st_size
         while remaining:
@@ -1808,11 +1884,65 @@ def undo_file_hash(name, fd, version):
         return digest.hexdigest()
 
 
-def undo_file_snapshot(path):
+def undo_file_snapshot(path, *, restoring=False):
     with open_directory_walk(path.parent) as fd:
         parent = os.fstat(fd)
         version = live_file_version(path.name, fd)
-        return (parent.st_dev, parent.st_ino), version, undo_file_hash(path.name, fd, version)
+        return (parent.st_dev, parent.st_ino), version, undo_file_hash(path.name, fd, version, restoring=restoring)
+
+
+def darwin_provenance(fd, label):
+    # A new inode can inherit this kernel-managed attribute without copying it.
+    name = b"com.apple.provenance"
+    names = ctypes.create_string_buffer(len(name) + 1)
+    libc = ctypes.CDLL(None, use_errno=True)
+    size = libc.flistxattr(fd, names, len(names), 0)
+    if size == 0:
+        return b""
+    if size == len(names) and names.value == name:
+        value = ctypes.create_string_buffer(64)
+        size = libc.fgetxattr(fd, name, value, len(value), 0, 0)
+        if 0 < size <= len(value):
+            return value.raw[:size]
+    raise ValueError(f"cannot restore {label} with extended attributes")
+
+
+def linux_inode_flags(fd, label):
+    # FS_IOC_GETFLAGS encodes a native long but writes an unsigned int.
+    flags = bytearray(ctypes.sizeof(ctypes.c_long))
+    machine = os.uname().machine
+    read = 0x40000000 if machine.startswith(("alpha", "mips", "parisc", "ppc", "sparc")) else 0x80000000
+    request = read | (len(flags) << 16) | (ord("f") << 8) | 1
+    try:
+        fcntl.ioctl(fd, request, flags)
+    except OSError as error:
+        if error.errno in (errno.ENOTTY, errno.EOPNOTSUPP, errno.EINVAL):
+            return 0
+        raise ValueError(f"cannot verify {label} filesystem flags: {error}") from error
+    return ctypes.c_uint.from_buffer(flags).value
+
+
+def check_restore_metadata(fd, replacement=None, *, label="undo backup"):
+    info = os.fstat(fd)
+    if not stat.S_ISREG(info.st_mode):
+        raise ValueError(f"{label} must be a regular file")
+    # FS_EXTENT_FL describes the normal on-disk layout of ext4 files.
+    if getattr(info, "st_flags", 0) or (sys.platform == "linux" and linux_inode_flags(fd, label) & ~0x80000):
+        raise ValueError(f"cannot restore {label} with filesystem flags")
+    if hasattr(os, "listxattr"):
+        if os.listxattr(fd):
+            raise ValueError(f"cannot restore {label} with extended attributes")
+    elif sys.platform == "darwin":
+        provenance = darwin_provenance(fd, label)
+        if provenance:
+            with ExitStack() as stack:
+                if replacement is None:
+                    replacement = stack.enter_context(tempfile.TemporaryFile(dir=ROOT)).fileno()
+                if provenance != darwin_provenance(replacement, "undo replacement"):
+                    raise ValueError(f"cannot preserve {label} provenance")
+    else:
+        raise ValueError(f"cannot verify {label} extended attributes")
+    return info
 
 
 def restore_ref_file(change, entry, path, snapshot, blob):
@@ -1822,8 +1952,8 @@ def restore_ref_file(change, entry, path, snapshot, blob):
         if (info.st_dev, info.st_ino) != parent or live_file_version(path.name, fd) != version:
             raise ValueError("working file or parent directory changed during undo")
 
-        def recheck():
-            if undo_file_hash(path.name, fd, version) != digest:
+        def recheck(replacement=None):
+            if undo_file_hash(path.name, fd, version, restoring=replacement is not None, replacement=replacement) != digest:
                 raise ValueError("working file changed during undo")
             with open_directory_walk(path.parent) as current:
                 if not os.path.samestat(info, os.fstat(current)):
@@ -1843,9 +1973,7 @@ def restore_ref_file(change, entry, path, snapshot, blob):
                 source = change / entry["backup"]
                 read_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
                 with os.fdopen(temp_fd, "wb") as stream, os.fdopen(os.open(source, read_flags), "rb") as backup:
-                    metadata = os.fstat(backup.fileno())
-                    if not stat.S_ISREG(metadata.st_mode):
-                        raise ValueError("undo backup changed during restore")
+                    metadata = check_restore_metadata(backup.fileno(), temp_fd)
                     shutil.copyfileobj(backup, stream)
                     stream.flush()
                     os.fchmod(temp_fd, stat.S_IMODE(metadata.st_mode))
@@ -1856,7 +1984,7 @@ def restore_ref_file(change, entry, path, snapshot, blob):
                         raise ValueError("undo backup changed during restore")
                     # POSIX rename has no conditional-on-inode variant. Check immediately
                     # before replacing and keep both names anchored to the verified parent.
-                    recheck()
+                    recheck(temp_fd)
                     os.replace(temporary, path.name, src_dir_fd=fd, dst_dir_fd=fd)
             finally:
                 try:
@@ -1880,12 +2008,17 @@ def undo_locked(args, locked):
     for change, data in plan:
         change = change_dir(change)
         record = records.get(change.name)
+        if args.scheduled_action is not None and (record is None or record["key"] != args.scheduled_action):
+            raise ValueError("undo does not match the scheduled action")
         if data.get("reverted"):
             if record and record.get("inverse", {}).get("done"):
                 inverse = record["inverse"]
                 if checked_ref(record, records, "inverse", git_exe) == inverse["old"]:
                     raise ValueError(f"completed inverse ref {record['ref']} is at its previous value; "
                                      f"the reverted backup record expects {inverse['new']}")
+                if args.scheduled_action is not None:
+                    verify_effect(record, "inverse", git_exe)
+                    return 0
             sys.exit(f"kaizen-backup: {change} was already reverted on {data['reverted']}")
         if "committed" in data or "revert_commit" in data:
             raise ValueError("undo requires a tool-owned commit record")
@@ -1895,8 +2028,12 @@ def undo_locked(args, locked):
         for entry in data["files"]:
             path = validate_entry(change, entry, roots)
             if record:
+                if entry.get("backup"):
+                    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                    with os.fdopen(os.open(change / entry["backup"], flags), "rb") as source:
+                        check_restore_metadata(source.fileno())
                 if path not in versions:
-                    versions[path] = undo_file_snapshot(path)
+                    versions[path] = undo_file_snapshot(path, restoring=not entry["created"])
                 _, version, live_hash = versions[path]
                 blob = backups[change][path]
                 if path not in seen and version and (not stat.S_ISREG(version[2]) or
@@ -1930,15 +2067,7 @@ def undo_locked(args, locked):
                     raise ValueError("working file changed before inverse update")
 
             if entries is None:
-                def cancel_prepared():
-                    recheck()
-                    if checked_ref(record, records, "commit", git_exe) != tip:
-                        raise ValueError("kaizen ref moved before cancelling the pending commit")
-                    record["commit"]["cancelled"] = True
-                    save_record(change, record)
-
-                root = ref_scope(record, git_exe)
-                update_ref(root, git_exe, record["ref"], record["commit"], cancel_prepared, verify_only=True)
+                cancel_commit(change, record, records, tip, git_exe, recheck)
             elif not record.get("inverse", {}).get("done") or tip == record["inverse"]["old"]:
                 transact_ref(change, record, records, "inverse", tip, entries, recheck, git_exe)
         if record:
@@ -1985,7 +2114,9 @@ def main(argv=None):
     p.add_argument("--verification", choices=("passed", "failed"), default="passed")
     p.set_defaults(func=finish)
     p = sub.add_parser("commit", allow_abbrev=False)
-    p.add_argument("--scheduled-baseline-stdin", action="store_true", help=argparse.SUPPRESS)
+    private = p.add_mutually_exclusive_group()
+    private.add_argument("--scheduled-baseline-stdin", action="store_true", help=argparse.SUPPRESS)
+    private.add_argument("--scheduled-recovery-stdin", action="store_true", help=argparse.SUPPRESS)
     p.add_argument("change", metavar="CHANGE_DIR")
     p.set_defaults(func=commit)
     p = sub.add_parser("action")
@@ -1999,6 +2130,7 @@ def main(argv=None):
     p = sub.add_parser("undo")
     p.add_argument("target", nargs="?", default="last")
     p.add_argument("--force", action="store_true")
+    p.add_argument("--scheduled-action", help=argparse.SUPPRESS)
     p.set_defaults(func=undo)
     p = sub.add_parser("prune")
     p.add_argument("--older-than", type=int, required=True, metavar="DAYS")
@@ -2007,9 +2139,15 @@ def main(argv=None):
     args = parser.parse_args(argv)
     try:
         if args.command == "commit":
-            if args.scheduled_baseline_stdin and argv != ["commit", "--scheduled-baseline-stdin", args.change]:
-                raise ValueError("invalid scheduled commit invocation")
+            for operation in ("scheduled_baseline_stdin", "scheduled_recovery_stdin"):
+                if getattr(args, operation) and argv != ["commit", "--" + operation.replace("_", "-"), args.change]:
+                    raise ValueError("invalid scheduled commit invocation")
             return commit(args)
+        if args.command == "undo" and args.scheduled_action is not None:
+            if (argv != ["undo", "--scheduled-action", args.scheduled_action, args.target]
+                    or not re.fullmatch(r"fa1_[0-9a-f]{64}", args.scheduled_action)
+                    or Path(args.target).parent != ROOT):
+                raise ValueError("invalid scheduled undo invocation")
         ROOT.mkdir(parents=True, exist_ok=True, mode=0o700)
         if not USER_ROOT:
             try:

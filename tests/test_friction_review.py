@@ -24,7 +24,9 @@ class ScheduledFrictionTests(PreparationTests):
     def test_suggestion_import_acknowledges_and_strips(self):
         inputs, receipt = self.scheduled()
         output = self.write(self.obj.folder / "review.md", 'Review\n<!-- kaizen-host-actions {"v":1,"actions":[]} -->\n')
-        self.runner["reconcile_scheduled"](self.config / "audits", self.obj, output, receipt)
+        terminal, requested = self.runner["reconcile_scheduled"](self.config / "audits", self.obj, output, receipt)
+        self.assertTrue(terminal)
+        self.assertFalse(requested)
         self.assertEqual(output.read_text(), 'Review\n')
         self.assertIsNone(self.scheduled())
         self.assertTrue(inputs.exists())
@@ -44,8 +46,10 @@ class ScheduledFrictionTests(PreparationTests):
 
     def test_closed_marker_apply_is_imported_as_suggestion_and_acknowledged(self):
         target, ident, output, receipt = self.marker_request()
-        self.assertTrue(self.runner["reconcile_scheduled"](
-            self.config / "audits", self.obj, output, receipt, authorize=self.fail))
+        terminal, requested = self.runner["reconcile_scheduled"](
+            self.config / "audits", self.obj, output, receipt, authorize=self.fail)
+        self.assertTrue(terminal)
+        self.assertFalse(requested)
         self.assertEqual(output.read_text(), "")
         store = json.loads((self.config / "audits/host-actions.json").read_text())
         self.assertEqual(store["receipts"][str(self.project)]["scheduled:" + receipt["generation"]], {ident: "terminal"})
@@ -70,8 +74,10 @@ class ScheduledFrictionTests(PreparationTests):
         output = self.write(self.obj.folder / "review.md", 'Review\n<!-- kaizen-host-actions ' + json.dumps(
             dict(v=1, actions=actions)) + ' -->\n')
 
-        self.assertTrue(self.runner["reconcile_scheduled"](
-            self.config / "audits", self.obj, output, receipt, authorize=self.fail))
+        terminal, requested = self.runner["reconcile_scheduled"](
+            self.config / "audits", self.obj, output, receipt, authorize=self.fail)
+        self.assertTrue(terminal)
+        self.assertFalse(requested)
         self.assertEqual(output.read_text(), 'Review\n')
         store = json.loads((self.config / "audits/host-actions.json").read_text())
         self.assertEqual(store["receipts"][str(self.project)]["scheduled:" + receipt["generation"]],
@@ -82,13 +88,15 @@ class ScheduledFrictionTests(PreparationTests):
         self.assertIsNone(self.scheduled("auto"))
 
     def test_apply_stays_pending_and_does_not_acknowledge(self):
-        _, _, output, receipt = self.marker_request()
+        _, ident, output, receipt = self.marker_request()
         reconcile = self.runner["reconcile_scheduled"]
         with patch.dict(reconcile.__globals__, scheduled_action_refusal=lambda _: None):
-            self.assertFalse(reconcile(self.config / "audits", self.obj, output, receipt))
+            terminal, requested = reconcile(self.config / "audits", self.obj, output, receipt)
+        self.assertFalse(terminal)
+        self.assertFalse(requested)
         self.assertIsNotNone(self.scheduled("auto"))
         store = json.loads((self.config / "audits/host-actions.json").read_text())
-        self.assertIn('pending', json.dumps(store))
+        self.assertEqual(store["receipts"][str(self.project)]["scheduled:" + receipt["generation"]], {ident: "pending"})
 
     def test_malformed_output_cannot_acknowledge(self):
         _, receipt = self.scheduled()
@@ -133,7 +141,10 @@ class ScheduledFrictionTests(PreparationTests):
         _, receipt = self.scheduled()
         output = self.write(self.obj.folder / "review.tmp", '<!-- kaizen-host-actions {"v":1,"actions":[]} -->\n')
         proposal = self.obj.folder / "cycle-2026-11-18.md"
-        self.assertTrue(self.runner["reconcile_scheduled"](self.config / "audits", self.obj, output, receipt, acknowledge=False))
+        terminal, requested = self.runner["reconcile_scheduled"](
+            self.config / "audits", self.obj, output, receipt, acknowledge=False)
+        self.assertTrue(terminal)
+        self.assertFalse(requested)
         recover = self.runner["recover_scheduled_publication"]
         recover(self.config / "audits", self.obj, receipt, proposal, output)
         # A failed rename leaves no publication and must not acknowledge.
