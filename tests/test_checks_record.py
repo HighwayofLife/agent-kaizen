@@ -1,4 +1,7 @@
 """Tests for per-project completed check bookkeeping."""
+import contextlib
+from datetime import datetime, timezone
+import io
 import json
 import os
 from pathlib import Path
@@ -7,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'scripts/kaizen-scheduled'
 
@@ -56,6 +60,23 @@ class ChecksRecordTests(unittest.TestCase):
                                         capture_output=True, text=True, env=self.env)
                 self.assertNotIn('invalid or future date', result.stdout + result.stderr)
                 self.assertNotIn('models: never run', result.stdout)
+
+    def test_record_validates_against_local_date_when_utc_is_yesterday(self):
+        class FixedDatetime(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                if tz is not None:
+                    return cls(2026, 1, 1, 12, tzinfo=timezone.utc)
+                return cls(2026, 1, 2, 2)
+
+        main = runpy.run_path(str(SCRIPT))['main']
+        with mock.patch.dict(main.__globals__, datetime=FixedDatetime), \
+                mock.patch.dict(os.environ, self.env), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(main(['checks', 'record', '--for', str(self.project), 'models']), 0)
+            self.assertEqual(main(['checks', 'record', '--for', str(self.project), 'models',
+                                   '--date', '2026-01-03']), 2)
+        self.assertEqual(json.loads(self.path().read_text())['models'], '2026-01-02')
 
     def test_concurrent_writers(self):
         path = self.path()

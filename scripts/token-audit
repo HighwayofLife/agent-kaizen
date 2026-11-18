@@ -1392,7 +1392,7 @@ def cwd_matches(raw, targets, realpaths):
     location = canonical(raw)
     return location is not None and any(
         target is not None and os.path.commonpath((location, target)) == target
-        for target in map(canonical, targets)
+        for target in targets
     )
 
 
@@ -1548,6 +1548,8 @@ def finish_codex_pairs(pairs, friction, session=None):
 
 def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=None, *,
             friction=True, friction_thresholds=None, friction_window=None):
+    if cwd is not None:
+        cwd = [os.path.normpath(os.path.realpath(path)) for path in cwd]
     data = dict(models=defaultdict(Counter), sessions=[], agents=defaultdict(list),
                 triggers=defaultdict(Counter), tool_chars=Counter(), tool_counts=Counter(),
                 images=0, bash=defaultdict(Counter), bash_chars=defaultdict(Counter),
