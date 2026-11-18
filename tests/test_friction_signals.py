@@ -1,7 +1,7 @@
 """Offline signal coverage with synthetic transcript rows."""
 import json
 
-from test_friction_claude import FrictionClaudeTests, start, end
+from test_friction_claude import AUDIT, FrictionClaudeTests, start, end
 from test_scripts import jsonl
 
 
@@ -99,3 +99,42 @@ class FrictionSignalTests(FrictionClaudeTests):
         jsonl(self.session, [start('not-lock', 0), not_lock, start('invalid', 0), invalid,
                              question, end('backwards', 1)])
         self.assertFalse(any(self.collect()['friction']['signals'].values()))
+
+    def test_invalid_permission_timestamps_are_not_accepted(self):
+        root = str(self.work.resolve())
+        accept = dict(source='user', decision='accept')
+        rows = [start('back', 5, 'ls', cwd=root),
+                end('back', 1, cwd=root, permissionDecision=accept, toolUseResult=dict(durationMs=1))]
+        for ident, stamp in [('missing', None), ('invalid', 'invalid')]:
+            rows.append(start(ident, 0, 'ls', cwd=root))
+            result = end(ident, 1, cwd=root, permissionDecision=accept, toolUseResult=dict(durationMs=1))
+            if stamp is None:
+                del result['timestamp']
+            else:
+                result['timestamp'] = stamp
+            rows.append(result)
+        jsonl(self.session, rows)
+        data = self.collect(cwd=[root])
+        self.assertEqual(data['friction']['permission_acceptance'][0]['accepted'], 0)
+        self.assertGreaterEqual(data['warnings']['malformed rows'], 3)
+
+    def test_batch_metadata_and_confirmed_signal_flags(self):
+        batch = end('one', 3, uuid='batch', toolUseResult=dict(timedOutAfterMs=3, interrupted=True))
+        batch['message']['content'].extend(end('two', 3)['message']['content'])
+        batch['message']['content'][0].update(is_error=True, content='could not acquire the lock')
+        usage = dict(type='system', subtype='informational', timestamp='2025-01-01T00:00:01Z',
+                     sessionId='fixture-session', uuid='limit', content='Usage limit reached')
+        jsonl(self.session, [start('one', 0), start('two', 0), batch, batch, usage])
+        friction = self.collect()['friction']
+        self.assertEqual((friction['signals']['timeouts'], friction['signals']['interrupts']), (1, 1))
+        flags = {flag['id']: flag['value'] for flag in friction['flags']}
+        self.assertEqual(flags, {'timeouts': 1, 'interrupts': 1, 'lock-contention': 1, 'usage-limits': 1})
+
+    def test_bounded_replay_and_nonliteral_calls(self):
+        fingerprint = AUDIT['replay_fingerprint']
+        self.assertEqual(fingerprint('a' * 100000), fingerprint('a' * 99999 + 'b'))
+        self.assertNotEqual(fingerprint('a' * 100000), fingerprint('a' * 100001))
+        state = dict(cwd={str(self.work.resolve())}, permissions={}, capped=False)
+        block = start('id', 0, 'echo ' + 'x' * 100000, cwd=str(self.work.resolve()))
+        AUDIT['permission_observation'](state, ('s', 'id'), block, block['message']['content'][0], True, [])
+        self.assertEqual(state['permissions'], {})
