@@ -52,6 +52,56 @@ class HostProbeTests(unittest.TestCase):
         if os.name == 'posix':
             self.assertTrue(all(p.stat().st_mode & 0o077 == 0 for p in files))
 
+    def test_shared_json_redacts_head(self):
+        subprocess.run(['git', '-C', str(self.project), 'init', '-q'], check=True)
+        subprocess.run(['git', '-C', str(self.project), '-c', 'user.name=Test',
+                        '-c', 'user.email=test@example.invalid', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty',
+                        '-qm', 'initial'], check=True)
+        head = subprocess.check_output(['git', '-C', str(self.project), 'rev-parse', 'HEAD'], text=True).strip()
+        result = self.cli(self.root / 'audit', '--json')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn(head, result.stdout)
+        private = json.loads(next((self.root / 'audit').glob('*.json')).read_text())
+        self.assertEqual(private['worktrees'][0]['head'], head)
+
+    def test_worktree_registration_must_point_back(self):
+        def git(*args):
+            subprocess.run(['git', '-C', str(self.project), *args], check=True, capture_output=True)
+        git('init', '-q')
+        git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+            '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-qm', 'initial')
+        first, second = self.root / 'first', self.root / 'second'
+        git('worktree', 'add', '-qb', 'first', str(first))
+        git('worktree', 'add', '-qb', 'second', str(second))
+        original = (second / '.git').read_text()
+        (second / '.git').write_text((first / '.git').read_text())
+        probe = self.probe()
+        self.assertIsNone(probe.worktrees())
+        self.assertIn('worktrees_unavailable', probe.warnings)
+        (second / '.git').write_text(original)
+        admin = Path(original.strip()[len('gitdir: '):])
+        (admin / 'gitdir').write_text(str(first / '.git') + '\n')
+        self.assertIsNone(self.probe().worktrees())
+
+    def test_config_symlinked_parent_directories_refused(self):
+        trees = [{'path': str(self.project), 'is_main': True}]
+        outside = self.root / 'outside'
+        (outside / 'kaizen').mkdir(parents=True)
+        (outside / 'kaizen/config.json').write_text(json.dumps({'frictionOutputDirs': ['custom']}))
+        (self.project / 'custom').mkdir()
+        (self.project / 'docs').symlink_to(outside, target_is_directory=True)
+        for linked in ('docs', 'kaizen'):
+            for dir_fd_support in (os.supports_dir_fd, set()):
+                probe = self.probe()
+                with mock.patch.object(probe_module.os, 'supports_dir_fd', dir_fd_support), \
+                     mock.patch.object(probe, 'git', side_effect=lambda root, *args: 'custom/\n' if args[0] == 'check-ignore' else ''):
+                    self.assertEqual(probe.directories(trees), [])
+                self.assertIn('output_config', probe.warnings)
+            if linked == 'docs':
+                (self.project / 'docs').unlink()
+                (self.project / 'docs').mkdir()
+                (self.project / 'docs/kaizen').symlink_to(outside / 'kaizen', target_is_directory=True)
+
     def test_output_refusal(self):
         target = self.root / 'target'
         target.mkdir()

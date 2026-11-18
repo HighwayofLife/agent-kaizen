@@ -179,6 +179,7 @@ class Probe:
             self.warn('worktrees_unavailable')
             return None
         trees = []
+        admin_ids = set()
         for index, block in enumerate(blocks):
             fields = {}
             for field in block.split('\0'):
@@ -197,7 +198,24 @@ class Probe:
                 live_stat = (path / live_common.strip()).stat()
                 valid = ((live_stat.st_dev, live_stat.st_ino) == (common_stat.st_dev, common_stat.st_ino)
                          and Path(top.strip()).resolve() == path)
-            except (AttributeError, OSError):
+                if index:
+                    gitfile = (path / '.git').read_text().strip()
+                    if not gitfile.startswith('gitdir: '):
+                        raise ValueError('invalid gitfile')
+                    admin = (path / gitfile[8:]).resolve()
+                    worktrees_dir = (self.project / common_path / 'worktrees').resolve()
+                    admin_stat = admin.stat()
+                    admin_id = (admin_stat.st_dev, admin_stat.st_ino)
+                    backlink = Path((admin / 'gitdir').read_text().strip())
+                    if not backlink.is_absolute():
+                        backlink = admin / backlink
+                    checkout_stat = path.stat()
+                    back_stat = backlink.parent.stat()
+                    valid = (valid and admin.parent == worktrees_dir and admin_id not in admin_ids
+                             and backlink.name == '.git'
+                             and (checkout_stat.st_dev, checkout_stat.st_ino) == (back_stat.st_dev, back_stat.st_ino))
+                    admin_ids.add(admin_id)
+            except (AttributeError, OSError, ValueError, UnicodeError):
                 valid = False
             if not valid:
                 self.warn('worktrees_unavailable')
@@ -262,7 +280,23 @@ class Probe:
         for root in roots:
             configured = []
             try:
-                fd = os.open(root / 'docs/kaizen/config.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+                if os.open in os.supports_dir_fd:
+                    parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                    try:
+                        for component in ('docs', 'kaizen'):
+                            child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+                            os.close(parent)
+                            parent = child
+                        fd = os.open('config.json', os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent)
+                    finally:
+                        os.close(parent)
+                else:
+                    config_path = root
+                    for component in ('docs', 'kaizen', 'config.json'):
+                        config_path = config_path / component
+                        if stat.S_ISLNK(config_path.lstat().st_mode):
+                            raise ValueError('symlink in config path')
+                    fd = os.open(config_path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
                 with os.fdopen(fd, 'rb') as stream:
                     if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
                         raise ValueError('not a regular file')
@@ -471,6 +505,7 @@ def main(argv=None):
                 tree['path'] = '[project]' if tree['path'] == str(args.project.resolve()) else '[worktree]'
                 if tree['branch'] is not None:
                     tree['branch'] = '[branch]'
+                tree.pop('head', None)
             for directory in public['regenerable_dirs']:
                 directory['path'] = '[output]'
                 directory['worktree'] = '[worktree]'
