@@ -1,0 +1,2 @@
+- Keep unsafe Codex rollouts out of regression baselines while retaining usage totals.
+- Keep large Codex rollouts and overlapping timelines bounded during friction analysis.

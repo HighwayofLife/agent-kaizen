@@ -105,6 +105,18 @@ class TimelineTests(unittest.TestCase):
         self.assertGreater(small, 0)
         self.assertLess(large, 6 * small, (small, large))
 
+    def test_nonlocal_cohorts_do_not_intersect_local_intervals(self):
+        local = [call(i * 100, i * 100 + 60, signature='local')
+                 for i in range(100) for _ in range(2)]
+        remote = [call(0, 10000, signature='remote' + str(i))
+                  for i in range(100) for _ in range(3)]
+        original = AUDIT['contention_intervals']
+        with patch.dict(AUDIT['heavy_timeline'].__globals__,
+                        contention_intervals=unittest.mock.Mock(wraps=original)):
+            mocked = AUDIT['heavy_timeline'].__globals__['contention_intervals']
+            AUDIT['heavy_timeline'](local + remote, THRESHOLDS, (), local)
+            self.assertEqual(mocked.call_count, 1)
+
     def test_contention_intersections_match_brute_force(self):
         rng = random.Random(20261118)
 
@@ -153,7 +165,7 @@ class TimelineTests(unittest.TestCase):
     def test_codex_pair_timestamps_reach_timeline(self):
         from test_friction_codex import call as codex_call, result, row
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
+            root = Path(directory).resolve()
             rows = [row('session_meta', -1, cwd=str(root))]
             for ident in range(3):
                 rows += [codex_call(str(ident), 1), result(str(ident), 121)]

@@ -28,6 +28,30 @@ class SignedTranscriptTests(SecurityCase):
             self.assertIsNotNone(AUDIT['write_extract'](data, self.root / 'report.md', default, {}))
         self.assertEqual(default.stat().st_mode & 0o777, 0o700)
 
+    def test_unsafe_codex_rollout_cannot_authenticate_regression(self):
+        project = self.project('codex-evidence')
+        now = datetime.now(timezone.utc) - timedelta(minutes=1)
+        rollout = self.cx / 'sessions/2025/01/01/rollout.jsonl'
+        events = [dict(row('session_meta', 0, cwd=str(project)), timestamp=now.isoformat())]
+        for i in range(3):
+            events.extend([dict(call(str(i)), timestamp=now.isoformat()),
+                           dict(result(str(i)), timestamp=(now + timedelta(seconds=5)).isoformat())])
+        usage = dict(input_tokens=7, output_tokens=3, total_tokens=10)
+        events.append(dict(row('event_msg', 6, type='token_count', info=dict(total_token_usage=usage)),
+                           timestamp=(now + timedelta(seconds=6)).isoformat()))
+        jsonl(rollout, events)
+        rollout.chmod(0o664)
+        data = json.loads(self.run_script('token-audit', '--cwd', project, '--json').stdout)
+        self.assertEqual(data['codex_sessions'][0]['tokens'], 10)
+        self.assertEqual(data['friction']['summary']['measured'], 3)
+        self.assertEqual(data['warnings']['unsafe permission transcript'], 1)
+        self.assertEqual(data['friction']['comparisons'], [])
+        self.assertNotIn('<!-- token-audit-friction-mac ', Path(data['report_path']).read_text())
+        rollout.chmod(0o644)
+        data = json.loads(self.run_script('token-audit', '--cwd', project, '--json').stdout)
+        self.assertEqual(data['friction']['comparisons'][0]['count'], 3)
+        self.assertIn('<!-- token-audit-friction-mac ', Path(data['report_path']).read_text())
+
     def test_unsafe_transcripts_do_not_supply_signed_counters(self):
         project = self.project("signed-evidence")
         folder = self.cfg / "projects" / "fixture"

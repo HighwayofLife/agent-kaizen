@@ -60,6 +60,7 @@ ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z_0-9]*=")
 CHEAPER_MODEL_THRESHOLDS = dict(cost_share=0.05, calls_median=15, result_chars_median=4000)
 FRICTION_THRESHOLDS = dict(slow_call_seconds=120, heavy_seconds=60)
 FRICTION_PAIR_LIMIT = 16384
+FRICTION_REJECTED_LIMIT = 16384
 MAX_TIMING_MS = timedelta.max.total_seconds() * 1000
 TIMED_TOOLS = frozenset(("Read", "Write", "Edit", "Glob", "Grep", "WebFetch", "WebSearch",
                          "NotebookEdit", "Skill", "LSP"))
@@ -1265,13 +1266,14 @@ def heavy_timeline(calls, thresholds, samples=(), local_calls=()):
         # Merge cohort occupancy before intersecting: expanding each call against
         # every overlap segment uses quadratic memory for staggered calls.
         occupancy = []
-        for c in cohort:
+        local_cohort = cohort and not (Counter(cohort) - local_counts)
+        for c in cohort if local_cohort else ():
             if occupancy and c[0] <= occupancy[-1][1]:
                 occupancy[-1] = (occupancy[-1][0], max(occupancy[-1][1], c[1]))
             else:
                 occupancy.append((c[0], c[1]))
-        intervals = contention_intervals(occupancy, local_intervals, local_ends)
-        load = median_load_ratio(samples, intervals) if cohort and not (Counter(cohort) - local_counts) else None
+        intervals = contention_intervals(occupancy, local_intervals, local_ends) if local_cohort else ()
+        load = median_load_ratio(samples, intervals) if local_cohort else None
         status = "insufficient" if ratio is None else "unconfirmed" if ratio >= 1.5 else "ok"
         if ratio is not None and ratio >= 1.5 and load is not None:
             status = "flagged" if load >= 0.8 else "ok"
@@ -1333,7 +1335,7 @@ def polling_summary(calls, slow_seconds):
 
 def finalize_friction(state, thresholds, window):
     grouped = state["codex_calls"]
-    comparison_groups = defaultdict(list, {key: list(value) for key, value in grouped.items()})
+    comparison_groups = defaultdict(list, {key: list(value) for key, value in state["trusted_codex_calls"].items()})
     signals = state["codex_signals"]
     calls = state.get("timeline", [])
     question_wait, prompted_wait, local_load, local_calls = [], [], [], []
@@ -1783,6 +1785,20 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
         data["codex_files_scanned"] += 1
         return True
 
+    def rollout_rows(path, bounds):
+        nonlocal trusted_rollout
+        source = None
+        if friction is not None:
+            try:
+                source = open_permission_transcript(path)
+                trusted_rollout = True
+            except (OSError, ValueError, AttributeError, ImportError):
+                data["warnings"]["unsafe permission transcript"] += 1
+        with (source if source is not None else nullcontext()):
+            yield from rows(path, since, data["warnings"], keep_model=True, bounds=bounds,
+                            canary=data["format_canary"], keep_codex=friction is not None,
+                            admit=admit if cwd is not None else None, source=source)
+
     # Session filenames are usually rollout-*.jsonl; scan the standard date tree.
     for path in root.glob("*/*/*/*.jsonl"):
         if too_old(path, since):
@@ -1796,20 +1812,22 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
 
         bounds = [None, None]
         pairs, disqualified, turns, current_cwd = {}, set(), {}, None
-        future_header, scoped_turn = False, False
+        future_header, scoped_turn, rejection_overflow, trusted_rollout = False, False, False, False
         # Older session files can contain recent resumes. Keep earlier model
         # metadata, but count only sessions with a token_count in the window.
-        for row in rows(path, since, data["warnings"], keep_model=True, bounds=bounds,
-                        canary=data["format_canary"], keep_codex=friction is not None,
-                        admit=admit if cwd is not None else None):
+        for row in rollout_rows(path, bounds):
             if "_codex_tool" in row:
                 kind, ident, observation = row["_codex_tool"]
                 stamp = row["timestamp"]
-                if not isinstance(ident, str) or ident in disqualified:
+                if (not isinstance(ident, str) or ident in disqualified
+                        or (rejection_overflow and ident not in pairs)):
                     continue
                 if stamp is not None and stamp > friction["until"]:
                     if ident not in pairs:
-                        disqualified.add(ident)
+                        if len(disqualified) < FRICTION_REJECTED_LIMIT:
+                            disqualified.add(ident)
+                        else:
+                            rejection_overflow = friction["capped"] = True
                     continue
                 valid = observation is not None and stamp is not None and stamp >= since
                 if valid:
@@ -1827,8 +1845,10 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                     # Keep rejected IDs separate from the budget for in-scope pairs.
                     if ident in pairs:
                         pairs[ident] = None
-                    else:
+                    elif len(disqualified) < FRICTION_REJECTED_LIMIT:
                         disqualified.add(ident)
+                    else:
+                        rejection_overflow = friction["capped"] = True
                     continue
                 if ident not in pairs:
                     if len(pairs) >= FRICTION_PAIR_LIMIT:
@@ -1893,7 +1913,7 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                     window.update(delta)
                     price(data, model, "codex", delta, codex=True)
         if friction is not None:
-            finish_codex_pairs(pairs, friction, str(path))
+            finish_codex_pairs(pairs, friction, str(path), trusted_rollout)
         first, last = bounds
         if seen_usage:
             if brief is not None:
@@ -1912,7 +1932,7 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                          output=window["output_tokens"], tokens=tokens)
 
 
-def finish_codex_pairs(pairs, friction, session=None):
+def finish_codex_pairs(pairs, friction, session=None, trusted=False):
     signals = friction["codex_signals"]
     for pair in pairs.values():
         if pair is None or pair[1] is None:
@@ -1933,6 +1953,8 @@ def finish_codex_pairs(pairs, friction, session=None):
                 continue
             friction["codex_samples"] += 1
             friction["codex_calls"][start[3]["signature"]].append((result["seconds"], True))
+            if trusted:
+                friction["trusted_codex_calls"][start[3]["signature"]].append((result["seconds"], True))
             if len(friction["timeline"]) >= FRICTION_PAIR_LIMIT:
                 friction["capped"] = True
             timeline_call(friction["timeline"], start[1], end, result["seconds"],
@@ -1952,7 +1974,7 @@ def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=No
         data["_friction"] = dict(pairs={}, trusted_pairs={}, capped=False, since=since, usage_limits=set(),
                                  until=now or datetime.now(timezone.utc),
                                  cwd=set(cwd or ()), permissions={}, warnings=data["warnings"], codex_calls=defaultdict(list),
-                                 codex_signals=Counter(), codex_samples=0, timeline=[],
+                                 trusted_codex_calls=defaultdict(list), codex_signals=Counter(), codex_samples=0, timeline=[],
                                  samples=read_samples(samples_dir if samples_dir is not None else default_samples_dir(), since, data["warnings"]))
     data["cache_writes"] = {kind: {bucket: Counter(writes=0, write_tokens=0, full_rewrites=0) for bucket in CACHE_BUCKETS}
                             for kind in ("main", "subagent")}

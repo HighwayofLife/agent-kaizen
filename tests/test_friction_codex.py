@@ -27,7 +27,7 @@ class FrictionCodexTests(unittest.TestCase):
     def setUp(self):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
-        self.root = Path(temp.name)
+        self.root = Path(temp.name).resolve()
         self.rollout = self.root / '2025/01/01/rollout.jsonl'
         self.work = str(self.root / 'work')
         self.meta = row('session_meta', -2, cwd=self.work, cli_version='1.2.3')
@@ -45,11 +45,13 @@ class FrictionCodexTests(unittest.TestCase):
         jsonl(self.rollout, [self.meta, row('turn_context', -1, model='example', effort='medium'),
                              start, end, start, end,
                              row('event_msg', 6, type='token_count', info=dict(total_token_usage=usage))])
-        original_open = Path.open
+        original_open = AUDIT['scan_codex'].__globals__['open_permission_transcript']
         original_loads = json.loads
 
-        with patch.object(Path, 'open', autospec=True, side_effect=original_open) as opened, patch.object(
+        with patch.dict(AUDIT['scan_codex'].__globals__,
+                        open_permission_transcript=unittest.mock.Mock(wraps=original_open)), patch.object(
                 json, 'loads', wraps=original_loads) as loads:
+            opened = AUDIT['scan_codex'].__globals__['open_permission_transcript']
             on = self.collect(cwd=[self.work])
         self.assertEqual(sum(b'private-body' in entry.args[0] for entry in loads.call_args_list
                              if isinstance(entry.args[0], bytes)), 2)
@@ -144,6 +146,15 @@ class FrictionCodexTests(unittest.TestCase):
             data = self.collect(cwd=[self.work], now=SINCE + timedelta(seconds=10))
         self.assertFalse(data['friction']['summary']['capped'])
         self.assertEqual(data['friction']['summary']['measured'], 1)
+
+    def test_rejected_id_overflow_fails_closed(self):
+        outside = str(self.root / 'other')
+        jsonl(self.rollout, [self.meta, call('a', cwd=outside), call('b', cwd=outside),
+                             call('c', cwd=outside), call('c'), result('c')])
+        with patch.dict(AUDIT['scan_codex'].__globals__, FRICTION_REJECTED_LIMIT=2):
+            summary = self.collect(cwd=[self.work])['friction']['summary']
+        self.assertTrue(summary['capped'])
+        self.assertEqual(summary['measured'], 0)
 
     def test_invalid_first_observation_disqualifies_id_without_using_pair_slots(self):
         bad_args = call('reused')
