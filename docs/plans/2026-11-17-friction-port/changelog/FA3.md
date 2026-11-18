@@ -1,3 +1,5 @@
 - Keep displaced broker ledgers in private storage outside the Git worktree and bind ledger exchanges to validated directories.
 - Preserve individual action receipts on update, replay completed imports, and prune superseded empty and acknowledged receipts.
 - Refuse unsafe macOS ancestor ACLs. Verify Linux output markers across worktrees and check inotify against the tracked-file count.
+- Bind interrupted ledger exchanges to the original backup directory. Move recovered legacy copies to private storage when it shares the ledger filesystem, and keep a private local fallback for separate backup volumes.
+- Keep legacy pending receipts within the store limit during recovery and prune superseded interactive imports.

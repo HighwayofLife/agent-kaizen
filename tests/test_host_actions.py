@@ -422,14 +422,35 @@ class HostActionsTests(unittest.TestCase):
             self.store.import_actions(block((ident, "suggest")), frozen, self.project, "review")
         self.assertEqual(self.store.path.read_bytes(), before)
 
+    def test_legacy_pending_store_can_close_receipts_under_size_cap(self):
+        ident = self.record()
+        row, = self.store.scoped(self.project)
+        project = str(self.project)
+        document = json.loads(self.store.path.read_text())
+        document["receipts"] = {project: {f"scheduled:{i:020d}": {ident: "pending"} for i in range(8400)}}
+        self.store.path.write_text(json.dumps(document, separators=(",", ":")))
+        with actions._directory(self.store.path.parent) as directory:
+            rows, _, receipts = self.store._load(directory)
+            self.store._save(directory, rows, receipts)
+            self.assertNotIn("apply_intents", json.loads(self.store.path.read_bytes()))
+            for receipt in receipts[project].values():
+                receipt[ident] = "terminal"
+            self.store._save(directory, rows, receipts)
+        frozen = {ident: dict(row, intents=["suggest", "apply"])}
+        generation = "scheduled:" + "0" * 20
+        self.assertEqual(self.store.import_actions(block((ident, "apply")), frozen, self.project, generation),
+                         {ident: "terminal"})
+        with self.assertRaisesRegex(ValueError, "different requests"):
+            self.store.import_actions(block((ident, "suggest")), frozen, self.project, generation)
+
     def test_import_prunes_old_empty_and_acknowledged_generations(self):
         ident = self.record()
         row, = self.store.scoped(self.project)
         frozen = {ident: dict(row, intents=["suggest", "apply"])}
         request = block((ident, "suggest"))
-        generations = [f"scheduled:{i:020d}" for i in range(1, 6)]
+        generations = [f"scheduled:{i:020d}" for i in (1, 2, 4, 5, 6)]
         self.store.import_actions(block(), {}, self.project, generations[0])
-        for generation in generations[1:3]:
+        for generation in (generations[1], "interactive:" + f"{3:020d}", generations[2]):
             self.store.import_actions(request, frozen, self.project, generation)
         other = self.record(self.other)
         other_row, = self.store.scoped(self.other)

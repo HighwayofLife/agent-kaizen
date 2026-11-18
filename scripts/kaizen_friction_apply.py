@@ -390,39 +390,70 @@ class BrokerLedger:
         if (common is not None and checkout is not None and common.stat().st_dev == ledger_device
                 and (common == checkout / ".git" or not common.is_relative_to(checkout))):
             return common / name
-        raise ValueError("broker ledger requires a private backup directory on its filesystem")
+        return self.path.parent / LEDGER_BACKUPS
 
     def recover_ledger_backups(self, ident, record):
-        locations = (self.ledger_backup_path(self.path.parent.stat().st_dev),
-                     self.path.parent / LEDGER_BACKUPS)
-        paths = [path for directory in locations if os.path.lexists(directory)
-                 for path in self.recover_ledger_copies(directory, ident)]
+        device = self.path.parent.stat().st_dev
+        preferred = self.ledger_backup_path(device)
+        legacy = self.path.parent / LEDGER_BACKUPS
+        pending = record.get("ledger_exchange") if record is not None else None
+        if pending:
+            path, dev, ino, name = pending
+            try:
+                paths = self.recover_ledger_copies(Path(path), ident, exchange=(dev, ino, name))
+            except FileNotFoundError as error:
+                raise ValueError("broker ledger backup directory changed during publication") from error
+        else:
+            paths = self.recover_ledger_copies(preferred, ident) if os.path.lexists(preferred) else []
+        # Finish the bound exchange before moving any legacy files.
+        if not pending and preferred != legacy and os.path.lexists(legacy):
+            with self.writable_ledger_backups(preferred, device, create=True) as destination:
+                paths += self.recover_ledger_copies(legacy, ident, move_to=(preferred, destination))
         if record is not None:
-            kept = sorted(set(record.get("ledger_backups", ())) | set(paths))
-            if kept != record.get("ledger_backups", []):
+            kept = set(record.get("ledger_backups", ())) | set(paths)
+            if preferred != legacy:
+                kept.difference_update(str(legacy / Path(path).name) for path in paths
+                                       if Path(path).parent == preferred)
+            kept = sorted(kept)
+            if pending or kept != record.get("ledger_backups", []):
+                record.pop("ledger_exchange", None)
                 record["ledger_backups"] = kept
                 self.save(record, record["phase"])
 
-    def recover_ledger_copies(self, directory, ident):
+    def recover_ledger_copies(self, directory, ident, *, exchange=None, move_to=None):
         # The same name holds the staged row before the swap and the displaced
         # ledger afterwards. Either can remain after an interrupted write.
         pattern = re.compile(re.escape(ident) + r"-[a-f0-9]{32}\.md")
         paths = []
         with self.host["_directory"](directory, private=True) as backups:
+            opened = os.fstat(backups)
+            if exchange and (opened.st_dev, opened.st_ino) != exchange[:2]:
+                raise ValueError("broker ledger backup directory changed during publication")
             self.check_acl(backups, "backup directory", "system.posix_acl_access")
-            for name in sorted(os.listdir(backups)):
+            for name in [exchange[2]] if exchange else sorted(os.listdir(backups)):
                 if not pattern.fullmatch(name):
                     continue
-                path = str(directory / name)
+                info = os.stat(name, dir_fd=backups, follow_symlinks=False)
+                safe = stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
+                if exchange and not safe:
+                    raise ValueError("unsafe broker ledger backup file")
+                folder, owner_fd = directory, backups
+                if move_to and safe:
+                    folder, owner_fd = move_to
+                    try:
+                        os.stat(name, dir_fd=owner_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        os.rename(name, name, src_dir_fd=backups, dst_dir_fd=owner_fd)
+                    else:
+                        raise ValueError("conflicting legacy broker ledger backup")
+                path = str(folder / name)
                 paths.append(path)
                 if path not in self.reported_backups:
                     print(f"Broker ledger copy preserved at {path!r}", flush=True)
                     self.reported_backups.add(path)
-                info = os.stat(name, dir_fd=backups, follow_symlinks=False)
-                if (stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
-                        and stat.S_IMODE(info.st_mode) != 0o600):
+                if safe and stat.S_IMODE(info.st_mode) != 0o600:
                     try:
-                        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=backups)
+                        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=owner_fd)
                     except PermissionError:
                         continue  # The directory still protects an unreadable displaced file.
                     try:
@@ -432,7 +463,11 @@ class BrokerLedger:
                             os.fsync(fd)
                     finally:
                         os.close(fd)
+            if move_to:
+                os.fsync(move_to[1])
             os.fsync(backups)
+            if exchange and not os.path.samestat(opened, os.stat(directory, follow_symlinks=False)):
+                raise ValueError("broker ledger backup directory changed during publication")
         return paths
 
     @contextmanager
@@ -503,6 +538,10 @@ class BrokerLedger:
                         stream.flush()
                         os.fsync(stream.fileno())
                     os.fsync(backups)
+                    if record is not None:
+                        info = os.fstat(backups)
+                        record["ledger_exchange"] = [str(backup_path), info.st_dev, info.st_ino, name]
+                        self.save(record, record["phase"])
                     with self.host["_directory"](self.path.parent) as live:
                         if not os.path.samestat(os.fstat(live), os.fstat(directory)):
                             raise ValueError("broker ledger changed during transaction")

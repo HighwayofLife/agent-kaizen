@@ -284,6 +284,12 @@ def _pending(generations):
     return {ident for receipt in generations.values() for ident, state in receipt.items() if state == "pending"}
 
 
+def _terminal_slots(generations):
+    for generation, receipt in sorted(generations.items()):
+        for ident in sorted(ident for ident, state in receipt.items() if state == "terminal"):
+            yield generation, ident
+
+
 class HostActions:
     def __init__(self, audits, backups, canonical_project, project_key):
         self.path = Path(audits) / "host-actions.json"
@@ -355,22 +361,33 @@ class HostActions:
                                for ident, state in receipt.items())):
                     raise ValueError("invalid host-action receipt")
         rows = _Rows((ident, row) for ident, row in rows.items() if ident not in skipped)
-        rows.apply_intents = store.get("apply_intents", {})
-        for project, generations in rows.apply_intents.items():
-            if not isinstance(generations, dict) or project not in receipts:
+        for project, saved in store.get("apply_intents", {}).items():
+            if project not in receipts:
                 raise ValueError("invalid host-action import intents")
-            for generation, ids in generations.items():
+            if isinstance(saved, str) and re.fullmatch(r"[1-9a-f][0-9a-f]*", saved):
+                slots = list(_terminal_slots(receipts[project]))
+                mask = int(saved, 16)
+                if mask.bit_length() > len(slots):
+                    raise ValueError("invalid host-action import intents")
+                for bit, (generation, ident) in enumerate(slots):
+                    if mask & (1 << bit):
+                        rows.apply_intents.setdefault(project, {}).setdefault(generation, set()).add(ident)
+                continue
+            if not isinstance(saved, dict):
+                raise ValueError("invalid host-action import intents")
+            for generation, ids in saved.items():
                 receipt = receipts[project].get(generation, {})
                 if (not isinstance(ids, list) or not ids or len(ids) > len(receipt)
                         or any(not isinstance(ident, str) or ident not in receipt for ident in ids)
                         or len(set(ids)) != len(ids) or _pending({generation: receipt}) - set(ids)):
                     raise ValueError("invalid host-action import intents")
-        # Legacy pending entries still tell us their original intent before the next save.
+                rows.apply_intents.setdefault(project, {})[generation] = set(ids)
+        # Pending receipts already encode intent. Remember it through in-place completion.
         for project, generations in receipts.items():
             for generation, receipt in generations.items():
                 pending = _pending({generation: receipt})
                 if pending:
-                    rows.apply_intents.setdefault(project, {}).setdefault(generation, sorted(pending))
+                    rows.apply_intents.setdefault(project, {}).setdefault(generation, set()).update(pending)
         if skipped:
             fields = _object_values(raw.decode("utf-8"))
             row_values = _object_values(fields["actions"])
@@ -422,7 +439,14 @@ class HostActions:
                 output_receipts[project][generation] = dict(receipt, **{
                     ident: marker(raw) for ident, raw in _object_values(value).items() if ident in rows.preserved})
         output = {"v": 1, "actions": output_rows, "receipts": output_receipts}
-        apply_intents = {project: entries for project, entries in getattr(rows, "apply_intents", {}).items() if entries}
+        # Only completed applies need extra metadata. Pack their positions among terminal receipts.
+        apply_intents = {}
+        for project, generations in getattr(rows, "apply_intents", {}).items():
+            slots = _terminal_slots(receipts[project])
+            mask = sum(1 << bit for bit, (generation, ident) in enumerate(slots)
+                       if ident in generations.get(generation, ()))
+            if mask:
+                apply_intents[project] = format(mask, "x")
         if apply_intents:
             output["apply_intents"] = apply_intents
         text = json.dumps(output, separators=(",", ":"))
@@ -501,8 +525,9 @@ class HostActions:
             if old is None or (project, name) in rows.preserved_receipts:
                 continue
             number = old[1] or old[2]
-            # Older empty imports carry no publication evidence. Keep unfinished and unpublished actions.
-            if number < current[1] and (not receipt or number <= acknowledged and "pending" not in receipt.values()):
+            # A superseded interactive generation can no longer be acknowledged.
+            if (number < current[1] and "pending" not in receipt.values()
+                    and (not receipt or number <= acknowledged or name.startswith("interactive:"))):
                 del generations[name]
                 rows.apply_intents.get(project, {}).pop(name, None)
 
@@ -555,7 +580,7 @@ class HostActions:
                     raise ValueError("host action requires manual resolution")
             generations[generation] = receipt
             if apply_ids := _pending({generation: receipt}):
-                rows.apply_intents.setdefault(project, {})[generation] = sorted(apply_ids)
+                rows.apply_intents.setdefault(project, {})[generation] = apply_ids
             self._prune_receipts(rows, project, generations, generation)
             self._save(directory, rows, receipts)
         return receipt
