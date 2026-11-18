@@ -35,6 +35,7 @@ import argparse
 import base64
 import ctypes
 import datetime
+import errno
 import hashlib
 import json
 import os
@@ -1860,7 +1861,7 @@ def live_file_version(name, fd):
         return None
 
 
-def undo_file_hash(name, fd, version):
+def undo_file_hash(name, fd, version, *, restoring=False, replacement=None):
     if version is None:
         return None
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
@@ -1868,6 +1869,8 @@ def undo_file_hash(name, fd, version):
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or file_version(info) != version:
             raise ValueError("working file changed during undo")
+        if restoring:
+            check_restore_metadata(stream.fileno(), replacement, label="working file")
         digest = hashlib.sha256()
         remaining = info.st_size
         while remaining:
@@ -1881,14 +1884,14 @@ def undo_file_hash(name, fd, version):
         return digest.hexdigest()
 
 
-def undo_file_snapshot(path):
+def undo_file_snapshot(path, *, restoring=False):
     with open_directory_walk(path.parent) as fd:
         parent = os.fstat(fd)
         version = live_file_version(path.name, fd)
-        return (parent.st_dev, parent.st_ino), version, undo_file_hash(path.name, fd, version)
+        return (parent.st_dev, parent.st_ino), version, undo_file_hash(path.name, fd, version, restoring=restoring)
 
 
-def darwin_provenance(fd):
+def darwin_provenance(fd, label):
     # A new inode can inherit this kernel-managed attribute without copying it.
     name = b"com.apple.provenance"
     names = ctypes.create_string_buffer(len(name) + 1)
@@ -1901,28 +1904,44 @@ def darwin_provenance(fd):
         size = libc.fgetxattr(fd, name, value, len(value), 0, 0)
         if 0 < size <= len(value):
             return value.raw[:size]
-    raise ValueError("cannot restore undo backup with extended attributes")
+    raise ValueError(f"cannot restore {label} with extended attributes")
 
 
-def check_restore_metadata(fd, replacement=None):
+def linux_inode_flags(fd, label):
+    # FS_IOC_GETFLAGS encodes a native long but writes an unsigned int.
+    flags = bytearray(ctypes.sizeof(ctypes.c_long))
+    machine = os.uname().machine
+    read = 0x40000000 if machine.startswith(("alpha", "mips", "parisc", "ppc", "sparc")) else 0x80000000
+    request = read | (len(flags) << 16) | (ord("f") << 8) | 1
+    try:
+        fcntl.ioctl(fd, request, flags)
+    except OSError as error:
+        if error.errno in (errno.ENOTTY, errno.EOPNOTSUPP, errno.EINVAL):
+            return 0
+        raise ValueError(f"cannot verify {label} filesystem flags: {error}") from error
+    return ctypes.c_uint.from_buffer(flags).value
+
+
+def check_restore_metadata(fd, replacement=None, *, label="undo backup"):
     info = os.fstat(fd)
     if not stat.S_ISREG(info.st_mode):
-        raise ValueError("undo backup must be a regular file")
-    if getattr(info, "st_flags", 0):
-        raise ValueError("cannot restore undo backup with filesystem flags")
+        raise ValueError(f"{label} must be a regular file")
+    # FS_EXTENT_FL describes the normal on-disk layout of ext4 files.
+    if getattr(info, "st_flags", 0) or (sys.platform == "linux" and linux_inode_flags(fd, label) & ~0x80000):
+        raise ValueError(f"cannot restore {label} with filesystem flags")
     if hasattr(os, "listxattr"):
         if os.listxattr(fd):
-            raise ValueError("cannot restore undo backup with extended attributes")
+            raise ValueError(f"cannot restore {label} with extended attributes")
     elif sys.platform == "darwin":
-        provenance = darwin_provenance(fd)
+        provenance = darwin_provenance(fd, label)
         if provenance:
             with ExitStack() as stack:
                 if replacement is None:
                     replacement = stack.enter_context(tempfile.TemporaryFile(dir=ROOT)).fileno()
-                if provenance != darwin_provenance(replacement):
-                    raise ValueError("cannot preserve undo backup provenance")
+                if provenance != darwin_provenance(replacement, "undo replacement"):
+                    raise ValueError(f"cannot preserve {label} provenance")
     else:
-        raise ValueError("cannot verify undo backup extended attributes")
+        raise ValueError(f"cannot verify {label} extended attributes")
     return info
 
 
@@ -1933,8 +1952,8 @@ def restore_ref_file(change, entry, path, snapshot, blob):
         if (info.st_dev, info.st_ino) != parent or live_file_version(path.name, fd) != version:
             raise ValueError("working file or parent directory changed during undo")
 
-        def recheck():
-            if undo_file_hash(path.name, fd, version) != digest:
+        def recheck(replacement=None):
+            if undo_file_hash(path.name, fd, version, restoring=replacement is not None, replacement=replacement) != digest:
                 raise ValueError("working file changed during undo")
             with open_directory_walk(path.parent) as current:
                 if not os.path.samestat(info, os.fstat(current)):
@@ -1965,7 +1984,7 @@ def restore_ref_file(change, entry, path, snapshot, blob):
                         raise ValueError("undo backup changed during restore")
                     # POSIX rename has no conditional-on-inode variant. Check immediately
                     # before replacing and keep both names anchored to the verified parent.
-                    recheck()
+                    recheck(temp_fd)
                     os.replace(temporary, path.name, src_dir_fd=fd, dst_dir_fd=fd)
             finally:
                 try:
@@ -2009,12 +2028,12 @@ def undo_locked(args, locked):
         for entry in data["files"]:
             path = validate_entry(change, entry, roots)
             if record:
-                if path not in versions:
-                    versions[path] = undo_file_snapshot(path)
                 if entry.get("backup"):
                     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
                     with os.fdopen(os.open(change / entry["backup"], flags), "rb") as source:
                         check_restore_metadata(source.fileno())
+                if path not in versions:
+                    versions[path] = undo_file_snapshot(path, restoring=not entry["created"])
                 _, version, live_hash = versions[path]
                 blob = backups[change][path]
                 if path not in seen and version and (not stat.S_ISREG(version[2]) or

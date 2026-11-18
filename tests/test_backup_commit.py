@@ -160,6 +160,8 @@ class BackupCommitTests(unittest.TestCase):
         ledger.write_text(fixture["after_utf8"] + "later bookkeeping\n")
         with self.helpers["ref_lock"]():
             self.assertEqual(write_commit(change, attested, key), first)
+            with self.assertRaisesRegex(ValueError, "commit transaction scope differs"):
+                write_commit(change, dict(attested, run_id="other"), key)
             with self.assertRaisesRegex(ValueError, "already bound"):
                 write_commit(old, attested, key)
         self.commit_cli(change, expected=2)
@@ -181,6 +183,61 @@ class BackupCommitTests(unittest.TestCase):
             self.skipTest("extended attribute fixture unavailable")
         self.assertIn("extended attributes", self.main("undo", change, expected=2))
         self.assertEqual(self.git("rev-parse", ref), oid)
+        self.assertEqual(self.target.read_text(), "after")
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS extended attributes")
+    def test_ref_undo_refuses_live_xattr_missing_from_backup(self):
+        xattr = "/usr/bin/xattr"
+        attr = "user.fixture"
+        subprocess.run([xattr, "-w", attr, "fixture", str(self.target)], check=True)
+        # Reproduce copy2 leaving the live file's xattr out of the backup.
+        with patch.object(shutil, "copy2", side_effect=shutil.copyfile):
+            change = self.begin_in_process("live-xattr")
+        self.assertNotIn(attr, subprocess.check_output([xattr, str(change / "files/1")], text=True).splitlines())
+        self.target.write_text("after")
+        self.script("finish", change)
+        self.commit_cli(change)
+        ref = "refs/kaizen/" + datetime.date.today().isoformat()
+        oid = self.git("rev-parse", ref)
+
+        self.assertIn("working file with extended attributes", self.main("undo", change, expected=2))
+        self.assertEqual(self.git("rev-parse", ref), oid)
+        self.assertEqual(self.target.read_text(), "after")
+        self.assertEqual(subprocess.check_output([xattr, "-p", attr, str(self.target)], text=True).strip(), "fixture")
+
+    def test_ref_undo_checks_linux_inode_flags(self):
+        change = self.ready()
+        self.commit_cli(change)
+        ref = "refs/kaizen/" + datetime.date.today().isoformat()
+        oid = self.git("rev-parse", ref)
+        backup = (change / "files/1").stat()
+
+        def get_flags(fd, request, flags):
+            immutable = 0x10 if os.path.samestat(os.fstat(fd), backup) else 0
+            flags[:4] = (0x80000 | immutable).to_bytes(4, sys.byteorder)
+            return 0
+
+        with (patch.object(sys, "platform", "linux"), patch.object(os, "listxattr", return_value=[], create=True),
+              patch.object(self.helpers["fcntl"], "ioctl", side_effect=get_flags) as ioctl):
+            self.assertIn("filesystem flags", self.main("undo", change, expected=2))
+            self.assertEqual(self.git("rev-parse", ref), oid)
+            ioctl.side_effect = OSError(errno.EACCES, "flag query denied")
+            self.assertIn("flag query denied", self.main("undo", change, expected=2))
+            self.assertEqual(self.git("rev-parse", ref), oid)
+            self.assertEqual(self.target.read_text(), "after")
+            ioctl.side_effect = OSError(errno.ENOTTY, "flag query unsupported")
+            self.main("undo", change)
+        self.assertEqual(self.target.read_text(), "before")
+        self.assertNotEqual(self.git("rev-parse", ref), oid)
+
+    @unittest.skipUnless(sys.platform == "linux" and shutil.which("chattr"), "Linux chattr unavailable")
+    def test_ref_undo_refuses_real_linux_nodump_flag(self):
+        change = self.ready()
+        self.commit_cli(change)
+        result = subprocess.run(["chattr", "+d", str(change / "files/1")], capture_output=True, text=True)
+        if result.returncode:
+            self.skipTest("cannot set the nodump flag: " + result.stderr.strip())
+        self.assertIn("filesystem flags", self.main("undo", change, expected=2))
         self.assertEqual(self.target.read_text(), "after")
 
     def test_local_commit_plumbing_preserves_checkout_index_and_verified_bytes(self):
