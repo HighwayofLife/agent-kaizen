@@ -60,6 +60,7 @@ def dirty_row(directory):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directories', nargs='*', type=Path, help='repository/worktree paths (default: current directory)')
+    parser.add_argument('--worktree-facts', action='store_true', help='show advisory Git worktree facts')
     args = parser.parse_args()
     print('RUNNING (pid, elapsed, command)')
     try:
@@ -95,6 +96,35 @@ def main():
         row = dirty_row(root)
         if row:
             print(row)
+    if args.worktree_facts:
+        print('\nWORKTREE FACTS (advisory)')
+        try:
+            from kaizen_worktree_facts import read_facts
+        except ImportError:
+            print('Worktree facts unavailable')
+        else:
+            shown = set()
+            for directory in args.directories or [Path.cwd()]:
+                facts = read_facts(directory.expanduser())
+                if facts is None:
+                    print(f'{directory}: unknown')
+                    continue
+                selected = None
+                if args.directories:
+                    selected = directory.expanduser().resolve()
+                    result = git(selected, 'rev-parse', '--show-toplevel')
+                    if result and result.returncode == 0:
+                        selected = Path(os.fsdecode(result.stdout.rstrip(b'\n'))).resolve()
+                for fact in facts:
+                    if (selected is not None and fact['path'] != selected) or fact['path'] in shown:
+                        continue
+                    shown.add(fact['path'])
+                    def value(item):
+                        return 'unknown' if item is None else str(item).lower() if isinstance(item, bool) else str(item)
+                    print(' '.join(f'{key}={value(fact[key])}' for key in
+                                   ('path', 'branch', 'tip', 'primary', 'linked', 'locked', 'detached', 'clean', 'merged')))
+                if selected is not None and selected not in shown:
+                    print(f'{directory}: unknown')
     return 0
 
 

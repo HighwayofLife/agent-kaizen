@@ -56,6 +56,73 @@ class DispatchStatusTests(StubCase):
         section = output.split('DIRTY WORKTREES (uncommitted paths outside out/, newest change age)')[1]
         self.assertIn(str(other), section)
 
+    def test_optional_facts_and_strict_dirty_status(self):
+        other = self.root / 'linked tree'
+        self.git('worktree', 'add', '-qb', 'topic', str(other))
+        self.git('worktree', 'lock', str(other))
+        (other / 'out').mkdir()
+        (other / 'out' / 'private').write_text('data')
+        output = self.run_script('dispatch-status', '--worktree-facts').stdout
+        facts = output.split('WORKTREE FACTS (advisory)')[1]
+        self.assertIn('primary=true linked=false locked=false detached=false clean=true merged=true', facts)
+        self.assertIn('primary=false linked=true locked=true detached=false clean=false merged=true', facts)
+        self.assertNotIn(str(other), output.split('WORKTREE FACTS (advisory)')[0])
+        selected = self.run_script('dispatch-status', '--worktree-facts', other).stdout
+        self.assertNotIn('primary=true', selected.split('WORKTREE FACTS (advisory)')[1])
+
+    def test_detached_and_unmerged(self):
+        other = self.root / 'linked'
+        self.git('worktree', 'add', '-qb', 'topic', str(other))
+        subprocess.run(['git', '-C', str(other), 'commit', '--allow-empty', '-qm', 'topic'],
+                       env=self.env, check=True)
+        subprocess.run(['git', '-C', str(other), 'checkout', '-q', '--detach'], env=self.env, check=True)
+        output = self.run_script('dispatch-status', '--worktree-facts', other).stdout
+        self.assertIn('branch=unknown', output)
+        self.assertIn('detached=true clean=true merged=false', output)
+        self.git('checkout', '-q', '--detach')
+        output = self.run_script('dispatch-status', '--worktree-facts', other).stdout
+        self.assertIn('merged=unknown', output)
+
+    def test_fallback_rejects_quoted_path_and_no_git(self):
+        other = self.root / 'line\nbreak'
+        self.git('worktree', 'add', '-qb', 'topic', str(other))
+        real = shutil.which('git', path=os.environ['PATH'])
+        wrapper = self.bin / 'git'
+        wrapper.write_text('#!/bin/sh\ncase "$*" in *"worktree list"*" -z"*) exit 129;; esac\n'
+                           'exec "%s" "$@"\n' % real)
+        wrapper.chmod(0o755)
+        output = self.run_script('dispatch-status', '--worktree-facts').stdout
+        self.assertIn(': unknown', output.split('WORKTREE FACTS (advisory)')[1])
+        wrapper.write_text('#!/bin/sh\nexit 127\n')
+        output = self.run_script('dispatch-status', '--worktree-facts').stdout
+        self.assertIn(': unknown', output.split('WORKTREE FACTS (advisory)')[1])
+
+    def test_fallback_plain_path_and_nul_unusual_path(self):
+        other = self.root / 'line\nbreak'
+        self.git('worktree', 'add', '-qb', 'topic', str(other))
+        output = self.run_script('dispatch-status', '--worktree-facts').stdout
+        self.assertIn(str(other), output.split('WORKTREE FACTS (advisory)')[1])
+        self.git('worktree', 'remove', str(other))
+        other = self.root / 'plain space'
+        self.git('worktree', 'add', '-qb', 'topic2', str(other))
+        real = shutil.which('git', path=os.environ['PATH'])
+        wrapper = self.bin / 'git'
+        wrapper.write_text('#!/bin/sh\ncase "$*" in *"worktree list"*" -z"*) exit 129;; esac\n'
+                           'exec "%s" "$@"\n' % real)
+        wrapper.chmod(0o755)
+        output = self.run_script('dispatch-status', '--worktree-facts').stdout
+        self.assertIn(str(other), output.split('WORKTREE FACTS (advisory)')[1])
+
+    def test_missing_helper_preserves_default_command(self):
+        standalone = self.bin / 'dispatch-status'
+        shutil.copy(Path(__file__).resolve().parents[1] / 'scripts/dispatch-status', standalone)
+        for args in ([], ['--worktree-facts']):
+            result = subprocess.run([str(standalone), *args], cwd=self.work, env=self.env,
+                                    capture_output=True, text=True, check=True)
+            self.assertIn('DIRTY WORKTREES', result.stdout)
+            if args:
+                self.assertIn('Worktree facts unavailable', result.stdout)
+
     def test_running_match_needs_codex_dispatch_script(self):
         fake = self.bin / 'codex-dispatch'
         fake.write_text('#!/bin/sh\nsleep 5\n')
