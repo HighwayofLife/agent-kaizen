@@ -57,6 +57,24 @@ class RulesLintTest(unittest.TestCase):
         self.assertIn(r"project-repos\.txt", {h["pattern"] for h in hits})
         self.assertIn("copies the runner, token-audit", {h["pattern"] for h in hits})
 
+    def test_old_model_alias_wording(self):
+        write(self.repo / "CLAUDE.md", "Names are normalised against the calibration ladder\n")
+        result = self.run_lint("--repo", self.repo, "--json")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["count"], 1)
+
+    def test_old_models_date_inference(self):
+        write(self.repo / "CLAUDE.md", "if the last `models-*.md` audit or ledger entry is old\n")
+        result = self.run_lint("--repo", self.repo, "--json")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["count"], 1)
+
+    def test_old_calibration_wording(self):
+        write(self.repo / "CLAUDE.md", "Propose calibration changes up or down one rung only.\n")
+        result = self.run_lint("--repo", self.repo, "--json")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["count"], 1)
+
     def test_text_output_and_global_root(self):
         write(self.claude / "kaizen-rules-lint.txt", "old wording\n")
         write(self.claude / "agents/a.md", "x\nold wording\n")

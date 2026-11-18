@@ -47,6 +47,7 @@ class RunnerTests(StubCase):
         result = self.config("show")
         self.assertEqual(json.loads(result.stdout), {
             "enabled": {"value": True, "source": "default"},
+            "pendingDays": {"value": 10, "source": "default"},
             "schedule": {"value": "active", "source": "default"},
             "scheduledAutonomy": {"value": "propose", "source": "default"},
             "autoProjects": {"value": [], "source": "default"},
@@ -643,7 +644,7 @@ class DiscoveryTests(DiscoveryCase):
         for name in ("curl", "wget", "claude"):
             executable(self.bin / name, '#!/bin/sh\nprintf called >> "$RECORD"\n')
         output = self.preview()
-        self.assertIn("config: enabled=true (default); schedule=always (project); scheduledAutonomy=propose (default)", output)
+        self.assertIn("config: enabled=true (default); pendingDays=10 (default); schedule=always (project); scheduledAutonomy=propose (default)", output)
         self.assertIn("gate: due (schedule always)", output)
         self.assertFalse(self.record.exists())
         with patch.object(self.runner.subprocess, "run", return_value=subprocess.CompletedProcess([], 1, "", "")) as run:

@@ -38,6 +38,8 @@ SCRIPTS = {
     "codex-dispatch": "codex-dispatch", "codex-run": "codex-run",
     "codex_common.py": "codex_common.py", "dispatch-status": "dispatch-status",
     "prompts": "prompts", "preambles": "preambles",
+    "packet-event": "packet-event", "flow-report": "flow-report",
+    "experiment-check": "experiment-check", "brief-lint": "brief-lint",
 }
 HOOKS = ("after-compact.sh", "block-image-read.sh", "limit-big-read.sh",
          "subagent-context.sh", "session-notes.sh")

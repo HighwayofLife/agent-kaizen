@@ -6,6 +6,8 @@ Commands:
   config set [--for DIR] KEY=VALUE  merge global or project scheduled settings
                                     (--for DIR scheduledAutonomy=auto|propose also adds or removes
                                     DIR in the global autoProjects list, which project auto needs)
+  checks path --for DIR            show the project check state path
+  checks record --for DIR NAME     record a completed check (optional --date YYYY-MM-DD)
   audit                            run the global token audit
   review [--dry-run]                audit and review every due project
   housekeep [--dry-run]             delete expired generated audit files
@@ -113,6 +115,7 @@ def valid_auto_projects(value):
 
 SCHEMA = {
     "enabled": {"kind": "bool", "default": True, "global_only": True},
+    "pendingDays": {"kind": "int", "default": 10, "minimum": 1},
     "schedule": {"kind": "enum", "default": "active", "choices": ("active", "always", "off")},
     "scheduledAutonomy": {"kind": "enum", "default": "propose", "choices": ("propose", "auto")},
     "autoProjects": {"kind": "strings", "default": [], "global_only": True,
@@ -1439,7 +1442,11 @@ def run_step(name, options, arguments, success=(0,)):
         result = run_group([options.python, str(script), *map(str, arguments)],
                                 capture_output=True, text=True, timeout=STEP_TIMEOUT)
         if result.returncode in success:
-            return "\n".join(result.stdout.strip().splitlines()[:30])
+            lines = result.stdout.strip().splitlines()
+            if len(lines) > 30:
+                # Keep the final summary when a helper lists many entries.
+                lines = lines[:28] + ["... (truncated)", lines[-1]]
+            return "\n".join(lines)
         reason = f"exit {result.returncode}"
         detail = (result.stderr or result.stdout).strip().splitlines()
         if detail:
@@ -1497,6 +1504,11 @@ def run_checks(audits, options, projects=None):
             output = run_step(name, options, arguments, success)
             if output is not None:
                 sections.append(f"## {title}\n\n{output}")
+        for project in projects:
+            output = run_step("experiment-check", options, ["--project", str(project.canonical),
+                              "--checks", "--state-file", str(project.folder / "checks.json")], (0, 1))
+            if output is not None and not output.startswith("experiment-check: 0 finding"):
+                sections.append(f"## Experiments: {project.canonical}\n\n{output}")
         if sections:
             audits.mkdir(parents=True, exist_ok=True)
             (audits / f"checks-{step_stamp()}.md").write_text(
@@ -2119,6 +2131,15 @@ def main(argv=None):
         subparser.add_argument("--for", dest="project_dir", type=Path, help="project directory")
         if action == "set":
             subparser.add_argument("assignments", metavar="KEY=VALUE", nargs="+")
+    checks = commands.add_parser("checks", help="locate or record completed checks")
+    check_actions = checks.add_subparsers(dest="action", required=True)
+    for action in ("path", "record"):
+        subparser = check_actions.add_parser(action, help=action + " check state")
+        subparser.add_argument("--for", dest="project_dir", type=Path, required=True)
+        if action == "record":
+            subparser.add_argument("name", choices=("models", "roster", "whats-new"))
+            # Local date, matching experiment-check and the dates people write in the ledger.
+            subparser.add_argument("--date", default=datetime.now().date().isoformat())
     cleanup = commands.add_parser("housekeep", help="delete expired generated audit files")
     cleanup.add_argument("--dry-run", action="store_true", help="preview deletions")
     cleanup.add_argument("--audits", type=Path, help="override the audits folder")
@@ -2143,6 +2164,38 @@ def main(argv=None):
         parser.error("--json requires --dry-run")
     global LOG_TO_STDERR
     LOG_TO_STDERR = getattr(args, "json", False)
+    if args.command == "checks":
+        project = canonical_project(args.project_dir)
+        if not (project / "docs/kaizen").is_dir():
+            parser.error(f"{args.project_dir} must contain docs/kaizen/")
+        path = Project(project, []).folder / "checks.json"
+        if args.action == "path":
+            print(path)
+            return 0
+        try:
+            if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.date):
+                raise ValueError("expected YYYY-MM-DD")
+            day = datetime.strptime(args.date, "%Y-%m-%d").date()
+            if day > datetime.now(timezone.utc).date():
+                raise ValueError("date cannot be in the future")
+            with config_lock(path):
+                try:
+                    raw = path.read_bytes()
+                    state = json.loads(raw.decode("utf-8"))
+                except FileNotFoundError:
+                    raw, state = None, {}
+                except (ValueError, UnicodeError) as error:
+                    raise ValueError(f"{path} is invalid; fix or remove it") from error
+                if not isinstance(state, dict):
+                    raise ValueError(f"{path} is not an object; fix or remove it")
+                if raw is not None:
+                    shutil.copy2(path, str(path) + ".bak")
+                write_config(path, {args.name: args.date})
+        except (OSError, ValueError) as error:
+            print(f"kaizen-scheduled: {error}", file=sys.stderr)
+            return 2
+        print(f"recorded {args.name} {args.date} in {path}")
+        return 0
     if args.command == "housekeep":
         audits = (args.audits if args.audits is not None else audits_dir()).expanduser().resolve()
         if args.dry_run or not audits.is_dir():

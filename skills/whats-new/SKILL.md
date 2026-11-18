@@ -40,6 +40,10 @@ Check for new features and tools that could make my workflow faster or cheaper.
 Cite the source page for every claim. Wait for my OK before changing anything; add
 ledger rows for what we adopt.
 
+## Record the check
+
+Only when this interactive run completed the check and delivered its result, run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled checks record --for . whats-new` as one plain command. Do not record a skipped, declined or failed check, or any scheduled or propose-only run. If the command fails, report the failure; do not edit the state file by hand.
+
 ## Done when
 
 a short, sourced list of upgrades, and sometimes a chance to delete a workaround of your own.

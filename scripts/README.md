@@ -42,6 +42,8 @@ Default logs live in the target repository's `out/dispatch/<UTC-stamp>-<brief>/`
 Brief and `-i IMAGE` paths resolve from the caller's directory. `-C` is the
 Codex/check working directory. `-p engineer|planner|none` selects a preamble.
 
+Pass `--brief-lint` to run `brief-lint --repo` with the `-C` directory before Codex. Errors stop dispatch and warnings are reported. Linting is skipped on `--resume`.
+
 Set `CODEX_DISPATCH_MODEL` to your preferred model, or override it with `-m`.
 When neither is set, no `-m` is sent to Codex; its configured default applies.
 `-e` sets reasoning effort (default `medium`). `--resume THREAD` inherits the
@@ -240,6 +242,8 @@ Zero-usage `<synthetic>` rows are not counted as calls.
 `kaizen-scheduled config show [--for DIR]` shows effective settings and the report path; `config set [--for DIR] KEY=VALUE...` merges settings, including global `retention` and `retentionOverrides`. `audit` writes a global audit; `review` audits and reviews due projects. `review --dry-run` previews without writes or tokens; add `--json` for structured output. Repeat `--project-dir DIR` to replace discovery, or use `--now` to set the review time.
 
 `housekeep [--dry-run] [--audits DIR]` removes old generated audit files under the retention settings. Use `--dry-run` to preview deletions.
+
+`checks path --for DIR` shows the project check state path; `checks record --for DIR NAME [--date YYYY-MM-DD]` records a completed check. The global or project `pendingDays` setting controls when pending experiments are flagged (default 10). Checks reports include an `## Experiments` section for each project with findings.
 
 Both audit and review accept `--audits`, `--python`, `--token-audit` and `--pricing` overrides. Review also accepts `--claude`, `--model` and `--max-turns`. Run each subcommand with `--help` for details.
 
@@ -532,6 +536,109 @@ plugin's own only when a path component equals the plugin name. `--unlink` remov
 
 Example: `kaizen-link --check`.
 
+## packet-event
+
+```text
+usage: packet-event [-h] [--file FILE] [--ts TS] [--detail DETAIL] id state
+
+Append a packet event. States: queued, dispatched, round-N (positive integer),
+checks, slot-wait, review, ready, landed, failed.
+
+positional arguments:
+  id               non-empty packet ID without a newline
+  state            packet state
+
+options:
+  -h, --help       show this help message and exit
+  --file FILE      event log path
+  --ts TS          timezone-aware ISO timestamp (default: current UTC time)
+  --detail DETAIL  optional event detail
+
+Default file: out/packet-events.jsonl. Exit codes: 0 written; 1 write failed;
+2 invalid input.
+```
+
+Append a packet state event to a JSONL file. Exit 0 means written, 1 means a write failed, and 2 means invalid input.
+
+Example: `packet-event packet-1 queued`.
+
+## flow-report
+
+```text
+usage: flow-report [-h] [--events EVENTS] [--json]
+
+Report packet flow. Wait: queued and slot-wait; touch: dispatched, round-N,
+checks, review and ready. Exit 0 for a report, 2 for usage or file errors.
+
+options:
+  -h, --help       show this help message and exit
+  --events EVENTS  event JSONL file (default: out/packet-events.jsonl)
+  --json           output JSON
+```
+
+Report packet wait and touch flow from an event log. Exit 0 means a report was produced; 2 means a usage or file error.
+
+Example: `flow-report --events out/packet-events.jsonl`.
+
+## experiment-check
+
+```text
+usage: experiment-check [-h] --project PROJECT [--pending-days PENDING_DAYS]
+                        [--today TODAY] [--json] [--checks]
+                        [--state-file STATE_FILE]
+
+Check project experiment ledger dates and metadata without running commands.
+
+options:
+  -h, --help            show this help message and exit
+  --project PROJECT
+  --pending-days PENDING_DAYS
+  --today TODAY
+  --json
+  --checks
+  --state-file STATE_FILE
+
+Exit codes: 0 no findings, 1 findings, 2 usage or ledger error. pendingDays is
+read from project then global config.
+```
+
+Check experiment ledger dates and metadata without running commands. Exit 0 means no findings, 1 means findings, and 2 means a usage or ledger error.
+
+Example: `experiment-check --project .`.
+
+## brief-lint
+
+```text
+usage: brief-lint [-h] [--repo REPO] [--sections SECTIONS] [--json]
+                  BRIEF.md [BRIEF.md ...]
+
+Check brief sections, inline repo paths, and fenced verify commands.
+
+Outside fences, inline-code paths containing / are checked when their first
+segment is a repo directory or their final segment has an extension. Bare file
+names, prose paths, globs, placeholders, URLs and absolute paths are ignored.
+Creates:, (new), and (external) declarations exempt paths throughout a brief.
+Fenced verify command names are checked against repo paths, PATH and shell
+builtins; dynamic, placeholder or unparsable commands produce warnings.
+Commands are inspected, never executed.
+
+positional arguments:
+  BRIEF.md
+
+options:
+  -h, --help           show this help message and exit
+  --repo REPO          repository root (default: current directory)
+  --sections SECTIONS  JSON object replacing aliases for selected sections
+  --json               output JSON
+
+Default aliases: goal: goal and why, goal, why; acceptance: acceptance criteria, acceptance; verify: verify, verification, verify commands; scope: scope, do not touch, don't touch
+Exit codes: 0 no errors, 1 findings include errors, 2 invalid usage.
+```
+
+Check brief sections, repository paths, and fenced verification commands without executing them. Exit 0 means no errors, 1 means findings include errors, and 2 means invalid usage.
+
+Example: `brief-lint --repo . task.md`.
+
 ## packet-report
 
 Read outcomes and propose calibration changes using the [outcome log contract](../docs/outcome-log.md).
@@ -539,10 +646,15 @@ Read outcomes and propose calibration changes using the [outcome log contract](.
 ```text
 usage: packet-report [-h] [--packets PACKETS | --project PROJECT]
                      [--since SINCE] [--until UNTIL] [--ladder LADDER]
+                     [--small-fix-lines N] [--small-fix-tokens N]
                      [--markdown | --json]
 ```
 
-An escalation is labelled by its full path of model names, with consecutive duplicates removed (`terra->sol->terra`). Names are normalised against the calibration ladder. `rounds: 1.0` is accepted; `1.5` and NaN make that history invalid. An escalation is also counted when only the effort rises between rounds (same model); such a pair is labelled with model and effort (`terra:medium->terra:high`). When only the model changes the label stays the model path (`terra->sol`). If both change, every step is labelled `model:effort`.
+An escalation is labelled by its full path of model names, with consecutive duplicates removed (`terra->sol->terra`). Labels are lowercased; a label that is not a known model becomes its single known hyphen- or colon-separated segment. Known models include ladder names and haiku, sonnet, opus, terra and sol. Labels with no known segment or multiple different known segments stay unchanged. `rounds: 1.0` is accepted; `1.5` and NaN make that history invalid. An escalation is also counted when only the effort rises between rounds (same model); such a pair is labelled with model and effort (`terra:medium->terra:high`). When only the model changes the label stays the model path (`terra->sol`). If both change, every step is labelled `model:effort`.
+
+The additive JSON keys `unknown_models`, `data_coverage`, and `landed_failing` report data quality for rows selected by `--since` and `--until`. Input token counts of zero are ambiguous; missing or invalid evidence is reported, and cost is never estimated.
+
+The `review_economics` JSON key reports landed and fix counts, fixes per landed row, fix-of-fix counts and rates, unknown references, severity coverage, no-MUST-FIX IDs, and thresholds. Counts follow date filters; fix attribution uses the full log. UP proposals include `fix_evidence` and become HOLD only when every attributed fix has complete evidence strictly below `--small-fix-lines` (default 100) and `--small-fix-tokens` (default 4000000). Otherwise `hold_blocked` explains why UP remains. Thresholds accept non-negative integers.
 
 Example: `packet-report --project . --markdown`.
 

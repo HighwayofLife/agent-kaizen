@@ -2,3 +2,7 @@
 project-repos\.txt
 # Schedule installation now uses kaizen-link.
 copies the runner, token-audit
+# Model aliases no longer depend only on the ladder.
+Names are normalised against the calibration ladder
+calibration changes up or down one rung only
+last `models-\*\.md` audit or ledger entry

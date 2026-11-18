@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""Check brief sections, inline repo paths, and fenced verify commands.
+
+Outside fences, inline-code paths containing / are checked when their first
+segment is a repo directory or their final segment has an extension. Bare file
+names, prose paths, globs, placeholders, URLs and absolute paths are ignored.
+Creates:, (new), and (external) declarations exempt paths throughout a brief.
+Fenced verify command names are checked against repo paths, PATH and shell
+builtins; dynamic, placeholder or unparsable commands produce warnings.
+Commands are inspected, never executed.
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import sys
+from pathlib import Path
+
+ALIASES = {
+    'goal': ['goal and why', 'goal', 'why'],
+    'acceptance': ['acceptance criteria', 'acceptance'],
+    'verify': ['verify', 'verification', 'verify commands'],
+    'scope': ['scope', 'do not touch', "don't touch"],
+}
+BUILTINS = set('cd export set echo test [ [[ source . exit true false unset :'.split())
+KEYWORDS = set('do done while until if then elif else fi case esac ! { }'.split())
+HEADING = re.compile(r'^\s*#{1,6}\s+(.+?)\s*#*\s*$')
+FENCE = re.compile(r'^\s*(`{3,}|~{3,})')
+SPAN = re.compile(r'`([^`\n]+)`')
+SUFFIX = re.compile(r':\d+(?:[-,]\d+)?$')
+ASSIGNMENT = re.compile(r'^[A-Za-z_][A-Za-z0-9_]*=')
+
+
+def normalize(text):
+    return ' '.join(re.sub(r'[^\w\s]', '', text.casefold()).split())
+
+
+def sections_and_lines(text, aliases):
+    sections = {key: [] for key in aliases}
+    current = []
+    outside = []
+    verify = []
+    fence = None
+    for line in text.splitlines():
+        marker = FENCE.match(line)
+        if marker and (fence is None or (marker.group(1)[0] == fence[0] and len(marker.group(1)) >= len(fence))):
+            fence = marker.group(1) if fence is None else None
+            current.append(line)
+            continue
+        if fence is not None:
+            current.append(line)
+            if any(current is body for body in sections['verify']):
+                verify.append(line)
+            continue
+        heading = HEADING.match(line)
+        if heading:
+            title = normalize(heading.group(1))
+            current = []
+            for key, choices in aliases.items():
+                if any(title.startswith(normalize(alias)) for alias in choices):
+                    sections[key].append(current)
+            continue
+        current.append(line)
+        outside.append(line)
+    return sections, outside, verify
+
+
+def path_name(value):
+    return SUFFIX.sub('', value)
+
+
+def lint(text, repo, aliases):
+    sections, lines, commands = sections_and_lines(text, aliases)
+    errors, warnings = [], []
+    for key, bodies in sections.items():
+        if not bodies:
+            errors.append('missing section: ' + key)
+        elif not any(any(line.strip() for line in body) for body in bodies):
+            errors.append('empty section: ' + key)
+    if len(text.splitlines()) > 200 or len(text.encode('utf-8')) > 12288:
+        warnings.append('brief exceeds 200 lines or 12288 bytes')
+    declared = set()
+    for bodies in sections['scope']:
+        for line in bodies:
+            if re.match(r'^\s*(?:\*\*)?creates:(?:\*\*)?', line, re.I):
+                declared.update(path_name(m.group(1)) for m in SPAN.finditer(line))
+    for line in lines:
+        for match in SPAN.finditer(line):
+            if re.match(r'\s+\((?:new|external)\)', line[match.end():], re.I):
+                declared.add(path_name(match.group(1)))
+    seen = set()
+    for line in lines:
+        for match in SPAN.finditer(line):
+            value = path_name(match.group(1))
+            if (value in seen or value in declared or '/' not in value
+                    or re.search(r'\s|[*?\[\]{}<>$]', value) or '://' in value
+                    or value.startswith(('-', '~', '/'))):
+                continue
+            first, last = value.split('/')[0], value.rsplit('/', 1)[-1]
+            if not (repo.joinpath(first).is_dir() or Path(last).suffix):
+                continue
+            seen.add(value)
+            if not repo.joinpath(value).exists():
+                errors.append('path not found: ' + value)
+    for raw in commands:
+        line = raw.strip()
+        if not line or line.startswith('#'):
+            continue
+        if line.startswith('$ '):
+            line = line[2:].strip()
+        # Split only on unquoted shell operators; shlex then handles words and
+        # comments within each segment. Substitutions need a real shell parser.
+        if '$(' in line or '`' in line:
+            warnings.append('cannot check command: ' + line)
+            continue
+        segments, current, quote, escaped, token_start = [], [], None, False, True
+        for char in line:
+            if escaped:
+                current.append(char)
+                escaped = False
+            elif char == "\\" and quote != "'":
+                current.append(char)
+                escaped = True
+            elif quote:
+                current.append(char)
+                if char == quote:
+                    quote = None
+            elif char in "'\"":
+                current.append(char)
+                quote = char
+                token_start = False
+            elif char == '#' and token_start:
+                break
+            elif char == '&' and current and current[-1] in '<>':
+                current.append(char)
+                token_start = False
+            elif char in '&|;':
+                segments.append(''.join(current))
+                current = []
+                token_start = True
+            else:
+                current.append(char)
+                token_start = char.isspace()
+        segments.append(''.join(current))
+        try:
+            groups = [shlex.split(segment, comments=True, posix=True) for segment in segments]
+        except ValueError:
+            warnings.append('cannot check command: ' + line)
+            continue
+        for group in groups:
+            while group and (group[0] in KEYWORDS or ASSIGNMENT.match(group[0]) or group[0] == 'env'):
+                group.pop(0)
+            if group and group[0] == 'for':
+                continue
+            if not group:
+                continue
+            word = group[0]
+            if word.startswith('<') or '$' in word or '`' in word:
+                warnings.append('cannot check command: ' + line)
+            elif word not in BUILTINS and not ((repo / word).exists() if '/' in word else (shutil.which(word) or ((repo / word).is_file() and os.access(repo / word, os.X_OK)))):
+                errors.append('command not found: ' + word)
+    return errors, warnings
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="Default aliases: " + '; '.join(k + ': ' + ', '.join(v) for k, v in ALIASES.items()) +
+        '\nExit codes: 0 no errors, 1 findings include errors, 2 invalid usage.')
+    parser.add_argument('--repo', type=Path, default=Path('.'), help='repository root (default: current directory)')
+    parser.add_argument('--sections', type=Path, help='JSON object replacing aliases for selected sections')
+    parser.add_argument('--json', action='store_true', help='output JSON')
+    parser.add_argument('briefs', nargs='+', metavar='BRIEF.md')
+    args = parser.parse_args()
+    aliases = dict(ALIASES)
+    try:
+        if args.sections:
+            config = json.loads(args.sections.read_text(encoding='utf-8'))
+            if (not isinstance(config, dict) or any(k not in aliases or not isinstance(v, list)
+                    or any(not isinstance(a, str) or not normalize(a) for a in v) for k, v in config.items())):
+                raise ValueError('sections must map known keys to lists of nonempty aliases')
+            aliases.update(config)
+        contents = [Path(path).read_text(encoding='utf-8') for path in args.briefs]
+    except (OSError, UnicodeError, ValueError) as exc:
+        parser.error(str(exc))
+    files = []
+    for path, content in zip(args.briefs, contents):
+        errors, warnings = lint(content, args.repo, aliases)
+        files.append(dict(path=path, errors=errors, warnings=warnings))
+    status = 'errors' if any(item['errors'] for item in files) else 'ok'
+    if args.json:
+        print(json.dumps(dict(status=status, files=files)))
+    else:
+        for item in files:
+            errors, warnings = item['errors'], item['warnings']
+            result = f'{len(errors)} error(s), {len(warnings)} warning(s)' if errors or warnings else 'ok'
+            print(f"{item['path']}: {result}")
+            for kind, findings in [('error', errors), ('warning', warnings)]:
+                for finding in findings:
+                    print(f'{kind}: {finding}')
+    return int(status == 'errors')
+
+
+if __name__ == '__main__':
+    sys.exit(main())

@@ -3,6 +3,8 @@
 # AUDIT_DIR overrides the audits directory; CLAUDE_CONFIG_DIR selects the config directory.
 # KAIZEN_NOTICE_ALL=1 also enables notices outside enrolled projects.
 # Reads global enabled and global or project schedule from agent-kaizen config files.
+emitted=0
+trap '[ "$emitted" = 1 ] || printf "{}\n"' EXIT
 command -v jq >/dev/null 2>&1 || exit 0
 home=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
 dir=${AUDIT_DIR:-$home/audits}
@@ -64,13 +66,77 @@ if [ -z "$latest" ]; then
         fi
     done < <(ls -t "$dir"/token-audit-*.md 2>/dev/null)
 fi
-[ -n "$latest" ] && [ ! -e "${latest%.md}.reviewed" ] || exit 0
-marker="${latest%.md}.noticed-$(date +%F)"
-[ -e "$marker" ] && exit 0
-extra=""
-[ -n "$proposal" ] && [ "$proposal" -nt "$latest" ] && extra=" A propose-only review is ready too: $proposal."
-msg="An unreviewed usage audit exists: $latest.$extra When there is a pause, run /agent-kaizen:review (read the headline and flagged sections, not the whole file), propose changes to the user, then touch ${latest%.md}.reviewed."
-out=$(jq -n --arg c "$msg" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}') || exit 0
-[ -n "$out" ] || exit 0
-touch "$marker" 2>/dev/null
+audit_msg=
+audit_marker=
+if [ -n "$latest" ] && [ ! -e "${latest%.md}.reviewed" ]; then
+    marker="${latest%.md}.noticed-$(date +%F)"
+    if (set -o noclobber; : > "$marker") 2>/dev/null; then
+        audit_marker=$marker
+        extra=""
+        [ -n "$proposal" ] && [ "$proposal" -nt "$latest" ] && extra=" A propose-only review is ready too: $proposal."
+        audit_msg="An unreviewed usage audit exists: $latest.$extra When there is a pause, run /agent-kaizen:review (read the headline and flagged sections, not the whole file), propose changes to the user, then touch ${latest%.md}.reviewed."
+    fi
+fi
+
+experiment_msg=
+experiment_marker=
+plugin_root=${CLAUDE_PLUGIN_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." 2>/dev/null && pwd)}
+checker=$plugin_root/scripts/experiment-check
+if { [ -n "$root" ] || [ -n "$key" ]; } && command -v python3 >/dev/null 2>&1 && [ -f "$checker" ]; then
+    [ -n "$root" ] || root=$start
+    checksum=$(printf '%s' "${key:-$root}" | cksum)
+    checksum=${checksum%% *}
+    marker="$dir/experiments-$checksum.noticed-$(date +%F)"
+    check_args=()
+    [ -n "$key" ] && check_args=(--checks --state-file "$dir/projects/$key/checks.json")
+    if [ -n "$checksum" ] && [ ! -e "$marker" ]; then
+        if command -v timeout >/dev/null 2>&1; then
+            output=$(timeout -k 1 "${KAIZEN_NOTICE_TIMEOUT:-10}" python3 "$checker" --project "$root" "${check_args[@]}" 2>/dev/null)
+            status=$?
+        elif command -v gtimeout >/dev/null 2>&1; then
+            output=$(gtimeout -k 1 "${KAIZEN_NOTICE_TIMEOUT:-10}" python3 "$checker" --project "$root" "${check_args[@]}" 2>/dev/null)
+            status=$?
+        else
+            output=$(
+                tmp=$(mktemp) || exit 2
+                python3 "$checker" --project "$root" "${check_args[@]}" >"$tmp" 2>/dev/null &
+                pid=$!
+                (sleep "${KAIZEN_NOTICE_TIMEOUT:-10}"; kill "$pid" 2>/dev/null; sleep 1; kill -KILL "$pid" 2>/dev/null) >/dev/null 2>&1 &
+                watchdog=$!
+                wait "$pid" 2>/dev/null
+                status=$?
+                kill "$watchdog" 2>/dev/null
+                wait "$watchdog" 2>/dev/null
+                head -n 12 "$tmp"
+                rm -f "$tmp"
+                exit "$status"
+            )
+            status=$?
+        fi
+        if [ "$status" -eq 1 ] && mkdir -p "$dir" 2>/dev/null &&
+            (set -o noclobber; : > "$marker") 2>/dev/null; then
+            experiment_marker=$marker
+            output=$(printf '%s\n' "$output" | head -n 12)
+            experiment_msg="Experiments need attention in this project (docs/kaizen/LEDGER.md):
+$output
+When there is a pause, run /agent-kaizen:review."
+        fi
+    fi
+fi
+
+msg=$audit_msg
+if [ -n "$experiment_msg" ]; then
+    msg="${msg:+$msg
+
+}$experiment_msg"
+fi
+[ -n "$msg" ] || exit 0
+out=$(jq -n --arg c "$msg" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}')
+if [ -z "$out" ]; then
+    [ -n "$audit_marker" ] && rm -f "$audit_marker"
+    [ -n "$experiment_marker" ] && rm -f "$experiment_marker"
+    exit 0
+fi
 printf '%s\n' "$out"
+emitted=1
+exit 0

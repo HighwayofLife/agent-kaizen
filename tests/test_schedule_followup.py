@@ -85,7 +85,16 @@ class ProcessGroupTests(RobustCase):
 
     def test_timeout_kills_helpers_after_the_leader_exits(self):
         executable(self.claude, FORKER.rsplit('time.sleep(120)', 1)[0] + 'sys.exit(0)\n')
-        with self.assertRaises(subprocess.TimeoutExpired):
+        communicate = self.runner.GroupPopen.communicate
+
+        def after_leader_exits(child, *args, **kwargs):
+            # Start the timeout only after startup, with the helper holding the pipes open.
+            wait_for(self.grandchild)
+            self.assertEqual(child.wait(timeout=10), 0)
+            return communicate(child, *args, **kwargs)
+
+        with patch.object(self.runner.GroupPopen, 'communicate', after_leader_exits), \
+                self.assertRaises(subprocess.TimeoutExpired):
             self.runner.run_group([str(self.claude)], env=self.env, capture_output=True, timeout=0.4)
         self.assert_helper_gone()
 

@@ -55,6 +55,15 @@ class SessionNotesTests(unittest.TestCase):
                           f'| c | done | {old} |\n')
         self.assertIn('1 ledger rows still pending', self.context())
 
+    def test_eight_column_ledger_pending(self):
+        ledger = self.root / 'docs/kaizen/LEDGER.md'
+        ledger.parent.mkdir(parents=True)
+        old = datetime.date.today() - datetime.timedelta(days=7)
+        ledger.write_text('| date | change | why | expected effect | measured effect | keep/revert | metric command | review date |\n'
+                          '| --- | --- | --- | --- | --- | --- | --- | --- |\n'
+                          f'| {old} | old change | | | pending | | | |\n')
+        self.assertIn('1 ledger rows still pending', self.context())
+
     def test_dispatch_sections_and_config_fallback(self):
         self.stub('dispatch-status', "printf 'RUNNING\\n  worker 1\\nOTHER\\n  ignore\\nDIRTY WORKTREES\\n  branch 2\\n'",
                   self.root / 'config/bin')

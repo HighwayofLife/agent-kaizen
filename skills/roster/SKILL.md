@@ -99,7 +99,7 @@ Phase 5: build it.
 Phase 6: verify and record.
 - Smoke-test each agent and script with a tiny read-only task, and report pass or fail.
 - Add a ledger row per vendor or agent added (docs/kaizen/LEDGER.md), with how the next
-  audit will show whether it helps (per-pool usage, per-agent cost and success rate).
+  audit will show whether it helps (per-pool usage, per-agent cost and success rate). Include metric command and review date using `${CLAUDE_PLUGIN_ROOT}/skills/start/SKILL.md`.
 - Remind me that /agent-kaizen:models and /agent-kaizen:cycle re-check the roster
   periodically.
 ```
@@ -109,6 +109,10 @@ Phase 6: verify and record.
 - Pattern scripts: `${CLAUDE_PLUGIN_ROOT}/scripts/codex-dispatch`, `${CLAUDE_PLUGIN_ROOT}/scripts/codex-review` and `${CLAUDE_PLUGIN_ROOT}/scripts/README.md`.
 - Agent templates: `${CLAUDE_PLUGIN_ROOT}/templates/agents/*.md`. Role context: `${CLAUDE_PLUGIN_ROOT}/templates/agent-context/`.
 - Routing table skeleton: `${CLAUDE_PLUGIN_ROOT}/templates/global-CLAUDE.md` (the Routing section). An example of a multi-vendor roster: `${CLAUDE_PLUGIN_ROOT}/docs/what-we-learned.md` ("Routing and models").
+
+## Record the check
+
+Only when this interactive run completed the check and delivered its result, run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled checks record --for . roster` as one plain command. Do not record a skipped, declined or failed check, or any scheduled or propose-only run. If the command fails, report the failure; do not edit the state file by hand.
 
 ## Done when
 

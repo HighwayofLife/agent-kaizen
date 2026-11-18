@@ -1,6 +1,7 @@
 """Dispatch guards exercised with a fake Codex in isolated worktrees."""
 import os
 import shlex
+import shutil
 import signal
 import subprocess
 import time
@@ -20,6 +21,75 @@ class DispatchGuardTests(StubCase):
         write(self.work / 'tracked', 'original\n')
         subprocess.run(['git', '-C', str(self.work), 'add', '.'], check=True, env=self.env)
         subprocess.run(['git', '-C', str(self.work), 'commit', '-qm', 'initial'], check=True, env=self.env)
+
+    def valid_brief(self, extra=""):
+        write(self.brief, "# Goal\nTask\n# Scope\nEdit files\n"
+              "# Acceptance criteria\nWorks\n# Verification\n```sh\ntrue\n```\n" + extra)
+
+    def test_brief_lint_is_off_by_default(self):
+        result = self.dispatch('--allow-no-change')
+        self.assertEqual(self.report(result)[-1], 'STATUS: DONE')
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_brief_lint_valid_brief_dispatches(self):
+        write(self.work / 'sub' / 'inside', 'exists')
+        self.valid_brief('Existing: `sub/inside`\n')
+        result = self.dispatch('--brief-lint', '--allow-no-change')
+        self.assertEqual(self.report(result)[-1], 'STATUS: DONE')
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_brief_lint_errors_stop_before_output_directory(self):
+        for content in ('# Goal\nTask\n',
+                        '# Goal\nTask\n# Scope\n`missing/file.txt`\n'
+                        '# Acceptance\nWorks\n# Verify\ntrue\n'):
+            with self.subTest(content=content):
+                write(self.brief, content)
+                result = self.dispatch('--brief-lint', code=2)
+                self.assertIn('Reason: brief-lint:', result.stdout)
+                self.assertIn('STATUS: CODEX FAILED', result.stdout)
+                self.assertFalse(self.record.exists())
+                self.assertFalse((self.work / 'out/dispatch').exists())
+
+    def test_brief_lint_warnings_and_report_limit(self):
+        self.valid_brief('Extra\n' * 201 + '```sh\n' + '$unknown\n' * 25 + '```\n')
+        result = self.dispatch('--brief-lint', '--allow-no-change', *['-k', 'true'] * 12)
+        self.assertIn('WARNING: brief-lint:', result.stdout)
+        self.assertEqual(self.report(result)[-1], 'STATUS: DONE')
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_brief_lint_uses_working_directory_for_paths(self):
+        write(self.work / 'sub' / 'inside', 'exists')
+        other = self.root / 'other'
+        (other / 'sub').mkdir(parents=True)
+        self.valid_brief('Path: `sub/inside`\n')
+        result = self.dispatch('--brief-lint', '-C', other, code=2)
+        self.assertIn('path not found: sub/inside', result.stdout)
+        self.assertFalse(self.record.exists())
+        self.assertFalse((other / 'out/dispatch').exists())
+        self.assertEqual(self.report(self.dispatch('--brief-lint', '--allow-no-change'))[-1], 'STATUS: DONE')
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_brief_lint_skipped_for_resume(self):
+        result = self.dispatch('--brief-lint', '--resume', 'previous', '--allow-no-change')
+        self.assertEqual(self.report(result)[-1], 'STATUS: DONE')
+        self.assertEqual(len(self.calls()), 1)
+
+    def test_brief_lint_missing_tool(self):
+        scripts = self.root / 'scripts'
+        shutil.copytree(SCRIPTS, scripts)
+        (scripts / 'brief-lint').unlink()
+        command = [str(scripts / 'codex-dispatch'), '-C', str(self.work)]
+        result = subprocess.run(command + ['--brief-lint', str(self.brief)], cwd=self.work,
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+        self.assertIn('Reason: brief-lint failed:', result.stdout)
+        self.assertIn('STATUS: CODEX FAILED', result.stdout)
+        self.assertFalse(self.record.exists())
+        self.assertFalse((self.work / 'out/dispatch').exists())
+        result = subprocess.run(command + ['--allow-no-change', str(self.brief)], cwd=self.work,
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual(len(self.calls()), 1)
 
     def test_no_change_resumes_and_fails(self):
         result = self.dispatch(code=1)
