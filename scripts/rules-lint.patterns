@@ -6,3 +6,5 @@ copies the runner, token-audit
 Names are normalised against the calibration ladder
 calibration changes up or down one rung only
 last `models-\*\.md` audit or ledger entry
+# Skill descriptions are hidden when model invocation is disabled.
+Skill and agent descriptions\*\* are listed every turn

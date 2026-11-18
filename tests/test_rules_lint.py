@@ -57,6 +57,15 @@ class RulesLintTest(unittest.TestCase):
         self.assertIn(r"project-repos\.txt", {h["pattern"] for h in hits})
         self.assertIn("copies the runner, token-audit", {h["pattern"] for h in hits})
 
+    def test_skill_description_wording(self):
+        write(self.repo / "CLAUDE.md", "All skills are user-triggered (`disable-model-invocation: true`), so their descriptions don't cost context on every turn.\n")
+        result = self.run_lint("--repo", self.repo, "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        write(self.repo / "CLAUDE.md", "**Skill and agent descriptions** are listed every turn.\n")
+        result = self.run_lint("--repo", self.repo, "--json")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertEqual(json.loads(result.stdout)["count"], 1)
+
     def test_old_model_alias_wording(self):
         write(self.repo / "CLAUDE.md", "Names are normalised against the calibration ladder\n")
         result = self.run_lint("--repo", self.repo, "--json")
