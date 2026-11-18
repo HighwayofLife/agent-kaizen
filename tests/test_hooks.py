@@ -147,6 +147,52 @@ class HookTests(unittest.TestCase):
         (project / 'docs/kaizen/config.json').write_text('{"hostActions":"off"}')
         self.assertIsNone(run('audit-notice.sh', {'cwd': str(worktree)}, env))
 
+    def test_actions_canonical_config_safety_and_precedence(self):
+        import runpy
+        import sys
+        sys.path.insert(0, str(ROOT / 'scripts'))
+        self.addCleanup(sys.path.remove, str(ROOT / 'scripts'))
+        from kaizen_friction_actions import HostActions
+        self.tmp = self.tmp.resolve()
+        project, audits, _, env = self.notice_setup()
+        subprocess.run(['git', 'init', '-q', str(project)], check=True)
+        subprocess.run(['git', '-C', str(project), '-c', 'user.name=Test', '-c', 'user.email=test@localhost', '-c', 'commit.gpgsign=false', 'commit', '--allow-empty', '-qm', 'initial'], check=True)
+        worktree = self.tmp / 'worktree'
+        subprocess.run(['git', '-C', str(project), 'worktree', 'add', '-qb', 'linked', str(worktree)], check=True)
+        (worktree / 'docs/kaizen').mkdir(parents=True, exist_ok=True)
+        runner = runpy.run_path(str(ROOT / 'scripts/kaizen-scheduled'))
+        backup = self.tmp / 'backup'
+        env.update(CLAUDE_PLUGIN_ROOT=str(ROOT), KAIZEN_BACKUP_DIR=str(backup))
+        HostActions(audits, backup, runner['action_project'], runner['key']).record(project, 'test', 'one', 'evidence', allowed=('one',))
+        canonical = project / 'docs/kaizen/config.json'
+        checkout = worktree / 'docs/kaizen/config.json'
+        global_config = Path(env['CLAUDE_CONFIG_DIR']) / 'agent-kaizen.json'
+        global_config.parent.mkdir(parents=True)
+        def notice():
+            for marker in audits.glob('host-actions-*.noticed-*'):
+                marker.unlink()
+            return run('audit-notice.sh', {'cwd': str(worktree)}, env)
+        global_config.write_text('{"hostActions":"off"}')
+        canonical.write_text('{"hostActions":"suggest"}')
+        self.assertIsNotNone(notice())
+        canonical.write_text('{"hostActions":"off"}')
+        global_config.write_text('{"hostActions":"suggest"}')
+        self.assertIsNone(notice())
+        checkout.write_text('{"hostActions":"suggest"}')
+        self.assertIsNotNone(notice())
+        checkout.unlink()
+        canonical.unlink()
+        os.mkfifo(canonical)
+        for marker in audits.glob('host-actions-*.noticed-*'):
+            marker.unlink()
+        result = subprocess.run(['bash', str(HOOKS / 'audit-notice.sh')], input=json.dumps({'cwd': str(worktree)}),
+                                text=True, capture_output=True, env={**os.environ, **env}, timeout=3)
+        self.assertEqual(result.returncode, 0)
+        self.assertTrue(json.loads(result.stdout))
+        canonical.unlink()
+        canonical.write_text('{"hostActions":"off"}' + ' ' * 65536)
+        self.assertIsNotNone(notice())
+
     def test_claude_notice_golden(self):
         # Captured from d1accc4 scripts, not JSON reserialization; <TMP> replaces the temp root.
         project, audits, plugin, env = self.notice_setup()

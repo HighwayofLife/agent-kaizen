@@ -2,6 +2,7 @@
 import importlib.machinery
 import importlib.util
 import os
+import runpy
 import json
 from pathlib import Path
 import plistlib
@@ -316,6 +317,14 @@ class ScheduleTests(StubCase):
         self.assertNotIn('unavailable:', drift)
         self.assertFalse((self.home / '.claude/hooks').exists())
         shutil.rmtree(plugin)
+        sampler = target / 'kaizen_friction_sample.py'
+        self.assertEqual(sampler.read_bytes(), (SCRIPTS / sampler.name).read_bytes())
+        audit = runpy.run_path(str(target / 'token-audit'))
+        sampler_path = Path(audit['__file__']).with_name('kaizen_friction_sample.py')
+        spec = importlib.util.spec_from_file_location('installed_sampler', sampler_path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        self.assertTrue(callable(module.has_extended_acl))
         for name in ('usage-series', 'kaizen-scheduled', 'kaizen-backup'):
             help_result = subprocess.run([sys.executable, str(target / name), '--help'],
                                          env=self.env, capture_output=True, text=True)
