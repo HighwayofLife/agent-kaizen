@@ -41,3 +41,11 @@ Read `git show wt/p12:scripts/host-fix` at `eligible_path`, `checked_directory`,
 ## Report
 
 Report changed files and line counts, exact checks and outcomes, known uncertainty and any blocked verification. Label measurements with baseline/conditions. Redact paths and identifiers from shared output. Leave plugin version and release CHANGELOG to P27. Do not commit or push.
+
+## Delta (P15 security review, 2026-11-18)
+
+P15 landed with apply/undo gated. Its Sol high review found these; fix all before ungating apply or undo, each with a red test first:
+1. MUST-FIX: `scripts/host-fix` ~line 129 — policy validation splits each configured path and checks every prefix with no deadline; on Python 3.14 overlong prefixes return false from `is_symlink()`, so a config under 1 MiB can stall `apply` far past its 20-second deadline. Bound the work: cap path length and component count when loading policy (refuse over-limit configs) and check the deadline inside the prefix loop.
+2. ~line 274 — directory revalidation leaves a rename window before the create: the open descriptor still points at the directory if it is moved outside the eligible tree. Create relative to the verified dir fd and re-verify, after the create, that the dir fd's path still resolves to the same device/inode inside the eligible tree; on mismatch remove the just-created marker (by dir fd) and refuse.
+3. ~line 212 — nested worktrees inherit the innermost relative path for outer allowlist checks, so an outer policy can approve a different path from the one evaluated. Compute the relative path separately against each worktree root whose policy is consulted.
+4. ~line 275 — the existing-marker check runs after policy, traversal and action validation, so an invocation can refuse instead of returning the required no-op. Check for an existing marker (no-follow, by the verified dir fd) first and return the no-op.
