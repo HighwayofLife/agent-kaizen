@@ -3,15 +3,17 @@ from functools import partial
 import os
 from pathlib import Path
 import re
-import select
+import signal
 import shutil
 import stat
 import subprocess
 import time
+import threading
 
 MAX_OUTPUT = 1024 * 1024
 MAX_TREES = 256
 TIMEOUT = 5
+TOTAL_TIMEOUT = 20
 GIT_PATHS = ('/usr/bin/git', '/opt/homebrew/bin/git', '/usr/local/bin/git')
 GIT_ENV = dict(PATH='/usr/bin:/bin', LC_ALL='C', GIT_CONFIG_NOSYSTEM='1',
                GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0',
@@ -19,7 +21,8 @@ GIT_ENV = dict(PATH='/usr/bin:/bin', LC_ALL='C', GIT_CONFIG_NOSYSTEM='1',
                GIT_NO_REPLACE_OBJECTS='1', GIT_GRAFT_FILE=os.devnull)
 GIT_CONFIG = ('core.hooksPath=/dev/null', 'core.fsmonitor=false',
               'core.untrackedCache=false', 'core.commitGraph=false',
-              'core.multiPackIndex=false', 'fetch.writeCommitGraph=false')
+              'core.multiPackIndex=false', 'fetch.writeCommitGraph=false',
+              'diff.ignoreSubmodules=none')
 
 
 def file_id(info):
@@ -67,7 +70,7 @@ def repository_dirs(directory):
     return ()
 
 
-def resolve_git(directory, *protected):
+def resolve_git(directory, *protected, deadline=None):
     override = os.environ.get('KAIZEN_GIT')
     directory = Path(directory).resolve(strict=True)
     try:
@@ -96,7 +99,7 @@ def resolve_git(directory, *protected):
         if candidate is None:
             return None
         # Use the fixed Git to establish scope before running the override.
-        entries = records(partial(git, fixed), directory)
+        entries = records(partial(git, fixed, deadline=deadline), directory)
         if not entries:
             return None
         for entry in entries:
@@ -113,52 +116,68 @@ def resolve_git(directory, *protected):
         return None
 
 
-def git(executable, directory, *args, input_data=b''):
+def git(executable, directory, *args, input_data=b'', deadline=None):
     if executable is None:
         return None
+    timeout = TIMEOUT if deadline is None else min(TIMEOUT, deadline - time.monotonic())
+    if timeout <= 0:
+        return None
     process = None
+    reader = None
+    output = bytearray()
+
+    def stop(force=False):
+        if process.poll() is not None and not force:
+            return
+        try:
+            if os.name == 'posix':
+                os.killpg(process.pid, signal.SIGKILL)
+            elif process.poll() is None:
+                process.kill()
+        except OSError:
+            if process.poll() is None:
+                process.kill()
+
     try:
         config = [arg for value in GIT_CONFIG for arg in ('-c', value)]
+        # Override per-submodule ignore settings as well as diff.ignoreSubmodules.
+        if 'status' in args:
+            args = (*args, '--ignore-submodules=none')
         process = subprocess.Popen([str(executable), '--no-pager', '--no-optional-locks',
                                     '-C', str(directory), *config, *args], env=GIT_ENV,
                                    stdin=subprocess.PIPE if input_data else subprocess.DEVNULL,
-                                   stdout=subprocess.PIPE,
-                                   stderr=subprocess.DEVNULL)
-        deadline = time.monotonic() + TIMEOUT
-        output = bytearray()
-        pending = memoryview(input_data)
-        while True:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None
-            readers, writers, _ = select.select([process.stdout], [process.stdin] if pending else [], [], remaining)
-            if not readers and not writers:
-                return None
-            if writers:
-                pending = pending[os.write(process.stdin.fileno(), pending[:select.PIPE_BUF]):]
-                if not pending:
-                    process.stdin.close()
-            if not readers:
-                continue
-            chunk = os.read(process.stdout.fileno(), min(65536, MAX_OUTPUT + 1 - len(output)))
-            if not chunk:
-                if pending:
-                    return None
-                break
-            output.extend(chunk)
+                                   stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   start_new_session=(os.name == 'posix'))
+        stdout = process.stdout
+        process.stdout = None  # The bounded reader owns this pipe, not communicate().
+
+        def read_output():
+            while len(output) <= MAX_OUTPUT:
+                chunk = stdout.read(min(65536, MAX_OUTPUT + 1 - len(output)))
+                if not chunk:
+                    break
+                output.extend(chunk)
             if len(output) > MAX_OUTPUT:
-                return None
-        return process.wait(timeout=max(0.001, deadline - time.monotonic())), bytes(output)
+                stop()
+            stdout.close()
+
+        reader = threading.Thread(target=read_output, daemon=True)
+        reader.start()
+        end = time.monotonic() + timeout
+        process.communicate(input=input_data or None, timeout=timeout)
+        reader.join(max(0, end - time.monotonic()))
+        if reader.is_alive() or len(output) > MAX_OUTPUT:
+            return None
+        return process.returncode, bytes(output)
     except (OSError, subprocess.TimeoutExpired):
         return None
     finally:
         if process is not None:
-            if process.poll() is None:
-                process.kill()
+            stop(force=reader is not None and reader.is_alive())
             process.wait()
-            process.stdout.close()
-            if process.stdin is not None:
-                process.stdin.close()
+            if reader is not None:
+                reader.join(timeout=0.1)
+
 
 
 def records(run, directory):
@@ -197,14 +216,15 @@ def read_facts(directory, read_status):
     clean and merged are True, False, or None (unknown); they are advisory and
     must not be used alone to authorize deletion.
     """
+    deadline = time.monotonic() + TOTAL_TIMEOUT
     try:
-        executable = resolve_git(directory)
+        executable = resolve_git(directory, deadline=deadline)
     except (OSError, ValueError, RuntimeError):
         return None
     path_fallback = executable is None and 'KAIZEN_GIT' not in os.environ
     if path_fallback:
         executable = shutil.which('git')
-    run = partial(git, executable)
+    run = partial(git, executable, deadline=deadline)
     entries = records(run, directory)
     if not entries:
         return None
@@ -227,9 +247,15 @@ def read_facts(directory, read_status):
         tip = entry.get(b'HEAD', b'')
         detached = b'detached' in entry
         clean = merged = None
-        status = read_status(run, path)
+        status = read_status(run, path) if time.monotonic() < deadline else None
         if status is not None and status[0] == 0:
-            clean = not bool(status[1])
+            flags = run(path, 'ls-files', '-v', '-z')
+            if flags is not None and flags[0] == 0:
+                entries_flags = flags[1].split(b'\0')
+                if entries_flags[-1] == b'' and all(
+                        len(item) >= 3 and item[1:2] == b' ' and item[:1] == b'H'
+                        for item in entries_flags[:-1]):
+                    clean = not bool(status[1])
         if primary_tip and valid_tip(tip):
             ancestry = run(directory, 'merge-base', '--is-ancestor', os.fsdecode(tip), os.fsdecode(primary_tip))
             if ancestry is not None and ancestry[0] in (0, 1):

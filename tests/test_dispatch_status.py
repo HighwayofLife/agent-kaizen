@@ -3,6 +3,7 @@ from contextlib import redirect_stdout
 import io
 import os
 import runpy
+import select
 import shutil
 import subprocess
 import sys
@@ -75,6 +76,69 @@ class DispatchStatusTests(StubCase):
         self.assertNotIn(str(other), output.split('WORKTREE FACTS (advisory)')[0])
         selected = self.run_script('dispatch-status', '--worktree-facts', other).stdout
         self.assertNotIn('primary=true', selected.split('WORKTREE FACTS (advisory)')[1])
+
+    def test_hidden_index_flags_make_clean_unknown(self):
+        for flag in ('assume-unchanged', 'skip-worktree'):
+            with self.subTest(flag=flag):
+                self.git('update-index', '--' + flag, 'task.md')
+                (self.work / 'task.md').write_text('hidden change')
+                output = self.run_script('dispatch-status', '--worktree-facts', self.work).stdout
+                self.assertIn('clean=unknown', output)
+                self.git('update-index', '--no-' + flag, 'task.md')
+                self.git('restore', 'task.md')
+
+    def test_submodule_ignore_configuration_cannot_hide_changes(self):
+        sub = self.work / 'sub'
+        self.git('init', '-q', str(sub))
+        subprocess.run(['git', '-C', str(sub), 'config', 'user.email', 'test@example.invalid'], check=True)
+        subprocess.run(['git', '-C', str(sub), 'config', 'user.name', 'Test'], check=True)
+        (sub / 'tracked').write_text('original')
+        subprocess.run(['git', '-C', str(sub), 'add', 'tracked'], check=True)
+        subprocess.run(['git', '-C', str(sub), 'commit', '-qm', 'sub'], env=self.env, check=True)
+        tip = subprocess.check_output(['git', '-C', str(sub), 'rev-parse', 'HEAD']).decode().strip()
+        (self.work / '.gitmodules').write_text('[submodule \"sub\"]\n\tpath = sub\n\turl = ../sub\n')
+        self.git('add', '.gitmodules')
+        self.git('update-index', '--add', '--cacheinfo', f'160000,{tip},sub')
+        self.git('commit', '-qm', 'add submodule')
+        (sub / 'tracked').write_text('changed')
+        for setting in ('submodule.sub.ignore', 'diff.ignoreSubmodules'):
+            with self.subTest(setting=setting):
+                self.git('config', setting, 'all')
+                self.assertEqual(self.git('status', '--porcelain').stdout, '')
+                output = self.run_script('dispatch-status', '--worktree-facts', self.work).stdout
+                self.assertIn('clean=false', output)
+                self.git('config', '--unset', setting)
+
+    def test_overall_budget_leaves_unreached_worktrees_unknown(self):
+        other = self.root / 'linked'
+        self.git('worktree', 'add', '-qb', 'topic', str(other))
+        script_dir = str(Path(__file__).resolve().parents[1] / 'scripts')
+        with patch.object(sys, 'path', [script_dir, *sys.path]):
+            import kaizen_worktree_facts as facts
+            def slow_status(run, path):
+                time.sleep(0.2)
+                return run(path, 'status', '--porcelain')
+            with patch.object(facts, 'TOTAL_TIMEOUT', 0.1):
+                result = facts.read_facts(self.work, slow_status)
+        self.assertIsNotNone(result)
+        self.assertTrue(all(row['clean'] is None and row['merged'] is None for row in result))
+
+    def test_git_communicate_is_bounded_and_does_not_use_select(self):
+        script_dir = str(Path(__file__).resolve().parents[1] / 'scripts')
+        with patch.object(sys, 'path', [script_dir, *sys.path]):
+            import kaizen_worktree_facts as facts
+            with patch.object(select, 'select', side_effect=OSError('unsupported')):
+                self.assertEqual(facts.git(shutil.which('git'), self.work, 'rev-parse', '--is-inside-work-tree'),
+                                 (0, b'true\n'))
+            with patch.object(facts, 'MAX_OUTPUT', 2):
+                self.assertIsNone(facts.git(shutil.which('git'), self.work, 'rev-parse', '--is-inside-work-tree'))
+            sleeper = self.bin / 'slow-git'
+            sleeper.write_text('#!/bin/sh\nsleep 2\n')
+            sleeper.chmod(0o755)
+            with patch.object(facts, 'TIMEOUT', 0.05):
+                start = time.monotonic()
+                self.assertIsNone(facts.git(sleeper, self.work, 'status'))
+                self.assertLess(time.monotonic() - start, 1)
 
     def test_advisory_facts_fall_back_to_path_git(self):
         script = Path(__file__).resolve().parents[1] / 'scripts/dispatch-status'
