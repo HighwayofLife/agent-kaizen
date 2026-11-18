@@ -41,3 +41,12 @@ Read `git show wt/p12:scripts/host-fix` at `fixed_apply`, `fixed_undo`, `run_arg
 ## Report
 
 Report changed files and line counts, exact checks and outcomes, known uncertainty and any blocked verification. Label measurements with baseline/conditions. Redact paths and identifiers from shared output. Leave plugin version and release CHANGELOG to P27. Do not commit or push.
+
+## Delta (P15b security review, 2026-11-18)
+
+P15b landed with live marker writes gated by S3. Its Sol high review found these in `scripts/host-fix`; fix them in this packet (they share the recovery code P19 extends), each with a red test first, before any live write path is ungated:
+1. MUST-FIX ~line 483 (and apply rollback ~line 438): undo checks the marker's identity, then unlinks by name, so a concurrent build or user can replace `.nomedia` in between and lose their file. Close the window: rename the verified marker (by dir fd) to a tool-owned unique temp name in the same directory, re-verify the renamed file's identity, then unlink it; if it is not ours, rename it back and refuse.
+2. MUST-FIX ~line 431: the marker is published before the rename verification and rollback, so if a writable ancestor lets the directory move and apply is interrupted, the marker can survive outside the eligible tree while recovery points at the old path. Record the directory's device/inode in the recovery record before publishing; recovery must locate the marker through the recorded identity (open-by-fd chain from the eligible root and identity comparison), and when the directory cannot be found inside the eligible tree, report it clearly (path unknown, manual check) instead of claiming success.
+3. MUST-FIX ~line 468: undo needs the output directory to exist before it can record an absent marker, so a cleanup removing the directory after unlink leaves the record stuck in `undo-pending` across retries. A missing output directory (ENOENT on the verified parent chain) completes the undo as "marker absent".
+4. MUST-FIX ~line 133: config reads and ancestor walks have no deadline check when allowlists are absent or empty; deeply nested output triggers quadratic directory opens past the 20-second preflight budget. Check the deadline in every walk and cap the depth with a clear refusal.
+5. Residual (fix if cheap): a direct apply that meets a tool-stamped marker can refuse on state access or lock contention instead of no-oping; make the existing tool-stamped marker path no-op when its record matches.
