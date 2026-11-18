@@ -50,6 +50,7 @@ BIN = claude_home().resolve() / "bin"
 MANAGED_NAMES = (
     "kaizen-scheduled", "kaizen-token-audit", "token-audit", "kaizen-backup",
     "kaizen_credentials.py", "kaizen_friction_sample.py", "kaizen_friction_prepare.py", "kaizen_friction_actions.py",
+    "kaizen_friction_apply.py",
     "kaizen-friction-catalog.json",
     "kaizen-pricing.json", "pricing.json", "kaizen-link", "kaizen-doctor", "rules-lint",
     "rules-lint.patterns", "packet-report", "kaizen-project-report", "notes-ledger",
