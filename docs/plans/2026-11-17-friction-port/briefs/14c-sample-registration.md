@@ -51,3 +51,11 @@ Read `git show wt/p07:hooks/friction-sample.sh`, `git show wt/p07:hooks/hooks.js
 ## Report
 
 Report changed files and line counts, exact checks and outcomes, known uncertainty and any blocked verification. Label measurements with baseline/conditions. Redact paths and identifiers from shared output. Leave plugin version and release CHANGELOG to P27. Do not commit or push.
+
+## Delta: P14b security review findings (2026-11-18), fix all three before registering the sampler
+
+The sampler becomes live when this packet registers it, so fix these in `scripts/kaizen_friction_sample.py` first (red tests in `tests/test_friction_sampler.py`, do not delete or weaken existing tests):
+
+1. Teardown (~line 321) ignores whether `waitpid` actually reaped the killed query. If the child has not exited by the deadline it is orphaned when the sampler exits. Fix: after SIGKILL, reap with a bounded wait inside the remaining budget; if still unreaped, make sure the child cannot outlive the sampler unobserved (for example its own process group killed as a group, or a detached reaper), and record the sample as unusable. Test: a child that ignores the first signal is still gone after the sampler returns.
+2. The five-minute rate claim (~line 239) is taken even when the timing row fills the daily file or less than the required query budget remains, so later eligible hooks lose the slot without a sample. Fix: check the daily cap and remaining budget before claiming, or release/refund the claim when no process sample was taken. Test both cases.
+3. The persisted monotonic timestamp (~line 207) has no boot identity, so after a reboot a claim can be rejected long after the interval elapsed. Fix: store a boot identity with the stamp (for example the boot time from `sysctl kern.boottime` on macOS / `/proc/sys/kernel/random/boot_id` on Linux, bounded and fail-open to "new boot") and treat a different boot as an elapsed interval. Test with an injected boot identity.
