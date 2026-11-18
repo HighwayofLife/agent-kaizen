@@ -41,3 +41,9 @@ Read `git show wt/p07:hooks/friction-sample.sh`, `git show wt/p07:hooks/hooks.js
 ## Report
 
 Report changed files and line counts, exact checks and outcomes, known uncertainty and any blocked verification. Label measurements with baseline/conditions. Redact paths and identifiers from shared output. Leave plugin version and release CHANGELOG to P27. Do not commit or push.
+
+## Delta from the P14 reviews (2026-11-18)
+
+P14 landed with two accepted residuals. If process hardening can close them within this packet's cap, do so; otherwise keep them documented:
+- `SIGALRM` cannot interrupt a non-yielding native call, so a stalled async sampler can overrun 250 ms (a probe kept `main()` alive for 1.22 s). Non-blocking locks make other writers skip, and process exit releases flocks.
+- The alarm can fire during cleanup just before `os.close()`, leaving a live flock until process exit. Consider disarming the timer and blocking `SIGALRM` (`signal.pthread_sigmask`) before cleanup.

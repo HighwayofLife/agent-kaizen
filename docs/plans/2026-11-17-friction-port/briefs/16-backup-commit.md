@@ -43,3 +43,9 @@ The attestation contract is in [Approach and contracts](../plan.md#approach-and-
 ## Report
 
 Report changed files and line counts, exact checks and outcomes, known uncertainty and any blocked verification. Label measurements with baseline/conditions. Redact paths and identifiers from shared output. Leave plugin version and release CHANGELOG to P27. Do not commit or push.
+
+## Delta from the P08 security reviews (2026-11-18)
+
+- The clean-start stamp in any manifest is advisory only and never confers commit authority, interactive or scheduled. Commit authority comes from a live proof at commit time: HEAD and the index are unchanged from the trusted baseline (the runner tuple for scheduled runs; for interactive runs, the human invoking `commit` plus the `begin --repo` record), and the worktree differs from HEAD only by the manifest's files. Each of those files' before-hash must equal its HEAD blob, and its after-hash must equal its live bytes. Any other tracked or untracked difference is refused. This makes a forged or copied stamp harmless.
+- Bind the validated manifest's SHA-256 (as returned by P08's handoff) and re-check it before building the commit, so replacing `manifest.json` in place after approval is refused.
+- Run Git by the absolute path that P08's capture resolved before launch, never through the inherited `PATH`.
