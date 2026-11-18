@@ -255,6 +255,19 @@ def open_directory(path, *, dir_fd=None):
         os.close(fd)
 
 
+@contextmanager
+def open_directory_walk(path):
+    fd = os.open(path.anchor, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        for part in path.parts[1:]:
+            child = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+            os.close(fd)
+            fd = child
+        yield fd
+    finally:
+        os.close(fd)
+
+
 def directory_stamp(path, fd):
     info = os.fstat(fd)
     return {"path": str(path), "dev": info.st_dev, "ino": info.st_ino}
@@ -445,23 +458,23 @@ def git_identity(directory, git_exe):
     return git_snapshot(directory, git_exe)[0]
 
 
-def matches_blob(path, mode, oid):
-    if path.parent.resolve(strict=True) != path.parent:
+def matches_blob(path, mode, oid, *, dir_fd=None):
+    if dir_fd is None and path.parent.resolve(strict=True) != path.parent:
         return False
     digest = hashlib.sha256() if len(oid) == 64 else hashlib.sha1()
     if mode == b"120000":
-        raw = os.readlink(os.fsencode(path))
+        raw = os.readlink(os.fsencode(path), dir_fd=dir_fd)
         digest.update(b"blob %d\0" % len(raw) + raw)
     else:
         flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
-        with os.fdopen(os.open(path, flags), "rb") as stream:
+        with os.fdopen(os.open(path, flags, dir_fd=dir_fd), "rb") as stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or bool(info.st_mode & stat.S_IXUSR) != (mode == b"100755"):
                 return False
             digest.update(b"blob %d\0" % info.st_size)
             for chunk in iter(lambda: stream.read(65536), b""):
                 digest.update(chunk)
-            if file_version(path.lstat()) != file_version(info):
+            if file_version(os.stat(path, dir_fd=dir_fd, follow_symlinks=False)) != file_version(info):
                 return False
     return digest.hexdigest().encode("ascii") == oid
 
@@ -533,16 +546,42 @@ MAX_GIT_OBJECT_BYTES = 64 * 1024 * 1024
 MAX_GIT_METADATA_BYTES = 8 * 1024 * 1024
 
 
+def check_object_packs(root, git_exe):
+    directory = Path(os.fsdecode(git(root, "rev-parse", "--path-format=absolute", "--git-path", "objects",
+                                    git_exe=git_exe).removesuffix(b"\n")))
+    refuse_symlinks(directory / "pack")
+    refuse_symlinks(directory / "info")
+    if os.path.lexists(directory / "info" / "alternates"):
+        raise ValueError("Git alternate object stores cannot be bounded")
+    try:
+        packs = list((directory / "pack").iterdir())
+    except FileNotFoundError:
+        return
+    for pack in packs:
+        if pack.suffix != ".pack":
+            continue
+        info = pack.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_GIT_OBJECT_BYTES:
+            raise ValueError("Git pack is not a regular file within its size limit")
+
+
 def verify_object(root, kind, oid, git_exe):
     if not re.fullmatch(rb"[0-9a-f]{40}|[0-9a-f]{64}", oid):
         raise ValueError("invalid Git object ID")
     kind_bytes = kind.encode("ascii")
-    metadata = git(root, "cat-file", "--batch-check", git_exe=git_exe, input=oid + b"\n").split()
-    if len(metadata) != 3 or metadata[:2] != [oid, kind_bytes] or not metadata[2].isdigit():
+    check_object_packs(root, git_exe)
+    fields = "%(objectname) %(objecttype) %(objectsize) %(objectsize:disk) %(deltabase)"
+    metadata = git(root, "cat-file", f"--batch-check={fields}", git_exe=git_exe, input=oid + b"\n").split()
+    if (len(metadata) != 5 or metadata[:2] != [oid, kind_bytes]
+            or not all(value.isdigit() for value in metadata[2:4])):
         raise ValueError(f"invalid Git {kind} object metadata")
+    # A compressed pack size does not bound the inflated base chain. Refuse all deltas.
+    # Git may still inspect damaged packs or see a pack replaced between the checks and read.
+    if metadata[4] != b"0" * len(oid):
+        raise ValueError("Git delta base chain cannot be bounded")
     size = int(metadata[2])
     limit = MAX_GIT_OBJECT_BYTES if kind == "blob" else min(MAX_GIT_OBJECT_BYTES, MAX_GIT_METADATA_BYTES)
-    if size > limit:
+    if size > limit or int(metadata[3]) > MAX_GIT_OBJECT_BYTES:
         raise ValueError("Git object exceeds its size limit")
     command, env = git_command(root, "cat-file", kind, oid.decode("ascii"), git_exe=git_exe)
     deadline = time.monotonic() + 10
@@ -1025,15 +1064,18 @@ def ref_scope(record):
     return root, git_exe
 
 
-def check_git_write_paths(record, *, objects=False):
+def check_git_write_paths(record, *, objects=False, ref=None):
     common = Path(record["state"]["common_dir"]["path"])
-    ref = record["ref"]
+    ref = ref or record["ref"]
     paths = [common / ref, common / "logs" / ref, common / "packed-refs"]
     regular_leaves = set(paths)
     if objects:
         directory = common / "objects"
         refuse_symlinks(directory)
-        paths.extend([directory, *(path for path in directory.iterdir() if re.fullmatch(r"[0-9a-f]{2}", path.name))])
+        index = directory / "loose-object-idx"
+        regular_leaves.add(index)
+        paths.extend([directory, index, *(path for path in directory.iterdir()
+                                          if re.fullmatch(r"[0-9a-f]{2}", path.name))])
     for path in paths:
         for item in (path, *path.parents):
             if item == common.parent:
@@ -1045,6 +1087,41 @@ def check_git_write_paths(record, *, objects=False):
                     raise ValueError("unsafe Git metadata path for ref or object writes")
     if os.path.lexists(common / "reftable"):
         raise ValueError("unsupported Git ref storage for backup writes")
+    return common
+
+
+def loose_symref(path):
+    try:
+        info = path.lstat()
+        if stat.S_ISLNK(info.st_mode):
+            return os.fsencode(os.readlink(path))
+        if stat.S_ISREG(info.st_mode):
+            with os.fdopen(os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK), "rb") as stream:
+                raw = stream.read(4096)
+            if raw.startswith(b"ref:"):
+                return raw[4:].strip()
+    except FileNotFoundError:
+        pass
+    return b""
+
+
+def check_symbolic_refs(root, git_exe, common):
+    prefix = b"refs/kaizen/"
+    for row in git(root, "for-each-ref", "--format=%(refname) %(symref)", git_exe=git_exe).splitlines():
+        if row.partition(b" ")[2].lower().startswith(prefix):
+            raise ValueError(f"symbolic ref targets refs/kaizen/: {os.fsdecode(row.partition(b' ')[0])}")
+
+    # Git's iterator omits dangling refs and can report the end of a symbolic chain.
+    # Inspect loose refs and every HEAD for the immediate target as well.
+    worktrees = common / "worktrees"
+    refuse_symlinks(worktrees)
+    for directory in (common, *(path for path in worktrees.glob("*") if path.is_dir())):
+        refuse_symlinks(directory)
+        if loose_symref(directory / "HEAD").lower().startswith(prefix):
+            raise ValueError("kaizen ref is checked out or targeted by a symbolic HEAD")
+        for path in (directory / "refs").rglob("*"):
+            if not path.name.endswith(".lock") and loose_symref(path).lower().startswith(prefix):
+                raise ValueError(f"symbolic ref targets refs/kaizen/: {path}")
 
 
 def checked_ref(record, records, phase, observing=None):
@@ -1052,10 +1129,11 @@ def checked_ref(record, records, phase, observing=None):
     ref = record["ref"]
     if not re.fullmatch(r"refs/kaizen/\d{4}-\d{2}-\d{2}", ref, re.ASCII):
         raise ValueError("invalid kaizen ref")
-    check_git_write_paths(record)
+    common = check_git_write_paths(record)
     args = {"git_exe": git_exe}
     if b"branch " + ref.encode("ascii") in git(root, "worktree", "list", "--porcelain", "-z", **args).split(b"\0"):
         raise ValueError("kaizen ref is checked out")
+    check_symbolic_refs(root, git_exe, common)
     try:
         git(root, "symbolic-ref", "--no-recurse", "-q", ref, **args)
     except subprocess.CalledProcessError as error:
@@ -1082,21 +1160,29 @@ def checked_ref(record, records, phase, observing=None):
             if effect["done"]:
                 if effect["old"] in completed:
                     raise ValueError("conflicting kaizen ref records")
-                completed[effect["old"]] = effect["new"]
+                completed[effect["old"]] = (effect, other["change"], name)
                 bases.update((effect["new"], other["state"]["head"]))
             elif ((other["change"], name) == (record["change"], phase)
                   or (other["change"], name) == (observing, "inverse")) and pending is None:
                 pending = effect
             else:
                 raise ValueError("kaizen ref has another pending transaction")
-    expected = zero
+    expected, tail = zero, None
     while expected in completed:
-        expected = completed.pop(expected)
+        tail = completed.pop(expected)
+        expected = tail[0]["new"]
     if completed or (pending and pending["old"] != expected):
         raise ValueError("kaizen ref records do not form a single history")
     if phase == "commit" and bases and record["state"]["head"] not in bases:
         raise ValueError("kaizen ref does not descend from the captured HEAD")
     if tip != expected and (pending is None or tip != pending["new"]):
+        if tail and tip == tail[0]["old"]:
+            if pending is None and tail[1:] == (record["change"], phase):
+                return tip
+            command = "commit" if tail[2] == "commit" else "undo"
+            raise ValueError(f"kaizen ref moved to its previous value; retry {command} for {tail[1]}")
+        if tip == zero and tail:
+            raise ValueError(f"journaled kaizen ref is missing: {ref}; expected {expected}")
         raise ValueError("kaizen ref moved or has no journaled owner")
     return tip
 
@@ -1147,17 +1233,88 @@ def verify_effect(record, phase):
     return verified_tree(root, effect["tree"].encode("ascii"), git_exe)
 
 
+def refuse_ref_lock(path):
+    lock = path.with_name(path.name + ".lock")
+    if os.path.lexists(lock):
+        raise ValueError(f"Git ref lock exists: {lock}. Check that no Git process is running, "
+                         "then remove the lock manually and retry.")
+
+
+def sync_ref_dirs(common, ref):
+    # Sync new directory entries all the way up, including the parent of packed-refs.
+    for directory in (common / ref).parents:
+        if directory == common.parent:
+            break
+        try:
+            with open_directory_walk(directory) as fd:
+                os.fsync(fd)
+        except FileNotFoundError:
+            if directory == common:
+                raise
+
+
+def pin_prefix():
+    return "refs/kaizen/pending/" + hashlib.sha256(os.fsencode(ROOT)).hexdigest() + "/"
+
+
+def pin_ref(record, phase):
+    return pin_prefix() + record_path(Path(record["change"])).name + "-" + phase
+
+
+def change_pin(record, ref, oid, *, remove=False):
+    common = check_git_write_paths(record, ref=ref)
+    path = common / ref
+    refuse_ref_lock(path)
+    if loose_symref(path):
+        raise ValueError(f"pending pin is a symbolic ref: {ref}")
+    state = record["state"]
+    options = dict(git_exe=state["git_executable"])
+    root = state["root"]
+    rows = git(root, "for-each-ref", "--format=%(refname) %(objectname)", ref, **options).splitlines()
+    if rows and rows != [f"{ref} {oid}".encode("ascii")]:
+        raise ValueError(f"pending pin differs from its ref transaction: {ref}")
+    if remove and rows:
+        git(root, "update-ref", "--no-deref", "-d", ref, oid, **options)
+    if not remove:
+        if not rows:
+            git(root, "update-ref", "--no-deref", ref, oid, "0" * len(oid), **options)
+        sync_ref_dirs(common, ref)
+
+
+def cleanup_pins(record, records):
+    state = record["state"]
+    prefix = pin_prefix()
+    pending = {pin_ref(other, phase) for other in records.values()
+               if other["state"]["common_dir"] == state["common_dir"]
+               for phase in ("commit", "inverse") if phase in other
+               and not (other[phase]["done"] or other[phase].get("cancelled"))}
+    rows = git(state["root"], "for-each-ref", "--format=%(refname) %(objectname)", prefix,
+               git_exe=state["git_executable"]).splitlines()
+    for row in rows:
+        ref, oid = row.decode("ascii").split(" ")
+        if re.fullmatch(re.escape(prefix) + r"r-[a-f0-9]{64}-(commit|inverse)", ref) and ref not in pending:
+            change_pin(record, ref, oid, remove=True)
+
+
 def update_ref(root, git_exe, ref, effect, check, *, verify_only=False):
-    command, env = git_command(root, "update-ref", "--stdin", git_exe=git_exe)
+    path = Path(os.fsdecode(git(root, "rev-parse", "--path-format=absolute", "--git-path", ref,
+                               git_exe=git_exe).removesuffix(b"\n")))
+    refuse_ref_lock(path)
     for oid in (effect["old"], effect["new"]):
         if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", oid):
             raise ValueError("invalid ref transaction object ID")
+    command, env = git_command(root, "update-ref", "--stdin", git_exe=git_exe)
     with subprocess.Popen(command, env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                           stderr=subprocess.DEVNULL) as proc:
         def exchange(request, response):
-            proc.stdin.write(request.encode("ascii"))
-            proc.stdin.flush()
+            try:
+                proc.stdin.write(request.encode("ascii"))
+                proc.stdin.flush()
+            except BrokenPipeError:
+                refuse_ref_lock(path)
+                raise
             if not select.select([proc.stdout], [], [], 10)[0] or proc.stdout.readline(128) != response:
+                refuse_ref_lock(path)
                 raise ValueError("Git refused the ref transaction")
 
         try:
@@ -1169,7 +1326,10 @@ def update_ref(root, git_exe, ref, effect, check, *, verify_only=False):
             if not verify_only:
                 exchange("commit\n", b"commit: ok\n")
         finally:
-            proc.stdin.close()  # EOF aborts a prepared transaction and releases Git's ref lock.
+            try:
+                proc.stdin.close()  # EOF aborts a prepared transaction and releases Git's ref lock.
+            except BrokenPipeError:
+                pass  # Git exited while receiving a request.
             try:
                 status = proc.wait(timeout=10)
             except subprocess.TimeoutExpired:
@@ -1183,6 +1343,9 @@ def transact_ref(change, record, records, phase, tip, entries, recheck):
     state = record["state"]
     root, git_exe = Path(state["root"]), state["git_executable"]
     effect = record.get(phase)
+    common = Path(state["common_dir"]["path"])
+    if effect is None or tip == effect["old"]:
+        refuse_ref_lock(common / record["ref"])
     for oid in {oid for _, oid in entries.values()}:
         verify_object(root, "blob", oid, git_exe)
     if effect is None:
@@ -1196,6 +1359,8 @@ def transact_ref(change, record, records, phase, tip, entries, recheck):
         record[phase] = effect = dict(old=tip, new=new, tree=tree, done=False)
         if verify_effect(record, phase) != entries:
             raise ValueError("kaizen commit differs from the verified tree")
+    pin = pin_ref(record, phase)
+    change_pin(record, pin, effect["new"])
     if tip == effect["old"]:
         recheck()
         save_record(change, record)  # Sync again on retry after an interrupted record write.
@@ -1210,8 +1375,10 @@ def transact_ref(change, record, records, phase, tip, entries, recheck):
     if checked_ref(record, records, phase) != effect["new"]:
         raise ValueError("kaizen ref moved after update")
     verify_effect(record, phase)
+    sync_ref_dirs(common, record["ref"])
     effect["done"] = True
     save_record(change, record)
+    change_pin(record, pin, effect["new"], remove=True)
 
 
 def write_commit(change, scheduled, key):
@@ -1228,6 +1395,9 @@ def write_commit(change, scheduled, key):
         tip = checked_ref(record, records, "commit")
         entries = verify_effect(record, "commit")
         if record["commit"]["done"]:
+            if tip == record["commit"]["old"]:
+                transact_ref(change, record, records, "commit", tip, entries, lambda: None)
+            cleanup_pins(record, records)
             return record
     if record is None or tip == record["commit"]["old"]:
         state, base, files, check = commit_preflight(change, scheduled)
@@ -1241,6 +1411,7 @@ def write_commit(change, scheduled, key):
             record = dict(change=change.name, key=key, request=request, manifest=stamp, state=state,
                           ref=local_ref())
             tip = checked_ref(record, records, "commit")
+            cleanup_pins(record, records)
         elif state != record["state"]:
             raise ValueError("Git baseline differs from the pending commit")
         original = {os.fsencode(path.relative_to(state["root"])): entry for path, entry in base.items()}
@@ -1255,6 +1426,7 @@ def write_commit(change, scheduled, key):
     else:
         recheck = lambda: None
     transact_ref(change, record, records, "commit", tip, entries, recheck)
+    cleanup_pins(record, records)
     return record
 
 
@@ -1270,6 +1442,8 @@ def checked_inverse(change, data, record, records, observing=None):
         tip = checked_ref(record, records, "commit")
         if tip != original["old"]:
             raise ValueError("complete the pending commit before undo")
+    else:
+        ref_scope(record)
     after = verify_effect(record, "commit") if original["done"] else None
     before = commit_tree(record, original["old"] if original["old"].strip("0") else record["state"]["head"])
     root = Path(record["state"]["root"])
@@ -1546,36 +1720,89 @@ def undo(args):
         return undo_locked(args, locked)
 
 
-def live_file_version(path):
+def live_file_version(name, fd):
     try:
-        return file_version(path.lstat())
+        return file_version(os.stat(name, dir_fd=fd, follow_symlinks=False))
     except FileNotFoundError:
         return None
 
 
-def restore_ref_file(change, entry, path, version, blob):
-    if live_file_version(path) != version:
-        raise ValueError("working file changed during undo")
-    if entry["created"]:
-        if version is None:
-            return
-        path.unlink()
-    else:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        scratch = private_store()
-        if scratch.stat().st_dev != path.parent.stat().st_dev:
-            scratch = path.parent  # Atomic replacement requires the same filesystem.
-        with tempfile.NamedTemporaryFile(dir=scratch, prefix=".kaizen-restore-", delete=False) as stream:
-            temporary = Path(stream.name)
+def undo_file_hash(name, fd, version):
+    if version is None:
+        return None
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+    with os.fdopen(os.open(name, flags, dir_fd=fd), "rb") as stream:
+        info = os.fstat(stream.fileno())
+        if not stat.S_ISREG(info.st_mode) or file_version(info) != version:
+            raise ValueError("working file changed during undo")
+        digest = hashlib.sha256()
+        remaining = info.st_size
+        while remaining:
+            chunk = stream.read(min(remaining, 65536))
+            if not chunk:
+                break
+            digest.update(chunk)
+            remaining -= len(chunk)
+        if remaining or live_file_version(name, fd) != version:
+            raise ValueError("working file changed during undo")
+        return digest.hexdigest()
+
+
+def undo_file_snapshot(path):
+    with open_directory_walk(path.parent) as fd:
+        parent = os.fstat(fd)
+        version = live_file_version(path.name, fd)
+        return (parent.st_dev, parent.st_ino), version, undo_file_hash(path.name, fd, version)
+
+
+def restore_ref_file(change, entry, path, snapshot, blob):
+    parent, version, digest = snapshot
+    with open_directory_walk(path.parent) as fd:
+        info = os.fstat(fd)
+        if (info.st_dev, info.st_ino) != parent or live_file_version(path.name, fd) != version:
+            raise ValueError("working file or parent directory changed during undo")
+
+        def recheck():
+            if undo_file_hash(path.name, fd, version) != digest:
+                raise ValueError("working file changed during undo")
+            with open_directory_walk(path.parent) as current:
+                if not os.path.samestat(info, os.fstat(current)):
+                    raise ValueError("working file parent directory changed during undo")
+            if live_file_version(path.name, fd) != version:
+                raise ValueError("working file changed during undo")
+
+        if entry["created"]:
+            recheck()
+            if version is not None:
+                os.unlink(path.name, dir_fd=fd)
+        else:
+            temporary = ".kaizen-restore-" + os.urandom(16).hex()
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            temp_fd = os.open(temporary, flags, 0o600, dir_fd=fd)
             try:
-                shutil.copy2(change / entry["backup"], temporary)
-                if not matches_blob(temporary, *blob) or live_file_version(path) != version:
-                    raise ValueError("working file or undo backup changed during restore")
-                os.fsync(stream.fileno())
-                os.replace(temporary, path)
+                source = change / entry["backup"]
+                read_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
+                with os.fdopen(temp_fd, "wb") as stream, os.fdopen(os.open(source, read_flags), "rb") as backup:
+                    metadata = os.fstat(backup.fileno())
+                    if not stat.S_ISREG(metadata.st_mode):
+                        raise ValueError("undo backup changed during restore")
+                    shutil.copyfileobj(backup, stream)
+                    stream.flush()
+                    os.fchmod(temp_fd, stat.S_IMODE(metadata.st_mode))
+                    os.utime(temp_fd, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+                    os.fsync(temp_fd)
+                    if (live_file_version(temporary, fd) != file_version(os.fstat(temp_fd))
+                            or not matches_blob(temporary, *blob, dir_fd=fd)):
+                        raise ValueError("undo backup changed during restore")
+                    # POSIX rename has no conditional-on-inode variant. Check immediately
+                    # before replacing and keep both names anchored to the verified parent.
+                    recheck()
+                    os.replace(temporary, path.name, src_dir_fd=fd, dst_dir_fd=fd)
             finally:
-                temporary.unlink(missing_ok=True)
-    with open_directory(path.parent) as fd:
+                try:
+                    os.unlink(temporary, dir_fd=fd)
+                except FileNotFoundError:
+                    pass
         os.fsync(fd)
 
 
@@ -1590,10 +1817,15 @@ def undo_locked(args, locked):
     backups, versions = {}, {}
     seen = {}  # the plan is newest first: path -> (newer change name, hash of its backup, i.e. the state it began from)
     for change, data in plan:
-        if data.get("reverted"):
-            sys.exit(f"kaizen-backup: {change} was already reverted on {data['reverted']}")
         change = change_dir(change)
         record = records.get(change.name)
+        if data.get("reverted"):
+            if record and record.get("inverse", {}).get("done"):
+                inverse = record["inverse"]
+                if checked_ref(record, records, "inverse") == inverse["old"]:
+                    raise ValueError(f"completed inverse ref {record['ref']} is at its previous value; "
+                                     f"the reverted backup record expects {inverse['new']}")
+            sys.exit(f"kaizen-backup: {change} was already reverted on {data['reverted']}")
         if "committed" in data or "revert_commit" in data:
             raise ValueError("undo requires a tool-owned commit record")
         applied = False
@@ -1602,17 +1834,20 @@ def undo_locked(args, locked):
         for entry in data["files"]:
             path = validate_entry(change, entry, roots)
             if record:
-                versions.setdefault(path, live_file_version(path))
-                version = versions[path]
+                if path not in versions:
+                    versions[path] = undo_file_snapshot(path)
+                _, version, live_hash = versions[path]
                 blob = backups[change][path]
                 if path not in seen and version and (not stat.S_ISREG(version[2]) or
                         bool(version[2] & stat.S_IXUSR) != (blob is not None and blob[0] == b"100755")):
                     conflicts.append(f"{path} changed mode after {change.name}")
+            else:
+                live_hash = sha(path) if path not in seen else None
             before = sha(change / entry["backup"]) if entry.get("backup") else None
             if not data.get("finished"):
                 if entry["created"] and path.exists():
                     conflicts.append(f"{entry['path']} was created by {change.name}, which was never finished")
-            elif path not in seen and sha(path) not in (entry.get("after_sha256"),
+            elif path not in seen and live_hash not in (entry.get("after_sha256"),
                                                         before if applied else entry.get("after_sha256")):
                 conflicts.append(f"{entry['path']} changed after {change.name}")
             elif path in seen and seen[path][0] != change.name and seen[path][1] != entry.get("after_sha256"):
@@ -1624,13 +1859,13 @@ def undo_locked(args, locked):
         return 2
     for change, data in plan:  # newest change first
         record = records.get(change.name)
-        if record and not (record.get("inverse", {}).get("done") or record["commit"].get("cancelled")):
+        if record and not record["commit"].get("cancelled"):
             tip, entries, _, _ = checked_inverse(change, data, record, records)
 
             def recheck():
                 if manifest_stamp(change)[1] != record["manifest"]:
                     raise ValueError("commit manifest changed before inverse update")
-                if any(live_file_version(path) != versions[path] for path in backups[change]):
+                if any(undo_file_snapshot(path) != versions[path] for path in backups[change]):
                     raise ValueError("working file changed before inverse update")
 
             if entries is None:
@@ -1643,11 +1878,13 @@ def undo_locked(args, locked):
 
                 root, git_exe = ref_scope(record)
                 update_ref(root, git_exe, record["ref"], record["commit"], cancel_prepared, verify_only=True)
-            else:
+            elif not record.get("inverse", {}).get("done") or tip == record["inverse"]["old"]:
                 transact_ref(change, record, records, "inverse", tip, entries, recheck)
+        if record:
+            cleanup_pins(record, records)
         for entry in data["files"]:
             path = validate_entry(change, entry, roots)
-            if path in versions and live_file_version(path) != versions[path]:
+            if not record and path in versions and undo_file_snapshot(path) != versions[path]:
                 raise ValueError("working file changed during undo")
             if record:
                 restore_ref_file(change, entry, path, versions[path], backups[change][path])
@@ -1661,7 +1898,7 @@ def undo_locked(args, locked):
                 shutil.copy2(change / entry["backup"], path)
                 print(f"restored {path}")
             if path in versions:
-                versions[path] = live_file_version(path)
+                versions[path] = undo_file_snapshot(path)
         for act in data["actions"]:
             print(f"ACTION to reverse by hand (not run): {act['undo']}   # was: {act['did']}")
         data["reverted"] = datetime.date.today().isoformat()

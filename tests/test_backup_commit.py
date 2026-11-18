@@ -233,6 +233,161 @@ class BackupCommitTests(unittest.TestCase):
         self.assertIn("object exceeds its size limit", self.main("commit", change, expected=2,
                                                                 MAX_GIT_OBJECT_BYTES=512))
 
+    def test_object_verification_refuses_large_packs_before_content(self):
+        verify = self.helpers["verify_object"]
+        executable = self.helpers["resolve_git"]()
+        oid = self.git("rev-parse", "HEAD:tracked").encode("ascii")
+        self.git("repack", "-ad")
+        with patch.dict(self.helpers, MAX_GIT_OBJECT_BYTES=64):
+            with self.assertRaisesRegex(ValueError, "pack.*size limit"):
+                verify(self.repo, "blob", oid, executable)
+
+    def test_object_verification_refuses_deltas_before_content(self):
+        verify = self.helpers["verify_object"]
+        executable = self.helpers["resolve_git"]()
+        oid = self.git("rev-parse", "HEAD:tracked").encode("ascii")
+        command = self.helpers["git"]
+
+        def delta_metadata(root, *args, **kwargs):
+            if args[0] == "cat-file" and "%(deltabase)" in args[1]:
+                return b" ".join((oid, b"blob", b"6", b"30", b"1" * len(oid))) + b"\n"
+            return command(root, *args, **kwargs)
+
+        with patch.dict(self.helpers, git=delta_metadata):
+            with self.assertRaisesRegex(ValueError, "delta.*cannot be bounded"):
+                verify(self.repo, "blob", oid, executable)
+
+    def test_unsafe_loose_object_index_is_refused_before_object_writes(self):
+        change = self.ready()
+        outside = self.tmp / "outside-index"
+        outside.write_text("unchanged")
+        index = self.repo / ".git/objects/loose-object-idx"
+        index.symlink_to(outside)
+        self.assertIn("unsafe Git metadata", self.commit_cli(change, expected=2).stderr)
+        self.assertEqual(outside.read_text(), "unchanged")
+
+    def test_symbolic_refs_into_kaizen_are_refused_even_if_the_target_is_missing(self):
+        change = self.ready()
+        ref = "refs/kaizen/" + datetime.date.today().isoformat()
+        branch = self.git("symbolic-ref", "HEAD")
+        alias = "refs/heads/kaizen-alias"
+        for target in (ref, "refs/kaizen/unrelated"):
+            with self.subTest(target=target):
+                self.git("symbolic-ref", alias, target)
+                self.assertIn("symbolic ref", self.commit_cli(change, expected=2).stderr)
+                self.git("symbolic-ref", "--delete", alias)
+        self.git("update-ref", "refs/kaizen/unrelated", "HEAD")
+        self.git("symbolic-ref", "HEAD", "refs/kaizen/unrelated")
+        self.assertIn("symbolic HEAD", self.commit_cli(change, expected=2).stderr)
+        self.git("symbolic-ref", "HEAD", branch)
+        self.git("symbolic-ref", branch, "refs/kaizen/unrelated")
+        self.assertIn("symbolic ref", self.commit_cli(change, expected=2).stderr)
+
+    def test_ref_directory_is_synced_before_each_effect_is_done(self):
+        change = self.ready()
+        ref = "refs/kaizen/" + datetime.date.today().isoformat()
+        parent = self.repo / ".git/refs/kaizen"
+        sync, save = os.fsync, self.helpers["save_record"]
+        synced = []
+
+        def observe_sync(fd):
+            if (parent / Path(ref).name).exists() and os.path.samestat(os.fstat(fd), parent.stat()):
+                synced.append(self.git("rev-parse", ref))
+            return sync(fd)
+
+        def check_save(folder, record):
+            effect = record.get("inverse", record["commit"])
+            if effect["done"]:
+                self.assertIn(effect["new"], synced)
+            return save(folder, record)
+
+        with patch.object(os, "fsync", observe_sync):
+            self.main("commit", change, save_record=check_save)
+            self.main("undo", change, save_record=check_save)
+
+    def test_completed_effects_recover_when_ref_rename_was_lost(self):
+        change = self.ready()
+        ref = self.commit_cli(change).stdout.split()[-1]
+        before = self.git("rev-parse", ref)
+        self.git("update-ref", "-d", ref, before)
+        self.main("commit", change)
+        self.assertEqual(self.git("rev-parse", ref), before)
+
+        def fail_restore(*args):
+            raise OSError("interrupted before restoring files")
+
+        self.main("undo", change, expected=2, restore_ref_file=fail_restore)
+        inverse = self.git("rev-parse", ref)
+        self.git("update-ref", ref, before, inverse)
+        self.main("undo", change)
+        self.assertEqual((self.git("rev-parse", ref), self.target.read_text()), (inverse, "before"))
+        self.git("update-ref", ref, before, inverse)
+        self.assertIn(inverse, self.main("undo", change, expected=2))
+        self.assertEqual((self.git("rev-parse", ref), self.target.read_text()), (before, "before"))
+
+    def test_pending_commit_and_inverse_stay_pinned_until_complete(self):
+        change = self.ready()
+        pins = "refs/kaizen/pending/"
+        save = self.helpers["save_record"]
+
+        def stop_at_journal(folder, record):
+            effect = record.get("inverse", record["commit"])
+            if not effect["done"]:
+                self.assertEqual(self.git("for-each-ref", "--format=%(objectname)", pins), effect["new"])
+                save(folder, record)
+                raise OSError("interrupted before ref update")
+            save(folder, record)
+
+        def stop_after_completion(folder, record):
+            save(folder, record)
+            if record.get("inverse", record["commit"])["done"]:
+                raise OSError("interrupted before removing the completed pin")
+
+        for command in ("commit", "undo"):
+            self.main(command, change, expected=2, save_record=stop_at_journal)
+            self.git("reflog", "expire", "--expire=now", "--all")
+            self.git("-c", "pack.window=0", "gc", "--prune=now")
+            self.main(command, change, expected=2, save_record=stop_after_completion)
+            self.assertTrue(self.git("for-each-ref", pins))
+            self.main(command, change)
+            self.assertEqual(self.git("for-each-ref", pins), "")
+
+    def test_undo_refuses_editor_save_after_temp_sync(self):
+        self.check_undo_race(swap=False)
+
+    def test_undo_refuses_parent_swap_after_temp_sync(self):
+        self.check_undo_race(swap=True)
+
+    def check_undo_race(self, *, swap):
+        nested = self.repo / "nested"
+        nested.mkdir()
+        self.target = self.target.rename(nested / "tracked")
+        self.git("add", "-A")
+        self.git("commit", "-qm", "move tracked file")
+        change = self.ready()
+        self.commit_cli(change)
+        outside = self.tmp / "outside"
+        outside.mkdir()
+        (outside / "tracked").write_text("after")
+        old_parent = self.tmp / "moved"
+        sync = os.fsync
+
+        def concurrent_save(fd):
+            info = os.fstat(fd)
+            if stat.S_ISREG(info.st_mode) and info.st_size == len("before"):
+                if swap:
+                    nested.rename(old_parent)
+                    nested.symlink_to(outside, target_is_directory=True)
+                else:
+                    self.target.write_text("editor save")
+            return sync(fd)
+
+        with patch.object(os, "fsync", concurrent_save):
+            self.main("undo", change, expected=2)
+        self.assertEqual((outside / "tracked").read_text(), "after")
+        self.assertEqual((old_parent / "tracked").read_text() if swap else self.target.read_text(),
+                         "after" if swap else "editor save")
+
     def test_checkout_tmpdir_is_never_probed_and_symlink_loop_refuses(self):
         alias = self.tmp / "scratch-link"
         alias.symlink_to(self.repo, target_is_directory=True)
@@ -278,6 +433,7 @@ class BackupCommitTests(unittest.TestCase):
 
         self.main("commit", change, expected=2, save_record=fail_save("commit"))
         self.assertFalse(journal.exists())
+        self.assertTrue(self.git("for-each-ref", "refs/kaizen/pending/"))
         self.main("commit", change, expected=2, save_record=fail_save("commit", after=True))
         oid = json.loads(journal.read_text())["commit"]["new"]
         self.assertEqual(self.git("for-each-ref", ref), "")
@@ -290,6 +446,7 @@ class BackupCommitTests(unittest.TestCase):
         self.main("commit", change, expected=2, save_record=fail_save("commit", done=True))
         self.main("commit", change)
         self.assertEqual(self.git("rev-parse", ref), oid)
+        self.assertEqual(self.git("for-each-ref", "refs/kaizen/pending/"), "")
         cas_happens = False
         self.main("undo", change, expected=2, update_ref=fail_cas)
         inverse = json.loads(journal.read_text())["inverse"]["new"]
@@ -299,10 +456,10 @@ class BackupCommitTests(unittest.TestCase):
         self.assertEqual((self.git("rev-parse", ref), self.target.read_text()), (inverse, "after"))
         self.main("undo", change, expected=2, save_record=fail_save("inverse", done=True))
         def fail_copy(_, target):
-            target.write_text("incomplete copy")
+            target.write(b"incomplete copy")
             raise OSError("interrupted copy")
 
-        with patch.object(shutil, "copy2", fail_copy):
+        with patch.object(shutil, "copyfileobj", fail_copy):
             self.main("undo", change, expected=2)
         self.assertEqual(self.target.read_text(), "after")
         self.target.write_text("before")  # Files may already have been restored before interruption.
@@ -322,11 +479,15 @@ class BackupCommitTests(unittest.TestCase):
         self.assertEqual(self.target.read_text(), "user edit")
         ref_lock = self.repo / ".git" / (ref + ".lock")
         ref_lock.touch()
-        self.main("undo", "--force", abandoned, expected=2)
+        refusal = self.main("undo", "--force", abandoned, expected=2)
+        self.assertIn(str(ref_lock), refusal)
+        self.assertIn("no Git process is running", refusal)
+        self.assertTrue(ref_lock.exists())
         self.assertEqual(self.target.read_text(), "user edit")
         ref_lock.unlink()
         self.main("undo", "--force", abandoned)
         self.assertEqual((self.git("rev-parse", ref), self.target.read_text()), (inverse, "before"))
+        self.assertEqual(self.git("for-each-ref", "refs/kaizen/pending/"), "")
         self.main("commit", abandoned, expected=2)
 
     def test_inverse_keeps_later_owned_files_and_rejects_moves_and_forgery(self):
