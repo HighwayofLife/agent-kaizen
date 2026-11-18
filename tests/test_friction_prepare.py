@@ -210,6 +210,25 @@ class PreparationTests(unittest.TestCase):
         receipt = json.loads(next((self.backups / 'friction').glob('receipt-*.json')).read_text())
         self.assertEqual(len(next(iter(receipt['allowed'].values()))['provenance']), 2)
 
+    def test_acknowledged_worktree_finding_stays_closed(self):
+        for i, size in enumerate((42, 84)):
+            linked = self.root / f'linked{i}'
+            build = linked / 'build'
+            build.mkdir(parents=True)
+            self.obj.anchors.append(linked)
+            self.probe['findings'].append(dict(id='indexed-output', catalog_id='spotlight-output',
+                                               subject=str(build), evidence=dict(size_bytes=size)))
+            self.probe['regenerable_dirs'].append(dict(path=str(build), size_bytes=size))
+        self.write_evidence()
+        inputs = self.run_prepare()
+        action, = json.loads(inputs.read_text())['actions']
+        self.assertEqual(action['evidence'], [84])
+        self.assertEqual(self.reconcile(inputs, self.actions([action['id']])), {action['id']: 'terminal'})
+        self.reconcile(inputs)
+        for attempt in range(2):
+            with self.subTest(attempt=attempt):
+                self.assertIsNone(self.run_prepare())
+
     def test_worktree_output_symlink_escape_is_rejected(self):
         linked, outside = self.root / 'linked', self.root / 'outside'
         linked.mkdir()

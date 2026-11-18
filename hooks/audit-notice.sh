@@ -62,7 +62,7 @@ while :; do
 done
 [ -n "$root" ] || [ -n "$key" ] || [ "${KAIZEN_NOTICE_ALL:-0}" = 1 ] || exit 0
 
-# Read config without opening FIFOs or accepting oversized files.
+# Follow config symlinks and read only bounded regular files.
 if ! command -v python3 >/dev/null 2>&1; then
     [ ! -e "$home/agent-kaizen.json" ] && [ ! -L "$home/agent-kaizen.json" ] || exit 0
     if [ -n "$root" ]; then
@@ -78,7 +78,7 @@ for path in sys.argv[1:]:
         values.append({})
         continue
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
     except FileNotFoundError:
         values.append({})
         continue

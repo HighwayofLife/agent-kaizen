@@ -145,6 +145,36 @@ class FrictionCodexTests(unittest.TestCase):
         self.assertFalse(data['friction']['summary']['capped'])
         self.assertEqual(data['friction']['summary']['measured'], 1)
 
+    def test_invalid_first_observation_disqualifies_id_without_using_pair_slots(self):
+        bad_args = call('reused')
+        bad_args['payload']['arguments'] = '{'
+        missing_timestamp = call('reused')
+        del missing_timestamp['timestamp']
+        for first in (bad_args, call('reused', -1), call('reused', 20),
+                      dict(call('reused'), timestamp='invalid'), missing_timestamp,
+                      call('reused', cwd=str(self.root / 'other')),
+                      result('reused', cwd=str(self.root / 'other'))):
+            with self.subTest(first=first):
+                jsonl(self.rollout, [self.meta, first, call('reused', 3), result('reused', 4),
+                                     call('good', 5), result('good', 6, output='Wall time: 121 seconds')])
+                with patch.dict(AUDIT['scan_codex'].__globals__, FRICTION_PAIR_LIMIT=1):
+                    summary = self.collect(cwd=[self.work], now=SINCE + timedelta(seconds=10))['friction']['summary']
+                self.assertFalse(summary['capped'])
+                self.assertEqual(summary['measured'], 1)
+                self.assertEqual(summary['slow_calls'][0]['seconds_total'], 121)
+
+    def test_future_header_does_not_rehabilitate_earlier_call_id(self):
+        jsonl(self.rollout, [row('session_meta', 20, cwd=self.work),
+                             call('reused'), result('reused'),
+                             row('turn_context', 2, cwd=self.work),
+                             call('reused', 3), result('reused', 4),
+                             call('good', 5), result('good', 6, output='Wall time: 121 seconds')])
+        with patch.dict(AUDIT['scan_codex'].__globals__, FRICTION_PAIR_LIMIT=1):
+            summary = self.collect(cwd=[self.work], now=SINCE + timedelta(seconds=10))['friction']['summary']
+        self.assertFalse(summary['capped'])
+        self.assertEqual(summary['measured'], 1)
+        self.assertEqual(summary['slow_calls'][0]['seconds_total'], 121)
+
     def test_output_requires_valid_bounded_json(self):
         prefix = 'Wall time: 150 seconds\nOutput:\n'
         jsonl(self.rollout, [self.meta, call('invalid'), call('oversized'),
