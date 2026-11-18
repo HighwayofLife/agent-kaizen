@@ -4,6 +4,7 @@ from contextlib import ExitStack, contextmanager
 import ctypes
 from datetime import datetime, timezone
 import errno
+import hashlib
 from heapq import nlargest
 import json
 import math
@@ -29,6 +30,7 @@ BUDGET = 0.250
 LOCK_RETRY_BUDGET = 0.020
 LOCK_NAME = ".lock"
 PROCESS_INTERVAL_NS = 300_000_000_000
+PROCESS_QUERY_BUDGET = 0.050
 PROCESS_LIMIT = 256 * 1024
 CATALOGUE_LIMIT = 64 * 1024
 PROCESS_COMMAND = ("/bin/ps", "-A", "-ww", "-o", "pcpu=,comm=")
@@ -198,24 +200,49 @@ def repair_tail(fd, size):
     return end
 
 
+def boot_identity():
+    """Read a boot identifier without launching a synchronous subprocess."""
+    try:
+        if sys.platform == "darwin":
+            class Timeval(ctypes.Structure):
+                _fields_ = [("seconds", ctypes.c_long), ("microseconds", ctypes.c_int)]
+            value = Timeval()
+            size = ctypes.c_size_t(ctypes.sizeof(value))
+            libc = ctypes.CDLL(None, use_errno=True)
+            if libc.sysctlbyname(b"kern.boottime", ctypes.byref(value), ctypes.byref(size), None, 0):
+                return None
+            identity = (str(value.seconds) + ":" + str(value.microseconds)).encode("ascii")
+        else:
+            with open("/proc/sys/kernel/random/boot_id", "rb") as stream:
+                identity = stream.read(129).strip()
+            if not identity or len(identity) > 128:
+                return None
+        return hashlib.sha256(identity).digest()[:16]
+    except (OSError, AttributeError, ValueError):
+        return None
+
+
 def claim_process(lock):
-    # Keep one fixed-width stamp on the lock inode, shared across UTC days.
-    previous = os.pread(lock, 9, 0)
+    # Unknown boot identity fails open rather than persisting an ambiguous stamp.
+    boot = boot_identity()
+    previous = os.pread(lock, 25, 0)
     now = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
-    if len(previous) == 8:
-        stamp = int.from_bytes(previous, "big")
-        elapsed = now - stamp if now >= stamp else now  # After a reboot, use uptime.
-        if elapsed < PROCESS_INTERVAL_NS:
+    if boot is not None and len(previous) == 24 and previous[:16] == boot:
+        stamp = int.from_bytes(previous[16:], "big")
+        if now >= stamp and now - stamp < PROCESS_INTERVAL_NS:
             return False
     if sys.platform == "darwin" and has_extended_acl(lock):
         return False
-    claimed = os.pwrite(lock, now.to_bytes(8, "big"), 0) == 8
-    if not claimed or len(previous) > 8:
-        os.ftruncate(lock, 8 if claimed else 0)
+    if boot is None:
+        os.ftruncate(lock, 0)
+        return True
+    record = boot + now.to_bytes(8, "big")
+    claimed = os.pwrite(lock, record, 0) == len(record)
+    os.ftruncate(lock, len(record) if claimed else 0)
     return claimed
 
 
-def append(path, day, row, deadline, want_process=False):
+def append(path, day, row, deadline, want_process=False, process_min_size=32):
     if len(row) >= ROW_LIMIT or time.monotonic() >= deadline:
         return
     with storage(path, deadline) as directory:
@@ -236,7 +263,8 @@ def append(path, day, row, deadline, want_process=False):
                 if size + len(row) <= DAY_LIMIT and time.monotonic() < deadline:
                     if os.write(fd, row) != len(row):
                         os.ftruncate(fd, size)  # Roll back a partial row before unlocking.
-                    elif want_process and time.monotonic() < deadline:
+                    elif (want_process and size + len(row) + process_min_size <= DAY_LIMIT
+                          and deadline - time.monotonic() >= PROCESS_QUERY_BUDGET):
                         file_info(directory, LOCK_NAME, lock)
                         return claim_process(lock)
 
@@ -318,7 +346,10 @@ def query_processes(deadline):
                     os.killpg(pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
-                wait_for_query(pid, deadline)
+                # A killed process group cannot continue running even if the bounded
+                # reap expires; the incomplete query is never used.
+                if wait_for_query(pid, deadline) is None:
+                    return None
     return output if status == 0 and not cancelled else None
 
 
@@ -359,7 +390,9 @@ def sample(fd, deadline=None):
     audits = Path(os.getenv("AUDIT_DIR") or home / "audits").expanduser()
     path = audits / "samples"
     want_process = bool(load and cores and float(load) >= int(cores))
-    if append(path, day, ("\t".join(fields) + "\n").encode("ascii"), deadline, want_process):
+    process_min_size = len("\t".join(("P", str(ms), load, cores, "x")) + "\n")
+    if append(path, day, ("\t".join(fields) + "\n").encode("ascii"), deadline,
+              want_process, process_min_size):
         names = catalogue_names()
         if names:
             hits = process_basename_fields(query_processes(deadline), names)
