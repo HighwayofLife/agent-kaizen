@@ -10,6 +10,24 @@ from test_scripts import jsonl
 
 
 class SignedTranscriptTests(SecurityCase):
+    def test_extract_store_rejects_custom_mode_and_symlink_ancestor(self):
+        from unittest.mock import patch
+        data = dict(since='2025-01-01', agent_usage={})
+        custom = self.root / 'custom'
+        custom.mkdir(mode=0o755)
+        custom.chmod(0o755)
+        self.assertIsNone(AUDIT['write_extract'](data, self.root / 'report.md', custom, {}))
+        self.assertEqual(custom.stat().st_mode & 0o777, 0o755)
+        link = self.root / 'link'
+        link.symlink_to(custom, target_is_directory=True)
+        self.assertIsNone(AUDIT['write_extract'](data, self.root / 'report.md', link / 'extracts', {}))
+        default = self.cfg / 'audits/extracts'
+        default.mkdir(parents=True, mode=0o755)
+        default.chmod(0o755)
+        with patch.dict(__import__('os').environ, CLAUDE_CONFIG_DIR=str(self.cfg)):
+            self.assertIsNotNone(AUDIT['write_extract'](data, self.root / 'report.md', default, {}))
+        self.assertEqual(default.stat().st_mode & 0o777, 0o700)
+
     def test_unsafe_transcripts_do_not_supply_signed_counters(self):
         project = self.project("signed-evidence")
         folder = self.cfg / "projects" / "fixture"

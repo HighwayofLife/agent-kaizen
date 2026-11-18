@@ -135,6 +135,16 @@ class FrictionCodexTests(unittest.TestCase):
                 data = self.collect(cwd=[self.work], now=SINCE + timedelta(seconds=10))
                 self.assertEqual(data['friction']['summary']['measured'], 1)
 
+    def test_out_of_scope_future_header_does_not_exhaust_pair_limit(self):
+        rows = [row('session_meta', 20, cwd=self.work)]
+        rows += [call(str(i), cwd=str(self.root / 'other')) for i in range(3)]
+        rows += [row('turn_context', 2, cwd=self.work), call('inside', 3), result('inside', 4)]
+        jsonl(self.rollout, rows)
+        with patch.dict(AUDIT['scan_codex'].__globals__, FRICTION_PAIR_LIMIT=2):
+            data = self.collect(cwd=[self.work], now=SINCE + timedelta(seconds=10))
+        self.assertFalse(data['friction']['summary']['capped'])
+        self.assertEqual(data['friction']['summary']['measured'], 1)
+
     def test_output_requires_valid_bounded_json(self):
         prefix = 'Wall time: 150 seconds\nOutput:\n'
         jsonl(self.rollout, [self.meta, call('invalid'), call('oversized'),

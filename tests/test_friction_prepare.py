@@ -48,6 +48,12 @@ class ComparisonTests(unittest.TestCase):
         self.assertEqual(len(new), 2)
         self.assertFalse(self.compare(state, flags=flags, basis="mixed")[0])
 
+    def test_estimated_acknowledgement_does_not_hide_measured(self):
+        estimated = dict(self.flag, basis="estimated", value=16)
+        measured = dict(self.flag, basis="measured", value=4)
+        _, state = self.compare({}, flag=estimated, basis="mixed")
+        self.assertEqual(self.compare(state, flag=measured, basis="mixed")[0], [measured])
+
     def test_policy_switches_and_switch_back(self):
         _, initial = self.compare({})
         for change in (dict(project="/other"), dict(basis="row_gap"),
@@ -186,6 +192,40 @@ class PreparationTests(unittest.TestCase):
             with self.assertWarns(UserWarning):
                 self.assertEqual(json.loads(self.run_prepare().read_text())["actions"], [])
 
+    def test_worktree_only_outputs_merge_and_keep_flags(self):
+        linked1, linked2 = self.root / 'linked1', self.root / 'linked2'
+        for linked in (linked1, linked2):
+            (linked / 'build').mkdir(parents=True)
+        self.obj.anchors.extend([linked1, linked2])
+        self.probe['findings'] = [dict(id='indexed-output', catalog_id='spotlight-output',
+                                       subject=str(linked / 'build'), evidence=dict(size_bytes=size))
+                                  for linked, size in ((linked1, 42), (linked2, 84))]
+        self.probe['regenerable_dirs'] = [dict(path=item['subject'], size_bytes=item['evidence']['size_bytes'])
+                                          for item in self.probe['findings']]
+        self.write_evidence()
+        view = json.loads(self.run_prepare().read_text())
+        self.assertEqual(len(view['actions']), 1)
+        self.assertEqual(view['actions'][0]['evidence'], [84])
+        self.assertTrue(view['flags'])
+        receipt = json.loads(next((self.backups / 'friction').glob('receipt-*.json')).read_text())
+        self.assertEqual(len(next(iter(receipt['allowed'].values()))['provenance']), 2)
+
+    def test_worktree_output_symlink_escape_is_rejected(self):
+        linked, outside = self.root / 'linked', self.root / 'outside'
+        linked.mkdir()
+        outside.mkdir()
+        (linked / 'build').symlink_to(outside, target_is_directory=True)
+        self.obj.anchors.append(linked)
+        path = str(linked / 'build')
+        self.probe['findings'] = [dict(id='indexed-output', catalog_id='spotlight-output',
+                                       subject=path, evidence=dict(size_bytes=42))]
+        self.probe['regenerable_dirs'] = [dict(path=path, size_bytes=42)]
+        self.write_evidence()
+        with self.assertWarns(UserWarning):
+            view = json.loads(self.run_prepare().read_text())
+        self.assertFalse(view['actions'])
+        self.assertTrue(view['flags'])
+
     def test_flapping_action_is_held(self):
         _, ident = self.candidate()
         host = runpy.run_path(str(PATH.parent / "kaizen_friction_actions.py"))
@@ -201,6 +241,25 @@ class PreparationTests(unittest.TestCase):
         self.write_evidence()
         with patch.object(prepare.runpy, "run_path", side_effect=load):
             self.assertIsNone(self.run_prepare())
+
+    def test_reconciliation_rechecks_policy_after_lock(self):
+        from contextlib import contextmanager
+        inputs = self.run_prepare()
+        original = prepare.runpy.run_path
+        def load(path):
+            module = original(path)
+            if str(path).endswith('kaizen_friction_actions.py'):
+                locked = module['_locked']
+                @contextmanager
+                def disable_while_waiting(directory, name):
+                    with locked(directory, name):
+                        self.write(self.project / 'docs/kaizen/config.json', '{"friction":"off"}')
+                        yield
+                module['_locked'] = disable_while_waiting
+            return module
+        with patch.object(prepare.runpy, 'run_path', side_effect=load):
+            with self.assertRaises(ValueError):
+                self.reconcile(inputs, self.actions())
 
     def test_interruption_empty_import_and_idempotent_ack(self):
         first = self.run_prepare()
