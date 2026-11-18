@@ -71,8 +71,11 @@ def metadata_row(line, timestamp):
 # Top-level record kinds emitted by the two transcript formats.
 CLAUDE_TYPES = frozenset(("user", "assistant", "system", "progress", "file-history-snapshot",
                           "queue-operation", "summary", "custom-title", "attachment", "api-request-shape",
-                          "last-prompt", "pr-link"))
-CODEX_TYPES = frozenset(("session_meta", "turn_context", "response_item", "event_msg", "compacted"))
+                          "last-prompt", "pr-link", "api-request", "api-request-blob", "atis-latch",
+                          "session-owner", "mode", "ai-title", "permission-mode", "tools-used",
+                          "cost-state", "file-history-delta"))
+CODEX_TYPES = frozenset(("session_meta", "turn_context", "response_item", "event_msg", "compacted",
+                         "token_usage_record", "world_state"))
 TYPE_FIELD = re.compile(rb'"type"\s*:\s*"([^"\\]+)"')
 VERSION_FIELD = re.compile(rb'"(?:version|cli_version)"\s*:')
 
@@ -111,6 +114,8 @@ def canary_row(line, since, counts, codex, session_version):
         entry["records"] += 1
         if kind not in known:
             entry["unknown_records"] += 1
+            name = kind if isinstance(kind, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", kind) else "<other>"
+            entry[("unknown_type", name)] += 1
         if not codex and kind == "assistant":
             message = row.get("message")
             if isinstance(message, dict) and message.get("model") != "<synthetic>":
@@ -924,6 +929,11 @@ def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=No
         "brief_chars_median": int(statistics.median([n for values in data["briefs"].values() for n in values])) if data["briefs"] else 0,
         "codex_brief_chars_median": int(statistics.median([n for values in data["codex_briefs"].values() for n in values])) if data["codex_briefs"] else 0,
     }
+    unknown_types = Counter()
+    for counts in data["format_canary"].values():
+        unknown_types.update({key[1]: count for key, count in counts.items()
+                              if isinstance(key, tuple) and key[0] == "unknown_type"})
+    data["unknown_types"] = dict(unknown_types)
     data["format_canary"] = {version: dict(records=c["records"], unknown_records=c["unknown_records"],
                                             missing_usage=c["missing_usage"])
                              for version, c in sorted(data["format_canary"].items())}
@@ -1327,7 +1337,9 @@ def report(data, out, scope):
                            for bucket in CACHE_BUCKETS)
     headline.append("Cache write gaps (main and individual subagent transcripts): " + gap_counts + ".")
     if any(c["unknown_records"] or c["missing_usage"] for c in data["format_canary"].values()):
-        headline.append("FORMAT-DRIFT: " + h["format_canary"])
+        types = sorted(data.get("unknown_types", {}).items(), key=lambda item: (-item[1], item[0]))[:5]
+        suffix = " unknown_types=" + ",".join(f"{name}:{count}" for name, count in types) if types else ""
+        headline.append("FORMAT-DRIFT: " + h["format_canary"] + suffix)
     elif not data["format_canary"]:
         headline.append("FORMAT-DRIFT: no transcript data observed.")
     sections = []

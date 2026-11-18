@@ -85,6 +85,20 @@ class DoctorTests(unittest.TestCase):
         self.assertEqual(before, after)
         self.assertIn('usage:', self.doctor('--help'))
 
+    def test_empty_and_live_wal(self):
+        wal = Path(str(self.db) + '-wal')
+        wal.touch()
+        self.assertIn('PASS usage database ingest within 7 days', self.doctor())
+        wal.unlink()
+        with sqlite3.connect(self.db) as conn:
+            conn.execute('PRAGMA journal_mode=WAL')
+            conn.execute("UPDATE files SET ingested_at='2000-01-01T00:00:00+00:00'")
+            conn.commit()
+            conn.execute('INSERT INTO files VALUES (?)', (datetime.now(timezone.utc).isoformat(),))
+            conn.commit()
+            self.assertGreater(wal.stat().st_size, 0)
+            self.assertIn('PASS usage database ingest within 7 days', self.doctor())
+
     def test_stale_cache_and_hooks(self):
         (self.cache / 'scripts/kaizen-link').write_text('stale')
         self.assertIn('WARN installed cache differs', self.doctor())

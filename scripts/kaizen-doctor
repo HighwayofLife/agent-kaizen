@@ -146,9 +146,10 @@ def main():
 
     try:
         db = Path(os.environ.get('KAIZEN_USAGE_DB') or HOME / 'kaizen-usage.db').expanduser()
-        if Path(str(db) + '-wal').exists():
-            raise ValueError()
-        with sqlite3.connect(db.resolve().as_uri() + '?mode=ro&immutable=1', uri=True, timeout=1) as conn:
+        wal = Path(str(db) + '-wal')
+        live_wal = wal.exists() and wal.stat().st_size > 0
+        query = '?mode=ro' if live_wal else '?mode=ro&immutable=1'
+        with sqlite3.connect(db.resolve().as_uri() + query, uri=True, timeout=1) as conn:
             conn.set_progress_handler(lambda: 1, 100000)
             value = conn.execute('SELECT max(ingested_at) FROM files').fetchone()[0]
         stamp = datetime.fromisoformat(value.replace('Z', '+00:00'))
@@ -158,6 +159,11 @@ def main():
         if age < 0 or age > 7:
             raise ValueError()
         emit('PASS', 'usage database ingest within 7 days')
+    except sqlite3.OperationalError as exc:
+        if 'locked' in str(exc).lower() or 'busy' in str(exc).lower():
+            emit('WARN', 'usage database busy; retry', 'usage-db ingest')
+        else:
+            emit('WARN', 'usage database ingest missing, unknown, or over 7 days old', 'usage-db ingest')
     except (OSError, sqlite3.Error, ValueError, TypeError, AttributeError, IndexError):
         emit('WARN', 'usage database ingest missing, unknown, or over 7 days old', 'usage-db ingest')
 
