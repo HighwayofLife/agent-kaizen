@@ -2,9 +2,25 @@
 
 | Job | Frequency | Tokens |
 |---|---|---|
-| Global audit (`kaizen-scheduled audit`) | About every 3 days | None |
+| Global audit | On session start when due, or on an optional OS schedule | None |
 | Per-project review (`kaizen-scheduled review`) | Weekly, when due | One headless Sonnet run per project |
 | Session notice | Session start | None |
+
+## Session-start audits
+
+Claude Code starts the audit in the background at startup or resume. The hook
+uses the same lock as the OS job. It skips a busy lock and runs when the last
+recorded successful global audit is more than three days old or there is no
+valid timestamp. An audit that fails or produces no report can retry at the
+next session start. The worker has a 600-second deadline for the entire run.
+
+The audit covers all local projects. Per-project checks run only for enrolled
+projects. For an immediate first look at your usage, run `kaizen-scan`.
+
+Set `"autoAudit": false` in `<Claude config dir>/agent-kaizen.json` or run
+`kaizen-scheduled config set autoAudit=false` to opt out of the hook. Global
+`enabled=false` also disables it. OS jobs are optional and keep their own
+schedule.
 
 ## Why local and not cloud
 
@@ -79,6 +95,7 @@ Settings live in `agent-kaizen.json` in the Claude config directory and in each 
 | Key | Scope | Values and default |
 |---|---|---|
 | `enabled` | Global | `true` (default), `false` disables all scheduled work |
+| `autoAudit` | Global only | `true` (default), `false` disables session-start audits |
 | `pendingDays` | Global or project | Positive integer; pending experiments are flagged after this many days, default `10` |
 | `schedule` | Global or project | `active` (default), `always`, `off` |
 | `scheduledAutonomy` | Global or project | `propose` (default), `auto`. A project file's `auto` counts only if the project is in `autoProjects` |
@@ -107,6 +124,7 @@ The audits directory is `<Claude config dir>/audits`:
 ```text
 <audits>/token-audit-*.md
 <audits>/token-audit-*.reviewed
+<audits>/auto-audit-state.json
 <audits>/checks-*.md
 <audits>/extracts/*.extract.json
 <audits>/projects/index.json
@@ -131,7 +149,18 @@ The machine-local `checks.json` records completed models, roster and whats-new c
 
 The checks report includes an experiments section for each project with findings or a checker failure. Session start also notices experiment findings once per day per project using a marker in the audits directory; `KAIZEN_NOTICE_TIMEOUT` bounds the check in seconds (default 10).
 
-The scheduled `audit` job runs `usage-db ingest --quiet` after the token audit, so the SQLite usage store keeps history after Claude Code deletes old transcripts. The database is `KAIZEN_USAGE_DB`, default `kaizen-usage.db` under the Claude config dir. A failure there is logged as a step failure and never fails the audit.
+Both the session-start worker and the scheduled `audit` job run
+`usage-db ingest --quiet` after the token audit. They append to the same
+SQLite database, so it keeps history after Claude Code deletes old transcripts.
+The database is `KAIZEN_USAGE_DB`, default `kaizen-usage.db` under the Claude
+config dir. An ingest failure is logged separately in `<audits>/run.log` for
+the hook and for installed OS jobs.
+
+Successful global runs with a report update `<audits>/auto-audit-state.json`. An async hook can be cancelled when a session ends, notably in short `claude -p` runs; a cancelled run does not record success and retries at the next session start, so users who only run short sessions can keep the OS job (`install-schedule`).
+To delete generated data, stop any active runs and disable the hook and OS jobs
+if you want the data to stay deleted. Delete the database and any matching
+`-wal` and `-shm` files to clear usage history. Delete the audits directory
+to remove reports, extracts, logs, and the last-success timestamp.
 
 ### Retention
 
@@ -145,7 +174,7 @@ The runner tidies after each scheduled audit and review; interactive cycles run 
 | `temp` | `projects/*/cycle-*.md.*` (temporary files of a killed run) | 1 day |
 | `reports` | `token-audit-*.md`, `projects/*/token-audit-*.md`, `projects/*/cycle-*.md`, `checks-*.md`, `projects/*/project-report-*.md` | 365 days; newest 5 per folder and family kept |
 
-A report's `.reviewed` marker is removed with it. Only regular files inside the audits folder are deleted; symlinks are skipped. Each deletion is logged: in `run.log` for scheduled runs, on screen for manual ones. Housekeeping does not touch `host-actions.json`, `host-fixes/`, `projects/index.json`, project `state.json` files, `run.log`, `kaizen-backups/`, transcripts, Codex sessions or project files.
+A report's `.reviewed` marker is removed with it. Only regular files inside the audits folder are deleted; symlinks are skipped. Each deletion is logged: in `run.log` for scheduled runs, on screen for manual ones. Housekeeping does not touch `auto-audit-state.json`, `host-actions.json`, `host-fixes/`, `projects/index.json`, project `state.json` files, `run.log`, `kaizen-backups/`, transcripts, Codex sessions or project files.
 
 Set `retention=off` to keep everything. Override a kind with `kaizen-scheduled config set retentionOverrides='{"extracts":{"days":14}}'`. Each kind accepts positive integer `days`, `hours` and `maxMB`; `hours` takes precedence over `days`.
 
@@ -158,7 +187,7 @@ Environment variables read by the scheduled runner:
 | Variable | Effect |
 |---|---|
 | `KAIZEN_REVIEW_TIMEOUT` | Seconds allowed for one model run; default 3600, `0` = no limit. Every other step has a fixed 600-second limit |
-| `KAIZEN_LOCK_WAIT` | Seconds a run waits for the run lock; default 1800 |
+| `KAIZEN_LOCK_WAIT` | Seconds an OS or manual run waits for the run lock; default 1800 |
 | `KAIZEN_SKIP_CHECKS` | `1` skips the project discovery and index update, the `checks-*.md` report (drift, stale rules, notes-ledger due, experiments) and the per-project report. The token audit, the review and housekeeping still run |
 | `KAIZEN_BACKUP_DIR` | Backup root, default `<Claude config dir>/kaizen-backups`; empty counts as unset |
 | `KAIZEN_USAGE_DB` | Usage database, default `kaizen-usage.db` under the Claude config dir |

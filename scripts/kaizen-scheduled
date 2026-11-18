@@ -9,6 +9,7 @@ Commands:
   checks path --for DIR            show the project check state path
   checks record --for DIR NAME     record a completed check (optional --date YYYY-MM-DD)
   audit                            run the global token audit
+  auto-audit                       run the global token audit if due (SessionStart)
   review [--dry-run]                audit and review every due project
   housekeep [--dry-run]             delete expired generated audit files
 
@@ -115,6 +116,7 @@ def valid_auto_projects(value):
 
 SCHEMA = {
     "enabled": {"kind": "bool", "default": True, "global_only": True},
+    "autoAudit": {"kind": "bool", "default": True, "global_only": True},
     "pendingDays": {"kind": "int", "default": 10, "minimum": 1},
     "schedule": {"kind": "enum", "default": "active", "choices": ("active", "always", "off")},
     "scheduledAutonomy": {"kind": "enum", "default": "propose", "choices": ("propose", "auto")},
@@ -279,6 +281,8 @@ def log(message):
 
 # Wall-clock limits. Every helper step gets STEP_TIMEOUT; the model run gets KAIZEN_REVIEW_TIMEOUT.
 STEP_TIMEOUT = 600
+AUTO_AUDIT_TIMEOUT = STEP_TIMEOUT
+AUTO_AUDIT_STATE = "auto-audit-state.json"
 REVIEW_TIMEOUT = 3600
 LOCK_WAIT = 1800
 LOG_LIMIT = 1 << 20
@@ -305,14 +309,15 @@ def failure_text(error):
 
 
 @contextlib.contextmanager
-def run_lock(audits, watchdog=False):
-    """Hold <audits>/.lock for a whole run; yield False if another run keeps it past KAIZEN_LOCK_WAIT."""
+def run_lock(audits, watchdog=False, wait=None):
+    """Hold <audits>/.lock for a whole run, waiting up to KAIZEN_LOCK_WAIT by default."""
     if fcntl is None:
         yield True
         return
     audits.mkdir(parents=True, exist_ok=True)
     path = audits / ".lock"
-    wait = env_seconds("KAIZEN_LOCK_WAIT", LOCK_WAIT)
+    if wait is None:
+        wait = env_seconds("KAIZEN_LOCK_WAIT", LOCK_WAIT)
     deadline = time.monotonic() + wait
     announced = False
     with path.open("a") as handle:
@@ -356,12 +361,11 @@ SIGNALS = {"fired": None, "raised": False, "deferred": 0, "child": None, "stoppa
 def _on_signal(number, frame):
     if SIGNALS["fired"] is None:
         SIGNALS["fired"] = number
+    child = SIGNALS["child"]
+    if child is not None:
+        child.kill()
     if SIGNALS["raised"] or SIGNALS["deferred"]:
-        # One exception only; cleanup keeps running. A deferred signal must still stop the model run.
-        child = SIGNALS["child"]
-        if child is not None:
-            child.kill()
-        return
+        return  # One exception only; cleanup keeps running.
     SIGNALS["raised"] = True
     raise Terminated(number)
 
@@ -432,8 +436,9 @@ os.execvpe(sys.argv[3], sys.argv[3:], os.environ)
 
 def run_group(command, stoppable=False, **kwargs):
     """subprocess.run in a new session whose whole group is killed on timeout or error. With
-    stoppable, a signal held back by protected() also kills it (the model run)."""
+    stoppable or a worker deadline, track the group for signal cleanup and hard kills."""
     original = subprocess.Popen
+    stoppable = stoppable or SIGNALS.get("deadline", False)
     reader = writer = None
     try:
         if stoppable:
@@ -459,21 +464,29 @@ def run_group(command, stoppable=False, **kwargs):
 
 
 @contextlib.contextmanager
-def terminating_on_signals():
-    """Turn SIGTERM, SIGHUP and SIGINT into Terminated. The child is killed as the exception unwinds
-    through subprocess.run."""
+def terminating_on_signals(timeout=None):
+    """Unwind on SIGTERM, SIGHUP, SIGINT or the optional whole-run deadline."""
     SIGNALS.update(fired=None, raised=False, deferred=0, child=None, stoppable=False)
     previous = {}
-    for name in ("SIGTERM", "SIGHUP", "SIGINT"):
+    names = ("SIGTERM", "SIGHUP", "SIGINT")
+    if timeout is not None:
+        names += ("SIGALRM",)
+    for name in names:
         number = getattr(signal, name, None)
         try:
-            if number is not None and signal.getsignal(number) != signal.SIG_IGN:  # nohup stays honoured
+            if number is not None and (name == "SIGALRM" or signal.getsignal(number) != signal.SIG_IGN):
                 previous[number] = signal.signal(number, _on_signal)
         except ValueError:  # not the main thread
             break
     try:
+        if timeout is not None:
+            SIGNALS["deadline"] = True
+            signal.setitimer(signal.ITIMER_REAL, timeout)
         yield
     finally:
+        if timeout is not None:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            SIGNALS.pop("deadline", None)
         for number, handler in previous.items():
             signal.signal(number, handler)
 
@@ -715,6 +728,10 @@ def write_state(project, state):
     """Atomically save state, including review ids before starting Claude."""
     path = project.folder / "state.json"
     path.parent.mkdir(parents=True, exist_ok=True)
+    write_state_file(path, state)
+
+
+def write_state_file(path, state):
     temporary = None
     try:
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
@@ -1411,6 +1428,31 @@ def run_audit(audits, options):
             scheduled_housekeep(audits)
 
 
+def run_auto_audit(args):
+    with terminating_on_signals(timeout=AUTO_AUDIT_TIMEOUT):
+        cfg = effective()
+        if fcntl is None or not (cfg["enabled"]["value"] and cfg["autoAudit"]["value"]):
+            return
+        audits = audits_dir().resolve()
+        with run_lock(audits, watchdog=True, wait=0) as held:
+            if not held:
+                return
+            state = load_config(audits / AUTO_AUDIT_STATE)
+            last = parse_time(state.get("last_audit_ok"))
+            current = now()
+            if last is not None and timedelta(0) <= current - last <= timedelta(days=3):
+                return
+            options = command_options(args)
+            rotate_log(audits)
+            with (audits / "run.log").open("a", encoding="utf-8", buffering=1) as stream:
+                with contextlib.redirect_stdout(stream), contextlib.redirect_stderr(stream):
+                    try:
+                        run_audit(audits, options)
+                    except Terminated as error:
+                        log(f"auto-audit: stopped by {error.name}; will retry next session")
+                        raise
+
+
 def run_review(audits, project_dirs, options, clock):
     safety = {"ledger_violation": False, "stopped": False}
     try:
@@ -1568,8 +1610,14 @@ def run_usage_db(options):
 
 
 def _run_audit(audits, options):
-    code = _run_token_audit(audits, options)
+    code, report = _run_token_audit(audits, options)
     run_usage_db(options)
+    # Only the unscoped audit reaches this path. Its callers hold the run lock.
+    try:
+        if fcntl is not None and code == 0 and report.is_file():
+            write_state_file(audits / AUTO_AUDIT_STATE, {"last_audit_ok": timestamp(now())})
+    except OSError as error:
+        log(f"audit state: failed ({error})")
     return code
 
 
@@ -1584,12 +1632,12 @@ def _run_token_audit(audits, options):
             report = report_path(result.stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         log(f"audit: failed ({failure_text(error)})")
-        return 1
+        return 1, None
     if result.returncode:
         log(f"audit: failed (exit {result.returncode})")
-    else:
-        log(f"audit: ok {report}")
-    return result.returncode
+        return result.returncode, None
+    log(f"audit: ok {report}")
+    return 0, report
 
 
 def report_path(stdout):
@@ -2144,6 +2192,7 @@ def main(argv=None):
     cleanup.add_argument("--dry-run", action="store_true", help="preview deletions")
     cleanup.add_argument("--audits", type=Path, help="override the audits folder")
     audit = commands.add_parser("audit", help="run the global token audit")
+    commands.add_parser("auto-audit", help="run the global token audit if due at session start")
     review = commands.add_parser("review", help="audit and review due projects")
     review.add_argument("--json", action="store_true", help="with --dry-run, list project autonomy and sources as JSON")
     review.add_argument("--dry-run", action="store_true", help="preview without tokens or writes")
@@ -2164,6 +2213,15 @@ def main(argv=None):
         parser.error("--json requires --dry-run")
     global LOG_TO_STDERR
     LOG_TO_STDERR = getattr(args, "json", False)
+    if args.command == "auto-audit":
+        try:
+            run_auto_audit(args)
+        except Terminated as error:
+            return 128 + error.number
+        except (OSError, ValueError) as error:
+            print(f"kaizen-scheduled: {error}", file=sys.stderr)
+            return 2
+        return 0
     if args.command == "checks":
         project = canonical_project(args.project_dir)
         if not (project / "docs/kaizen").is_dir():
