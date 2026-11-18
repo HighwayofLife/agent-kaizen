@@ -6,9 +6,9 @@ Changelog: none.
 
 ## Goal
 
-Batch review 7 (Sol medium, 634c943..253dd03) found six defects. Fix ALL six, each with a regression test that fails before the fix. Do not commit or push. Do not edit `.claude-plugin/plugin.json` or `CHANGELOG.md`. Do not delete or weaken tests. The line numbers are from 253dd03; P23 and P18d have since changed these files, so re-locate each finding in the current code and report any already fixed.
+Batch review 7 (Sol medium, 634c943..253dd03) found six defects, and item 7 is a pre-existing check failure. Fix ALL seven, each with a regression test that fails before the fix. Do not commit or push. Do not edit `.claude-plugin/plugin.json` or `CHANGELOG.md`. Do not delete or weaken tests. The line numbers are from 253dd03; P23 and P18d have since changed these files, so re-locate each finding in the current code and report any already fixed.
 
-Owned files: `hooks/audit-notice.sh`, `scripts/kaizen_friction_prepare.py`, `scripts/token-audit`, `tests/test_hooks.py`, `tests/test_friction_prepare.py`, `tests/test_friction_timeline.py`.
+Owned files: `hooks/audit-notice.sh`, `scripts/kaizen_friction_prepare.py`, `scripts/token-audit`, `tests/test_hooks.py`, `tests/test_friction_prepare.py`, `tests/test_friction_timeline.py`, `tools/context-budget.json`.
 
 ## Findings
 
@@ -19,6 +19,8 @@ Owned files: `hooks/audit-notice.sh`, `scripts/kaizen_friction_prepare.py`, `scr
 5. `scripts/kaizen_friction_prepare.py:75`: measured and estimated regressions share one acknowledgement bucket, so acknowledging a larger row-gap estimate suppresses a newly measured regression for the same command. Fix: key acknowledgements by basis (`measured`, `estimated`, `unconfirmed`) as well as identity; a measured regression is never suppressed by an estimated acknowledgement. Test.
 6. `scripts/token-audit:1214`: the contention overlap scan restarts from the first local interval for every cohort (a 16,383-call, 5,461-cohort benchmark took 19.2 s versus 7.3 s before BF13a). Fix: sort intervals once and advance a moving start pointer (or bisect) per cohort while keeping BF13a's memory bound. Add a test that the scan does linear-ish work (for example, count interval visits on a synthetic input) and keep `tests/bench_token_audit.py` within budget.
 
+7. `tools/context_budget.py` fails on `release-0.13` with "hooks/audit-notice.sh: hook changed; review and update inventory": BF13a changed the hook without updating the reviewed inventory in `tools/context-budget.json`. After fix 1, review the hook's literal output bytes and update the inventory entry (hash and reviewed byte count) the way the file's other entries are recorded. The total must stay within the 1024-byte budget (it was 1023); if fix 1 adds printed bytes, trim them rather than raising the budget. Check: `python3 tools/context_budget.py` exits 0.
+
 ## Verification
 
 - `python3 -m unittest discover -s tests -p 'test_hooks.py'`
@@ -26,6 +28,7 @@ Owned files: `hooks/audit-notice.sh`, `scripts/kaizen_friction_prepare.py`, `scr
 - `python3 -m unittest discover -s tests -p 'test_friction_timeline.py'`
 - `python3 -m unittest discover -s tests -p 'test_runner.py'`
 - `python3 tests/bench_token_audit.py --baseline d8a4cb7 --max-ratio 1.10` and with `--no-friction`
+- `python3 tools/context_budget.py`
 - `git diff --check`
 
 ## Report
