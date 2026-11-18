@@ -23,13 +23,14 @@ class WorktreePruneTests(unittest.TestCase):
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve()
         self.primary, self.target = self.root / 'primary', self.root / 'target'
-        self.home = self.root / 'config'
-        self.journal = self.home / 'audits/worktree-prunes'
+        self.home = self.root / 'home'
+        self.journal = self.home / '.claude/audits/worktree-prunes'
+        self.config = self.root / 'config'
         self.old = int(time.time()) - 3 * 86400
         self.env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
         self.env.pop('KAIZEN_GIT', None)
         self.env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
-                        CLAUDE_CONFIG_DIR=str(self.home), GIT_AUTHOR_NAME='Fixture',
+                        HOME=str(self.home), CLAUDE_CONFIG_DIR=str(self.config), GIT_AUTHOR_NAME='Fixture',
                         GIT_COMMITTER_NAME='Fixture', GIT_AUTHOR_EMAIL='test@example.invalid',
                         GIT_COMMITTER_EMAIL='test@example.invalid',
                         GIT_AUTHOR_DATE=f'@{self.old} +0000', GIT_COMMITTER_DATE=f'@{self.old} +0000')
@@ -125,7 +126,17 @@ class WorktreePruneTests(unittest.TestCase):
                                           common=str(self.common), path=str(self.target),
                                           branch='refs/heads/topic', branch_tip=tip)))
         record.chmod(0o600)
-        self.refused('disabled pending journal', record=record)
+        self.refused('disabled pending safe removal', record=record)
+        redirected = self.config / 'audits/worktree-prunes'
+        redirected.mkdir(parents=True, mode=0o700)
+        shutil.copy2(record, redirected / record.name)
+        self.refused('outside the private journal', record=redirected / record.name)
+        forged = json.loads(record.read_text())
+        forged['path'] = str(self.root / 'unrelated')
+        (self.journal / 'forged.json').write_text(json.dumps(forged))
+        (self.journal / 'forged.json').chmod(0o600)
+        self.refused('disabled pending safe removal', record=self.journal / 'forged.json')
+        self.assertFalse(Path(forged['path']).exists())
         self.git(self.primary, 'commit', '--allow-empty', '-qm', 'new tip')
         self.git(self.primary, 'branch', '-f', 'topic', 'main')
         self.refused('branch tip no longer equals', record=record)
@@ -228,6 +239,60 @@ class WorktreePruneTests(unittest.TestCase):
                 blob.write_bytes(zlib.compress(data))
                 self.refused('unexpected type or size')
 
+    def test_blob_payload_must_hash_to_its_oid(self):
+        oid = self.git(self.target, 'rev-parse', 'HEAD:tracked')
+        blob = self.common / 'objects' / oid[:2] / oid[2:]
+        blob.unlink()
+        blob.write_bytes(zlib.compress(b'blob 10\0corrupted\n'))
+        output = subprocess.run(['git', '-C', str(self.target), 'cat-file', '--batch-check'],
+                                input=oid + '\n', env=self.env, capture_output=True, text=True, check=True)
+        self.assertEqual(output.stdout, f'{oid} blob 10\n')
+        self.refused('Git blob payload does not match its object ID')
+
+    def test_blob_payload_is_streamed_across_chunks(self):
+        tracked = self.primary / 'tracked'
+        tracked.write_bytes(b'x' * (2 * 1024 * 1024))
+        self.git(self.primary, 'commit', '-qam', 'large blob')
+        self.git(self.target, 'merge', '--ff-only', 'main')
+        self.age()
+        self.refused('eligible worktree')
+
+    def test_refuses_alternates_into_checkout_or_admin(self):
+        oid = self.git(self.target, 'rev-parse', 'HEAD:tracked')
+        objects = self.common / 'objects'
+        blob = objects / oid[:2] / oid[2:]
+        alternate = self.admin / 'objects'
+        borrowed = alternate / oid[:2] / oid[2:]
+        borrowed.parent.mkdir(parents=True)
+        blob.rename(borrowed)
+        alternate_file = objects / 'info/alternates'
+        self.refused('Git blob is missing', GIT_ALTERNATE_OBJECT_DIRECTORIES=str(alternate))
+        alternate_file.write_text(os.path.relpath(alternate, objects) + '\n')
+        self.assertEqual(self.git(self.target, 'cat-file', '-t', oid), 'blob')
+        self.refused('alternate object directory is inside the removal scope')
+        (objects / 'alias').symlink_to(borrowed.parent)
+        alternate_file.write_text('"alias/.."\n')
+        self.assertEqual(self.git(self.target, 'cat-file', '-t', oid), 'blob')
+        self.refused('alternate object directory is inside the removal scope')
+
+        external = self.root / 'external-objects'
+        (external / 'info').mkdir(parents=True)
+        alternate_file.write_text(str(external) + '\n')
+        (external / 'info/alternates').write_text(str(alternate) + '\n')
+        self.refused('alternate object directory is inside the removal scope')
+        (external / 'info/alternates').unlink()
+        external_blob = external / oid[:2] / oid[2:]
+        external_blob.parent.mkdir()
+        borrowed.rename(external_blob)
+        self.refused('eligible worktree')
+
+        (alternate / 'info').mkdir()
+        checkout_objects = self.target / 'objects'
+        checkout_objects.mkdir()
+        (alternate / 'info/alternates').write_text(str(checkout_objects) + '\n')
+        self.age()
+        self.refused('alternate object directory is inside the removal scope')
+
     def test_index_extensions_refuse_private_or_unknown_data(self):
         index = self.admin / 'index'
         for version in (2, 4):
@@ -326,8 +391,10 @@ class WorktreePruneTests(unittest.TestCase):
         self.assertFalse(marker.exists())
 
     def test_live_scan_refuses_untracked_xattrs(self):
-        for path in (self.target / 'tracked', self.target):
-            with self.subTest(path=path):
+        locations = [(self.target / 'tracked', 'tracked'), (self.target, '.'),
+                     *((self.admin / name, 'admin/' + name) for name in ('index', 'HEAD', 'logs/HEAD'))]
+        for path, label in locations:
+            with self.subTest(label=label):
                 if hasattr(os, 'setxattr'):
                     os.setxattr(path, 'user.fixture', b'private')
                 elif sys.platform == 'darwin':
@@ -336,7 +403,7 @@ class WorktreePruneTests(unittest.TestCase):
                     subprocess.run(['xattr', '-w', 'user.fixture', 'private', str(path)], check=True)
                 else:
                     self.skipTest('no xattr setter for this platform')
-                self.refused(f'extended attributes at {str(path.relative_to(self.target))!r}')
+                self.refused(f'extended attributes at {label!r}')
                 if hasattr(os, 'removexattr'):
                     os.removexattr(path, 'user.fixture')
                 else:
