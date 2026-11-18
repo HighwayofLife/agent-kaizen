@@ -236,6 +236,11 @@ From P24's Sol high security review (2026-11-18). These are fail-closed while S3
 - G2 (S3/S7) `scripts/kaizen_friction_apply.py` recovery rejects native `retire-pending` and `undo-pending` journals. A crash during rollback can leave a marker live with no scheduled recovery path. Add recovery for both journal states.
 - G3 (S3/S7) Populated ignored outputs prevent budget proof (fail-closed). This blocks scheduled markers for ordinary build directories. Define a bounded proof for ignored output directories.
 
+- G4 (S3/S7) `scripts/kaizen-scheduled` recovery requires current auto authorization even for a marker applied before a crash. Switching to `--propose-only` or disabling host actions can strand that marker with no ledger row and no broker undo. Recovery of an already-started effect must not depend on current authorization.
+- G5 (S3/S7) `scripts/kaizen_friction_apply.py` writes a `cancelled` record for an unstarted reservation, and that record rejects later attempts for the same stable ID. Fresh evidence with a valid budget can't retry an action that never ran.
+- G6 (S3/S7) `scripts/kaizen-scheduled` lets an older pending action block acknowledgement of every later publication for the project. Scope the acknowledgement block to the pending action's own generation.
+- G7 (S3/S7) `scripts/kaizen-scheduled` import checks only that the version allowlist is nonempty, while launch checks the installed version. An unsupported upgrade can leave marker requests pending forever. Use the same installed-version check at import.
+
 ## P27 docs and release
 
 Assemble README, command and scheduling docs, CI checks and the 0.13.0 CHANGELOG/version. Preserve the 0.12.0 host matrix. Keep the release candidate local until the real-input gate accepts all advertised capabilities. P27 owns a follow-up claims pass whenever P28 blocks a conditional capability. Verify refusal and confirm downgraded docs, then rerun P28 for the affected checks. [Release brief](briefs/27-release.md)
