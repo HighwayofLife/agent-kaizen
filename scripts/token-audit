@@ -2465,7 +2465,7 @@ def apply_regression(data, out, scope, extract_dir):
                                       basis=row["basis"], detail="Comparable median timing grew by at least 1.5 times."))
 
 
-def report(data, out, scope):
+def report(data, out, scope, extract_binding=None):
     h = data["headline"]
     headline = [f"Claude: {h['claude_calls']:,} calls; {h['claude_context']:,} context tokens; {h['claude_output']:,} output tokens.",
                 f"Codex: {h['codex_sessions']:,} sessions; {h['codex_tokens']:,} tokens."]
@@ -2603,6 +2603,8 @@ def report(data, out, scope):
     extra, headlines = measurement_sections(data)
     if "friction" in data:
         extra += friction_sections(data["friction"])
+    if extract_binding is not None:
+        extra.append("<!-- token-audit-friction " + json.dumps(extract_binding) + " -->")
     return "\n".join(lines + extra + ["<!-- token-audit-complete -->"]) + "\n", headline + headlines
 
 
@@ -2652,15 +2654,15 @@ def write_extract(data, out, directory, scope, now=None):
                     value["allow_rule_mac"] = hmac.digest(secret, b"allow-rule-extract-v2\0" + payload, "sha256").hex()
                 except (OSError, ValueError):
                     print("token-audit: could not authenticate allow-rule evidence", file=sys.stderr)
+        raw = (json.dumps(value) + "\n").encode("ascii")
         candidate = ".extract-" + os.urandom(16).hex()
         fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd)
         temporary = candidate
-        with os.fdopen(fd, "w") as stream:
-            json.dump(value, stream)
-            stream.write("\n")
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(raw)
         os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
         temporary = None
-        return str(directory / name)
+        return str(directory / name), dict(size=len(raw), sha256=hashlib.sha256(raw).hexdigest())
     except (OSError, ValueError) as exc:
         print(f"token-audit: extract not written ({exc})", file=sys.stderr)
         return None
@@ -2768,12 +2770,13 @@ def main():
         apply_regression(data, out, scope, args.extract_out)
         for warning in data["parser_warnings"]:
             print(warning, file=sys.stderr)
-        text, headline = report(data, out, scope)
-        extract_path = None
+        extract_path = binding = None
         if not args.no_write:
             out.parent.mkdir(parents=True, exist_ok=True)
+            extract_path, binding = write_extract(data, out, args.extract_out, scope, now) or (None, None)
+        text, headline = report(data, out, scope, binding)
+        if not args.no_write:
             out.write_text(text)
-            extract_path = write_extract(data, out, args.extract_out, scope, now)
         if args.json:
             print(json.dumps(dict(report_path=None if args.no_write else str(out), extract_path=extract_path, **data), indent=2))
         else:

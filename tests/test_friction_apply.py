@@ -201,7 +201,7 @@ class BrokerLedgerTests(unittest.TestCase):
                                               self.runner["action_project"], self.runner["key"])
         self.secret = self.store._secret(create=True)
         self.extracts = config / "audits/extracts"
-        self.extracts.mkdir(mode=0o700, parents=True)
+        self.extracts.mkdir(mode=0o700, parents=True, exist_ok=True)
 
     def action(self, literal, roots):
         selector = json.dumps([literal, *map(str, roots)], separators=(",", ":"))
@@ -471,6 +471,151 @@ class BrokerLedgerTests(unittest.TestCase):
     def test_undo_resolves_relative_state_paths(self):
         self.copied_install_undo_and_bookkeeping_recovery(relative_state=True)
 
+    def scheduled_marker_crashes(self, installed, command, env):
+        runner, runtime = (installed / name for name in ("kaizen-scheduled", "kaizen_friction_apply.py"))
+        fix = installed / "kaizen-host-fix"
+        # Exercise the copied transactions with a disposable marker on either Unix test host.
+        publication = "os.rename('.fixture-marker', MARKER, src_dir_fd=directory, dst_dir_fd=directory)"
+        fix_source = (fix.read_text().replace("LINUX_WRITES = False", "LINUX_WRITES = True")
+                       .replace("PLATFORM = sys.platform", "PLATFORM = 'linux'")
+                       .replace("os.O_TMPFILE", "os.O_CREAT")
+                       .replace("fd = os.open('.'", "fd = os.open('.fixture-marker'")
+                       .replace("os.link(f'/proc/self/fd/{fd}', MARKER, dst_dir_fd=directory, follow_symlinks=True)",
+                                publication))
+        fix.write_text(fix_source)
+        runtime_source = runtime.read_text().replace("frozenset()", "frozenset({'99.0.0'})", 1).replace(
+            'sys.platform.startswith("linux") and tool["LINUX_WRITES"]', 'tool["LINUX_WRITES"]')
+        runtime.write_text(runtime_source)
+        probe = installed / "kaizen-host-probe"
+        probe.write_text("""import json, pathlib, sys
+from datetime import datetime, timezone
+project = sys.argv[sys.argv.index('--project') + 1]
+out = pathlib.Path(sys.argv[sys.argv.index('--out') + 1])
+target = project + '/build'
+(out / 'host-probe-fixture.json').write_text(json.dumps(dict(v=1, project=project,
+    generated_at=datetime.now(timezone.utc).isoformat(),
+    findings=[dict(id='indexed-output', catalog_id='linux-localsearch',
+                   subject=target, evidence=dict(size_bytes=1))],
+    regenerable_dirs=[dict(path=target, size_bytes=1)])))
+""")
+        claude = installed / "fixture-claude"
+        claude.write_text("#!" + sys.executable + "\n" + r"""import json, os, pathlib, sys, time
+if sys.argv[1:] == ['--version']:
+    print('99.0.0 (Claude Code)')
+    sys.exit()
+prompt = sys.argv[sys.argv.index('-p') + 1]
+inputs = pathlib.Path(json.loads(prompt.split(' friction-inputs=', 1)[1]))
+ident = json.loads(inputs.read_text())['actions'][0]['id']
+line = '<!-- kaizen-host-actions ' + json.dumps(dict(v=1, actions=[dict(id=ident, intent='apply')])) + ' -->'
+session = sys.argv[sys.argv.index('--session-id') + 1]
+fault = os.getenv('FIXTURE_FAULT')
+if fault == 'timeout':
+    time.sleep(3)
+if fault == 'invalid':
+    (pathlib.Path(os.environ['CLAUDE_CONFIG_DIR']) / 'agent-kaizen.json').write_text('{"maxChangesPerRun":false}')
+if fault == 'target':
+    pathlib.Path('build').rename('old-build')
+    pathlib.Path('build').mkdir()
+if fault == 'malformed':
+    line = '<!-- kaizen-host-actions invalid -->'
+events = [
+    dict(type='system', subtype='init', claude_code_version='99.0.0', cwd=os.getcwd()),
+    dict(type='assistant', parent_tool_use_id=None, message=dict(role='assistant',
+         content=[dict(type='text', text='Review')])),
+    dict(type='result', subtype='success', is_error=False, result='Review\n' + line + '\n'),
+]
+if fault == 'unbacked':
+    events[1]['message']['content'].append(dict(type='tool_use', id='tool', name='Write',
+        input=dict(file_path=os.path.join(os.getcwd(), 'unbacked'), content='fixture')))
+    events.insert(2, dict(type='user', parent_tool_use_id=None, message=dict(
+        role='user', content=[dict(type='tool_result', tool_use_id='tool')])))
+for index, event in enumerate(events):
+    print(json.dumps(dict(event, session_id=session, uuid=str(index))))
+""")
+        claude.chmod(0o700)
+        config = installed.parent
+        policy = config / "agent-kaizen.json"
+        enabled = '{"scheduledAutonomy":"auto","schedule":"always"}'
+        for crash in ("timeout", "invalid", "target", "malformed", "unbacked", "takeover", "effect", "row", "policy"):
+            policy.write_text(enabled)
+            project = installed.parent.parent / crash
+            ledger = project / apply.LEDGER
+            ledger.parent.mkdir(parents=True)
+            ledger.write_text(self.table)
+            marker = project / "build/.nomedia"
+            marker.parent.mkdir()
+            (project / ".gitignore").write_text("build/\n")
+            for args in (("init", "-q"), ("add", "."), ("-c", "user.name=Fixture", "-c",
+                         "user.email=fixture@example.invalid", "-c", "core.hooksPath=/dev/null",
+                         "commit", "--no-gpg-sign", "-qm", "fixture")):
+                subprocess.run(["git", "-C", str(project), *args], check=True, env=env)
+            source = runner.read_text()
+            if crash == "takeover":
+                statement = '                        run_scheduled_broker(audits, project, options, receipt=prepared[1], attempt=attempt)'
+                runner.write_text(source.replace(statement, '''                        state_path = root / "friction" / ("prepare-" + project.key + ".json")
+                        takeover = json.loads(state_path.read_text())
+                        takeover["generation"] += 1
+                        state_path.write_text(json.dumps(takeover))
+''' + statement))
+            if crash == "effect":
+                statement = '            record["verification"] = result'
+                runtime.write_text(runtime_source.replace(statement, '            os._exit(77)\n' + statement))
+            elif crash == "row":
+                statement = '                    terminal(ident, applied=phase == "recorded")'
+                runner.write_text(source.replace(statement, '                    os._exit(77)\n' + statement))
+            review = ("review", "--force", "--project-dir", project, "--claude", claude)
+            if crash == "policy":
+                fix.write_text(fix_source.replace(publication, publication + '''
+    (Path(os.environ["CLAUDE_CONFIG_DIR"]) / "agent-kaizen.json").write_text('{"maxChangesPerRun":false}')
+'''))
+                command(runner, *review, KAIZEN_SKIP_CHECKS="1")
+                self.assertFalse(marker.exists())
+                policy.write_text(enabled)
+                fix.write_text(fix_source)
+                command(runner, *review, KAIZEN_SKIP_CHECKS="1")
+                self.assertEqual(ledger.read_text(), self.table)
+                receipts = json.loads((config / "audits/host-actions.json").read_text())["receipts"]
+                self.assertNotIn("pending", json.dumps(receipts[str(project)]))
+                continue
+            if crash not in ("effect", "row"):
+                journals = config / "backups/friction"
+                command(runner, *review, KAIZEN_SKIP_CHECKS="1", FIXTURE_FAULT=crash,
+                        KAIZEN_REVIEW_TIMEOUT="1" if crash == "timeout" else "30")
+                self.assertFalse(marker.exists(), crash)
+                self.assertFalse(list(journals.glob("broker-fa1_*.json")), crash)
+                self.assertEqual(ledger.read_text(), self.table, crash)
+                self.assertFalse(any("acknowledged_generation" in json.loads(path.read_text())
+                                     for path in journals.glob("prepare-*.json")), crash)
+                if crash in ("target", "takeover"):
+                    receipts = json.loads((config / "audits/host-actions.json").read_text())["receipts"]
+                    self.assertIn("pending", json.dumps(receipts[str(project)]))
+                runner.write_text(source)
+                continue
+            command(runner, *review, code=77, KAIZEN_SKIP_CHECKS="1")
+            state = config / "audits/host-actions.json"
+            rows = json.loads(state.read_text())["actions"]
+            ident, = (ident for ident, row in rows.items() if row["canonical_project"] == str(project))
+            self.assertTrue(marker.is_file())
+            stamp = marker.stat().st_ino
+            self.assertEqual(ledger.read_text().count(ident), int(crash == "row"))
+            prepare_state = next(path for path in (config / "backups/friction").glob("prepare-*.json")
+                                 if json.loads(path.read_text())["project"] == str(project))
+            self.assertNotIn("acknowledged_generation", json.loads(prepare_state.read_text()))
+            runner.write_text(source)
+            runtime.write_text(runtime_source)
+            command(runner, *review, KAIZEN_SKIP_CHECKS="1")
+            self.assertEqual(marker.stat().st_ino, stamp)
+            self.assertEqual(ledger.read_text().count(ident), 1)
+            self.assertIn("acknowledged_generation", json.loads(prepare_state.read_text()))
+            command(runner, "actions", "undo", ident, "--for", project)
+            self.assertFalse(marker.exists())
+            self.assertIn("reverted", ledger.read_text())
+        project = installed.parent.parent / "target"
+        command(runner, "review", "--force", "--project-dir", project, "--claude", claude, KAIZEN_SKIP_CHECKS="1")
+        self.assertTrue((project / "build/.nomedia").exists())
+        self.assertEqual((project / apply.LEDGER).read_text().count("[action:"), 1)
+        (config / "agent-kaizen.json").unlink()
+
     def copied_install_undo_and_bookkeeping_recovery(self, *, relative_state=False):
         from test_schedule import CRONTAB
 
@@ -492,13 +637,15 @@ class BrokerLedgerTests(unittest.TestCase):
             def command(path, *args, code=0, **extra_env):
                 result = subprocess.run([sys.executable, "-I", str(path), *map(str, args)], env=dict(env, **extra_env),
                                         cwd=root, capture_output=True, text=True, timeout=30)
-                self.assertEqual(result.returncode, code, result.stderr)
+                self.assertEqual(result.returncode, code, result.stdout + result.stderr)
 
             command(scripts / "install-schedule", "--apply", "--scheduler", "cron")
             installed = config / "bin"
             shutil.rmtree(cache)
             runtime = installed / "kaizen_friction_apply.py"
             self.assertFalse(runtime.is_symlink())
+            if not relative_state:
+                self.scheduled_marker_crashes(installed, command, env)
             broker = runpy.run_path(str(runtime))["BrokerLedger"]
             host = runpy.run_path(str(installed / "kaizen_friction_actions.py"))
             runner = installed / "kaizen-scheduled"
@@ -507,7 +654,7 @@ class BrokerLedgerTests(unittest.TestCase):
                                         installed_runner["action_project"], installed_runner["key"])
             secret = store._secret(create=True)
             extracts = config / "audits/extracts"
-            extracts.mkdir(mode=0o700, parents=True)
+            extracts.mkdir(mode=0o700, parents=True, exist_ok=True)
             # Flip only the disposable native helper's live gate to exercise its real transaction and inverse.
             helper = installed / "kaizen-allow-rule"
             helper.write_text(helper.read_text().replace("WRITES_ENABLED = False", "WRITES_ENABLED = True", 1))

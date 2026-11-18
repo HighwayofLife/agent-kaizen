@@ -164,7 +164,7 @@ def _evidence(report, audits, project, cfg, current, host):
     def marker(name):
         matches = re.findall(r"^<!-- token-audit-" + name + r" (.*?) -->$", text, re.M)
         if len(matches) != 1:
-            raise ValueError("missing or ambiguous audit marker")
+            raise ValueError(f"missing or ambiguous audit {name} marker")
         return json.loads(matches[0], object_pairs_hook=host["_unique"])
     scope, ref = marker("scope"), marker("extract")
     name = report.stem + ".extract.json"
@@ -177,6 +177,10 @@ def _evidence(report, audits, project, cfg, current, host):
             or scope["codex"] not in ("cwd", "none")):
         raise ValueError("invalid audit identity or scope")
     extract_raw, extract_identity = _read(audits / "extracts" / name, host, current, REPORT_AGE)
+    binding = marker("friction")
+    if (not isinstance(binding, dict) or type(binding.get("size")) is not int
+            or binding != dict(size=len(extract_raw), sha256=extract_identity["sha256"])):
+        raise ValueError("audit extract digest or size does not match the report")
     extract = _json(extract_raw, host)
     block = extract.get("friction")
     identities = dict(report=report_identity, extract=extract_identity)
@@ -245,14 +249,15 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
                         candidates.append((info.st_mtime_ns, candidate.name, candidate))
                 except OSError:
                     continue
+        refusal = None
         for _, _, candidate in sorted(candidates, reverse=True)[:8]:
             try:
                 scope, block, identities = _evidence(candidate, audits, project, cfg, current, host)
                 break
-            except (OSError, ValueError, KeyError, TypeError):
-                continue
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                refusal = error
         else:
-            raise ValueError("no fresh scoped audit")
+            raise ValueError("no fresh scoped audit" + (f" ({refusal})" if refusal else ""))
     probe = {"findings": [], "regenerable_dirs": []}
     if cfg["hostActions"]["value"] != "off":
         probes = _files(project.folder, r"host-probe-[\w.-]+\.json", host)
