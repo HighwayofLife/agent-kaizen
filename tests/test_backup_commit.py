@@ -1,4 +1,5 @@
-"""Clean Git capture and ordinary manifest handoff for local backup commits."""
+"""Clean Git capture, manifest handoff and local commit plumbing."""
+import base64
 import datetime
 import errno
 import hashlib
@@ -13,6 +14,7 @@ import sys
 import tempfile
 import threading
 import unittest
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from unittest.mock import patch
@@ -60,6 +62,160 @@ class BackupCommitTests(unittest.TestCase):
                 ["begin", "--run", run, "--repo", str(self.repo), "--skill", "trim",
                  "--ledger", "fixture", str(self.target)]), 0)
         return self.backups / f"{run}-01-trim"
+
+    def commit_cli(self, change, baseline=None, *, raw=None, expected=0):
+        option = [] if baseline is None and raw is None else ["--scheduled-baseline-stdin"]
+        result = subprocess.run([sys.executable, str(SCRIPT), "commit", *option, str(change)],
+                                input=raw if raw is not None else json.dumps(baseline),
+                                env=self.env, cwd=self.repo, capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
+        return result
+
+    def test_scheduled_commit_preflight_and_ledger_attestation(self):
+        fixture = json.loads(Path(__file__).with_name("fixtures").joinpath("ledger_attestation_v1.json").read_text())
+        proof = fixture["valid"]
+        ledger = self.repo / proof["ledger_relpath"]
+        ledger.parent.mkdir(parents=True)
+        ledger.write_bytes(base64.b64decode(proof["before_b64"]))
+        self.git("add", ".")
+        self.git("-c", "user.name=Test", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "ledger")
+        self.env.update(KAIZEN_RUN_ID=proof["run_id"], KAIZEN_SESSION_ID=proof["session_id"])
+        old = self.begin("--run", "old")
+        old_stat = old.stat()
+        scope = dict(v=1, baseline=self.capture(self.repo), run_id=proof["run_id"], session_id=proof["session_id"],
+                     started_at=datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                     before=[[str(old)], [[old_stat.st_dev, old_stat.st_ino]]],
+                     root_identity=self.helpers["backup_root_identity"](self.backups), ledger_attestation=None)
+        change = self.begin()
+        self.assertNotIn("git", self.manifest(change))
+        self.target.write_text("after")
+        self.script("finish", change)
+        manifest = change / "manifest.json"
+        raw = manifest.read_bytes()
+        info = change.stat()
+        scope.update(change_id=change.name, change_identity=[info.st_dev, info.st_ino],
+                     manifest_sha256=hashlib.sha256(raw).hexdigest())
+        self.commit_cli(change, scope)
+        for override in ({"run_id": "other"}, {"session_id": "other"},
+                         {"before": [[str(change)], []]}, {"change_id": old.name},
+                         {"baseline": None}, {"manifest_sha256": "0" * 64}):
+            self.commit_cli(change, dict(scope, **override), expected=2)
+        self.commit_cli(change, {k: v for k, v in scope.items() if k != "session_id"}, expected=2)
+        manifest.write_text(json.dumps(dict(self.manifest(change), git=scope["baseline"])))
+        self.commit_cli(change, scope, expected=2)
+        self.commit_cli(change, expected=2)
+        manifest.write_bytes(raw)
+
+        ledger.write_text(fixture["after_utf8"])
+        self.commit_cli(change, scope, expected=2)
+        attested = dict(scope, ledger_attestation=proof)
+        self.commit_cli(change, attested)
+        _, _, selected, _ = self.helpers["commit_preflight"](change, attested)
+        self.assertEqual(set(selected), {self.target})
+        for name, override in fixture["invalid_overrides"].items():
+            with self.subTest(case=name):
+                self.commit_cli(change, dict(scope, ledger_attestation=dict(proof, **override)), expected=2)
+        duplicate = json.dumps(attested).replace('"before_b64":', '"v": 1, "before_b64":')
+        self.commit_cli(change, raw=duplicate, expected=2)
+        foreign_row = fixture["after_utf8"].replace(change.name, old.name)
+        ledger.write_text(foreign_row)
+        self.commit_cli(change, dict(scope, ledger_attestation=dict(
+            proof, manifest_ids=[old.name], after_sha256=hashlib.sha256(ledger.read_bytes()).hexdigest())), expected=2)
+        extra = self.repo / "unapproved"
+        sibling = Path(self.script("begin", "--skill", "trim", "--ledger", "fixture", extra))
+        extra.touch()
+        self.script("finish", sibling)
+        ledger.write_text(fixture["after_utf8"] + foreign_row.splitlines()[-1].replace(old.name, sibling.name) + "\n")
+        self.commit_cli(change, dict(scope, ledger_attestation=dict(
+            proof, manifest_ids=[change.name, sibling.name], after_sha256=hashlib.sha256(ledger.read_bytes()).hexdigest())),
+                        expected=2)
+        extra.unlink()
+        self.assertEqual(self.git("for-each-ref", "refs/heads/kaizen/"), "")
+        ledger.write_text(fixture["after_utf8"] + "another line\n")
+        self.commit_cli(change, attested, expected=2)
+        ledger.write_text(fixture["after_utf8"])
+        self.git("add", str(ledger))
+        self.commit_cli(change, attested, expected=2)
+
+    def test_local_commit_plumbing_preserves_checkout_index_and_verified_bytes(self):
+        index = self.repo / ".git" / "index"
+        (self.repo / ".gitattributes").write_text("tracked filter=tripwire\n")
+        self.git("add", ".gitattributes")
+        self.git("-c", "user.name=Test", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "attributes")
+        change = self.begin("--repo", ".")
+        self.target.write_text("after")
+        self.script("finish", change)
+        self.git("config", "filter.tripwire.clean", "exit 1")
+        self.git("config", "filter.tripwire.required", "true")
+        self.git("config", "user.name", "Test")
+        self.git("config", "user.email", "fixture@example.invalid")
+        head, raw_index = self.git("rev-parse", "HEAD"), index.read_bytes()
+        self.commit_cli(change)
+        self.assertEqual(self.git("for-each-ref", "refs/heads/kaizen/"), "")
+        plan = self.helpers["commit_preflight"](change)
+        state, _, _, recheck = plan
+        manifest = change / "manifest.json"
+        before = manifest.read_bytes()
+        manifest.write_bytes(before + b" ")
+        with self.assertRaisesRegex(ValueError, "manifest hash changed"):
+            self.helpers["tree_from_files"](*plan)
+        manifest.write_bytes(before)
+        tree = self.helpers["tree_from_files"](*plan)
+        ref = "kaizen/" + datetime.date.today().isoformat()
+        self.git("worktree", "add", "--no-checkout", "-qb", ref, str(self.tmp / "linked"))
+        with self.assertRaisesRegex(ValueError, "checked out"):
+            self.helpers["write_commit"](state, tree, change.name, recheck)
+        self.git("worktree", "remove", "--force", str(self.tmp / "linked"))
+        with self.assertRaisesRegex(ValueError, "no journaled owner"):
+            self.helpers["write_commit"](state, tree, change.name, recheck)
+        self.git("branch", "-D", ref)
+        new = self.helpers["write_commit"](state, tree, change.name, recheck)
+        self.assertEqual(self.git("rev-parse", ref), new)
+        self.assertEqual(self.git("show", f"{new}:tracked"), "after")
+        self.assertTrue(self.git("show", "-s", "--format=%B", new).endswith(f"kaizen-backup change: {change.name}"))
+        self.assertEqual((self.git("rev-parse", "HEAD"), index.read_bytes(), self.target.read_text()),
+                         (head, raw_index, "after"))
+
+    def test_commit_refuses_dirty_bytes_and_forged_git_objects(self):
+        nested = self.repo / "nested"
+        nested.mkdir()
+        (nested / "keep").write_text("unchanged")
+        self.git("add", ".")
+        self.git("-c", "user.name=Test", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "nested")
+        change = self.begin("--repo", ".")
+        self.target.write_text("after")
+        self.script("finish", change)
+        backup = change / "files" / "1"
+        backup.write_text("forged before")
+        self.commit_cli(change, expected=2)
+        backup.write_text("before")
+        extra = self.repo / "unrelated"
+        extra.touch()
+        self.commit_cli(change, expected=2)
+        extra.unlink()
+        self.commit_cli(change)
+        for kind, spec in (("commit", "HEAD"), ("tree", "HEAD^{tree}"), ("tree", "HEAD:nested")):
+            oid = self.git("rev-parse", spec)
+            loose = self.repo / ".git" / "objects" / oid[:2] / oid[2:]
+            original = loose.read_bytes()
+            header, content = zlib.decompress(original).split(b"\0", 1)
+            loose.chmod(0o600)
+            loose.write_bytes(zlib.compress(header + b"\0" + content[:-1] + b"x"))
+            try:
+                self.assertIn("commit refused", self.commit_cli(change, expected=2).stderr, kind)
+            finally:
+                loose.write_bytes(original)
+
+    def test_deep_backup_root_can_reserve_a_fallback_slot(self):
+        root = self.tmp
+        limit = os.pathconf(root, "PC_PATH_MAX") - 45
+        while len(os.fsencode(root)) < limit - 1:
+            root /= "d" * min(180, limit - len(os.fsencode(root)) - 1)
+        root.mkdir(parents=True)
+        with patch.dict(self.helpers, ROOT=root, BACKUP_ROOT=root, fcntl=None), patch("sys.stdout"):
+            self.assertEqual(self.helpers["main"](
+                ["begin", "--run", ".kaizen", "--skill", "t", "--ledger", "fixture", str(self.target)]), 0)
+        self.assertEqual((root / ".kaizen-01-t" / "files" / "1").read_text(), "before")
 
     def test_capture_and_first_interactive_begin(self):
         tree = self.tmp / "linked"
