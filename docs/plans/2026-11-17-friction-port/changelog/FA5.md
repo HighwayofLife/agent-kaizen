@@ -1,0 +1,3 @@
+- Make advisory worktree facts refuse unsafe Git filters and unavailable trusted Git, and avoid reporting cleanliness for stale registrations.
+- Refuse unknown worktree metadata and bound private-ref scanning. Use a fixed isolated interpreter for worktree pruning.
+- Refuse truncated project audit extracts and recover interrupted undos with missing staged files.

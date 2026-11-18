@@ -4,7 +4,6 @@ import os
 from pathlib import Path
 import re
 import signal
-import shutil
 import stat
 import subprocess
 import time
@@ -210,6 +209,34 @@ def records(run, directory):
     return entries if entries and len(entries) <= MAX_TREES else None
 
 
+def safe_status_config(run, path, depth=0):
+    # Status descends into submodules, which have their own filter configuration.
+    if depth > 16:
+        return False
+    config = run(path, 'config', '--includes', '--name-only', '--get-regexp', r'^filter\.')
+    index = run(path, 'ls-files', '--stage', '-z')
+    if config is None or config[0] != 1 or config[1] or index is None or index[0]:
+        return False
+    fields = index[1].split(b'\0')
+    if fields[-1] != b'':
+        return False
+    for item in fields[:-1]:
+        if item.startswith(b'160000 '):
+            header, sep, name = item.partition(b'\t')
+            if not sep or not name or b'..' in name.split(b'/'):
+                return False
+            child = (path / os.fsdecode(name)).resolve()
+            try:
+                dirs = repository_dirs(child)
+                if not child.is_relative_to(path) or not dirs or dirs[0] != child:
+                    return False
+            except (OSError, ValueError, RuntimeError):
+                return False
+            if not safe_status_config(run, child, depth + 1):
+                return False
+    return True
+
+
 def read_facts(directory, read_status):
     """Return facts for registered trees, or None when registration is unavailable.
 
@@ -221,9 +248,6 @@ def read_facts(directory, read_status):
         executable = resolve_git(directory, deadline=deadline)
     except (OSError, ValueError, RuntimeError):
         return None
-    path_fallback = executable is None and 'KAIZEN_GIT' not in os.environ
-    if path_fallback:
-        executable = shutil.which('git')
     run = partial(git, executable, deadline=deadline)
     entries = records(run, directory)
     if not entries:
@@ -247,9 +271,28 @@ def read_facts(directory, read_status):
         tip = entry.get(b'HEAD', b'')
         detached = b'detached' in entry
         clean = merged = None
-        status = read_status(run, path) if time.monotonic() < deadline else None
+        # Verify the registration still points to this repository before status.
+        try:
+            dirs = repository_dirs(path)
+            primary_dirs = repository_dirs(Path(os.fsdecode(primary[b'worktree'])).resolve())
+            same_repo = (dirs and primary_dirs and dirs[0] == path
+                         and file_id(dirs[2 if len(dirs) > 2 else 1].stat())
+                         == file_id(primary_dirs[2 if len(primary_dirs) > 2 else 1].stat()))
+        except (OSError, ValueError, RuntimeError, IndexError):
+            same_repo = False
+        if same_repo:
+            head = run(path, 'rev-parse', '--verify', 'HEAD')
+            symbolic = run(path, 'symbolic-ref', '-q', 'HEAD')
+            same_repo = (head is not None and head[0] == 0 and head[1].strip() == tip
+                         and symbolic is not None and
+                         ((detached and symbolic[0] == 1) or
+                          (not detached and symbolic[0] == 0 and symbolic[1].strip() == branch)))
+        safe = same_repo and safe_status_config(run, path)
+        status = read_status(run, path) if safe and time.monotonic() < deadline else None
         if status is not None and status[0] == 0:
-            flags = run(path, 'ls-files', '-v', '-z')
+            if status[1]:
+                clean = False
+            flags = run(path, 'ls-files', '-v', '-z') if clean is None else None
             if flags is not None and flags[0] == 0:
                 entries_flags = flags[1].split(b'\0')
                 if entries_flags[-1] == b'' and all(
@@ -264,6 +307,4 @@ def read_facts(directory, read_status):
                           tip=os.fsdecode(tip) if valid_tip(tip) else None, primary=index == 0,
                           linked=index != 0, locked=b'locked' in entry, detached=detached,
                           clean=clean, merged=merged))
-        if path_fallback:
-            facts[-1]['git_source'] = 'path'
     return facts

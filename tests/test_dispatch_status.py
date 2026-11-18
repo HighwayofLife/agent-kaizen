@@ -153,7 +153,31 @@ class DispatchStatusTests(StubCase):
                 with patch.object(sys, 'argv', [str(script), '--worktree-facts', str(self.work)]):
                     with redirect_stdout(output):
                         runpy.run_path(str(script))['main']()
-        self.assertIn('clean=true merged=true git_source=path', output.getvalue())
+        self.assertIn(': unknown', output.getvalue())
+
+    def test_facts_refuse_filters_stale_registration_and_report_dirty(self):
+        script_dir = str(Path(__file__).resolve().parents[1] / 'scripts')
+        other = self.root / 'linked'
+        self.git('worktree', 'add', '-qb', 'topic', str(other))
+        with patch.object(sys, 'path', [script_dir, *sys.path]):
+            import kaizen_worktree_facts as facts
+            status = lambda run, path: run(path, 'status', '--porcelain', '-z')
+            self.git('update-index', '--assume-unchanged', 'task.md')
+            (self.work / 'new').write_text('new')
+            rows = facts.read_facts(self.work, status)
+            self.assertFalse(rows[0]['clean'])
+            self.git('config', 'filter.fixture.clean', 'touch ' + str(self.root / 'executed'))
+            (self.work / '.gitattributes').write_text('task.md filter=fixture\n')
+            (self.work / 'task.md').write_text('changed')
+            rows = facts.read_facts(self.work, status)
+            self.assertIsNone(rows[0]['clean'])
+            self.assertFalse((self.root / 'executed').exists())
+            self.git('config', '--unset', 'filter.fixture.clean')
+            shutil.rmtree(other)
+            other.mkdir()
+            subprocess.run(['git', 'init', '-q', str(other)], check=True)
+            rows = facts.read_facts(self.work, status)
+            self.assertIsNone(rows[1]['clean'])
 
     def test_detached_and_unmerged(self):
         other = self.root / 'linked'

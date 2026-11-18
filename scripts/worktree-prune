@@ -1,4 +1,4 @@
-#!/usr/bin/env -S python3 -I
+#!/usr/bin/python3 -I
 """Check whether a linked worktree can be removed or restored."""
 # Explicit `python3 worktree-prune` without -I honours the caller's PYTHONPATH
 # at interpreter startup. The re-exec guard isolates the rest of the command.
@@ -158,6 +158,7 @@ def check_metadata(admin, common):
                         'MERGE_AUTOSTASH', 'BISECT_EXPECTED_REV', 'NOTES_MERGE_PARTIAL', 'NOTES_MERGE_REF')
                         or (entry.name != 'ORIG_HEAD' and entry.name.endswith('_HEAD'))):
                     raise Refused('worktree has private refs')
+    count = 0
     for name, kind in (('refs', 'refs'), ('logs', 'reflogs')):
         root = admin / name
         pending = [root] if os.path.lexists(root) else []
@@ -168,7 +169,11 @@ def check_metadata(admin, common):
             if not stat.S_ISDIR(directory.lstat().st_mode):
                 raise Refused(f'worktree has private {kind} at {str(directory.relative_to(admin))!r}')
             with os.scandir(directory) as entries:
-                pending.extend(Path(entry.path) for entry in entries)
+                for entry in entries:
+                    count += 1
+                    if count > MAX_WALK_ENTRIES:
+                        raise Refused('worktree metadata exceeds entry limit')
+                    pending.append(Path(entry.path))
 
 
 def check_reflog(run, primary, admin, tip, primary_tip):
@@ -608,6 +613,23 @@ def preflight(executable, project, path, cutoff):
     check_alternates(common, admin, path)
     blobs = check_live(path, meta, tree, algorithm, cutoff, check_xattrs)
     check_blobs(executable, path, blobs, algorithm)
+    with os.scandir(admin) as entries:
+        for entry in entries:
+            if entry.name == 'objects':
+                pending = [Path(entry.path)]
+                count = 0
+                while pending:
+                    directory = pending.pop()
+                    if not stat.S_ISDIR(directory.lstat().st_mode):
+                        raise Refused('unrecognized worktree metadata')
+                    with os.scandir(directory) as children:
+                        for child in children:
+                            count += 1
+                            if count > MAX_WALK_ENTRIES:
+                                raise Refused('worktree metadata exceeds entry limit')
+                            pending.append(Path(child.path))
+            elif entry.name not in ('HEAD', 'index', 'gitdir', 'commondir', 'ORIG_HEAD', 'refs', 'logs'):
+                raise Refused('unrecognized worktree metadata')
     if identity != (inode(path), inode(admin), inode(common), file_id((path / '.git').lstat())):
         raise Refused('worktree identity changed during preflight')
     return branch, tip, primary_branch, primary_tip, identity, history, residuals

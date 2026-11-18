@@ -135,11 +135,11 @@ def find_extract(audits, project, now):
                     if cutoff <= info.st_mtime <= now.timestamp():
                         if not private:
                             raise Refused(UNSAFE_EXTRACTS)
-                        candidates.append((info.st_mtime_ns, fd, entry.name, version(info)))
+                        candidates.append((info.st_mtime_ns, fd, entry.name, version(info), directory != primary))
                         if len(candidates) > 512:
                             raise Refused("too many recent audit extracts")
         latest, tied = None, False
-        for stamp, fd, name, expected in sorted(candidates, reverse=True):
+        for stamp, fd, name, expected, scoped_store in sorted(candidates, reverse=True):
             modified = datetime.fromtimestamp(stamp / 1e9, timezone.utc)
             if latest is not None and modified < latest[0]:
                 break
@@ -150,6 +150,8 @@ def find_extract(audits, project, now):
             try:
                 data = json.loads(raw)
             except (ValueError, RecursionError):
+                if scoped_store:
+                    raise Refused("invalid project audit extract") from None
                 continue
             scope = data.get("scope") if isinstance(data, dict) else None
             roots = scope.get("cwd") if isinstance(scope, dict) else None
@@ -771,6 +773,13 @@ def update_rule(settings, path, entry, records, ident, root, rule, undo, action_
                 cancel_pending(settings, entry, records, save)
                 if same_request:
                     raise Refused("pending undo cancelled because ownership of the current entry cannot be verified")
+                pending = None
+        elif pending["undo"] and pending["temp"] and pending["after"] is not None and named_version(settings, pending["temp"]) is None:
+            if same_request:
+                pending.update(temp=stage_name(), after=None)
+                save()
+            else:
+                cancel_pending(settings, entry, records, save)
                 pending = None
         elif not same_request:
             raise Refused("another settings transaction is pending")
