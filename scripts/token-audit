@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Stream Claude project transcripts and Codex sessions into a compact audit."""
 import argparse
+from bisect import bisect_left, bisect_right
 from contextlib import ExitStack
 import fnmatch
 import importlib.util
@@ -956,7 +957,7 @@ def default_samples_dir():
 
 def read_samples(directory, since, warnings, until=None):
     """Pin private storage, then read only bounded UTC days; never create storage."""
-    result = dict(events={}, load=[], procs=[], hours=set())
+    result = dict(events={}, load=[], procs=[], hours=set(), skipped_days=set())
     until = until or datetime.now(timezone.utc)
     if not hasattr(os, "O_NOFOLLOW") or not hasattr(os, "geteuid"):
         return result
@@ -986,7 +987,8 @@ def read_samples(directory, since, warnings, until=None):
             spec.loader.exec_module(helper)
             if sys.platform == "darwin" and helper.has_extended_acl(fd):
                 raise ValueError("sample ACL")
-            first, last = since.astimezone(timezone.utc).date().isoformat(), until.date().isoformat()
+            first = since.astimezone(timezone.utc).date().isoformat()
+            last = (until.astimezone(timezone.utc) + timedelta(seconds=SAMPLE_JOIN_SECONDS)).date().isoformat()
             paths = []
             with os.scandir(fd) as entries:
                 for count, entry in enumerate(entries):
@@ -1001,7 +1003,14 @@ def read_samples(directory, since, warnings, until=None):
                 day = name[:10]
                 try:
                     child = os.open(day + ".tsv", os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=fd)
-                    with os.fdopen(child, "rb") as stream:
+                    try:
+                        if not stat.S_ISREG(os.fstat(child).st_mode):
+                            raise ValueError("not a regular sample file")
+                        stream = os.fdopen(child, "rb")
+                    except BaseException:
+                        os.close(child)
+                        raise
+                    with stream:
                         size = helper.file_info(fd, day + ".tsv", stream.fileno()).st_size
                         if sys.platform == "darwin" and helper.has_extended_acl(stream.fileno()):
                             raise ValueError("sample ACL")
@@ -1070,6 +1079,7 @@ def read_samples(directory, since, warnings, until=None):
                     continue  # Missing days and retention races are normal.
                 except (OSError, ValueError):
                     warnings["skipped sample files"] += 1
+                    result["skipped_days"].add(day)
     except FileNotFoundError:
         pass
     except (OSError, ValueError, ImportError, AttributeError):
@@ -1168,13 +1178,31 @@ def heavy_timeline(calls, thresholds, samples=(), local_calls=()):
         cohorts[(call[3], call[4])][0 if ident in overlapped else 1].append(call[2])
         if ident in overlapped:
             over_groups[(call[3], call[4])].append(call)
+    # Only local calls can establish that a local load sample describes the overlap.
+    local_events = Counter()
+    for call in ordered:
+        if local_counts[call]:
+            local_counts[call] -= 1
+            local_events[call[0]] += 1
+            local_events[call[1]] -= 1
+    local_counts = Counter(local_calls)
+    active, previous, local_intervals = 0, None, []
+    for stamp, delta in sorted(local_events.items()):
+        if active >= 2 and previous is not None:
+            local_intervals.append((previous, stamp))
+        active += delta
+        previous = stamp
+    local_starts = [start for start, _ in local_intervals]
+    local_ends = [end for _, end in local_intervals]
     contention = []
     for (signature, basis), (over, alone) in sorted(cohorts.items()):
         ratio = None
         if len(over) >= 3 and len(alone) >= 3 and statistics.median(alone) > 0:
             ratio = statistics.median(over) / statistics.median(alone)
         cohort = over_groups[(signature, basis)]
-        load = median_load_ratio(samples, [(c[0], c[1]) for c in cohort]) if cohort and not (Counter(cohort) - local_counts) else None
+        intervals = [(max(c[0], start), min(c[1], end)) for c in cohort
+                     for start, end in local_intervals[bisect_right(local_ends, c[0]):bisect_left(local_starts, c[1])]]
+        load = median_load_ratio(samples, intervals) if cohort and not (Counter(cohort) - local_counts) else None
         status = "insufficient" if ratio is None else "unconfirmed" if ratio >= 1.5 else "ok"
         if ratio is not None and ratio >= 1.5 and load is not None:
             status = "flagged" if load >= 0.8 else "ok"
@@ -1258,7 +1286,13 @@ def finalize_friction(state, thresholds, window):
         if name == "AskUserQuestion" and end >= start and not background:
             question_wait.append((end - start).total_seconds())
         sample = sample_data["events"].get(key) if name == "Bash" else None
-        comparable = sample is not None and abs(sample[0] - end.timestamp()) <= SAMPLE_JOIN_SECONDS
+        join_days = {(end + timedelta(seconds=offset)).astimezone(timezone.utc).date().isoformat()
+                     for offset in (-SAMPLE_JOIN_SECONDS, SAMPLE_JOIN_SECONDS)}
+        incomplete = name == "Bash" and bool(join_days.intersection(sample_data.get("skipped_days", ())))
+        if incomplete:
+            measured = None
+        comparable = (sample is not None and not incomplete
+                      and abs(sample[0] - end.timestamp()) <= SAMPLE_JOIN_SECONDS)
         if comparable and measured is not None and sample[1] is not None and abs(measured - sample[1]) > 0.001:
             comparable = False
         if comparable and measured is None:
@@ -1614,18 +1648,22 @@ def cwd_of_file(path, limit=50):
     return None
 
 
-def cwd_matches(raw, targets, realpaths):
-    def canonical(path):
-        if path not in realpaths:
-            try:
-                realpaths[path] = os.path.normpath(os.path.realpath(path))
-            except (OSError, ValueError):
-                realpaths[path] = None
+def canonical_cwd(path, realpaths):
+    if path in realpaths:
         return realpaths[path]
+    try:
+        result = os.path.normpath(os.path.realpath(path))
+    except (OSError, ValueError):
+        result = None
+    if len(path) <= 4096 and (result is None or len(result) <= 4096) and len(realpaths) < 1024:
+        realpaths[path] = result
+    return result
 
+
+def cwd_matches(raw, targets, realpaths):
     if not isinstance(raw, str) or not os.path.isabs(raw) or "\0" in raw:
         return False
-    location = canonical(raw)
+    location = canonical_cwd(raw, realpaths)
     return location is not None and any(
         target is not None and os.path.commonpath((location, target)) == target
         for target in targets
@@ -1683,7 +1721,7 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
                     location = turns.get(turn, current_cwd) if isinstance(turn, (str, tuple)) else current_cwd
                 if location is not None:
                     in_scope = cwd_matches(location, cwd or (), realpaths)
-                    location = realpaths.get(location) if isinstance(location, str) else None
+                    location = canonical_cwd(location, realpaths) if isinstance(location, str) else None
                     if location is None or (cwd is not None and not in_scope):
                         pairs[ident] = None
                         continue

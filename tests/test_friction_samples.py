@@ -123,6 +123,33 @@ class FrictionSamplesTests(unittest.TestCase):
         self.assertEqual(heavy(codex, {'heavy_seconds': 60}, metrics, local)[0][0]['status'], 'unconfirmed')
         self.assertEqual(heavy(calls, {'heavy_seconds': 60}, [(450 + i, .7, 4) for i in range(3)], local)[0][0]['status'], 'ok')
 
+    def test_codex_overlap_cannot_confirm_claude_load(self):
+        calls = [(i * 100, i * 100 + 60, 60, 'cargo', 'measured', False, ('claude', 's')) for i in range(3)]
+        calls += [(400 + i * 200, 500 + i * 200, 100, 'cargo', 'measured', False, ('claude', 's')) for i in range(3)]
+        codex = [(480 + i * 200, 580 + i * 200, 100, 'other', 'measured', False, ('codex', 's')) for i in range(3)]
+        metrics = [(450 + i, .9, 4) for i in range(3)]
+        rows, _ = AUDIT['heavy_timeline'](calls + codex, {'heavy_seconds': 60}, metrics, calls)
+        self.assertEqual(next(r for r in rows if r['signature'] == 'cargo')['status'], 'unconfirmed')
+
+    def test_skipped_adjacent_day_invalidates_join(self):
+        self.rows = [start('one', 86000), end('one', 86399)]
+        self.write(self.sample(second=86399))
+        path = self.samples / '2025-01-02.tsv'
+        with path.open('wb') as stream:
+            stream.truncate(5 * 1024 * 1024 + 1)
+        path.chmod(0o600)
+        self.assertEqual(self.collect()['friction']['summary']['measured'], 0)
+
+    def test_directory_sample_does_not_leak_fd(self):
+        if not os.path.isdir('/dev/fd'):
+            self.skipTest('/dev/fd unavailable')
+        (self.samples / '2025-01-01.tsv').mkdir()
+        before = len(os.listdir('/dev/fd'))
+        for _ in range(20):
+            self.read()
+        self.assertEqual(len(os.listdir('/dev/fd')), before)
+        self.assertEqual(self.warnings['skipped sample files'], 20)
+
     def test_catalogue_summary_and_end_to_end_load(self):
         self.rows = [row for i in range(4) for row in (start(str(i), 0), end(str(i), 200 + i))]
         text = ''.join(self.sample(str(i), second=200 + i) for i in range(4))
