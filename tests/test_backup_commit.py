@@ -123,7 +123,7 @@ class BackupCommitTests(unittest.TestCase):
         self.assertEqual(self.target.read_text(), "before")
         self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o600)
 
-    def test_legacy_ref_undo_compares_backup_and_live_modes(self):
+    def test_legacy_ref_undo_uses_journaled_mode_without_a_live_file(self):
         self.target.chmod(0o600)
         change = self.ready()
         manifest = self.manifest(change)
@@ -136,13 +136,29 @@ class BackupCommitTests(unittest.TestCase):
         self.assertIn("backup mode", self.main("undo", change, "--force", expected=2))
         self.assertEqual(self.git("rev-parse", ref), tip)
         backup.chmod(0o600)
-        self.main("undo", change)
+        journal = self.helpers["record_path"](change)
+        record = journal.read_text()
+        journal.write_text(json.dumps(dict(json.loads(record), legacy_modes=None)))
+        self.assertIn("invalid journaled backup modes", self.main("undo", change, expected=2))
+        journal.write_text(record)
+        self.target.unlink()
+        self.main("undo", change, "--force")
         self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o600)
 
     def test_undo_run_does_not_accept_an_editor_save_after_a_shared_restore(self):
-        older = self.ready("shared")
-        ref = self.commit_cli(older).stdout.split()[-1]
-        tip = self.git("rev-parse", ref)
+        self.check_shared_restore_race(committed=True)
+
+    def test_ordinary_undo_run_does_not_overwrite_an_editor_save(self):
+        self.check_shared_restore_race(committed=False)
+
+    def check_shared_restore_race(self, *, committed):
+        older = self.ready("shared") if committed else self.begin("--run", "shared")
+        if committed:
+            self.commit_cli(older)
+        else:
+            self.target.write_text("after")
+            self.script("finish", older)
+        refs = self.git("for-each-ref", "refs/kaizen/")
         newer = self.begin("--run", "shared")
         self.target.write_text("newer")
         self.script("finish", newer)
@@ -156,7 +172,7 @@ class BackupCommitTests(unittest.TestCase):
 
         with patch.object(shutil, "copy2", restore_then_edit):
             self.assertIn("working file changed", self.main("undo", "run", expected=2))
-        self.assertEqual((self.git("rev-parse", ref), self.target.read_text()), (tip, "editor save"))
+        self.assertEqual((self.git("for-each-ref", "refs/kaizen/"), self.target.read_text()), (refs, "editor save"))
         self.assertIsNone(self.manifest(older)["reverted"])
 
     def test_undo_run_keeps_the_identity_of_its_own_ref_restore(self):
@@ -195,6 +211,11 @@ class BackupCommitTests(unittest.TestCase):
         self.assertIsNone(self.manifest(moved)["reverted"])
 
     def test_commit_syncs_rollback_material_before_saving_the_journal(self):
+        self.backups = self.tmp / "a/b/backups"
+        self.env["KAIZEN_BACKUP_DIR"] = str(self.backups)
+        roots = patch.dict(self.helpers, ROOT=self.backups, BACKUP_ROOT=self.backups)
+        roots.start()
+        self.addCleanup(roots.stop)
         change = self.ready()
         sync, save = os.fsync, self.helpers["save_record"]
         synced = []
@@ -209,10 +230,11 @@ class BackupCommitTests(unittest.TestCase):
         def check_save(folder, record):
             if not record["commit"]["done"]:
                 positions = [synced.index(identity(path.stat())) for path in
-                             (change / "files/1", change / "files", change / "manifest.json", change, self.backups)]
+                             (change / "files/1", change / "files", change / "manifest.json", change,
+                              self.backups, self.backups.parent, self.backups.parent.parent)]
                 self.assertLess(positions[0], positions[1])
                 self.assertLess(max(positions[1:3]), positions[3])
-                self.assertLess(positions[3], positions[4])
+                self.assertEqual(positions[3:], sorted(positions[3:]))
             return save(folder, record)
 
         def fail_backup_sync(fd):
@@ -228,6 +250,50 @@ class BackupCommitTests(unittest.TestCase):
         with patch.object(os, "fsync", observe_sync):
             self.main("commit", change, save_record=check_save)
 
+    def test_commit_rejects_a_backup_replaced_after_preflight(self):
+        change = self.ready()
+        backup = change / "files/1"
+        sync = self.helpers["sync_commit_backup"]
+
+        def replace_before_sync(*args, **kwargs):
+            replacement = backup.with_name("replacement")
+            replacement.write_text("wrong!")
+            replacement.chmod(stat.S_IMODE(backup.stat().st_mode))
+            replacement.replace(backup)
+            sync(*args, **kwargs)
+
+        self.main("commit", change, expected=2, sync_commit_backup=replace_before_sync)
+        self.assertEqual(self.git("for-each-ref", "refs/kaizen/"), "")
+
+    def test_undo_ignores_an_unrelated_corrupt_journal(self):
+        corrupt = self.ready("journaled")
+        self.commit_cli(corrupt)
+        self.helpers["record_path"](corrupt).write_text("{")
+        change = self.begin("--run", "ordinary")
+        self.target.write_text("ordinary edit")
+        self.script("finish", change)
+        self.main("undo", corrupt, expected=2)
+        self.main("undo", change)
+        self.assertEqual(self.target.read_text(), "after")
+
+    def test_begin_reads_files_behind_search_only_directories(self):
+        parent = self.repo / "search"
+        parent.mkdir()
+        self.target = self.target.rename(parent / "tracked")
+        parent.chmod(0o100)
+        self.addCleanup(parent.chmod, 0o700)
+        change = self.begin()
+        self.assertEqual((change / "files/1").read_text(), "before")
+
+    def test_prune_retains_a_renamed_journaled_folder(self):
+        change = self.ready()
+        manifest = dict(self.manifest(change), created_at="2000-01-01")
+        (change / "manifest.json").write_text(json.dumps(manifest))
+        self.commit_cli(change)
+        moved = change.rename(change.with_name("renamed"))
+        self.main("prune", "--older-than", 1, "--apply")
+        self.assertTrue((moved / "files/1").exists())
+
     def test_ref_undo_refuses_to_replace_a_hard_link(self):
         change = self.ready()
         ref = self.commit_cli(change).stdout.split()[-1]
@@ -242,6 +308,8 @@ class BackupCommitTests(unittest.TestCase):
     def test_forced_ref_undo_recreates_removed_parent_directories(self):
         nested = self.repo / "outer/inner"
         nested.mkdir(parents=True)
+        for directory in (nested.parent, nested):
+            directory.chmod(0o700)
         self.target = self.target.rename(nested / "tracked")
         other = nested / "other"
         other.write_text("other before")
@@ -258,7 +326,13 @@ class BackupCommitTests(unittest.TestCase):
         self.main("undo", change, expected=2)
         self.assertFalse(nested.parent.exists())
         self.assertEqual(self.git("rev-parse", ref), tip)
-        self.main("undo", change, "--force")
+        old_umask = os.umask(0o022)
+        try:
+            self.main("undo", change, "--force")
+        finally:
+            os.umask(old_umask)
+        for directory in (nested.parent, nested):
+            self.assertEqual(stat.S_IMODE(directory.stat().st_mode), 0o700)
         self.assertEqual((self.target.read_text(), other.read_text()), ("before", "other before"))
         self.assertEqual(self.git("diff", "HEAD", ref), "")
 

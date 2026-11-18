@@ -1,5 +1,6 @@
 - Back up the credential-checked path even if its symlink changes while waiting for Git or a lock.
-- Sync rollback files and the finished manifest before publishing a local commit.
-- Verify Git-backed restore permissions and preserve intervening editor saves on shared paths in the same run.
-- Refuse undo of renamed transaction folders and hard-linked restore targets.
-- Let forced Git-backed undo recreate missing parent directories.
+- Sync verified rollback files, the finished manifest and backup ancestors before publishing a local commit.
+- Verify Git-backed restore permissions even if the working file is missing or its mode changed. Preserve intervening editor saves during shared-path undo, including ordinary runs.
+- Refuse undo of renamed transaction folders and hard-linked Git restore targets. Keep renamed transaction folders during prune.
+- Recreate missing restore directories with private permissions. Back up readable files in search-only directories.
+- Let ordinary undo proceed when an unreadable journal belongs to a different, identifiable backup folder.
