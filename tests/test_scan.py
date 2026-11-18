@@ -33,6 +33,8 @@ class ScanTests(unittest.TestCase):
         empty = self.run_scan()
         self.assertIn('SKIP Context average: no data (', empty.stdout)
         self.assertIn('scan again', empty.stdout)
+        self.assertNotIn(str(self.root), empty.stdout + empty.stderr)
+        self.assertIn('~/', empty.stderr)
         self.assertEqual(before, snapshot(self.root))
         demo = self.run_scan('--demo')
         self.assertEqual(before, snapshot(self.root))

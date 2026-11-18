@@ -32,9 +32,9 @@ def read_json(path):
         return json.load(stream)
 
 
-def command(args):
+def command(args, timeout=10):
     try:
-        return subprocess.run(args, capture_output=True, text=True, timeout=10)
+        return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -72,16 +72,17 @@ def main():
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
         emit('WARN', 'link or installed cache status unknown', fix_link)
 
-    expected = {'SessionStart': ('startup|resume', 'audit-notice.sh'),
-                'UserPromptSubmit': (None, 'bash-burst.sh'),
-                'PostToolUse': ('Bash', 'bash-burst.sh'),
-                'PostToolUseFailure': ('Bash', 'bash-burst.sh')}
+    expected = [('SessionStart', 'startup|resume', 'audit-notice.sh'),
+                ('SessionStart', 'startup|resume', 'session-audit.sh'),
+                ('UserPromptSubmit', None, 'bash-burst.sh'),
+                ('PostToolUse', 'Bash', 'bash-burst.sh'),
+                ('PostToolUseFailure', 'Bash', 'bash-burst.sh')]
     try:
         hooks = read_json(root / 'hooks/hooks.json')['hooks']
-        for event, (matcher, script) in expected.items():
+        for event, matcher, script in expected:
             rows = hooks[event]
             if not any(row.get('matcher') == matcher and any(
-                    item.get('type') == 'command' and item.get('command') ==
+                    item.get('type') == 'command' and (script != 'session-audit.sh' or item.get('async') is True) and item.get('command') ==
                     'bash "${{CLAUDE_PLUGIN_ROOT}}/hooks/{}"'.format(script)
                     for item in row.get('hooks', [])) for row in rows):
                 raise ValueError()
@@ -110,7 +111,10 @@ def main():
 
     timers = [Path.home() / 'Library/LaunchAgents/com.agent-kaizen.audit.plist',
               Path(os.environ.get('XDG_CONFIG_HOME') or Path.home() / '.config') / 'systemd/user/agent-kaizen-audit.timer']
-    if any(p.is_file() for p in timers):
+    cron = command(['crontab', '-l'], timeout=2)
+    cron_found = bool(cron and cron.returncode == 0 and any(
+        line.rstrip().endswith('# agent-kaizen-audit') for line in cron.stdout.splitlines()))
+    if cron_found or any(p.is_file() for p in timers):
         emit('WARN', 'scheduler job file found; active status unknown', 'install-schedule --help')
     else:
         emit('WARN', 'optional scheduler not detected; hooks run automatically', 'install-schedule --help')
@@ -168,7 +172,7 @@ def main():
                 if line.startswith('<!-- token-audit-headline ') and line.rstrip().endswith(' -->'):
                     canary = json.loads(line[len('<!-- token-audit-headline '):].rstrip()[:-4]).get('format_canary')
                     break
-        match = re.fullmatch(r'v1 unknown_records=(\d+) missing_usage=(\d+) cli=(\S+)', canary or '')
+        match = re.fullmatch(r'(?:format_canary: )?v1 unknown_records=(\d+) missing_usage=(\d+) cli=(\S+)', canary or '')
         if not match or match.group(3).lower() in ('unknown', 'none', 'n/a'):
             raise ValueError()
         if int(match.group(1)) or int(match.group(2)):

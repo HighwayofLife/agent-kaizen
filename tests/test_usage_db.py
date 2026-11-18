@@ -104,6 +104,15 @@ class IngestTests(UsageDbCase):
         self.assertEqual(self.counts(self.ingest().stdout), (2, 0, 0, 0))
         self.assertEqual(self.query('SELECT count(*) FROM calls'), [(3,)])
 
+    def test_backfill_does_not_count_as_insert(self):
+        self.basic()
+        self.ingest()
+        with sqlite3.connect(self.db) as conn:
+            conn.execute('UPDATE calls SET is_subagent = NULL')
+            conn.execute('DELETE FROM files')
+        self.assertEqual(self.counts(self.ingest().stdout)[2], 0)
+        self.assertEqual(self.query('SELECT count(*) FROM calls WHERE is_subagent IS NULL'), [(0,)])
+
     def test_quiet_prints_nothing(self):
         self.basic()
         self.assertEqual(self.ingest('--quiet').stdout, '')
@@ -507,6 +516,14 @@ class QueryTests(UsageDbCase):
         with sqlite3.connect(self.db) as conn:
             conn.execute("UPDATE calls SET session = NULL WHERE call_id = '0'")
         self.assertIn('unknown', [r['gap'] for r in self.report('--cache')])
+
+    def test_unknown_origin_sequence(self):
+        self.main_file([assistant('2025-01-01T00:00:00Z', 'a',
+                                  usage=dict(input_tokens=20, cache_creation_input_tokens=80))])
+        self.ingest()
+        with sqlite3.connect(self.db) as conn:
+            conn.execute('UPDATE calls SET is_subagent = NULL')
+        self.assertEqual(self.report('--cache')[0]['sequence'], 'unknown')
 
     def test_subagent_named_main_has_separate_history(self):
         usage = dict(input_tokens=20, cache_creation_input_tokens=80)

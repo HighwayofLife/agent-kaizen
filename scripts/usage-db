@@ -260,7 +260,7 @@ def codex_calls(path, session, warnings):
 
 def store_file(conn, path, source, size, mtime_ns, calls, project, session, agent, warnings, is_subagent=None):
     """Insert one file's calls and its files row in one transaction; return calls added."""
-    before = conn.total_changes
+    added = 0
     unreadable = warnings['unreadable files']
     conn.execute('BEGIN IMMEDIATE')
     try:
@@ -273,13 +273,12 @@ def store_file(conn, path, source, size, mtime_ns, calls, project, session, agen
                              (is_subagent, source, call[0]))
             batch.append((source, call[0], call[1], call[2], project, session, agent) + call[3:] + (is_subagent,))
             if len(batch) >= BATCH:
-                conn.executemany(insert, batch)
+                added += conn.executemany(insert, batch).rowcount
                 batch.clear()
         if batch:
-            conn.executemany(insert, batch)
+            added += conn.executemany(insert, batch).rowcount
         if warnings['unreadable files'] != unreadable:
             raise OSError('unreadable')  # do not mark a partly read file as done
-        added = conn.total_changes - before
         conn.execute('INSERT OR REPLACE INTO files VALUES (?,?,?,?,?)', (
             str(path), source, size, mtime_ns, datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')))
         conn.execute('COMMIT')
@@ -513,7 +512,7 @@ def cache_report(conn, args):
                     or (args.project and args.project.lower() not in (project or '').lower())
                     or (args.since and day_ < args.since) or (args.until and day_ > args.until)):
                 continue
-            kind = 'main' if is_subagent == 0 else 'subagent_approximate'
+            kind = 'unknown' if is_subagent is None else ('main' if is_subagent == 0 else 'subagent_approximate')
             entry = result.setdefault((source, kind, bucket), Counter())
             AUDIT.cache_add({bucket: entry}, bucket, write, input_ + read + write)
     columns = ['source', 'sequence', 'gap', 'writes', 'write_tokens', 'full_rewrites']
