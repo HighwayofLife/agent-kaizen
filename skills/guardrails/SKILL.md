@@ -1,6 +1,6 @@
 ---
 name: guardrails
-description: "Install hooks that block whole-file reads of big files, images in the wrong context, and late compaction, each with an override."
+description: "Install hooks for big reads, images, compaction, and Agent tier allowances, each with an override."
 disable-model-invocation: true
 argument-hint: "[propose|safe|auto|yolo]"
 ---
@@ -48,6 +48,34 @@ change. Back up settings.json first. Add ledger rows.
 ## Bundled resources
 
 Bundled, tested hooks: `${CLAUDE_PLUGIN_ROOT}/hooks/limit-big-read.sh`, `${CLAUDE_PLUGIN_ROOT}/hooks/block-image-read.sh`, `${CLAUDE_PLUGIN_ROOT}/hooks/after-compact.sh`, `${CLAUDE_PLUGIN_ROOT}/hooks/subagent-context.sh`, with wiring in `${CLAUDE_PLUGIN_ROOT}/templates/settings.example.json`. Copy them to <Claude config dir>/hooks/ and adapt them, rather than writing new ones.
+
+## Opt-in Agent tier guard
+
+Copy `${CLAUDE_PLUGIN_ROOT}/hooks/tier-guard.sh` to `<Claude config dir>/hooks/` and
+merge the settings template's `PreToolUse` entry with matcher `Agent`. Install
+`jq` and Python 3.9 or later if needed. Add rules to `<Claude config dir>/agent-kaizen.json`.
+
+```json
+{"guardrails": {"agentTiers": [
+  {"pattern": "deep-*", "freeSpawns": 2, "reasonRegex": "^Tier reason:[ \\t]*\\S"}
+]}}
+```
+
+The first case-sensitive glob matching `tool_input.subagent_type` sets the free
+allowance per session, including requests that omit `model`. After the allowance,
+retry with a non-empty `Tier reason: <why>` line. The guard searches the prompt
+on each reason line with the configured Python regex and multiline anchors. Disable it by
+removing the `Agent` entry, clearing `agentTiers`, or setting global `enabled` to `false`.
+
+The counter tracks allowed PreToolUse requests even if the spawn later fails.
+The config directory must be owner-owned and not group- or world-writable, or the guard silently stays off.
+A lock can be reclaimed when its owner exits or its PID belongs to a different
+process. If a live owner holds the lock past the short wait, the request is allowed.
+Owner-only state lives in `<Claude config dir>/kaizen-tier-guard/`. Log entries
+contain only a timestamp, rule and supplied reason. Keep sensitive details out
+of the reason. Input, config, dependency, state and lock errors allow the request.
+After a decision, the guard prunes counters and logs older than 30 days when it
+can take their locks.
 
 ## Done when
 

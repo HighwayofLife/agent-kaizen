@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Keep a small SQLite store of per-call token usage from Claude and Codex logs."""
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
+from contextlib import closing
 import csv
 from datetime import datetime, timedelta, timezone
 import hashlib
@@ -9,10 +10,12 @@ import importlib.util
 from importlib.machinery import SourceFileLoader
 import io
 import json
+import math
 import os
 from pathlib import Path
 import re
 import sqlite3
+from statistics import mean, median
 import sys
 import time
 
@@ -25,7 +28,7 @@ def load_sibling(name, file):
 
 
 AUDIT = load_sibling('kaizen_token_audit', 'token-audit')
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
 BATCH = 2000
 BUSY_SECONDS = 30
@@ -36,7 +39,7 @@ CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT) WITHOUT ROWID;
 CREATE TABLE files (path TEXT PRIMARY KEY, source TEXT, size INTEGER, mtime_ns INTEGER, ingested_at TEXT);
 CREATE TABLE calls (
     source TEXT NOT NULL, call_id TEXT NOT NULL, ts TEXT NOT NULL, day TEXT NOT NULL,
-    project TEXT, session TEXT, agent TEXT, model TEXT,
+    project TEXT, session TEXT, agent TEXT, model TEXT, is_subagent INTEGER,
     input INTEGER NOT NULL DEFAULT 0, cache_read INTEGER NOT NULL DEFAULT 0,
     cache_write_5m INTEGER NOT NULL DEFAULT 0, cache_write_1h INTEGER NOT NULL DEFAULT 0,
     output INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (source, call_id)) WITHOUT ROWID;
@@ -107,7 +110,8 @@ def migrate(conn):
 
     Rows whose file still exists are renamed. A row that would collide with an already renamed one is
     a copy of the same call (the same session read under another file name), so it is dropped."""
-    paths = [Path(row[0]) for row in conn.execute("SELECT path FROM files WHERE source = 'codex'")]
+    version = int(conn.execute("SELECT value FROM meta WHERE key = 'schema_version'").fetchone()[0])
+    paths = [Path(row[0]) for row in conn.execute("SELECT path FROM files WHERE source = 'codex'")] if version < 2 else []
     stems = Counter(path.stem for path in paths)
     for path in paths:
         stem = path.stem
@@ -119,6 +123,10 @@ def migrate(conn):
                      "WHERE source = 'codex' AND call_id >= ? AND call_id < ?",
                      (session + ':', len(low) + 1, low, high))
         conn.execute("DELETE FROM calls WHERE source = 'codex' AND call_id >= ? AND call_id < ?", (low, high))
+    if "is_subagent" not in {row[1] for row in conn.execute("PRAGMA table_info(calls)")}:
+        conn.execute("ALTER TABLE calls ADD COLUMN is_subagent INTEGER")
+        # Older rows do not identify transcript origin. Reingest available files.
+        conn.execute("DELETE FROM files WHERE source = 'claude'")
     conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),))
 
 
@@ -250,25 +258,27 @@ def codex_calls(path, session, warnings):
 
 # --- ingest ---
 
-def store_file(conn, path, source, size, mtime_ns, calls, project, session, agent, warnings):
+def store_file(conn, path, source, size, mtime_ns, calls, project, session, agent, warnings, is_subagent=None):
     """Insert one file's calls and its files row in one transaction; return calls added."""
-    before = conn.total_changes
+    added = 0
     unreadable = warnings['unreadable files']
     conn.execute('BEGIN IMMEDIATE')
     try:
         batch = []
         insert = ('INSERT OR IGNORE INTO calls (source, call_id, ts, day, project, session, agent, model, input, '
-                  'cache_read, cache_write_5m, cache_write_1h, output) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)')
+                  'cache_read, cache_write_5m, cache_write_1h, output, is_subagent) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)')
         for call in calls:
-            batch.append((source, call[0], call[1], call[2], project, session, agent) + call[3:])
+            if source == 'claude':
+                conn.execute('UPDATE calls SET is_subagent = ? WHERE source = ? AND call_id = ? AND is_subagent IS NULL',
+                             (is_subagent, source, call[0]))
+            batch.append((source, call[0], call[1], call[2], project, session, agent) + call[3:] + (is_subagent,))
             if len(batch) >= BATCH:
-                conn.executemany(insert, batch)
+                added += conn.executemany(insert, batch).rowcount
                 batch.clear()
         if batch:
-            conn.executemany(insert, batch)
+            added += conn.executemany(insert, batch).rowcount
         if warnings['unreadable files'] != unreadable:
             raise OSError('unreadable')  # do not mark a partly read file as done
-        added = conn.total_changes - before
         conn.execute('INSERT OR REPLACE INTO files VALUES (?,?,?,?,?)', (
             str(path), source, size, mtime_ns, datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')))
         conn.execute('COMMIT')
@@ -322,7 +332,7 @@ def ingest(args):
             calls = codex_calls(file, identity or file.stem, warnings)
         try:
             stats['added'] += store_file(conn, file, source, info.st_size, info.st_mtime_ns, calls,
-                                         project, session, agent, warnings)
+                                         project, session, agent, warnings, None if main is None else int(not main))
         except OSError:
             continue
     conn.close()
@@ -474,8 +484,51 @@ def report_rows(conn, args, state):
 REPORT_COLUMNS = ['key', 'calls', 'input', 'cache_read', 'cache_write', 'output', 'cost_usd', 'unpriced_calls']
 
 
+
+def cache_report(conn, args):
+    # Fetch full histories before date and project filtering; SQLite text ordering
+    # does not sort timestamps with different fractional precision correctly.
+    origin = "is_subagent" if "is_subagent" in {row[1] for row in conn.execute("PRAGMA table_info(calls)")} else "NULL"
+    rows = list(conn.execute("SELECT source, session, agent, " + origin + ", call_id, ts, day, project, input, cache_read, "
+                             "cache_write_5m + cache_write_1h FROM calls"))
+    def parsed(value):
+        try:
+            return AUDIT.date_time(value)
+        except (ValueError, TypeError, OverflowError):
+            return None
+    histories = {}
+    for source, session, agent, is_subagent, ident, ts, day_, project, input_, read, write in rows:
+        key = (source, session, is_subagent, agent)
+        histories.setdefault(key, []).append((parsed(ts), ident, day_, project, input_, read, write))
+    result = {}
+    for (source, session, is_subagent, agent), calls in histories.items():
+        calls.sort(key=lambda row: (row[0] is None, row[0] or EPOCH, row[1]))
+        previous = None
+        for index, (ts, ident, day_, project, input_, read, write) in enumerate(calls):
+            bucket = (AUDIT.cache_bucket(previous, ts, first=index == 0)
+                      if session and agent and is_subagent is not None else 'unknown')
+            previous = ts
+            if (not write or (args.source and source != args.source)
+                    or (args.project and args.project.lower() not in (project or '').lower())
+                    or (args.since and day_ < args.since) or (args.until and day_ > args.until)):
+                continue
+            kind = 'unknown' if is_subagent is None else ('main' if is_subagent == 0 else 'subagent_approximate')
+            entry = result.setdefault((source, kind, bucket), Counter())
+            AUDIT.cache_add({bucket: entry}, bucket, write, input_ + read + write)
+    columns = ['source', 'sequence', 'gap', 'writes', 'write_tokens', 'full_rewrites']
+    table = [[source, kind, bucket, entry['writes'], entry['write_tokens'], entry['full_rewrites']]
+             for (source, kind, bucket), entry in sorted(result.items(),
+                 key=lambda item: (item[0][0], item[0][1], AUDIT.CACHE_BUCKETS.index(item[0][2])))]
+    print(render(columns, table, args.format), end='')
+    return 0
+
 def report(args):
     conn = open_read(db_path(args))
+    if args.cache:
+        try:
+            return cache_report(conn, args)
+        finally:
+            conn.close()
     state = pricing_state(args)
     groups = report_rows(conn, args, state)
     conn.close()
@@ -551,7 +604,175 @@ def run_sql(args):
     return 0
 
 
+# --- regression guard ---
+
+GUARD_LOOKBACK_DAYS = 120
+GUARD_MINIMUMS = dict(main_avg_context=1000, expensive_agent_calls=2, agent_cost_share=0.05,
+                      output_per_call=100, full_rewrite_share=0.05)
+
+
+def guard_rewrites(conn, origin, bound=None):
+    # stamp() stores UTC ISO times. Removing the final Z sorts whole seconds
+    # before fractions of that second. Keep the predecessor across UTC days.
+    where = "source = 'claude' AND " + origin + " = 0 AND session != ''"
+    # Sort just the bounded calls and keep LAG's predecessor while streaming.
+    # First calls without a cache write cannot affect the rewrite metric.
+    window_where = where + (' AND day >= ?' if bound else '')
+    rows = conn.execute(f"""
+        SELECT day, ts, cache_write_5m + cache_write_1h,
+               input + cache_read + cache_write_5m + cache_write_1h, session
+        FROM calls WHERE {window_where}
+        ORDER BY session, rtrim(ts, 'Z'), call_id
+    """, (bound,) if bound else ())
+    daily = defaultdict(Counter)
+    pending = {}
+
+    def add(date, current, previous, write, context):
+        try:
+            gap = AUDIT.cache_bucket(AUDIT.date_time(previous), AUDIT.date_time(current))
+        except (TypeError, ValueError, OverflowError):
+            return
+        if gap != 'unknown':
+            AUDIT.cache_add(daily, date, write, context)
+
+    last_session, previous = None, None
+    for date, current, write, context, session in rows:
+        if session != last_session:
+            previous = None
+            last_session = session
+        if write > 0 and context > 0:
+            if previous is not None:
+                add(date, current, previous, write, context)
+            elif bound:
+                pending[session] = (date, current, write, context)
+        previous = current
+    if pending:
+        # Only first-in-window writes need an earlier predecessor. The call id
+        # breaks timestamp ties, which cannot change the predecessor's time.
+        conn.execute('CREATE TEMP TABLE IF NOT EXISTS guard_pending_sessions (id TEXT PRIMARY KEY) WITHOUT ROWID')
+        conn.execute('DELETE FROM guard_pending_sessions')
+        conn.executemany('INSERT INTO guard_pending_sessions VALUES (?)', ((session,) for session in pending))
+        query = f"""
+            SELECT calls.session, MAX(rtrim(ts, 'Z')) FROM calls {{hint}}
+            JOIN guard_pending_sessions AS pending ON calls.session = pending.id
+            WHERE day < ? AND {where} GROUP BY calls.session
+        """
+        try:
+            rows = conn.execute(query.format(hint='INDEXED BY calls_day'), (bound,)).fetchall()
+        except sqlite3.OperationalError as exc:
+            # A database without the schema's day index still gets a correct answer.
+            if 'no such index' not in str(exc):
+                raise
+            rows = conn.execute(query.format(hint=''), (bound,)).fetchall()
+        for session, previous in rows:
+            date, current, write, context = pending[session]
+            add(date, current, previous, write, context)
+    return {date: row['full_rewrites'] / row['writes'] for date, row in daily.items()}
+
+
+def guard_days(conn, args, bound=None):
+    origin = 'is_subagent' if 'is_subagent' in {row[1] for row in conn.execute('PRAGMA table_info(calls)')} else 'NULL'
+    days = {metric: {} for metric in GUARD_MINIMUMS}
+    totals, agents = defaultdict(Counter), defaultdict(lambda: defaultdict(list))
+    state = pricing_state(args)
+    costs = defaultdict(list)
+    for (date, subagent, agent), source, model, calls, tokens, _, cost, unpriced in priced_rows(
+            conn, state, ['day >= ?'] if bound else [], [bound] if bound else [], ['day', origin, 'agent']):
+        row = totals[date]
+        row.update(calls=calls, output=tokens[4], unpriced=unpriced)
+        costs[date].append(cost)
+        if source != 'claude':
+            continue
+        if subagent == 0:
+            row.update(main=calls, context=sum(tokens[:4]))
+        elif subagent == 1:
+            row['claude_agent_calls'] += calls
+            family = re.match(r'claude-(opus|fable|sonnet|haiku)(?:[-\[].*)?$', model, re.IGNORECASE)
+            price_key = None if family else AUDIT.pricing_key(state['_pricing'], model)
+            tier_model = model if family else (price_key or model)
+            if re.fullmatch(r'claude-(?:opus|fable)(?:[-\[].*)?', tier_model, re.IGNORECASE):
+                row['expensive'] += calls
+            if agent and agent != 'unknown' and re.fullmatch(r'[a-zA-Z][a-zA-Z0-9_-]{0,63}', agent):
+                agents[agent][date].append(cost)
+            if not family and not price_key:
+                row['unknown_tier'] += calls
+        else:
+            row['unknown_origin'] += calls
+
+    for date, row in totals.items():
+        row['cost'] = math.fsum(costs[date])
+        days['output_per_call'][date] = row['output'] / row['calls']
+        if row['main']:
+            days['main_avg_context'][date] = row['context'] / row['main']
+        if not (row['unknown_tier'] or row['unknown_origin']) and (row['main'] or row['claude_agent_calls']):
+            days['expensive_agent_calls'][date] = row['expensive']
+    for agent, costs in agents.items():
+        days['agent_cost_share.' + agent] = {
+            date: math.fsum(cost) / totals[date]['cost'] for date, cost in costs.items()
+            if not (totals[date]['unpriced'] or totals[date]['unknown_origin']) and totals[date]['cost'] > 0
+        }
+    if agents:
+        del days['agent_cost_share']
+    days['full_rewrite_share'] = guard_rewrites(conn, origin, bound)
+    return days
+
+
+def guard(args):
+    with closing(open_read(db_path(args))) as conn:
+        # Avoid repeatedly reloading call rows through calls_day while grouping.
+        # These connection-local settings leave the read-only database unchanged.
+        conn.execute('PRAGMA mmap_size = 268435456')
+        conn.execute('PRAGMA cache_size = -65536')
+        conn.execute('PRAGMA temp_store = MEMORY')
+        conn.execute('BEGIN')
+        newest = conn.execute('SELECT MAX(day) FROM calls').fetchone()[0]
+        bound = (datetime.strptime(newest, '%Y-%m-%d') - timedelta(days=GUARD_LOOKBACK_DAYS - 1)).date().isoformat() if newest else None
+        days = guard_days(conn, args, bound)
+    minimums = dict(GUARD_MINIMUMS, **dict(args.minimum))
+    regressions, insufficient = [], []
+    for metric, values in sorted(days.items()):
+        if len(values) < 17:
+            insufficient.append(f'insufficient data {metric} ({len(values)}/17 active UTC days)')
+            continue
+        window = [values[date] for date in sorted(values)[-17:]]
+        baseline, recent = window[:14], window[14:]
+        center = median(baseline)
+        mad = median(abs(value - center) for value in baseline)
+        now = mean(recent)
+        kind = metric.split('.')[0]
+        limit = max(args.mad_multiplier * mad, args.relative_threshold * abs(center), minimums[kind])
+        if now > center + limit:
+            severity = (now - center) / (limit or GUARD_MINIMUMS[kind])
+            regressions.append((-severity, metric, now, center))
+    for _, metric, now, center in sorted(regressions):
+        current, baseline = f'{now:.6g}', f'{center:.6g}'
+        if current == baseline and now != center:
+            current, baseline = repr(now), repr(center)
+        print(f'REGRESSION {metric} {current} vs {baseline}')
+    for line in insufficient:
+        print(line)
+    if not (regressions or insufficient):
+        print('No regressions')
+    return 0
+
+
 # --- command line ---
+
+def nonnegative(value):
+    try:
+        number_ = float(value)
+        if math.isfinite(number_) and number_ >= 0:
+            return number_
+    except ValueError:
+        pass
+    raise argparse.ArgumentTypeError('expected a finite nonnegative number')
+
+
+def guard_minimum(value):
+    metric, _, floor = value.partition('=')
+    if metric not in GUARD_MINIMUMS:
+        raise argparse.ArgumentTypeError('expected a metric from the documented minimums')
+    return metric, nonnegative(floor)
 
 def positive_days(value):
     try:
@@ -575,7 +796,7 @@ def build_parser():
     common.add_argument('--db', type=Path, default=None, metavar='PATH',
                         help='database file (default: $KAIZEN_USAGE_DB, else <CLAUDE_CONFIG_DIR or ~/.claude>/kaizen-usage.db)')
     parser = argparse.ArgumentParser(description=__doc__)
-    commands = parser.add_subparsers(dest='command', required=True, metavar='{ingest,status,report,prune,sql}')
+    commands = parser.add_subparsers(dest='command', required=True, metavar='{ingest,status,report,guard,prune,sql}')
     ingest_parser = commands.add_parser('ingest', parents=[common], help='read new or changed transcripts into the database',
                                         description='Read Claude transcripts and Codex session files that are new or changed since the last run.')
     ingest_parser.add_argument('--quiet', action='store_true', default=False, help='print nothing on success (default: print one summary line)')
@@ -583,6 +804,7 @@ def build_parser():
                         description='Show the database path, size, schema version, call counts, day range and last ingest time.')
     report_parser = commands.add_parser('report', parents=[common], help='aggregate usage and cost',
                                         description='Aggregate calls, tokens and list-price cost, priced now from pricing.json.')
+    report_parser.add_argument('--cache', action='store_true', help='show cache writes by preceding call gap; subagent type gaps are approximate (Codex has no write data)')
     report_parser.add_argument('--since', type=day, metavar='YYYY-MM-DD', help='first UTC day (default: all)')
     report_parser.add_argument('--until', type=day, metavar='YYYY-MM-DD', help='last UTC day, inclusive (default: all)')
     report_parser.add_argument('--by', choices=sorted(GROUPS), default='day',
@@ -590,8 +812,28 @@ def build_parser():
     report_parser.add_argument('--project', metavar='SUBSTR', help='keep projects whose path contains SUBSTR, ignoring case (default: all)')
     report_parser.add_argument('--source', choices=('claude', 'codex'), help='keep one source (default: both)')
     report_parser.add_argument('--format', choices=('table', 'csv', 'json'), default='table', help='output format (default: table)')
-    report_parser.add_argument('--pricing', type=Path, default=Path(__file__).resolve().with_name('pricing.json'),
-                               help='price file (default: pricing.json next to this script)')
+    guard_parser = commands.add_parser('guard', parents=[common], help='detect daily usage regressions',
+        description='Read-only. For each metric, compare the mean of the last 3 active UTC days with the median '
+        'of the preceding 14. Flag increases above max(3 * unscaled MAD, 20% of |median|, metric minimum). '
+        'Rank by increase divided by that threshold (default metric minimum if zero), then by name. '
+        f'Use the {GUARD_LOOKBACK_DAYS} UTC days ending on the newest database day. '
+        'Reports and insufficient data exit 0.',
+        epilog='Context is per Claude main call. Expensive calls count Claude Opus and Fable subagent calls '
+        'on days with known Claude origin and subagent tier. Days containing unclassifiable subagent models '
+        'are excluded from the expensive-call baseline and recent window. Output is per stored call across sources. '
+        'Agent cost share uses days that agent ran and the total daily list-price cost when fully priced '
+        'and positive. Full-rewrite share uses positive-context Claude main cache writes with a known '
+        'preceding call, and counts writes of at least 80% of context. On a quiet day every session start '
+        'runs the checker, bounded by 2 seconds.')
+    for priced_parser in (report_parser, guard_parser):
+        priced_parser.add_argument('--pricing', type=Path, default=Path(__file__).resolve().with_name('pricing.json'),
+                                   help='price file (default: pricing.json next to this script)')
+    guard_parser.add_argument('--mad-multiplier', type=nonnegative, default=3, help='unscaled MAD multiplier (default: 3)')
+    guard_parser.add_argument('--relative-threshold', type=nonnegative, default=0.20,
+                              help='fraction of absolute baseline median (default: 0.20)')
+    guard_parser.add_argument('--minimum', type=guard_minimum, action='append', default=[], metavar='METRIC=VALUE',
+                              help='absolute floor, repeatable (defaults: ' +
+                              ', '.join(f'{metric}={value:g}' for metric, value in GUARD_MINIMUMS.items()) + ')')
     prune_parser = commands.add_parser('prune', parents=[common], help='delete old calls (dry run unless --apply)',
                                        description='Delete calls older than DAYS UTC days. Without --apply, only print how many rows and '
                                                    'which dates would go. After --apply the file is vacuumed. Nothing is pruned automatically. '
@@ -612,7 +854,7 @@ def main():
     if args.command == 'report' and args.since and args.until and args.until < args.since:
         parser.error('--until must be on or after --since')
     try:
-        return dict(ingest=ingest, status=status, report=report, prune=prune, sql=run_sql)[args.command](args)
+        return dict(ingest=ingest, status=status, report=report, guard=guard, prune=prune, sql=run_sql)[args.command](args)
     except Fatal as exc:
         print(f'usage-db: {exc}', file=sys.stderr)
         return exc.code

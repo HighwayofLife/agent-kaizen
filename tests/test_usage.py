@@ -85,6 +85,45 @@ class UsageTests(StubCase):
             v=1, file=Path(data['extract_path']).name)) + ' -->')
         self.assertNotIn('extract', json.loads(lines[index][len('<!-- token-audit-headline '):-len(' -->')]))
 
+    def test_cache_headline_and_sequence(self):
+        project = self.home / '.claude/projects/example'
+        def call(ts, ident, usage):
+            return dict(type='assistant', timestamp=ts, message=dict(id=ident, model='test', content=[], usage=usage))
+        usage = dict(input_tokens=20, cache_creation_input_tokens=80)
+        jsonl(project / 'main.jsonl', [
+            call('2025-01-01T00:00:00Z', 'a', usage),
+            call('2025-01-01T00:05:00Z', 'b', usage),
+            call('2025-01-01T01:05:00.000001Z', 'c', usage),
+            call('2025-01-01T01:05:00.000001Z', 'd', dict(input_tokens=0, output_tokens=1)),
+            call('2025-01-01T01:05:01Z', 'e', usage)])
+        data = json.loads(self.run_script('token-audit', '--since', '2025-01-01', '--json').stdout)
+        gaps = data['cache_writes']['main']
+        self.assertEqual(gaps['first']['writes'], 1)
+        self.assertEqual(gaps['le_5m']['writes'], 2)
+        self.assertEqual(gaps['gt_60m']['writes'], 1)
+        self.assertEqual(gaps['le_5m']['full_rewrites'], 2)
+        self.assertIn('Claude cache writes: 4 calls; 320 tokens; 4 full rewrites',
+                      Path(data['report_path']).read_text())
+        self.assertEqual(AUDIT['cache_bucket'](None, datetime.now(timezone.utc), first=True), 'first')
+        counter = Counter()
+        AUDIT['cache_add']({'unknown': counter}, 'unknown', 0, 0)
+        self.assertEqual(counter['full_rewrites'], 0)
+
+    def test_cache_predecessor_before_window(self):
+        project = self.home / '.claude/projects/example'
+        usage = dict(input_tokens=20, cache_creation_input_tokens=80)
+        def call(ts, ident):
+            return dict(type='assistant', timestamp=ts, message=dict(id=ident, model='test', content=[], usage=usage))
+        synthetic = call('2025-01-01T23:59:30Z', 'synthetic')
+        synthetic['message'].update(model='<synthetic>', usage={'input_tokens': 0})
+        empty = call('2025-01-01T23:59:45Z', 'empty')
+        empty['message']['usage'] = {'input_tokens': 0}
+        jsonl(project / 'main.jsonl', [call('2025-01-01T23:59:00Z', 'a'), synthetic, empty,
+                                      call('2025-01-02T00:01:00Z', 'b')])
+        gaps = json.loads(self.run_script('token-audit', '--since', '2025-01-02', '--json').stdout)['cache_writes']['main']
+        self.assertEqual(gaps['le_5m']['writes'], 1)
+        self.assertEqual(gaps['first']['writes'], 0)
+
     def test_extract_defaults_override_and_privacy(self):
         pricing = self.fixture()
         for config in (None, self.root / 'config'):
@@ -120,6 +159,55 @@ class UsageTests(StubCase):
         report = Path(normal.stdout.splitlines()[0])
         self.assertTrue(report.is_file())
         self.assertTrue((self.root / 'extracts' / (report.stem + '.extract.json')).is_file())
+
+    def test_no_write_preserves_config_roots_and_data(self):
+        pricing = self.fixture()
+        claude = self.home / '.claude'
+        codex = self.root / 'codex'
+        write(codex / 'sentinel', 'unchanged')
+        self.env.update(CLAUDE_CONFIG_DIR=str(claude), CODEX_HOME=str(codex))
+        output, extracts = self.root / 'output', self.root / 'extracts'
+
+        def snapshot():
+            return {str(path): path.read_bytes() if path.is_file() else None
+                    for root in (claude, codex) for path in [root, *root.rglob('*')]}
+
+        args = ('--pricing', pricing, '--since', '2025-01-01', '--json')
+        normal = json.loads(self.run_script('token-audit', *args, '--out', output,
+                                            '--extract-out', extracts).stdout)
+        before = snapshot()
+        destinations = {str(path): path.read_bytes() for root in (output, extracts)
+                        for path in root.rglob('*') if path.is_file()}
+        result = json.loads(self.run_script('token-audit', *args, '--no-write', '--out', output,
+                                            '--extract-out', extracts).stdout)
+        self.assertIsNone(result.pop('report_path'))
+        self.assertIsNone(result.pop('extract_path'))
+        normal.pop('report_path')
+        normal.pop('extract_path')
+        self.assertEqual(result, normal)
+        self.assertEqual(snapshot(), before)
+        self.assertEqual(destinations, {str(path): path.read_bytes() for root in (output, extracts)
+                                        for path in root.rglob('*') if path.is_file()})
+
+        missing_output = self.root / 'missing-output'
+        blocked = write(self.root / 'blocked', 'file, not a directory')
+        for destination in (None, missing_output, blocked):
+            with self.subTest(destination=destination):
+                extra = ('--out', destination, '--extract-out', destination) if destination else ()
+                data = json.loads(self.run_script('token-audit', *args, '--no-write', *extra).stdout)
+                self.assertIsNone(data['report_path'])
+                self.assertIsNone(data['extract_path'])
+                self.assertEqual(snapshot(), before)
+        failed = self.run_script('token-audit', *args, '--no-write', '--out', missing_output,
+                                 '--extract-out', missing_output,
+                                 '--project-dir', self.root / 'missing', code=1)
+        self.assertEqual(failed.stdout, '')
+        self.assertIn('project directory missing:', failed.stderr)
+        invalid = self.run_script('token-audit', '--no-write', '--json', '--days', '-1', code=2)
+        self.assertEqual(invalid.stdout, '')
+        self.assertFalse(missing_output.exists())
+        self.assertEqual(blocked.read_text(), 'file, not a directory')
+        self.assertEqual(snapshot(), before)
 
     def test_atomic_replace_failure_cleans_temporary_file(self):
         directory = self.root / 'extracts'

@@ -50,6 +50,16 @@
     ],
     "PreToolUse": [
       {
+        "matcher": "Agent",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "# Copy the hook and set guardrails.agentTiers in agent-kaizen.json to opt in. Remove this entry or clear its rules to disable. Retry with a Tier reason line. Private kaizen-tier-guard state stores counts and override reasons.\nbash \"${CLAUDE_CONFIG_DIR:-$HOME/.claude}/hooks/tier-guard.sh\"",
+            "timeout": 5
+          }
+        ]
+      },
+      {
         "matcher": "Read",
         "hooks": [
           {

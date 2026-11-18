@@ -104,6 +104,15 @@ class IngestTests(UsageDbCase):
         self.assertEqual(self.counts(self.ingest().stdout), (2, 0, 0, 0))
         self.assertEqual(self.query('SELECT count(*) FROM calls'), [(3,)])
 
+    def test_backfill_does_not_count_as_insert(self):
+        self.basic()
+        self.ingest()
+        with sqlite3.connect(self.db) as conn:
+            conn.execute('UPDATE calls SET is_subagent = NULL')
+            conn.execute('DELETE FROM files')
+        self.assertEqual(self.counts(self.ingest().stdout)[2], 0)
+        self.assertEqual(self.query('SELECT count(*) FROM calls WHERE is_subagent IS NULL'), [(0,)])
+
     def test_quiet_prints_nothing(self):
         self.basic()
         self.assertEqual(self.ingest('--quiet').stdout, '')
@@ -228,7 +237,7 @@ class IngestTests(UsageDbCase):
         copy = self.codex_file(rows, name='rollout-copy', day='2025/02/09', session_id='sess-1')
         self.ingest()
         self.assertEqual(self.query("SELECT count(*) FROM calls WHERE source = 'codex'"), [(2,)])
-        self.assertEqual(self.query("SELECT value FROM meta WHERE key = 'schema_version'"), [('2',)])
+        self.assertEqual(self.query("SELECT value FROM meta WHERE key = 'schema_version'"), [('3',)])
         self.assertEqual(self.query("SELECT count(*) FROM calls WHERE call_id LIKE 'rollout-%'"), [(0,)])
         self.assertEqual(self.counts(self.ingest().stdout)[2], 0)
         self.assertEqual(self.query('SELECT count(*) FROM calls'), [(3,)])
@@ -243,7 +252,7 @@ class IngestTests(UsageDbCase):
             conn.execute("DELETE FROM calls")
             for stem in ('rollout-one', 'rollout-copy'):
                 conn.execute("INSERT INTO calls VALUES ('codex', ?, '2025-01-01T10:00:00Z', '2025-01-01', 'p', ?, 'main', "
-                             "'gpt-test-sol', 80, 20, 0, 0, 10)", (f'{stem}:2025-01-01T10:00:00Z:110', stem))
+                             "'gpt-test-sol', NULL, 80, 20, 0, 0, 10)", (f'{stem}:2025-01-01T10:00:00Z:110', stem))
             conn.execute("UPDATE meta SET value = '1' WHERE key = 'schema_version'")
         self.ingest()
         self.assertEqual(self.query('SELECT count(*) FROM calls'), [(1,)])
@@ -419,7 +428,7 @@ class QueryTests(UsageDbCase):
         self.codex_file([token_count('2025-01-03T10:00:00Z', 100, 0, 10)], day='2025/01/03')
         self.ingest()
         text = self.run_script('usage-db', 'status').stdout
-        for expected in (str(self.db), 'schema version: 2', 'claude calls: 2', 'codex calls: 1',
+        for expected in (str(self.db), 'schema version: 3', 'claude calls: 2', 'codex calls: 1',
                          'first day: 2025-01-01', 'last day: 2025-01-03'):
             self.assertIn(expected, text)
         self.assertRegex(text, r'last ingest: \d{4}-\d\d-\d\dT')
@@ -479,6 +488,54 @@ class QueryTests(UsageDbCase):
                          token_count('2025-01-02T12:00:00Z', 1500, 200, 160)])
         self.codex_file([token_count('2025-01-02T12:00:00Z', 100, 0, 10)], name='rollout-two', day='2025/01/02')
         self.ingest()
+
+    def test_cache_gaps_and_formats(self):
+        usage = dict(input_tokens=20, cache_creation_input_tokens=80)
+        stamps = ['2025-01-01T23:55:00Z', '2025-01-02T00:00:00Z',
+                  '2025-01-02T00:05:00.000001Z', '2025-01-02T01:05:00.000001Z',
+                  '2025-01-02T02:05:00.000002Z', '2025-01-02T02:05:00.000002Z']
+        self.main_file([assistant(ts, str(i), usage=usage, cwd=self.cwd) for i, ts in enumerate(stamps)])
+        for name, ts in [('a', '2025-01-02T00:00:00Z'), ('b', '2025-01-02T00:01:00Z')]:
+            sub = self.config / f'projects/alpha/main/subagents/{name}.jsonl'
+            jsonl(sub, [assistant(ts, 'sub-' + name, usage=usage)])
+            write(sub.with_suffix('.meta.json'), json.dumps(dict(agentType='worker')))
+        self.codex_file([token_count('2025-01-02T00:00:00Z', 100, 10, 1)])
+        self.ingest()
+        result = self.report('--cache', '--source', 'claude', '--since', '2025-01-02', '--project', 'alpha')
+        main = {r['gap']: r for r in result if r['sequence'] == 'main'}
+        self.assertEqual({k: v['writes'] for k, v in main.items()},
+                         dict(le_5m=2, gt_5m_le_60m=2, gt_60m=1))
+        self.assertEqual(sum(v['full_rewrites'] for v in main.values()), 5)
+        sub = [r for r in result if r['sequence'] == 'subagent_approximate']
+        self.assertEqual({r['gap'] for r in sub}, {'first', 'le_5m'})
+        self.assertEqual(self.report('--cache', '--source', 'codex'), [])
+        csv_text = self.run_script('usage-db', 'report', '--cache', '--format', 'csv').stdout
+        self.assertEqual(next(csv.reader(io.StringIO(csv_text))),
+                         ['source', 'sequence', 'gap', 'writes', 'write_tokens', 'full_rewrites'])
+        self.assertIn('subagent_approximate', self.run_script('usage-db', 'report', '--cache').stdout)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE calls SET session = NULL WHERE call_id = '0'")
+        self.assertIn('unknown', [r['gap'] for r in self.report('--cache')])
+
+    def test_unknown_origin_sequence(self):
+        self.main_file([assistant('2025-01-01T00:00:00Z', 'a',
+                                  usage=dict(input_tokens=20, cache_creation_input_tokens=80))])
+        self.ingest()
+        with sqlite3.connect(self.db) as conn:
+            conn.execute('UPDATE calls SET is_subagent = NULL')
+        self.assertEqual(self.report('--cache')[0]['sequence'], 'unknown')
+
+    def test_subagent_named_main_has_separate_history(self):
+        usage = dict(input_tokens=20, cache_creation_input_tokens=80)
+        self.main_file([assistant('2025-01-01T00:00:00Z', 'm1', usage=usage),
+                        assistant('2025-01-01T01:00:00Z', 'm2', usage=usage)])
+        sub = self.config / 'projects/alpha/main/subagents/worker.jsonl'
+        jsonl(sub, [assistant('2025-01-01T00:59:00Z', 's1', usage=usage)])
+        write(sub.with_suffix('.meta.json'), json.dumps(dict(agentType='main')))
+        self.ingest()
+        result = self.report('--cache')
+        self.assertEqual({r['gap'] for r in result if r['sequence'] == 'main'}, {'first', 'gt_5m_le_60m'})
+        self.assertEqual([r['gap'] for r in result if r['sequence'] == 'subagent_approximate'], ['first'])
 
     def test_report_matches_usage_series_for_the_same_window(self):
         self.fixtures()

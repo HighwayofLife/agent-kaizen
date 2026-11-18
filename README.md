@@ -92,9 +92,15 @@ Or install it straight from GitHub, without a clone:
 /plugin install agent-kaizen@agent-kaizen-tools
 ```
 
-To update: `git pull` in the clone (or `/plugin marketplace update` for a GitHub install), then `/reload-plugins` or start a new session. Releases bump `version` in `plugin.json` (see [CHANGELOG.md](CHANGELOG.md)); a GitHub install only picks up a new version. Re-run `install-schedule --apply` after updating to refresh the scheduled scripts. See the [0.4.0 migration note](docs/scheduling.md#03x-migration).
+To update: `git pull` in the clone (or `/plugin marketplace update` for a GitHub install), then `/reload-plugins` or start a new session. Releases bump `version` in `plugin.json` (see [CHANGELOG.md](CHANGELOG.md)); a GitHub install only picks up a new version. If you installed OS jobs, re-run `install-schedule --apply` after updating to refresh the scheduled scripts. See the [0.4.0 migration note](docs/scheduling.md#03x-migration).
 
-### 2. Start the loop in a project
+### 2. Scan recent usage
+
+Run `/agent-kaizen:scan` for a no-write scorecard across local projects, or
+`/agent-kaizen:scan --demo` for an isolated synthetic example. The scan points
+each warning to a skill and skips checks with missing data.
+
+### 3. Start the loop in a project
 
 Open Claude Code in your project and run:
 
@@ -125,7 +131,7 @@ In every mode, each applied change is backed up (to `KAIZEN_BACKUP_DIR`, or `kai
 
 ### 3. Make it periodic
 
-Run `/agent-kaizen:schedule`. It finds the plugin path and asks before it installs anything. Or run `scripts/install-schedule` from the plugin or your clone; the plugin path varies by install.
+SessionStart runs an audit when the last successful audit is over 3 days old. An OS schedule is optional and useful for fixed schedules or infrequent sessions. Run `/agent-kaizen:schedule` to install one. It finds the plugin path and asks before it installs anything. Or run `scripts/install-schedule` from the plugin or your clone; the plugin path varies by install.
 
 ```bash
 scripts/install-schedule --apply                  # audit about every 3 days, no tokens
@@ -193,10 +199,11 @@ Flags, timeouts and the report format are in [scripts/README.md](scripts/README.
 
 ## Skills
 
-All skills are user-triggered (`disable-model-invocation: true`), so their descriptions don't cost context on every turn.
+All skills are user-triggered (`disable-model-invocation: true`), so their descriptions don't cost context on every turn. In Claude Code 2.1.327, the auditor agent description was about 110 tokens; `claude plugin details` overcounts by including hidden skill descriptions. The repository budget uses bytes/4 as a proxy, not an exact token count.
 
 | Skill | What it does | When |
 |---|---|---|
+| `/agent-kaizen:scan` | No-write scorecard and offline demo | After installation |
 | `/agent-kaizen:start` | Ledger, loop README and baseline of what loads every turn | Once per project |
 | `/agent-kaizen:audit` | Token, turn and tool usage per session and agent type; ranked savings | First, then every few changes |
 | `/agent-kaizen:cycle` | One full loop: audit → review → model and release checks when due → proposals | The default entry point |
@@ -248,7 +255,7 @@ docs/               what-we-learned.md, scheduling.md, autonomy.md, outcome-log.
 assets/             banner, teaser animation and loop diagram; assets/src/ has the scripts that draw them
 ```
 
-The guardrail hooks and templates are **opt-in**: `/agent-kaizen:guardrails` and `/agent-kaizen:lean-agents` install and adapt them with your approval. Installing the plugin enables the audit notice and Bash burst hook.
+The guardrail hooks and templates are **opt-in**: `/agent-kaizen:guardrails` and `/agent-kaizen:lean-agents` install and adapt them with your approval. Installing the plugin enables the audit notice, Bash burst, and session-audit hooks. Session-audit runs the zero-token audit at session start when the last successful audit is over 3 days old, prints nothing, and can be turned off with `"autoAudit": false` in the global `agent-kaizen.json`; see [scheduling](docs/scheduling.md).
 
 The Bash burst hook counts main-session Bash calls per user turn, failed calls included. Every eight calls by default it adds: "N Bash calls this turn. Chain the remaining steps into one command or script that prints a summary, or hand the investigation to a cheaper read-only subagent." Set `KAIZEN_BASH_BURST` to change the threshold. To turn it off, set `KAIZEN_BASH_BURST=0` or put `"enabled": false` in `agent-kaizen.json` in the Claude config dir.
 

@@ -58,6 +58,7 @@ def main():
                     run(['uv', 'run', '--python', args.python, 'python', '-c', runner,
                          str(Path(directory) / 'python3')])
             stage('unit tests', tests)
+        stage('context budget', lambda: run([sys.executable, 'tools/context_budget.py', '--root', str(ROOT)]))
         hooks = sorted(str(p) for p in (ROOT / 'hooks').glob('*.sh'))
         stage('shellcheck', lambda: run(['shellcheck', '-S', 'warning'] + hooks))
         def json_check():

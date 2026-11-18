@@ -2,6 +2,45 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.11.0 (2026-11-17)
+
+First-five-minutes loop: a no-write first scan, a doctor, hook-driven audits, cache-write explanations, a regression sentinel and an opt-in agent tier guard.
+
+`kaizen-scan`, `scan`:
+
+- New zero-token, no-write first scan prints PASS, WARN, FAIL and SKIP lines with fixing skills. `--demo` uses synthetic fixtures. The README quick start begins with install, then scan.
+
+`kaizen-demo-fixtures`:
+
+- New synthetic transcripts support demos and tests.
+
+`kaizen-doctor`:
+
+- New read-only install health check covers plugin cache, hooks, tools, scheduler including cron, pricing age, database freshness, config and format canary.
+
+`token-audit`, `usage-db`:
+
+- `token-audit --no-write` skips report and extract writes. Reports include a `format_canary: v1` headline field and show `FORMAT-DRIFT` for unknown records or missing usage fields, naming the top unknown record types. The canary knows the record types written by Claude Code 2.1.32x and Codex 0.167.
+- `usage-db report --cache` shows cache writes by idle-gap bucket and full-rewrite counts for main sessions and subagents; old rows may have unknown attribution. `token-audit` adds a cache headline.
+- `usage-db guard` reports usage regressions over the last 120 database days. The session notice shows at most one regression line per day.
+
+`session-audit.sh`, `install-schedule`:
+
+- An async SessionStart audit runs when the last successful audit is over three days old. Set `autoAudit: false` in `agent-kaizen.json` to opt out. OS scheduling via `install-schedule` is optional.
+
+`tier-guard.sh`:
+
+- The opt-in guardrails hook allows free spawns per session per rule, then denies requests without a `Tier reason:` line. It always exits 0 and fails open.
+
+`tools/context_budget.py`, `tools/ci-local`:
+
+- An always-on model-visible text budget runs in local CI.
+
+Fixes:
+
+- Re-ingest counts report newly added calls correctly.
+- Scheduler detection recognises cron correctly.
+
 ## 0.10.0 (2026-11-17)
 
 Packet flow, experiment follow-up, brief preflight and due-check notices.

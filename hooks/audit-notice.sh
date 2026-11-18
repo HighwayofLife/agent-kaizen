@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# SessionStart: notice an unreviewed audit at most once per day; never fail the session.
+trap '' PIPE
+# SessionStart: show daily audit, experiment and usage regression notices; never fail the session.
 # AUDIT_DIR overrides the audits directory; CLAUDE_CONFIG_DIR selects the config directory.
 # KAIZEN_NOTICE_ALL=1 also enables notices outside enrolled projects.
 # Reads global enabled and global or project schedule from agent-kaizen config files.
@@ -124,19 +125,53 @@ When there is a pause, run /agent-kaizen:review."
     fi
 fi
 
+regression_msg=
+regression_marker=
+checker=$plugin_root/scripts/usage-db
+if [ -f "$checker" ] && command -v python3 >/dev/null 2>&1 &&
+    { [ -n "${KAIZEN_USAGE_DB:-}" ] || [ -f "$home/kaizen-usage.db" ]; } &&
+    today=$(date -u +%F 2>/dev/null) && [ ! -e "$dir/usage-regression.noticed-$today" ]; then
+    # Python provides the deadline on macOS too, without coreutils or a watchdog shell.
+    output=$(python3 -c '
+import subprocess, sys
+result = subprocess.run([sys.executable, "-B", sys.argv[1], "guard"], capture_output=True,
+                        text=True, timeout=2, check=True)
+print(result.stdout.partition("\n")[0])
+' "$checker" 2>/dev/null) || output=
+    number='[0-9]+([.][0-9]+)?([eE][+-]?[0-9]+)?'
+    finding="^REGRESSION [a-zA-Z][a-zA-Z0-9_.-]{0,80} $number vs $number$"
+    if [[ $output =~ $finding ]] && today=$(date -u +%F 2>/dev/null) && mkdir -p "$dir" 2>/dev/null &&
+        (set -o noclobber; : > "$dir/usage-regression.noticed-$today") 2>/dev/null; then
+        regression_marker="$dir/usage-regression.noticed-$today"
+        regression_msg=$output
+    fi
+fi
+
 msg=$audit_msg
 if [ -n "$experiment_msg" ]; then
     msg="${msg:+$msg
 
 }$experiment_msg"
 fi
+if [ -n "$regression_msg" ]; then
+    msg="${msg:+$msg
+
+}$regression_msg"
+fi
 [ -n "$msg" ] || exit 0
-out=$(jq -n --arg c "$msg" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}')
-if [ -z "$out" ]; then
+if ! out=$(jq -n --arg c "$msg" '{hookSpecificOutput:{hookEventName:"SessionStart",additionalContext:$c}}') ||
+    [ -z "$out" ]; then
     [ -n "$audit_marker" ] && rm -f "$audit_marker"
     [ -n "$experiment_marker" ] && rm -f "$experiment_marker"
+    [ -n "$regression_marker" ] && rm -f "$regression_marker"
     exit 0
 fi
-printf '%s\n' "$out"
-emitted=1
+if printf '%s\n' "$out"; then
+    emitted=1
+else
+    [ -n "$audit_marker" ] && rm -f "$audit_marker"
+    [ -n "$experiment_marker" ] && rm -f "$experiment_marker"
+    [ -n "$regression_marker" ] && rm -f "$regression_marker"
+    emitted=1
+fi
 exit 0

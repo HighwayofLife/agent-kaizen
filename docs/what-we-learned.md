@@ -34,7 +34,7 @@ Tool schemas count as context too.
 - **Project `.mcp.json` servers** are controlled with `disabledMcpjsonServers` / `enabledMcpjsonServers`.
 - **Tool search stays on** (`ENABLE_TOOL_SEARCH` unset or `true`), so MCP tool schemas are deferred until a tool is actually needed.
 - **Codex MCP servers per run.** Our Codex config has engine and DCC MCP servers (a game engine and a 3D tool). Code-only runs disable them with `-c mcp_servers.NAME.enabled=false`, which keeps their tool lists out of the run and stops a run from touching an open editor by accident.
-- **Skill and agent descriptions** are listed every turn. Skills you only trigger yourself get `disable-model-invocation: true`, and agent descriptions stay at one or two sentences.
+- **Skill and agent descriptions.** In Claude Code 2.1.327, inspecting model-visible context showed that descriptions of skills with `disable-model-invocation: true` are hidden; the auditor agent description was about 110 tokens. `claude plugin details` overcounts by including hidden skills. `tools/context_budget.py` counts visible description bytes and reviewed literal hook output, using bytes/4 as a proxy rather than an exact token count. Its baseline is 784 bytes (196 proxy tokens), with a 1,024-byte budget; dynamic hook content is excluded.
 - **Cache awareness.** Connecting or disconnecting servers, switching models and compacting all invalidate the prompt cache. Make these changes between sessions.
 
 ## Routing and models

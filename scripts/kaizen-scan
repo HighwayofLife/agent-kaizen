@@ -1,0 +1,104 @@
+#!/usr/bin/env python3
+"""Show a no-write scorecard of recent local agent usage."""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+HERE = Path(__file__).resolve().parent
+# Signal, warning threshold, audit source, fixing skill. Thresholds are screening
+# heuristics, not claims of savings; unavailable sources never produce a pass.
+CHECKS = (
+    ('Context average', '>= 150000 tokens/call', 'headline.claude_context_per_call', 'slim-instructions'),
+    ('Context peak', '>= 180000 tokens', 'sessions[].peak', 'guardrails'),
+    ('Cache rewrites', '>= 25% of calls', 'cache_writes.*.*.full_rewrites / writes', 'trim-context'),
+    ('Wakeups', '>= 10 per session', 'unavailable: completion counts', 'batch-wakeups'),
+    ('Relay agents', '>= 1 agent named relay', 'agent_usage[].agent, spawns', 'codex-dispatch'),
+    ('Images', '>= 1 image result', 'images', 'guardrails'),
+    ('Unused tools', '>= 1 candidate', 'unused_tools', 'trim-context'),
+    ('Instruction size', '>= 20000 bytes', 'unavailable: instruction bytes', 'slim-instructions'),
+    ('Inherited models', '>= 1 inherited model', 'unavailable: model configuration', 'lean-agents'),
+    ('Stuck turns', '>= 1 flagged turn', 'stuck_turns.flagged_turns', 'tools-before-tokens'),
+    ('Bash volume', '>= 50 calls', 'bash.*.*', 'tools-before-tokens'),
+)
+
+
+def score(data):
+    calls = data.get('headline', {}).get('claude_calls', 0)
+    sessions = data.get('sessions', [])
+    buckets = [bucket for group in data.get('cache_writes', {}).values() for bucket in group.values()]
+    writes = sum(b.get('writes', 0) for b in buckets)
+    rewrites = sum(b.get('full_rewrites', 0) for b in buckets)
+    agents = data.get('agent_usage', [])
+    stuck = data.get('stuck_turns', {})
+    bash = data.get('bash', {})
+    values = [
+        (data.get('headline', {}).get('claude_context_per_call'), calls > 0 and 'claude_context_per_call' in data.get('headline', {}), 150000),
+        (max((s.get('peak', 0) for s in sessions), default=0), bool(sessions) and all('peak' in s for s in sessions), 180000),
+        (100 * rewrites / writes if writes else None, writes > 0, 25),
+        (None, False, 10),
+        (sum(a.get('spawns', 0) for a in agents if 'relay' in a.get('agent', '').lower()), calls > 0 and 'agent_usage' in data, 1),
+        (data.get('images'), calls > 0 and 'images' in data, 1),
+        (len(data.get('unused_tools', [])), bool(data.get('unused_tools')), 1),
+        (None, False, 20000), (None, False, 1),
+        (stuck.get('flagged_turns'), stuck.get('turns', 0) > 0 and 'flagged_turns' in stuck, 1),
+        (sum(sum(group.values()) for group in bash.values()), calls > 0 and 'bash' in data, 50),
+    ]
+    for (name, threshold, source, skill), (value, available, limit) in zip(CHECKS, values):
+        status = 'SKIP' if not available else 'WARN' if value >= limit else 'PASS'
+        if not available:
+            detail = 'no data (insufficient or unsupported data)'
+        elif name == 'Cache rewrites':
+            detail = f'{value:,.1f}'.rstrip('0').rstrip('.') + '%'
+        else:
+            detail = f'{value:,}'
+        yield f'{status} {name}: {detail}; warn {threshold}; source {source}; /agent-kaizen:{skill}'
+
+
+def run_audit(env):
+    result = subprocess.run([sys.executable, str(HERE / 'token-audit'), '--no-write', '--json'],
+                            env=env, text=True, capture_output=True)
+    if result.returncode:
+        raise RuntimeError(result.stderr.strip() or 'token-audit failed')
+    return json.loads(result.stdout), result.stderr.strip()
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     epilog='Exit 0 on a completed scan, or 1 if the scan fails.')
+    parser.add_argument('--demo', action='store_true', help='scan an isolated temporary synthetic fixture')
+    args = parser.parse_args()
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE='1')
+    try:
+        if args.demo:
+            with tempfile.TemporaryDirectory(prefix='kaizen-scan-') as tmp:
+                env.update(HOME=tmp, CLAUDE_CONFIG_DIR=str(Path(tmp) / 'claude'),
+                           CODEX_HOME=str(Path(tmp) / 'codex'), XDG_CONFIG_HOME=str(Path(tmp) / 'config'))
+                subprocess.run([sys.executable, str(HERE / 'kaizen-demo-fixtures'), '--output',
+                                env['CLAUDE_CONFIG_DIR']], env=env, check=True, capture_output=True)
+                data, warning = run_audit(env)
+        else:
+            data, warning = run_audit(env)
+        print('Recent local usage (last 3 days; thresholds are screening heuristics):')
+        lines = list(score(data))
+        lines.sort(key=lambda line: ('FAIL', 'WARN', 'PASS', 'SKIP').index(line.split(' ', 1)[0]))
+        print('\n'.join(lines))
+        print('Start: review a warning with its named skill; for missing data, use Claude Code or Codex and scan again.')
+        counts = [sum(line.startswith(status + ' ') for line in lines)
+                  for status in ('FAIL', 'WARN', 'PASS', 'SKIP')]
+        print(f'{counts[0]} fail, {counts[1]} warn, {counts[2]} pass, {counts[3]} skipped')
+        if warning:
+            print('Audit note: ' + warning.replace(str(Path.home()), '~'), file=sys.stderr)
+        return 0
+    except (OSError, ValueError, RuntimeError, subprocess.CalledProcessError) as exc:
+        print('FAIL scan: {}; check that token-audit and its fixture script are installed.'.format(
+            str(exc).replace(str(Path.home()), '~')), file=sys.stderr)
+        print('1 fail, 0 warn, 0 pass, 0 skipped', file=sys.stderr)
+        return 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())

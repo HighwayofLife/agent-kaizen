@@ -7,7 +7,7 @@ argument-hint: "[propose|safe|auto|yolo]"
 
 # Schedule the audit
 
-Schedule a global audit and an optional weekly project review.
+SessionStart runs the global audit when due. An OS job is optional and useful for fixed schedules or infrequent sessions; it can also run a weekly project review.
 
 **Changes:** scheduled jobs and settings, after you approve. The plugin supplies the SessionStart notice.
 
@@ -15,13 +15,13 @@ Schedule a global audit and an optional weekly project review.
 
 ## Task
 
-The global audit runs about every 3 days without tokens and writes `token-audit-<timestamp>.md` in `audits/` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`). The optional weekly review uses tokens: one headless Sonnet run per enrolled project with activity since its last review, with no project cap. It writes a `token-audit-<timestamp>.md` and `cycle-<yyyy-mm-dd>.md` per project (a second one on the same day gets a `-2` suffix) in `audits/projects/<key>/` in that config dir. The scheduled audit also writes `audits/checks-<timestamp>.md`; project reviews also write `audits/projects/<key>/project-report-<timestamp>.md`. The SessionStart hook announces new reports. Jobs use launchd on macOS, or cron or systemd user timers on Linux. Windows users can run the scripts by hand.
+The session-start audit runs when the last successful audit is over 3 days old, without tokens and writes `token-audit-<timestamp>.md` in `audits/` in your Claude config dir (`$CLAUDE_CONFIG_DIR` or `~/.claude`). The optional weekly review uses tokens: one headless Sonnet run per enrolled project with activity since its last review, with no project cap. It writes a `token-audit-<timestamp>.md` and `cycle-<yyyy-mm-dd>.md` per project (a second one on the same day gets a `-2` suffix) in `audits/projects/<key>/` in that config dir. The scheduled audit also writes `audits/checks-<timestamp>.md`; project reviews also write `audits/projects/<key>/project-report-<timestamp>.md`. Set global `autoAudit=false` to disable session-start audits. The SessionStart notice announces new reports. Both audit paths run retention housekeeping; `retention=off` keeps files. Jobs use launchd on macOS, or cron or systemd user timers on Linux. Windows users can run the scripts by hand.
 
 Global `enabled` defaults to true; false turns off all scheduled work. Global or project `schedule` is `active` (default, review only after activity), `always`, or `off` (no review or notice). Global or project `scheduledAutonomy` is `propose` (default) or `auto`. Project values override global ones, except that a project's `scheduledAutonomy: auto` counts only when the project is in the global `autoProjects` list. `config set --for <dir> scheduledAutonomy=auto` and `install-schedule --auto <dir>` write that opt-in. Interactive `autonomy` is separate and is not read by scheduled runs.
 
 Installing or changing scheduled jobs is a hard stop in `${CLAUDE_PLUGIN_ROOT}/docs/autonomy.md`. Even in `safe`, `auto` or `yolo`, ask each question in order and wait for its answer:
 
-1. Install the 3-day audit (no tokens)?
+1. Install the optional 3-day OS audit (no tokens)?
 2. Add the weekly review for every enrolled project with activity (uses tokens)?
 3. If yes to 2, which projects may it change files in: none (default), all, or named ones?
 4. Any project to leave out?

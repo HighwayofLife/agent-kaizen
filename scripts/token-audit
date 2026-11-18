@@ -68,15 +68,99 @@ def metadata_row(line, timestamp):
         "attachment": dict(type=attachment, **value)}))
 
 
-def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None, first_row=None):
+# Top-level record kinds emitted by the two transcript formats.
+CLAUDE_TYPES = frozenset(("user", "assistant", "system", "progress", "file-history-snapshot",
+                          "queue-operation", "summary", "custom-title", "attachment", "api-request-shape",
+                          "last-prompt", "pr-link", "api-request", "api-request-blob", "atis-latch",
+                          "session-owner", "mode", "ai-title", "permission-mode", "tools-used",
+                          "cost-state", "file-history-delta"))
+CODEX_TYPES = frozenset(("session_meta", "turn_context", "response_item", "event_msg", "compacted",
+                         "token_usage_record", "world_state"))
+TYPE_FIELD = re.compile(rb'"type"\s*:\s*"([^"\\]+)"')
+VERSION_FIELD = re.compile(rb'"(?:version|cli_version)"\s*:')
+
+
+def canary_row(line, since, counts, codex, session_version):
+    # Decode candidate records for classification; never retain their content.
+    match = TYPE_FIELD.search(line[:1024])
+    kind = match[1].decode("ascii", "replace") if match else None
+    known = CODEX_TYPES if codex else CLAUDE_TYPES
+    # Large ordinary Codex response items are content, not usage records.
+    # Their session metadata carries the version; avoid decoding their bodies.
+    if (codex and kind == "response_item" and len(line) > 2048
+            and not VERSION_FIELD.search(line[:1024])):
+        stamp = TIMESTAMP.search(line[:1024])
+        if stamp:
+            try:
+                if date_time(stamp[1].decode("ascii")) >= since:
+                    counts[session_version or "unknown"]["records"] += 1
+            except (ValueError, TypeError, UnicodeError, OverflowError):
+                pass
+        return session_version
+    try:
+        row = json.loads(line)
+        if not isinstance(row, dict):
+            return session_version
+        payload = row.get("payload") if isinstance(row.get("payload"), dict) else {}
+        version = row.get("version") or row.get("cli_version") or (payload.get("cli_version") if codex else None)
+        if isinstance(version, str) and re.fullmatch(r"[A-Za-z0-9._+-]{1,64}", version):
+            session_version = version
+        version = (session_version if codex else (version if isinstance(version, str) and re.fullmatch(r"[A-Za-z0-9._+-]{1,64}", version) else None)) or "unknown"
+        timestamp = row.get("timestamp")
+        if not isinstance(timestamp, str) or date_time(timestamp) < since:
+            return session_version
+        kind = row.get("type")
+        entry = counts[version]
+        entry["records"] += 1
+        if not isinstance(kind, str) or kind not in known:
+            entry["unknown_records"] += 1
+            name = kind if isinstance(kind, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,40}", kind) else "<other>"
+            entry[("unknown_type", name)] += 1
+        if not codex and kind == "assistant":
+            message = row.get("message")
+            if isinstance(message, dict) and message.get("model") != "<synthetic>":
+                usage = message.get("usage")
+                if not isinstance(usage, dict) or not all(k in usage for k in ("input_tokens", "output_tokens")):
+                    entry["missing_usage"] += 1
+        if codex and kind == "event_msg" and payload.get("type") == "token_count":
+            info = payload.get("info")
+            usage = info.get("total_token_usage") if isinstance(info, dict) else None
+            if not isinstance(usage, dict) or not all(k in usage for k in ("input_tokens", "output_tokens", "total_tokens")):
+                entry["missing_usage"] += 1
+    except (ValueError, TypeError, UnicodeError, OverflowError, RecursionError):
+        pass
+    return session_version
+
+
+def canary_summary(counts):
+    unknown = sum(c["unknown_records"] for c in counts.values())
+    missing = sum(c["missing_usage"] for c in counts.values())
+    versions = ",".join(sorted(counts)) or "none"
+    return f"format_canary: v1 unknown_records={unknown} missing_usage={missing} cli={versions}"
+
+
+def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None, first_row=None, canary=None):
     """Timestamp and record-type gates run before decoding large content."""
     cutoff = since.strftime("%Y-%m-%dT%H:%M:%S")
     saved_shape, saved_deltas, before_user = None, [], False
+    saved_call = None
     last_prefix, last_timestamp, last_stamp = None, None, None
+    session_version = None
     try:
         with path.open("rb") as stream:
             for line_number, line in enumerate(stream):
                 prefix = line[:1024]
+                if canary is not None and b'"timestamp"' in prefix:
+                    stamp = TIMESTAMP.search(line)
+                    if stamp:
+                        value = stamp[1].decode("ascii", "replace")
+                        try:
+                            recent = (value[:19] >= cutoff if value.endswith(("Z", "+00:00"))
+                                      else date_time(value) >= since)
+                            if recent or (keep_model and b'"session_meta"' in prefix):
+                                session_version = canary_row(line, since, canary, keep_model, session_version)
+                        except (ValueError, TypeError, OverflowError):
+                            pass
                 if (bounds is not None and last_stamp is not None and line.startswith(last_prefix)
                         and keep_model and not keep_tools and not CODEX_ROW.search(prefix)
                         and b'"model"' not in line):
@@ -118,6 +202,16 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                     old = (timestamp[:19] < cutoff if timestamp.endswith(("Z", "+00:00"))
                            else date_time(timestamp) < since)
                     if old and keep_tools:
+                        if b'"usage"' in line and b'"assistant"' in prefix:
+                            try:
+                                candidate = json.loads(line)
+                                message = candidate.get("message") or {}
+                                usage = message.get("usage") or {}
+                                if (message.get("model") != "<synthetic>" and isinstance(usage, dict)
+                                        and (context(usage) or usage.get("output_tokens"))):
+                                    saved_call = (line, timestamp)
+                            except (ValueError, TypeError, AttributeError):
+                                pass
                         if metadata:
                             if b'"api-request-shape"' in prefix:
                                 saved_shape = (line, timestamp)
@@ -130,12 +224,18 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                         continue
                     if old and not (keep_model and (b'"model"' in line or b'"token_count"' in prefix or b'"user_message"' in prefix or b'"role":"user"' in prefix or b'"role": "user"' in prefix or (bounds is not None and b'"turn_context"' in prefix))):
                         continue
-                    if keep_tools and (saved_shape or saved_deltas or before_user):
+                    if keep_tools and (saved_shape or saved_deltas or before_user or saved_call):
                         for saved, ts in ([saved_shape] if saved_shape else []) + saved_deltas:
                             try:
                                 yield dict(metadata_row(saved, ts), _before_window=True)
                             except (ValueError, UnicodeError):
                                 warnings["malformed rows"] += 1
+                        if saved_call:
+                            try:
+                                yield dict(json.loads(saved_call[0]), _before_window=True)
+                            except (ValueError, UnicodeError):
+                                warnings["malformed rows"] += 1
+                            saved_call = None
                         if before_user:
                             yield dict(type="user", message={}, _before_window=True)
                         saved_shape, saved_deltas, before_user = None, [], False
@@ -155,6 +255,25 @@ def context(usage):
     return sum(usage.get(key, 0) or 0 for key in (
         "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
 
+
+
+CACHE_BUCKETS = ("first", "unknown", "le_5m", "gt_5m_le_60m", "gt_60m")
+
+
+def cache_bucket(previous, current, first=False):
+    if current is None or (previous is None and not first):
+        return "unknown"
+    if previous is None:
+        return "first"
+    seconds = (current - previous).total_seconds()
+    if seconds < 0:
+        return "unknown"
+    return "le_5m" if seconds <= 300 else "gt_5m_le_60m" if seconds <= 3600 else "gt_60m"
+
+
+def cache_add(groups, bucket, write, ctx):
+    entry = groups[bucket]
+    entry.update(writes=1, write_tokens=write, full_rewrites=int(ctx > 0 and write * 5 >= ctx * 4))
 
 def empty_synthetic(message, usage):
     """Claude Code writes zero-usage <synthetic> assistant rows; they are not model calls."""
@@ -451,12 +570,22 @@ def scan_claude(path, agent, since, data, seen_messages, project):
     observed = dict(main=main, known=False, available=set(), loading=defaultdict(set), servers=set(),
                     used=set(), prompts=0, cwd=None, active=False)
     turn = None
-    for row in rows(path, since, data["warnings"], keep_tools=True):
+    cache_previous = None
+    cache_seen = False
+    for row in rows(path, since, data["warnings"], keep_tools=True, canary=data["format_canary"]):
         if row.get("type") in ("api-request-shape", "attachment"):
             tool_metadata(row, observed)
             continue
         observed["cwd"] = row.get("cwd") or observed["cwd"]
         if row.get("_before_window"):
+            message = row.get("message") or {}
+            usage = message.get("usage") if isinstance(message, dict) else None
+            if row.get("type") == "assistant" and isinstance(usage, dict) and usage and not empty_synthetic(message, usage):
+                try:
+                    cache_previous = date_time(row.get("timestamp", ""))
+                except (ValueError, TypeError, OverflowError):
+                    cache_previous = None
+                cache_seen = True
             raw = (row.get("message") or {}).get("content", "")
             if (row.get("type") == "user" and not row.get("isMeta")
                     and "<task-notification>" not in str(raw)):
@@ -508,6 +637,16 @@ def scan_claude(path, agent, since, data, seen_messages, project):
                 label = row.get("perTurnEffort") or row.get("effort") or "unknown"
                 data["_agent_models"][agent][model] += 1
                 data["_agent_effort"][agent][label if isinstance(label, str) else "unknown"] += 1
+            try:
+                cache_time = date_time(ts)
+            except (ValueError, TypeError, OverflowError):
+                cache_time = None
+            write = usage.get("cache_creation_input_tokens", 0) or 0
+            if write > 0:
+                cache_add(data["cache_writes"]["main" if main else "subagent"],
+                          cache_bucket(cache_previous, cache_time, first=not cache_seen), write, context(usage))
+            cache_previous = cache_time
+            cache_seen = True
             add(data["models"][model], usage)
             add(counter, usage)
             cost = price(data, model, agent or "main", usage)
@@ -668,7 +807,7 @@ def scan_codex(root, since, data, cwd=None, realpaths=None):
         bounds = [None, None]
         # Older session files can contain recent resumes. Keep earlier model
         # metadata, but count only sessions with a token_count in the window.
-        for row in rows(path, since, data["warnings"], keep_model=True, bounds=bounds, first_row=first_row):
+        for row in rows(path, since, data["warnings"], keep_model=True, bounds=bounds, first_row=first_row, canary=data["format_canary"]):
             payload = row.get("payload") or {}
             if not isinstance(payload, dict):
                 continue
@@ -723,6 +862,9 @@ def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=No
                 triggers=defaultdict(Counter), tool_chars=Counter(), tool_counts=Counter(),
                 images=0, bash=defaultdict(Counter), bash_chars=defaultdict(Counter),
                 codex=defaultdict(Counter), codex_sessions=[], briefs=defaultdict(list), codex_briefs=defaultdict(list), warnings=Counter(), codex_files_scanned=0)
+    data["format_canary"] = defaultdict(Counter)
+    data["cache_writes"] = {kind: {bucket: Counter(writes=0, write_tokens=0, full_rewrites=0) for bucket in CACHE_BUCKETS}
+                            for kind in ("main", "subagent")}
     data.update(cost=dict(total=0, by_agent=Counter(), by_model=Counter(), components=Counter(),
                           unpriced={}, pricing_error=pricing_error),
                 deferred_tools_unused=0, stuck_turns=dict(turns=0, flagged_turns=0, tool_calls=0, cost=0, signatures=[]),
@@ -787,7 +929,16 @@ def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=No
         "brief_chars_median": int(statistics.median([n for values in data["briefs"].values() for n in values])) if data["briefs"] else 0,
         "codex_brief_chars_median": int(statistics.median([n for values in data["codex_briefs"].values() for n in values])) if data["codex_briefs"] else 0,
     }
+    unknown_types = Counter()
+    for counts in data["format_canary"].values():
+        unknown_types.update({key[1]: count for key, count in counts.items()
+                              if isinstance(key, tuple) and key[0] == "unknown_type"})
+    data["unknown_types"] = dict(unknown_types)
+    data["format_canary"] = {version: dict(records=c["records"], unknown_records=c["unknown_records"],
+                                            missing_usage=c["missing_usage"])
+                             for version, c in sorted(data["format_canary"].items())}
     h = data["headline"]
+    h["format_canary"] = canary_summary(data["format_canary"])
     h.update(claude_context_per_call=h["claude_context"] // h["claude_calls"] if h["claude_calls"] else 0,
              claude_output_per_call=h["claude_output"] // h["claude_calls"] if h["claude_calls"] else 0,
              image_reads_per_100_calls=round(100 * h["image_reads"] / h["claude_calls"], 1) if h["claude_calls"] else 0,
@@ -1177,6 +1328,20 @@ def report(data, out, scope):
     h = data["headline"]
     headline = [f"Claude: {h['claude_calls']:,} calls; {h['claude_context']:,} context tokens; {h['claude_output']:,} output tokens.",
                 f"Codex: {h['codex_sessions']:,} sessions; {h['codex_tokens']:,} tokens."]
+    cache = data["cache_writes"]
+    writes = sum(entry["writes"] for groups in cache.values() for entry in groups.values())
+    tokens = sum(entry["write_tokens"] for groups in cache.values() for entry in groups.values())
+    rewrites = sum(entry["full_rewrites"] for groups in cache.values() for entry in groups.values())
+    headline.append(f"Claude cache writes: {writes:,} calls; {tokens:,} tokens; {rewrites:,} full rewrites (at least 80% of context). First observed gaps may be unknown; Codex does not report cache writes.")
+    gap_counts = ", ".join(f"{bucket} {sum(groups[bucket]['writes'] for groups in cache.values()):,}"
+                           for bucket in CACHE_BUCKETS)
+    headline.append("Cache write gaps (main and individual subagent transcripts): " + gap_counts + ".")
+    if any(c["unknown_records"] or c["missing_usage"] for c in data["format_canary"].values()):
+        types = sorted(data.get("unknown_types", {}).items(), key=lambda item: (-item[1], item[0]))[:5]
+        suffix = " unknown_types=" + ",".join(f"{name}:{count}" for name, count in types) if types else ""
+        headline.append("FORMAT-DRIFT: " + h["format_canary"] + suffix)
+    elif not data["format_canary"]:
+        headline.append("FORMAT-DRIFT: no transcript data observed.")
     sections = []
     sections.append(("1. Totals by model (Claude)",
                      ["Model | Calls | Context | Cache-read share | Output"],
@@ -1356,6 +1521,7 @@ def main():
     parser.add_argument("--extract-out", type=Path, default=claude_home() / "audits" / "extracts",
                         help="extract directory (default: Claude config dir/audits/extracts)")
     parser.add_argument("--json", action="store_true", help="print full structured data instead of headline stdout")
+    parser.add_argument("--no-write", action="store_true", help="do not write a report or extract")
     parser.add_argument("--pricing", type=Path, default=Path(__file__).resolve().with_name("pricing.json"),
                         help="pricing file (default: pricing.json next to this script)")
     for flag, default, text in (
@@ -1401,13 +1567,15 @@ def main():
         for warning in data["parser_warnings"]:
             print(warning, file=sys.stderr)
         text, headline = report(data, out, scope)
-        out.parent.mkdir(parents=True, exist_ok=True)
-        out.write_text(text)
-        extract_path = write_extract(data, out, args.extract_out, scope)
+        extract_path = None
+        if not args.no_write:
+            out.parent.mkdir(parents=True, exist_ok=True)
+            out.write_text(text)
+            extract_path = write_extract(data, out, args.extract_out, scope)
         if args.json:
-            print(json.dumps(dict(report_path=str(out), extract_path=extract_path, **data), indent=2))
+            print(json.dumps(dict(report_path=None if args.no_write else str(out), extract_path=extract_path, **data), indent=2))
         else:
-            print(str(out) + "\n" + "\n".join(headline))
+            print(("" if args.no_write else str(out) + "\n") + "\n".join(headline))
         return 0
     except (OSError, ValueError) as exc:
         print(f"token-audit: {exc}", file=sys.stderr)
