@@ -114,7 +114,11 @@ class UsageTests(StubCase):
         usage = dict(input_tokens=20, cache_creation_input_tokens=80)
         def call(ts, ident):
             return dict(type='assistant', timestamp=ts, message=dict(id=ident, model='test', content=[], usage=usage))
-        jsonl(project / 'main.jsonl', [call('2025-01-01T23:59:00Z', 'a'),
+        synthetic = call('2025-01-01T23:59:30Z', 'synthetic')
+        synthetic['message'].update(model='<synthetic>', usage={'input_tokens': 0})
+        empty = call('2025-01-01T23:59:45Z', 'empty')
+        empty['message']['usage'] = {'input_tokens': 0}
+        jsonl(project / 'main.jsonl', [call('2025-01-01T23:59:00Z', 'a'), synthetic, empty,
                                       call('2025-01-02T00:01:00Z', 'b')])
         gaps = json.loads(self.run_script('token-audit', '--since', '2025-01-02', '--json').stdout)['cache_writes']['main']
         self.assertEqual(gaps['le_5m']['writes'], 1)

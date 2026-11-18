@@ -66,6 +66,14 @@ class ContextBudgetTest(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('over budget by 1 bytes', result.stderr)
 
+    def test_block_scalar_description(self):
+        for marker in ('>', '>-', '|', '|-'):
+            with self.subTest(marker=marker):
+                self.write('agents/a.md', '---\ndescription: ' + marker + '\n  ' + 'a' * 60 + '\n  ' + 'b' * 60 + '\n---\n')
+                result = self.run_check()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('over budget', result.stderr)
+
     def test_missing_hook_inventory(self):
         self.config['hooks'] = {}
         self.save_config()

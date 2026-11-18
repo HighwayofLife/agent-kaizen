@@ -33,6 +33,23 @@ class FormatCanaryTests(unittest.TestCase):
         self.assertEqual(dict(counts['unknown']), dict(records=3, missing_usage=1))
         self.assertNotIn('private prompt', repr(counts))
 
+    def test_invalid_versions_and_old_rows(self):
+        counts = defaultdict(Counter)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'rows.jsonl'
+            rows = [dict(type='user', version=v, timestamp='2026-01-01T00:00:00Z')
+                    for v in ('/private/path', 'person@example.invalid', ['bad'])]
+            old = b'{"timestamp":"2020-01-01T00:00:00Z","type":"future", broken}'
+            path.write_bytes(old + b'\n' + b''.join(json.dumps(row).encode() + b'\n' for row in rows))
+            original = json.loads
+            def guarded(value, *args, **kwargs):
+                self.assertNotEqual(value, old + b'\n')
+                return original(value, *args, **kwargs)
+            with patch.object(AUDIT['rows'].__globals__['json'], 'loads', side_effect=guarded):
+                list(AUDIT['rows'](path, SINCE, Counter(), keep_tools=True, canary=counts))
+        self.assertEqual(dict(counts['unknown']), {'records': 3})
+        self.assertEqual(list(counts), ['unknown'])
+
     def test_codex_version_and_missing_usage(self):
         counts = defaultdict(Counter)
         version = None
