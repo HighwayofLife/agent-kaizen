@@ -4,6 +4,7 @@ from contextlib import ExitStack, contextmanager
 import ctypes
 from datetime import datetime, timezone
 import errno
+from heapq import nlargest
 import json
 import math
 import os
@@ -27,6 +28,11 @@ ROW_LIMIT = 4096
 BUDGET = 0.250
 LOCK_RETRY_BUDGET = 0.020
 LOCK_NAME = ".lock"
+PROCESS_INTERVAL_NS = 300_000_000_000
+PROCESS_LIMIT = 256 * 1024
+CATALOGUE_LIMIT = 64 * 1024
+PROCESS_COMMAND = ("/bin/ps", "-A", "-ww", "-o", "pcpu=,comm=")
+CANCEL_SIGNALS = (signal.SIGALRM, signal.SIGTERM, signal.SIGINT) if fcntl is not None else ()
 NOFOLLOW = os.O_NOFOLLOW | os.O_NONBLOCK if fcntl is not None else 0
 
 
@@ -61,15 +67,17 @@ def enabled(home):
             and config.get("frictionSampler") != "off")
 
 
-def read_event(fd, deadline):
+def read_bounded(fd, deadline, limit, cancelled=None):
     data = bytearray()
-    while len(data) <= INPUT_LIMIT:
+    while len(data) <= limit:
         remaining = deadline - time.monotonic()
-        if remaining <= 0 or not select.select([fd], [], [], remaining)[0]:
+        if remaining <= 0 or (cancelled and cancelled()):
             return None
-        chunk = os.read(fd, min(65536, INPUT_LIMIT + 1 - len(data)))
+        if not select.select([fd], [], [], min(remaining, 0.005) if cancelled else remaining)[0]:
+            continue
+        chunk = os.read(fd, min(65536, limit + 1 - len(data)))
         if not chunk:
-            return decode(data)
+            return bytes(data)
         data.extend(chunk)
     return None
 
@@ -190,7 +198,24 @@ def repair_tail(fd, size):
     return end
 
 
-def append(path, day, row, deadline):
+def claim_process(lock):
+    # Keep one fixed-width stamp on the lock inode, shared across UTC days.
+    previous = os.pread(lock, 9, 0)
+    now = time.clock_gettime_ns(time.CLOCK_MONOTONIC)
+    if len(previous) == 8:
+        stamp = int.from_bytes(previous, "big")
+        elapsed = now - stamp if now >= stamp else now  # After a reboot, use uptime.
+        if elapsed < PROCESS_INTERVAL_NS:
+            return False
+    if sys.platform == "darwin" and has_extended_acl(lock):
+        return False
+    claimed = os.pwrite(lock, now.to_bytes(8, "big"), 0) == 8
+    if not claimed or len(previous) > 8:
+        os.ftruncate(lock, 8 if claimed else 0)
+    return claimed
+
+
+def append(path, day, row, deadline, want_process=False):
     if len(row) >= ROW_LIMIT or time.monotonic() >= deadline:
         return
     with storage(path, deadline) as directory:
@@ -211,16 +236,114 @@ def append(path, day, row, deadline):
                 if size + len(row) <= DAY_LIMIT and time.monotonic() < deadline:
                     if os.write(fd, row) != len(row):
                         os.ftruncate(fd, size)  # Roll back a partial row before unlocking.
+                    elif want_process and time.monotonic() < deadline:
+                        file_info(directory, LOCK_NAME, lock)
+                        return claim_process(lock)
 
 
-def sample(fd):
-    deadline = time.monotonic() + BUDGET
+def sibling(*names):
+    here = Path(__file__).resolve().parent
+    return next((here / name for name in names if (here / name).is_file()), here / names[-1])
+
+
+def catalogue_names():
+    path = sibling("kaizen-friction-catalog.json", "friction-catalog.json")
+    with open(path, "rb", opener=lambda name, flags: os.open(name, flags | os.O_NONBLOCK)) as stream:
+        if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+            return set()
+        data = stream.read(CATALOGUE_LIMIT + 1)
+    catalog = decode(data) if len(data) <= CATALOGUE_LIMIT else None
+    if (not isinstance(catalog, dict) or type(catalog.get("v")) is not int or catalog["v"] != 1
+            or not isinstance(catalog.get("processes"), dict)):
+        return set()
+    names = set()
+    for spec in catalog["processes"].values():
+        if not isinstance(spec, dict) or not isinstance(spec.get("names"), list):
+            return set()
+        # A wildcard match could disclose a private suffix chosen by another process.
+        names.update(name.encode("ascii") for name in spec["names"]
+                     if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", name))
+    return names
+
+
+def wait_for_query(pid, deadline, cancelled=lambda: False):
+    while not cancelled():
+        done, status = os.waitpid(pid, os.WNOHANG)
+        if done:
+            return status
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(0.001, remaining))
+
+
+def query_processes(deadline):
+    # Leave part of the worker's budget to kill and reap a timed-out query.
+    query_deadline = deadline - LOCK_RETRY_BUDGET
+    if time.monotonic() >= query_deadline:
+        return None
+    cancelled = False
+
+    def cancel(_signum, _frame):
+        # Raising here could lose the pid at spawn or interrupt teardown.
+        nonlocal cancelled
+        cancelled = True
+
+    with ExitStack() as stack:
+        for sig in CANCEL_SIGNALS:
+            stack.callback(signal.signal, sig, signal.signal(sig, cancel))
+        reader, writer = os.pipe()
+        stack.callback(os.close, reader)
+        pid = None
+        try:
+            try:
+                if cancelled or time.monotonic() >= query_deadline:
+                    return None
+                actions = [(os.POSIX_SPAWN_DUP2, writer, 1),
+                           # Keep the pipe open if a descendant redirects stdout.
+                           (os.POSIX_SPAWN_DUP2, writer, 3),
+                           (os.POSIX_SPAWN_OPEN, 0, os.devnull, os.O_RDONLY, 0),
+                           (os.POSIX_SPAWN_OPEN, 2, os.devnull, os.O_WRONLY, 0)]
+                pid = os.posix_spawn(PROCESS_COMMAND[0], PROCESS_COMMAND, {"LC_ALL": "C"},
+                                     file_actions=actions, setpgroup=0)
+            finally:
+                os.close(writer)
+            output = read_bounded(reader, query_deadline, PROCESS_LIMIT, lambda: cancelled)
+            status = wait_for_query(pid, query_deadline, lambda: cancelled) if output is not None else None
+            if status is not None:
+                pid = None
+        finally:
+            if pid is not None:
+                try:
+                    os.killpg(pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                wait_for_query(pid, deadline)
+    return output if status == 0 and not cancelled else None
+
+
+def process_basename_fields(output, names):
+    if not output or not output.endswith(b"\n"):
+        return []
+    rows = []
+    for line in output[:-1].split(b"\n"):
+        fields = line.split(None, 1)
+        if len(fields) != 2 or not re.fullmatch(rb"[0-9]{1,12}(?:\.[0-9]{1,6})?", fields[0]):
+            return []
+        rows.append((float(fields[0]), os.path.basename(fields[1])))
+    return [name for _, name in nlargest(10, rows) if name in names]
+
+
+def sample(fd, deadline=None):
+    if deadline is None:
+        deadline = time.monotonic() + BUDGET
     if fcntl is None or host() != "claude":
         return
     home = Path(os.getenv("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
     if not enabled(home):
         return
-    event = read_event(fd, deadline)
+    data = read_bounded(fd, deadline, INPUT_LIMIT)
+    event = decode(data) if data is not None else None
     if (not isinstance(event, dict) or event.get("hook_event_name") != "PostToolUse"
             or event.get("tool_name") != "Bash" or event.get("is_interrupt") is True):
         return
@@ -234,7 +357,15 @@ def sample(fd):
     fields = (str(ms), sample_id(event.get("session_id")), sample_id(event.get("tool_use_id")),
               duration_ms, load, cores)
     audits = Path(os.getenv("AUDIT_DIR") or home / "audits").expanduser()
-    append(audits / "samples", day, ("\t".join(fields) + "\n").encode("ascii"), deadline)
+    path = audits / "samples"
+    want_process = bool(load and cores and float(load) >= int(cores))
+    if append(path, day, ("\t".join(fields) + "\n").encode("ascii"), deadline, want_process):
+        names = catalogue_names()
+        if names:
+            hits = process_basename_fields(query_processes(deadline), names)
+            if hits:
+                prefix = "\t".join(("P", str(ms), load, cores)).encode("ascii")
+                append(path, day, b"\t".join([prefix] + hits) + b"\n", deadline)
 
 
 def deadline_expired(_signum, _frame):
@@ -244,17 +375,19 @@ def deadline_expired(_signum, _frame):
 def main():
     if fcntl is None:
         return
-    previous = signal.signal(signal.SIGALRM, deadline_expired)
+    deadline = time.monotonic() + BUDGET
+    previous = {sig: signal.signal(sig, deadline_expired) for sig in CANCEL_SIGNALS}
     try:
         try:
-            signal.setitimer(signal.ITIMER_REAL, BUDGET)
-            sample(sys.stdin.fileno())
+            signal.setitimer(signal.ITIMER_REAL, max(0, deadline - time.monotonic()))
+            sample(sys.stdin.fileno(), deadline)
         finally:
             signal.setitimer(signal.ITIMER_REAL, 0)
     except (OSError, ValueError, RuntimeError):
         pass
     finally:
-        signal.signal(signal.SIGALRM, previous)
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)
 
 
 if __name__ == "__main__":

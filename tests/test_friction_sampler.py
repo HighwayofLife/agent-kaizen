@@ -7,11 +7,12 @@ import fcntl
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import subprocess
 import sys
 import tempfile
-from threading import Barrier, local
+from threading import Barrier, Event, local
 import time
 import unittest
 from unittest.mock import patch
@@ -29,7 +30,9 @@ class SamplerTests(unittest.TestCase):
         self.config = self.root / "agent-kaizen.json"
         self.samples = self.root / "audits" / "samples"
         self.env = {"HOME": str(self.root), "CLAUDE_CONFIG_DIR": str(self.root)}
-        self.command = [sys.executable, str(SCRIPTS / "kaizen_friction_sample.py")]
+        worker = self.root / "kaizen_friction_sample.py"
+        shutil.copyfile(SCRIPTS / worker.name, worker)
+        self.command = [sys.executable, str(worker)]
         self.payload = dict(hook_event_name="PostToolUse", tool_name="Bash",
                             session_id="session-1", tool_use_id="tool_1", duration_ms=1234.9,
                             tool_input={"command": "omit this"}, tool_response="omit output")
@@ -44,6 +47,123 @@ class SamplerTests(unittest.TestCase):
     def log(self):
         (path,) = self.samples.glob("*.tsv")
         return path
+
+    def sample_event(self, deadline=None):
+        with tempfile.TemporaryFile() as stream:
+            stream.write(json.dumps(self.payload).encode())
+            stream.seek(0)
+            sampler.sample(stream.fileno(), deadline)
+
+    def process_rows(self):
+        return [line for path in sorted(self.samples.glob("*.tsv"))
+                for line in path.read_bytes().splitlines() if line.startswith(b"P\t")]
+
+    def test_process_claim_releases_lock_and_survives_utc_rollover(self):
+        ms = 1735775999999
+        elapsed = sampler.PROCESS_INTERVAL_NS
+        started, release = Event(), Event()
+
+        def query(_deadline):
+            started.set()
+            self.assertTrue(release.wait(2))
+            return b"1 mds\n"
+
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch.object(sampler, "metrics", return_value=("4", "4")), \
+                patch.object(time, "time_ns", side_effect=lambda: ms * 1_000_000), \
+                patch.object(time, "clock_gettime_ns", side_effect=lambda _: elapsed), \
+                patch.object(sampler, "query_processes", side_effect=query) as poll:
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                future = pool.submit(self.sample_event, time.monotonic() + 2)
+                try:
+                    self.assertTrue(started.wait(1))
+                    ms += 1  # A competing claim crosses midnight while the winner polls.
+                    pool.submit(self.sample_event).result(timeout=1)
+                    self.assertEqual(len((self.samples / "2025-01-02.tsv").read_bytes().splitlines()), 1)
+                    poll.assert_called_once()
+                finally:
+                    release.set()
+                future.result()
+            ms += 600_000  # A forward wall-clock adjustment cannot renew the claim.
+            elapsed += sampler.PROCESS_INTERVAL_NS - 1
+            self.sample_event()
+            poll.assert_called_once()
+            ms -= 300_001
+            elapsed += 1
+            self.sample_event()
+            self.assertEqual(poll.call_count, 2)
+            with patch.object(sampler, "metrics", return_value=("3.99", "4")):
+                elapsed += sampler.PROCESS_INTERVAL_NS
+                self.sample_event()
+                self.assertEqual(poll.call_count, 2)
+        self.assertEqual(self.process_rows(), [b"P\t1735775999999\t4\t4\tmds",
+                                               b"P\t1735776299999\t4\t4\tmds"])
+
+    def test_process_append_rechecks_cap_after_query(self):
+        def query(_deadline):
+            # Simulate a timing writer consuming the capacity while the lock is released.
+            path = self.log()
+            remaining = sampler.DAY_LIMIT - path.stat().st_size
+            sampler.append(self.samples, path.stem, b"x" * (remaining - 1) + b"\n", time.monotonic() + 1)
+            return b"1 mds\n"
+
+        with patch.dict(os.environ, self.env, clear=True), \
+                patch.object(sampler, "DAY_LIMIT", 128), \
+                patch.object(sampler, "metrics", return_value=("4", "4")), \
+                patch.object(sampler, "query_processes", side_effect=query) as poll:
+            self.sample_event()
+            self.assertEqual(self.log().stat().st_size, sampler.DAY_LIMIT)
+            self.assertEqual(self.process_rows(), [])
+            poll.assert_called_once()
+
+    def test_copied_worker_resolves_catalogue_and_filters_process_names(self):
+        self.command = [sys.executable, "-c",
+                        "import sys; import kaizen_friction_sample as s; "
+                        "s.metrics = lambda: ('4', '4'); "
+                        "s.PROCESS_COMMAND = (sys.executable, '-c', sys.argv[1]); s.main()",
+                        "print('99 private-name\\n98 mdworker_private\\n1 mds\\n2 /system bin/mdworker_shared')"]
+        self.env["PYTHONPATH"] = str(self.root)
+        self.run_hook()
+        lock = self.samples / sampler.LOCK_NAME
+        lock.write_bytes(b"")
+        shutil.copyfile(SCRIPTS / "friction-catalog.json", self.root / "kaizen-friction-catalog.json")
+        self.run_hook()
+        rows = self.log().read_bytes().splitlines()
+        self.assertEqual(len(rows), 3)
+        self.assertEqual(rows[2].split(b"\t"),
+                         [b"P", rows[1].split(b"\t")[0], b"4", b"4", b"mdworker_shared", b"mds"])
+
+    def test_unusable_process_queries_keep_timing_rows(self):
+        for code in ("print('1 mds'); raise SystemExit(1)", "print('1 mds\\nbad')",
+                     "print('1 mds', end='')", "print('x' * 300000)",
+                     "print('99 unknown\\n' * 10 + '1 mds')"):
+            with self.subTest(code=code), patch.dict(os.environ, self.env, clear=True), \
+                    patch.object(sampler, "PROCESS_COMMAND", (sys.executable, "-c", code)), \
+                    patch.object(sampler, "metrics", return_value=("4", "4")):
+                self.sample_event()
+                self.assertEqual(self.process_rows(), [])
+                (self.samples / sampler.LOCK_NAME).write_bytes(b"")
+        self.assertEqual(len(self.log().read_bytes().splitlines()), 5)
+
+    def test_timed_out_or_cancelled_query_is_killed_and_reaped(self):
+        pid_file = self.root / "query-pid"
+        for cancel in (False, True):
+            with self.subTest(cancel=cancel):
+                query = ("import os, pathlib, signal, sys, time; "
+                         "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
+                         + ("os.kill(os.getppid(), signal.SIGTERM); " if cancel else "") + "time.sleep(3)")
+                self.command = [sys.executable, "-c",
+                                "import sys, time; import kaizen_friction_sample as s; "
+                                "s.metrics = lambda: ('4', '4'); "
+                                "s.PROCESS_COMMAND = (sys.executable, '-c', *sys.argv[1:]); "
+                                "start = time.monotonic(); s.main(); "
+                                "assert time.monotonic() - start < s.BUDGET + 0.1", query, str(pid_file)]
+                self.run_hook(PYTHONPATH=str(SCRIPTS))
+                with self.assertRaises(ProcessLookupError):
+                    os.kill(int(pid_file.read_text()), 0)
+                pid_file.unlink()
+                self.assertEqual(self.process_rows(), [])
+                (self.samples / sampler.LOCK_NAME).write_bytes(b"")
 
     def test_layout_privacy_and_optional_values(self):
         start = time.time_ns() // 1_000_000
