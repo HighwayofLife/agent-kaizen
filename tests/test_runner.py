@@ -586,6 +586,31 @@ class DiscoveryTests(DiscoveryCase):
         for path in project.paths:
             self.assertEqual(index[str(path)], project.key)
 
+    def test_case_varied_worktree_prefixes_yield_one_project(self):
+        main = self.root / "main"
+        write(main / "Component/file", "x")
+        self.git(main, "init")
+        self.git(main, "add", ".")
+        self.git(main, "commit", "-m", "component")
+        first, second = self.root / "first", self.root / "second"
+        for branch, worktree in (("first", first), ("second", second)):
+            self.git(main, "worktree", "add", "-b", branch, str(worktree))
+        (second / "Component").rename(second / "moved")
+        (second / "moved").rename(second / "component")
+        if not (second / "Component").exists():
+            self.skipTest("case-sensitive temporary volume")
+        members = [first / "Component", second / "component"]
+        for member in members:
+            write(member / "docs/kaizen/config.json", "{}")
+        self.assertEqual({self.git(member, "rev-parse", "--show-prefix") for member in members},
+                         {"Component/\n", "component/\n"})
+        projects, _ = self.discover(members)
+        self.assertEqual([project.canonical for project in projects], [members[0]])
+        self.assertFalse(projects[0].unknown)
+        self.assertTrue(set(members) <= set(projects[0].paths))
+        output = self.preview(*(argument for member in members for argument in ("--project-dir", member)))
+        self.assertEqual(output.count("project: "), 1)
+
     def test_git_fallback_relative_common_dir_and_lexical_canonical(self):
         a, b = self.project("a"), self.project("b")
         replies = ["../shared", "../shared", ""]
@@ -666,7 +691,10 @@ class DiscoveryTests(DiscoveryCase):
         self.assertTrue(run.called)
         for call in run.call_args_list:
             self.assertEqual(call.args[0][0], "git")
-            self.assertEqual(call.kwargs, {"capture_output": True, "text": True, "timeout": 600})
+            kwargs = dict(call.kwargs)
+            self.assertFalse(set(kwargs.pop("env")) & set(self.runner.GIT_LOCATION_ENV))
+            self.assertEqual(kwargs, {"capture_output": True, "encoding": "utf-8", "errors": "surrogateescape",
+                                      "timeout": 600})
 
 
 class GateTests(DiscoveryCase):
@@ -788,7 +816,7 @@ class GateTests(DiscoveryCase):
         projects = self.discover([parent, child])[0]
         cache = {}
         with patch.object(self.runner, "first_cwd", wraps=self.runner.first_cwd) as sniff:
-            with patch.object(self.runner.os.path, "realpath", wraps=os.path.realpath) as resolve:
+            with patch.object(self.runner, "canonical_path", wraps=self.runner.canonical_path) as resolve:
                 self.assertFalse(self.decision(parent, projects=projects, cache=cache)[0])
                 self.assertTrue(self.decision(child, projects=projects, cache=cache)[0])
         sniff.assert_called_once_with(session)
@@ -852,6 +880,19 @@ class GateTests(DiscoveryCase):
                 self.assertFalse(self.decision(path, projects=projects)[0])
 
     @unittest.skipUnless(shutil.which("git"), "git required")
+    def test_case_alias_session_cwd_counts_as_activity(self):
+        path = self.project("Mixed")
+        alias = self.root / "mIXED"
+        if not alias.exists():
+            self.skipTest("case-sensitive temporary volume")
+        for session in (lambda: self.claude_session(alias / "docs"), lambda: self.codex_session(alias)):
+            with self.subTest(session=session):
+                for stale in (self.cfg / "projects", self.cx / "sessions"):
+                    shutil.rmtree(stale, ignore_errors=True)
+                self.stamp(session())
+                self.assertEqual(self.decision(path)[0], True)
+        self.assertIn("gate: due (activity (codex session))", self.preview("--project-dir", path))
+
     def test_worktree_activity_counts_for_merged_project(self):
         self.env.update(GIT_AUTHOR_DATE="2026-10-01T00:00:00Z", GIT_COMMITTER_DATE="2026-10-01T00:00:00Z")
         main = self.repo("main")

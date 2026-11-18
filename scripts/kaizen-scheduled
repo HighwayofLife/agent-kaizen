@@ -564,17 +564,30 @@ def first_cwd(path, max_lines=50):
 
 
 class Project:
-    def __init__(self, canonical, paths, folder=None):
+    def __init__(self, canonical, paths, folder=None, unknown=False, anchors=None):
         self.canonical = Path(canonical).resolve()
         self.paths = sorted({self.canonical, *(Path(path).resolve() for path in paths)})
+        # Paths whose relative layout maps onto `canonical` (one per worktree): selectors are relative to them.
+        self.anchors = sorted({self.canonical, *(Path(path).resolve() for path in
+                                                  (paths if anchors is None else anchors))})
         self.key = key(self.canonical)
         self.folder = Path(folder) if folder is not None else audits_dir() / "projects" / self.key
+        # A Git probe failed, so the grouping may differ from a later run: no stable action scope.
+        self.unknown = unknown
+
+
+# Repository-locating variables would make the CLI and scheduled runs discover different scopes.
+GIT_LOCATION_ENV = ("GIT_DIR", "GIT_WORK_TREE", "GIT_COMMON_DIR", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY",
+                    "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE", "GIT_PREFIX",
+                    "GIT_CEILING_DIRECTORIES", "GIT_DISCOVERY_ACROSS_FILESYSTEM")
 
 
 def _git(directory, *arguments):
+    environment = {name: value for name, value in os.environ.items() if name not in GIT_LOCATION_ENV}
     try:
-        result = run_group(["git", "-C", str(directory), *arguments],
-                                capture_output=True, text=True, timeout=STEP_TIMEOUT)
+        # Fixed decoding keeps non-ASCII paths identical under any locale.
+        result = run_group(["git", "-C", str(directory), *arguments], capture_output=True, encoding="utf-8",
+                           errors="surrogateescape", env=environment, timeout=STEP_TIMEOUT)
     except (OSError, UnicodeError, subprocess.TimeoutExpired):
         return None
     return result.stdout.rstrip("\r\n") if result.returncode == 0 else None
@@ -608,6 +621,35 @@ def git_common_dir(directory):
     # Relative to `directory`; git < 2.31 echoes back --path-format=absolute.
     common = _git(directory, "rev-parse", "--git-common-dir")
     return (directory / common).resolve() if common else None
+
+
+def in_git_checkout(directory):
+    return any(os.path.lexists(path / ".git") for path in (directory, *directory.parents))
+
+
+def worktree_paths(directory):
+    """Return (existing canonical worktrees, complete), or None when Git cannot list them."""
+    output = _git(directory, "worktree", "list", "--porcelain", "-z")
+    exact = output is not None
+    if not exact:  # git < 2.36 has no -z; a path with a newline cannot be parsed there.
+        output = _git(directory, "worktree", "list", "--porcelain")
+        if output is None:
+            return None
+    listed, complete = [], True
+    for field in output.split("\0" if exact else "\n"):
+        if not field.startswith("worktree "):
+            continue
+        try:
+            path = canonical_path(field[len("worktree "):])
+        except (FileNotFoundError, NotADirectoryError):
+            complete = complete and exact  # A deleted worktree, unless the line was misparsed.
+            continue
+        except (OSError, RuntimeError, ValueError):
+            complete = False
+            continue
+        if path.is_dir():
+            listed.append(path)
+    return listed, complete
 
 
 def discover(claude_root, codex_root, index, project_dirs=None):
@@ -657,41 +699,54 @@ def discover(claude_root, codex_root, index, project_dirs=None):
         else:
             enrolled.add(project)
 
-    groups = {}
+    groups, unknown = {}, set()
     for directory in sorted(enrolled):
         common = git_common_dir(directory)
+        if common is None and in_git_checkout(directory):
+            unknown.add(directory)  # Never treat a checkout whose probe failed as standalone.
         groups.setdefault(("git", common) if common else ("directory", directory), []).append(directory)
 
-    projects = []
+    found = {}
+
+    def add(canonical, paths, uncertain, anchors=None):
+        # Case-varied prefixes in other worktrees can resolve to one canonical scope.
+        merged, was_uncertain, mapped = found.get(canonical, (set(), False, set()))
+        found[canonical] = (merged | set(paths), was_uncertain or uncertain,
+                            mapped | set(paths if anchors is None else anchors))
+
     for (kind, common), directories in groups.items():
-        paths = set(directories)
-        listed = []
-        worktrees = _git(directories[0], "worktree", "list", "--porcelain")
-        for line in (worktrees or "").splitlines():
-            if line.startswith("worktree "):
-                try:
-                    path = canonical_path(line[len("worktree "):])
-                except (OSError, RuntimeError, ValueError):
-                    continue
-                if path.is_dir():
-                    listed.append(path)
-                    paths.add(path)
-        root = (common.parent if kind == "git" and common.name == ".git"
-                else listed[0] if kind == "git" and listed else None)
-        if root is None:
-            projects.append(Project(directories[0], paths))
+        if kind == "directory":
+            add(directories[0], directories, directories[0] in unknown)
             continue
-        # Group the same enrolled prefix across worktrees, even when the repository root is enrolled.
+        worktrees = worktree_paths(directories[0])
+        listed, complete = worktrees if worktrees is not None else ([], False)
+        paths = set(directories) | set(listed)
+        root = common.parent if common.name == ".git" else listed[0] if listed else None
+        try:
+            root = canonical_path(root) if root is not None else None
+        except (OSError, RuntimeError, ValueError):
+            root = None
+        if root is None:
+            add(directories[0], paths, True)
+            continue
         roots = {root, *listed}
+        if (root / "docs/kaizen").is_dir():
+            # The repository root is itself enrolled: it is the project, with every worktree and
+            # every enrollment nested in any of them.
+            add(root, paths, not complete, anchors=roots)
+            continue
+        # Enrolled subdirectories of a larger repository: one project per subdirectory,
+        # grouped with the same subdirectory of the other worktrees.
         prefixes = {}
         for directory in directories:
             prefix = "" if directory in roots else _git(directory, "rev-parse", "--show-prefix")
             prefixes.setdefault(prefix.rstrip("/") if prefix is not None else None, []).append(directory)
         for prefix, members in prefixes.items():
             if prefix is None:
-                projects.extend(Project(member, {member}) for member in members)
+                for member in members:
+                    add(member, {member}, True)
                 continue
-            peers = {}
+            peers, uncertain = {}, not complete
             enrolled_peers = set(members)
             for worktree in roots:
                 peer = worktree / prefix
@@ -700,15 +755,20 @@ def discover(claude_root, codex_root, index, project_dirs=None):
                         continue
                     peer = canonical_path(peer)
                 except (OSError, RuntimeError, ValueError):
+                    uncertain = True
                     continue
                 if peer not in enrolled_peers and (peer / "docs/kaizen").is_dir():
-                    if git_common_dir(peer) != common:
+                    peer_common = git_common_dir(peer)
+                    if peer_common != common:
+                        uncertain = uncertain or peer_common is None
                         continue
                     enrolled_peers.add(peer)
                 peers[worktree] = peer
             main = peers.get(root)
             canonical = main if main in enrolled_peers else min(enrolled_peers)
-            projects.append(Project(canonical, {*members, *peers.values()}))
+            add(canonical, {*members, *peers.values()}, uncertain)
+    projects = [Project(canonical, paths, unknown=uncertain, anchors=anchors)
+                for canonical, (paths, uncertain, anchors) in found.items()]
     return sorted(projects, key=lambda project: project.canonical), sorted(not_enrolled)
 
 
@@ -828,12 +888,16 @@ def file_belongs(path, folder_name, target_paths, cache=None, codex=False):
     if cwd is None:
         return not codex and any(folder_name == re.sub(r"[^a-zA-Z0-9]", "-", str(target))
                                  for target in target_paths)
-    key = ("realpath", cwd)
+    key = ("canonical", cwd)
     if key not in cache:
         try:
-            cache[key] = os.path.realpath(cwd)
-        except (OSError, ValueError):  # e.g. an embedded NUL in a malformed row
-            cache[key] = cwd
+            # Match discovery's spelling, so a case alias of an enrolled path still counts.
+            cache[key] = str(canonical_path(cwd))
+        except (OSError, RuntimeError, ValueError):  # e.g. a deleted directory or an embedded NUL
+            try:
+                cache[key] = os.path.realpath(cwd)
+            except (OSError, ValueError):
+                cache[key] = cwd
     return any(candidate == str(target) or candidate.startswith(str(target).rstrip(os.sep) + os.sep)
                for target in target_paths for candidate in (cwd, cache[key]))
 
@@ -2233,16 +2297,24 @@ def action_project(directory, *, selector=None):
     if member is None:
         raise ValueError("host actions require an enrolled project")
     (project,), _ = discover(None, None, {}, [member])
+    if project.unknown:
+        raise ValueError("project scope is unknown because a Git probe failed; try again")
     if selector is None:
         return project.canonical
 
     target = canonical_path(member / selector)
-    owner = enrolled_project(target if target.is_dir() else target.parent)
-    if owner not in project.paths:
+    # The innermost worktree anchor holding the target, so a worktree nested in another maps correctly.
+    anchor = max((path for path in project.anchors if path == target or path in target.parents),
+                 key=lambda path: len(path.parts), default=None)
+    if anchor is None:
         raise ValueError("action target is outside the enrolled project")
-    target = canonical_path(project.canonical / target.relative_to(owner))
-    if enrolled_project(target if target.is_dir() else target.parent) != project.canonical:
-        raise ValueError("action target is outside the canonical project")
+    target = canonical_path(project.canonical / target.relative_to(anchor))
+    owner = enrolled_project(target if target.is_dir() else target.parent)
+    if owner != project.canonical:
+        # A nested enrollment belongs to this project only if discovery merges it (enrolled Git root).
+        (scope,), _ = discover(None, None, {}, [owner])
+        if scope.unknown or scope.canonical != project.canonical:
+            raise ValueError("action target is outside the canonical project")
     return project.canonical, target
 
 

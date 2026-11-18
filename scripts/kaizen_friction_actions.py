@@ -1,6 +1,7 @@
 """Machine-local identity and manual state for scoped host actions."""
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
+import errno
 import hashlib
 import hmac
 import json
@@ -8,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 
 try:
     import fcntl
@@ -16,6 +18,7 @@ except ImportError:
 
 STORE_LIMIT = 1024 * 1024
 EVIDENCE_LIMIT = 500
+CREATE_RETRIES = 100
 STATES = {"done": "done", "dismiss": "dismissed", "reopen": "open"}
 CATALOG_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 ROW_FIELDS = set("canonical_project catalog_id selector_key subject projects status first_seen updated_at "
@@ -35,7 +38,33 @@ def _id(secret, project, catalog_id, selector):
     return "fa1_" + hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def _check_directory(fd, owner=False, private=False):
+def _has_extended_acl(fd):
+    # Mirrors kaizen_friction_sample.has_extended_acl: Darwin ACLs can grant access the mode bits hide.
+    try:
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        get_acl, free_acl = libc.acl_get_fd_np, libc.acl_free
+    except (ImportError, AttributeError) as error:
+        raise OSError("cannot verify host-action ACL") from error
+    get_acl.argtypes = (ctypes.c_int, ctypes.c_int)
+    get_acl.restype = ctypes.c_void_p
+    free_acl.argtypes = (ctypes.c_void_p,)
+    acl = get_acl(fd, 0x100)  # ACL_TYPE_EXTENDED in sys/acl.h
+    if acl:
+        free_acl(acl)
+        return True
+    error = ctypes.get_errno()
+    if error != errno.ENOENT:  # Darwin returns ENOENT for an inode without an ACL.
+        raise OSError(error, "cannot verify host-action ACL")
+    return False
+
+
+def _check_acl(fd, kind):
+    if sys.platform == "darwin" and _has_extended_acl(fd):
+        raise ValueError(f"extended ACL on host-action {kind}")
+
+
+def _check_directory(fd, owner=False, private=False, store=False):
     info = os.fstat(fd)
     uid = os.geteuid()
     # A root-owned sticky ancestor (such as /tmp) protects each verified child from unlink or rename.
@@ -43,6 +72,8 @@ def _check_directory(fd, owner=False, private=False):
     if (info.st_uid not in ((uid,) if owner else (0, uid))
             or (info.st_mode & (0o077 if private else 0o022) and not sticky)):
         raise ValueError("unsafe host-action directory")
+    if store:
+        _check_acl(fd, "directory")
 
 
 @contextmanager
@@ -68,14 +99,19 @@ def _directory(path, create=False, private=False):
                     os.mkdir(name, 0o700, dir_fd=fd)
                 except FileExistsError:  # Another writer created the directory.
                     pass
-                else:
-                    os.fsync(fd)
                 child = os.open(name, flags, dir_fd=fd)
+            try:
+                if create and os.fstat(child).st_uid == os.geteuid():
+                    # This or a concurrent writer may have just created the entry: make it durable first.
+                    os.fsync(fd)
+            except BaseException:
+                os.close(child)
+                raise
             os.close(fd)
             fd = child
             remaining = len(path.parts) - index - 1
             _check_directory(fd, owner=remaining == 0 or (private and remaining == 1),
-                             private=private and remaining == 0)
+                             private=private and remaining == 0, store=remaining == 0)
         yield fd
     finally:
         os.close(fd)
@@ -83,7 +119,14 @@ def _directory(path, create=False, private=False):
 
 @contextmanager
 def _private_file(directory, name, flags=os.O_RDONLY, replaced=False):
-    fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
+    for attempt in range(CREATE_RETRIES):
+        try:
+            fd = os.open(name, flags | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory)
+            break
+        except FileNotFoundError:
+            # Darwin can fail concurrent O_CREAT opens of one new name with ENOENT.
+            if not flags & os.O_CREAT or attempt == CREATE_RETRIES - 1:
+                raise
     try:
         info = os.fstat(fd)
         # A reader can hold the previous inode after an atomic replacement.
@@ -91,6 +134,7 @@ def _private_file(directory, name, flags=os.O_RDONLY, replaced=False):
         if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
                 or info.st_mode & 0o077 or info.st_nlink not in links):
             raise ValueError("unsafe host-action file")
+        _check_acl(fd, "file")
         yield fd
     finally:
         os.close(fd)
@@ -106,8 +150,12 @@ def _read(directory, name, limit, replaced=False):
 
 @contextmanager
 def _locked(directory, name):
-    with _private_file(directory, name + ".lock", os.O_RDWR | os.O_CREAT) as fd:
+    name += ".lock"
+    with _private_file(directory, name, os.O_RDWR | os.O_CREAT) as fd:
         fcntl.flock(fd, fcntl.LOCK_EX)
+        # A replaced lock entry would let a later writer lock a different inode.
+        if not os.path.samestat(os.fstat(fd), os.stat(name, dir_fd=directory, follow_symlinks=False)):
+            raise ValueError("host-action lock was replaced")
         yield
 
 

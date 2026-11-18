@@ -126,6 +126,19 @@ class HostActionsTests(unittest.TestCase):
                          (ident, str(nested), str(target), [RUNNER["key"](nested)]))
         self.assertEqual(self.store.scoped(self.project), [])
 
+        # In a Git repository the enrolled root wins: the nested enrollment and its selectors map onto it.
+        self.git(self.project, "init")
+        self.assertEqual(RUNNER["action_project"](nested), self.project)
+        ids = {self.store.record(project, "target", selector, "evidence", path=True)
+               for project, selector in ((self.project, target), (self.project, alias),
+                                         (self.project, "Nested/File"), (nested, target.name))}
+        self.assertEqual(len(ids), 1)
+        self.assertNotIn(ident, ids)
+        row, = self.store.scoped(nested)
+        self.assertEqual((row["id"], row["canonical_project"], row["selector_key"], row["projects"]),
+                         (*ids, str(self.project), str(target), [RUNNER["key"](self.project)]))
+        self.assertEqual(self.store.scoped(self.project), [row])
+
     def test_scheduled_and_cli_share_linked_subproject_ids(self):
         main, first, second = (self.root / name for name in ("main", "z-worktree", "a-worktree"))
         component = " component"
@@ -157,12 +170,30 @@ class HostActionsTests(unittest.TestCase):
                          (str(member), str(member / "File"), False))
         self.cli("list", project=main / component, code=2)
 
+        # Once the repository root is enrolled it wins: every nested enrollment in any worktree joins it.
         for worktree in (main, first, second):
             (worktree / "docs/kaizen").mkdir(parents=True)
+        scheduled = [RUNNER["discover"](None, None, {}, [directory])[0][0]
+                     for directory in (first / component, second / component, first, main)]
+        self.assertEqual([project.canonical for project in scheduled], [main] * 4)
+        for directory in (main, main / component, first / component, second):
+            self.assertEqual(RUNNER["action_project"](directory), main)
+        root_ids = {self.store.record(worktree / component, "target", worktree / component / "File",
+                                      "evidence", path=True) for worktree in (first, second)}
+        root_ids |= {self.store.record(project, "target", selector, "evidence", path=True)
+                     for project, selector in ((main, f"{component}/File"), (first, f"{component}/File"),
+                                               (second / component, "File"))}
+        self.assertEqual(len(root_ids), 1)
+        self.assertTrue(root_ids.isdisjoint(path_ids))
+        row, = json.loads(self.cli("list", "--json", project=first / component))
+        self.assertEqual((row["id"], row["canonical_project"], row["selector_key"], row["projects"]),
+                         (*root_ids, str(main), str(main / component / "File"), [RUNNER["key"](main)]))
+        self.assertEqual([row["id"] for row in self.store.scoped(second / component)], [*root_ids])
+
         (main / component / "docs/kaizen").mkdir(parents=True)
         self.git(main / component, "init")  # An independently enrolled repository at the same prefix.
-        self.assertEqual(RUNNER["action_project"](first / component), member)
-        self.assertEqual(self.store.scoped(first), [])
+        self.assertEqual(RUNNER["action_project"](main / component), main / component)
+        self.assertEqual(RUNNER["action_project"](first / component), main)
         for project, target in ((first, first / component / "File"), (first / component, main / component / "File")):
             with self.assertRaises(ValueError):
                 self.store.action_id(project, "target", target, path=True)
@@ -241,7 +272,8 @@ class HostActionsTests(unittest.TestCase):
         with patch.object(os, "replace", side_effect=rename), patch.object(os, "fsync", side_effect=lambda fd:
                 events.append("directory" if stat.S_ISDIR(os.fstat(fd).st_mode) else "file")):
             self.store.mark(self.project, ident, "done")
-        self.assertEqual(events, ["file", "replace", "directory"])
+        self.assertEqual(events[events.index("file"):], ["file", "replace", "directory"])
+        self.assertEqual(set(events[:events.index("file")]), {"directory"})
 
     def test_ancestor_swap_after_lock_cannot_redirect_writer(self):
         ident = self.record()
@@ -439,3 +471,183 @@ class HostActionsTests(unittest.TestCase):
         path.unlink()
         path.symlink_to(self.secret)
         self.cli("done", ident, code=2)
+
+    def linked(self, *names, component=" component"):
+        main = self.root / "main"
+        (main / component).mkdir(parents=True)
+        (main / component / "File").touch()
+        self.git(main, "init")
+        self.git(main, "add", ".")
+        self.git(main, "commit", "-m", "Add component")
+        worktrees = [self.root / name for name in names]
+        for number, worktree in enumerate(worktrees):
+            self.git(main, "worktree", "add", "-b", f"branch-{number}", str(worktree))
+            (worktree / component / "docs/kaizen").mkdir(parents=True)
+        return main, [worktree / component for worktree in worktrees]
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin extended ACLs")
+    def test_darwin_extended_acls_refuse_store_key_and_locks(self):
+        self.record()
+        second = actions.HostActions(self.root / "second-audits", self.secret.parent.parent,
+                                     RUNNER["action_project"], RUNNER["key"])
+        key_lock = self.secret.with_suffix(".key.lock")
+        rows_lock = self.store.path.with_suffix(".json.lock")
+        before = self.store.path.read_bytes()
+        for path in (self.store.path.parent, self.store.path, rows_lock, self.secret.parent, self.secret, key_lock):
+            use = second if path == key_lock else self.store
+            grant = "group:everyone allow " + ("list" if path.is_dir() else "read")
+            subprocess.run(["chmod", "+a", grant, str(path)], check=True)
+            try:
+                with self.subTest(path=path.name), self.assertRaisesRegex(ValueError, "ACL"):
+                    use.action_id(self.project, "low-disk", "ls -a", allowed=LITERALS)
+                if path not in (rows_lock, key_lock):
+                    with self.subTest(path=path.name, read=True), self.assertRaisesRegex(ValueError, "ACL"):
+                        self.store.scoped(self.project)
+            finally:
+                subprocess.run(["chmod", "-N", str(path)], check=True)
+        self.assertEqual(self.store.path.read_bytes(), before)
+        self.assertFalse(second.path.exists())
+        self.assertEqual(len(self.store.scoped(self.project)), 1)
+
+    def test_failed_git_probe_leaves_linked_scope_unknown(self):
+        _, (member,) = self.linked("worktree")
+        canonical = RUNNER["action_project"](member)
+        namespace = RUNNER["discover"].__globals__
+        real = namespace["_git"]
+        for probe in ("--git-common-dir", "list", "--show-prefix"):
+            def timed_out(directory, *arguments):
+                return None if probe in arguments else real(directory, *arguments)
+
+            with self.subTest(probe=probe), patch.dict(namespace, _git=timed_out):
+                for mint in (self.store.action_id, self.store.record):
+                    with self.assertRaisesRegex(ValueError, "unknown"):
+                        mint(member, "low-disk", "ls", allowed=LITERALS)
+                with self.assertRaisesRegex(ValueError, "unknown"):
+                    self.store.scoped(member)
+            self.assertFalse(self.store.path.parent.exists())
+        fake = self.root / "bin"
+        fake.mkdir()
+        (fake / "git").write_text("#!/bin/sh\nexit 1\n")
+        (fake / "git").chmod(0o700)
+        ident = self.record(member)
+        result = subprocess.run([sys.executable, str(SCRIPT), "actions", "done", ident, "--for", str(member)],
+                                capture_output=True, text=True, env=dict(self.env, PATH=f"{fake}:{os.defpath}"))
+        self.assertEqual((result.returncode, result.stdout), (2, ""))
+        self.assertIn("scope is unknown", result.stderr)
+        self.assertEqual(json.loads(self.cli("list", "--json", project=member))[0]["status"], "open")
+        self.assertEqual(self.store.scoped(member)[0]["canonical_project"], str(canonical))
+
+    def test_special_character_worktree_paths_keep_cli_and_scheduled_ids(self):
+        names = ('a "q\\ wt', "n\nwt", "z-wt")
+        _, members = self.linked(*names)
+        expected = members[0]
+        for member in members:
+            with self.subTest(member=member.parent.name):
+                project, = RUNNER["discover"](None, None, {}, [member])[0]
+                self.assertEqual(project.canonical, expected)
+                self.assertTrue(set(members) <= set(project.paths))
+                self.assertFalse(project.unknown)
+        ident = self.record(members[2])
+        self.assertEqual({self.record(member) for member in members}, {ident})
+        row, = json.loads(self.cli("list", "--json", project=members[1]))
+        self.assertEqual((row["id"], row["canonical_project"]), (ident, str(expected)))
+        namespace = RUNNER["discover"].__globals__
+        real = namespace["_git"]
+        with patch.dict(namespace, _git=lambda directory, *arguments:  # git < 2.36 rejects -z.
+                        None if "-z" in arguments else real(directory, *arguments)):
+            for member in members:
+                with self.subTest(member=member.parent.name, git="old"), self.assertRaisesRegex(ValueError, "unknown"):
+                    self.record(member)
+
+    def test_git_location_environment_cannot_change_scope(self):
+        _, (canonical, member) = self.linked("a-wt", "z-wt")
+        ident = self.record(member)
+        self.assertEqual(self.store.scoped(member)[0]["canonical_project"], str(canonical))
+        other = self.root / "other-repo"
+        other.mkdir()
+        self.git(other, "init")
+        for name, value in (("GIT_DIR", str(other / ".git")), ("GIT_COMMON_DIR", str(other / ".git")),
+                            ("GIT_CEILING_DIRECTORIES", str(member.parent))):
+            with self.subTest(variable=name), patch.dict(os.environ, {name: value}):
+                self.assertEqual(self.record(member), ident)
+                result = subprocess.run([sys.executable, str(SCRIPT), "actions", "list", "--for", str(member)],
+                                        capture_output=True, text=True, env=dict(self.env, **{name: value}))
+                self.assertEqual((result.returncode, result.stdout.split(" ")[0]), (0, ident), result.stderr)
+
+    def test_store_directories_are_fsynced_before_first_use(self):
+        claude, backup = self.store.path.parent.parent, self.store.friction.parent
+        mkdir = os.mkdir
+
+        def raced(name, mode=0o777, *, dir_fd=None):
+            mkdir(name, 0o700, dir_fd=dir_fd)  # Another writer wins the race but has not fsynced yet.
+            raise FileExistsError(name)
+
+        for case in ("existing", "raced"):
+            with self.subTest(case=case):
+                for directory in (self.store.path.parent, self.store.friction):
+                    shutil.rmtree(directory, ignore_errors=True)
+                if case == "existing":
+                    for directory in (self.store.path.parent, self.store.friction):
+                        directory.mkdir(mode=0o700, parents=True)
+                events = []
+                fsync = os.fsync
+
+                def observe(fd):
+                    info = os.fstat(fd)
+                    events.append((info.st_dev, info.st_ino) if stat.S_ISDIR(info.st_mode) else "file")
+                    return fsync(fd)
+
+                with patch.object(os, "fsync", side_effect=observe), \
+                        patch.object(os, "mkdir", side_effect=raced if case == "raced" else mkdir):
+                    self.record()
+                first_file = events.index("file")
+                for parent in (claude, backup):
+                    info = parent.stat()
+                    self.assertIn((info.st_dev, info.st_ino), events[:first_file])
+
+    def test_replaced_lock_entry_refuses_write(self):
+        ident = self.record()
+        before = self.store.path.read_bytes()
+        lock = self.store.path.with_suffix(".json.lock")
+        flock = actions.fcntl.flock
+
+        def replace_lock(fd, operation):
+            flock(fd, operation)
+            lock.rename(lock.with_name("displaced.lock"))
+            lock.touch(mode=0o600)
+
+        with patch.object(actions.fcntl, "flock", side_effect=replace_lock), \
+                self.assertRaisesRegex(ValueError, "lock was replaced"):
+            self.store.mark(self.project, ident, "done")
+        self.assertEqual(self.store.path.read_bytes(), before)
+
+    def test_spurious_enoent_from_concurrent_lock_creation_is_retried(self):
+        self.record()
+        lock = self.store.path.with_suffix(".json.lock")
+        lock.unlink()
+        real, failures = os.open, []
+
+        def racing(path, flags, *args, **kwargs):
+            if path == lock.name and flags & os.O_CREAT and len(failures) < 3:
+                failures.append(path)
+                raise FileNotFoundError(path)  # What Darwin reports when two creators race.
+            return real(path, flags, *args, **kwargs)
+
+        with patch.object(os, "open", side_effect=racing):
+            self.record(literal="ls -a")
+        self.assertEqual(len(failures), 3)
+        self.assertEqual(len(self.store.scoped(self.project)), 2)
+
+    def test_reported_extended_acl_refuses_store_files_on_any_platform(self):
+        self.record()
+        before = self.store.path.read_bytes()
+        for path in (self.store.path.parent, self.store.path, self.secret.parent, self.secret):
+            identity = path.stat()
+            with self.subTest(path=path.name), patch.object(sys, "platform", "darwin"), \
+                    patch.object(actions, "_has_extended_acl",
+                                 side_effect=lambda fd: os.path.samestat(os.fstat(fd), identity)):
+                with self.assertRaisesRegex(ValueError, "ACL"):
+                    self.record(literal="ls -a")
+                with self.assertRaisesRegex(ValueError, "ACL"):
+                    self.store.scoped(self.project)
+            self.assertEqual(self.store.path.read_bytes(), before)
