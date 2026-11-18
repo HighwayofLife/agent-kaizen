@@ -474,8 +474,50 @@ def report_rows(conn, args, state):
 REPORT_COLUMNS = ['key', 'calls', 'input', 'cache_read', 'cache_write', 'output', 'cost_usd', 'unpriced_calls']
 
 
+
+def cache_report(conn, args):
+    # Fetch full histories before date and project filtering; SQLite text ordering
+    # does not sort timestamps with different fractional precision correctly.
+    rows = list(conn.execute("SELECT source, session, agent, call_id, ts, day, project, input, cache_read, "
+                             "cache_write_5m + cache_write_1h FROM calls"))
+    def parsed(value):
+        try:
+            return AUDIT.date_time(value)
+        except (ValueError, TypeError, OverflowError):
+            return None
+    histories = {}
+    for source, session, agent, ident, ts, day_, project, input_, read, write in rows:
+        key = (source, session, agent)
+        histories.setdefault(key, []).append((parsed(ts), ident, day_, project, input_, read, write))
+    result = {}
+    for (source, session, agent), calls in histories.items():
+        calls.sort(key=lambda row: (row[0] is None, row[0] or EPOCH, row[1]))
+        previous = None
+        for index, (ts, ident, day_, project, input_, read, write) in enumerate(calls):
+            bucket = (AUDIT.cache_bucket(previous, ts, first=index == 0)
+                      if session and agent else 'unknown')
+            previous = ts
+            if (not write or (args.source and source != args.source)
+                    or (args.project and args.project.lower() not in (project or '').lower())
+                    or (args.since and day_ < args.since) or (args.until and day_ > args.until)):
+                continue
+            kind = 'main' if agent == 'main' else 'subagent_approximate'
+            entry = result.setdefault((source, kind, bucket), Counter())
+            AUDIT.cache_add({bucket: entry}, bucket, write, input_ + read + write)
+    columns = ['source', 'sequence', 'gap', 'writes', 'write_tokens', 'full_rewrites']
+    table = [[source, kind, bucket, entry['writes'], entry['write_tokens'], entry['full_rewrites']]
+             for (source, kind, bucket), entry in sorted(result.items(),
+                 key=lambda item: (item[0][0], item[0][1], AUDIT.CACHE_BUCKETS.index(item[0][2])))]
+    print(render(columns, table, args.format), end='')
+    return 0
+
 def report(args):
     conn = open_read(db_path(args))
+    if args.cache:
+        try:
+            return cache_report(conn, args)
+        finally:
+            conn.close()
     state = pricing_state(args)
     groups = report_rows(conn, args, state)
     conn.close()
@@ -583,6 +625,7 @@ def build_parser():
                         description='Show the database path, size, schema version, call counts, day range and last ingest time.')
     report_parser = commands.add_parser('report', parents=[common], help='aggregate usage and cost',
                                         description='Aggregate calls, tokens and list-price cost, priced now from pricing.json.')
+    report_parser.add_argument('--cache', action='store_true', help='show cache writes by preceding call gap; subagent type gaps are approximate (Codex has no write data)')
     report_parser.add_argument('--since', type=day, metavar='YYYY-MM-DD', help='first UTC day (default: all)')
     report_parser.add_argument('--until', type=day, metavar='YYYY-MM-DD', help='last UTC day, inclusive (default: all)')
     report_parser.add_argument('--by', choices=sorted(GROUPS), default='day',

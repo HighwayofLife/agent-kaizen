@@ -156,6 +156,25 @@ def context(usage):
         "input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"))
 
 
+
+CACHE_BUCKETS = ("first", "unknown", "le_5m", "gt_5m_le_60m", "gt_60m")
+
+
+def cache_bucket(previous, current, first=False):
+    if current is None or (previous is None and not first):
+        return "unknown"
+    if previous is None:
+        return "first"
+    seconds = (current - previous).total_seconds()
+    if seconds < 0:
+        return "unknown"
+    return "le_5m" if seconds <= 300 else "gt_5m_le_60m" if seconds <= 3600 else "gt_60m"
+
+
+def cache_add(groups, bucket, write, ctx):
+    entry = groups[bucket]
+    entry.update(writes=1, write_tokens=write, full_rewrites=int(ctx > 0 and write * 5 >= ctx * 4))
+
 def empty_synthetic(message, usage):
     """Claude Code writes zero-usage <synthetic> assistant rows; they are not model calls."""
     return message.get("model") == "<synthetic>" and not (context(usage) or usage.get("output_tokens"))
@@ -451,6 +470,7 @@ def scan_claude(path, agent, since, data, seen_messages, project):
     observed = dict(main=main, known=False, available=set(), loading=defaultdict(set), servers=set(),
                     used=set(), prompts=0, cwd=None, active=False)
     turn = None
+    cache_previous = None
     for row in rows(path, since, data["warnings"], keep_tools=True):
         if row.get("type") in ("api-request-shape", "attachment"):
             tool_metadata(row, observed)
@@ -508,6 +528,15 @@ def scan_claude(path, agent, since, data, seen_messages, project):
                 label = row.get("perTurnEffort") or row.get("effort") or "unknown"
                 data["_agent_models"][agent][model] += 1
                 data["_agent_effort"][agent][label if isinstance(label, str) else "unknown"] += 1
+            try:
+                cache_time = date_time(ts)
+            except (ValueError, TypeError, OverflowError):
+                cache_time = None
+            write = usage.get("cache_creation_input_tokens", 0) or 0
+            if write > 0:
+                cache_add(data["cache_writes"]["main" if main else "subagent"],
+                          cache_bucket(cache_previous, cache_time), write, context(usage))
+            cache_previous = cache_time
             add(data["models"][model], usage)
             add(counter, usage)
             cost = price(data, model, agent or "main", usage)
@@ -723,6 +752,8 @@ def collect(projects, codex_root, since, pricing, pricing_error, options, cwd=No
                 triggers=defaultdict(Counter), tool_chars=Counter(), tool_counts=Counter(),
                 images=0, bash=defaultdict(Counter), bash_chars=defaultdict(Counter),
                 codex=defaultdict(Counter), codex_sessions=[], briefs=defaultdict(list), codex_briefs=defaultdict(list), warnings=Counter(), codex_files_scanned=0)
+    data["cache_writes"] = {kind: {bucket: Counter(writes=0, write_tokens=0, full_rewrites=0) for bucket in CACHE_BUCKETS}
+                            for kind in ("main", "subagent")}
     data.update(cost=dict(total=0, by_agent=Counter(), by_model=Counter(), components=Counter(),
                           unpriced={}, pricing_error=pricing_error),
                 deferred_tools_unused=0, stuck_turns=dict(turns=0, flagged_turns=0, tool_calls=0, cost=0, signatures=[]),
@@ -1177,6 +1208,14 @@ def report(data, out, scope):
     h = data["headline"]
     headline = [f"Claude: {h['claude_calls']:,} calls; {h['claude_context']:,} context tokens; {h['claude_output']:,} output tokens.",
                 f"Codex: {h['codex_sessions']:,} sessions; {h['codex_tokens']:,} tokens."]
+    cache = data["cache_writes"]
+    writes = sum(entry["writes"] for groups in cache.values() for entry in groups.values())
+    tokens = sum(entry["write_tokens"] for groups in cache.values() for entry in groups.values())
+    rewrites = sum(entry["full_rewrites"] for groups in cache.values() for entry in groups.values())
+    headline.append(f"Claude cache writes: {writes:,} calls; {tokens:,} tokens; {rewrites:,} full rewrites (at least 80% of context). First observed gaps may be unknown; Codex does not report cache writes.")
+    gap_counts = ", ".join(f"{bucket} {sum(groups[bucket]['writes'] for groups in cache.values()):,}"
+                           for bucket in CACHE_BUCKETS)
+    headline.append("Cache write gaps (main and individual subagent transcripts): " + gap_counts + ".")
     sections = []
     sections.append(("1. Totals by model (Claude)",
                      ["Model | Calls | Context | Cache-read share | Output"],

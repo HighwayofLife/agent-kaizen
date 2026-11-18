@@ -480,6 +480,34 @@ class QueryTests(UsageDbCase):
         self.codex_file([token_count('2025-01-02T12:00:00Z', 100, 0, 10)], name='rollout-two', day='2025/01/02')
         self.ingest()
 
+    def test_cache_gaps_and_formats(self):
+        usage = dict(input_tokens=20, cache_creation_input_tokens=80)
+        stamps = ['2025-01-01T23:55:00Z', '2025-01-02T00:00:00Z',
+                  '2025-01-02T00:05:00.000001Z', '2025-01-02T01:05:00.000001Z',
+                  '2025-01-02T02:05:00.000002Z', '2025-01-02T02:05:00.000002Z']
+        self.main_file([assistant(ts, str(i), usage=usage, cwd=self.cwd) for i, ts in enumerate(stamps)])
+        for name, ts in [('a', '2025-01-02T00:00:00Z'), ('b', '2025-01-02T00:01:00Z')]:
+            sub = self.config / f'projects/alpha/main/subagents/{name}.jsonl'
+            jsonl(sub, [assistant(ts, 'sub-' + name, usage=usage)])
+            write(sub.with_suffix('.meta.json'), json.dumps(dict(agentType='worker')))
+        self.codex_file([token_count('2025-01-02T00:00:00Z', 100, 10, 1)])
+        self.ingest()
+        result = self.report('--cache', '--source', 'claude', '--since', '2025-01-02', '--project', 'alpha')
+        main = {r['gap']: r for r in result if r['sequence'] == 'main'}
+        self.assertEqual({k: v['writes'] for k, v in main.items()},
+                         dict(le_5m=2, gt_5m_le_60m=2, gt_60m=1))
+        self.assertEqual(sum(v['full_rewrites'] for v in main.values()), 5)
+        sub = [r for r in result if r['sequence'] == 'subagent_approximate']
+        self.assertEqual({r['gap'] for r in sub}, {'first', 'le_5m'})
+        self.assertEqual(self.report('--cache', '--source', 'codex'), [])
+        csv_text = self.run_script('usage-db', 'report', '--cache', '--format', 'csv').stdout
+        self.assertEqual(next(csv.reader(io.StringIO(csv_text))),
+                         ['source', 'sequence', 'gap', 'writes', 'write_tokens', 'full_rewrites'])
+        self.assertIn('subagent_approximate', self.run_script('usage-db', 'report', '--cache').stdout)
+        with sqlite3.connect(self.db) as conn:
+            conn.execute("UPDATE calls SET session = NULL WHERE call_id = '0'")
+        self.assertIn('unknown', [r['gap'] for r in self.report('--cache')])
+
     def test_report_matches_usage_series_for_the_same_window(self):
         self.fixtures()
         for window in (('2025-01-01', '2025-01-03'), ('2025-01-02', '2025-01-02')):
