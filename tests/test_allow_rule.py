@@ -45,7 +45,7 @@ class AllowRuleTests(SecurityCase):
         data.update(updates)
         if self.secret is not None:
             payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("ascii")
-            data["allow_rule_mac"] = hmac.digest(self.secret, b"allow-rule-extract-v1\0" + payload, "sha256").hex()
+            data["allow_rule_mac"] = hmac.digest(self.secret, b"allow-rule-extract-v2\0" + payload, "sha256").hex()
         self.extracts.mkdir(mode=0o700, parents=True, exist_ok=True)
         return write(self.extracts / (name + ".extract.json"), json.dumps(data))
 
@@ -226,7 +226,10 @@ class AllowRuleTests(SecurityCase):
 
     def broker_action(self, project, literal):
         ident = runpy.run_path(str(SCRIPTS / "kaizen_friction_actions.py"))["_id"]
-        scope = json.dumps([literal, str(project)], separators=(",", ":"))
+        extract = json.loads((self.extracts / "fixture.extract.json").read_bytes())
+        extract.pop("allow_rule_mac")
+        digest = hashlib.sha256(json.dumps(extract, sort_keys=True, separators=(",", ":")).encode("ascii")).hexdigest()
+        scope = json.dumps([literal, str(project), digest], separators=(",", ":"))
         return ident(self.secret, str(project), "allow-rule", scope)
 
     def test_extract_requires_private_stores_ancestors_and_files(self):
@@ -257,6 +260,18 @@ class AllowRuleTests(SecurityCase):
             self.assertFalse(self.target.exists())
         path.write_bytes(signed)
         self.assertEqual(tool(self.repo, "ls")["status"], "applied")
+
+    def test_legacy_signature_cannot_authorize_settings_write(self):
+        tool = self.transaction()
+        path = self.extracts / "fixture.extract.json"
+        data = json.loads(path.read_bytes())
+        data.pop("allow_rule_mac")
+        payload = json.dumps(data, sort_keys=True, separators=(",", ":")).encode("ascii")
+        data["allow_rule_mac"] = hmac.digest(self.secret, b"allow-rule-extract-v1\0" + payload, "sha256").hex()
+        path.write_text(json.dumps(data))
+        with self.assertRaisesRegex(tool.__globals__["Refused"], "authentication"):
+            tool(self.repo, "ls")
+        self.assertFalse(self.target.exists())
 
     def test_managed_undo_preserves_user_settings_and_existing_rules(self):
         tool = self.transaction()
@@ -409,6 +424,112 @@ class AllowRuleTests(SecurityCase):
                 self.extract(self.row(literal="ls -a"))
                 self.assertEqual(tool(self.repo, "ls -a")["status"], "applied")
 
+    def test_recover_published_grant_after_editor_change(self):
+        tool = self.transaction()
+        state = tool.__globals__
+        first = tool(self.repo, "ls -a")["record"]
+        action = self.broker_action(self.repo, "ls")
+        publish = state["write_effect"]
+
+        def interrupt(*args):
+            publish(*args)
+            edited = json.loads(self.target.read_bytes())
+            edited["editor"] = True
+            write(self.target.with_name("editor.json"), json.dumps(edited)).replace(self.target)
+            raise OSError("fixture interruption")
+
+        with patch.dict(state, write_effect=interrupt), self.assertRaises(OSError):
+            tool(self.repo, "ls", action_id=action)
+        self.assertEqual(tool(self.repo, "ls", action_id=action), dict(status="applied", record=action))
+        self.assertEqual(tool(self.repo, record=action)["status"], "undone")
+        self.assertEqual(json.loads(self.target.read_bytes()), dict(editor=True, permissions=dict(allow=["Bash(ls -a)"])))
+        with self.assertRaisesRegex(state["Refused"], "ownership"):
+            tool(self.repo, record=first)
+
+    def test_recover_published_grant_before_receipt_after_editor_change(self):
+        tool = self.transaction()
+        state = tool.__globals__
+        action = self.broker_action(self.repo, "ls")
+        publish = state["write_effect"]
+
+        def interrupt(*args):
+            def refuse_receipt():
+                raise OSError("fixture interruption before publication receipt")
+
+            publish(*args[:-1], refuse_receipt)
+
+        with patch.dict(state, write_effect=interrupt), self.assertRaises(OSError):
+            tool(self.repo, "ls", action_id=action)
+        edited = json.loads(self.target.read_bytes())
+        edited["editor"] = True
+        write(self.target.with_name("editor.json"), json.dumps(edited)).replace(self.target)
+        self.assertEqual(tool(self.repo, "ls", action_id=action), dict(status="applied", record=action))
+        self.assertEqual(tool(self.repo, record=action)["status"], "undone")
+        self.assertEqual(json.loads(self.target.read_bytes()), dict(editor=True, permissions=dict(allow=[])))
+
+    def test_recover_interrupted_undo_after_editor_change(self):
+        for retained in (False, True):
+            with self.subTest(retained=retained):
+                self.repo = self.project(f"undo-{retained}")
+                self.target = self.repo / ".claude/settings.local.json"
+                tool = self.transaction()
+                state = tool.__globals__
+                record = tool(self.repo, "ls")["record"]
+
+                def interrupt(*_):
+                    raise OSError("fixture interruption")
+
+                with patch.dict(state, write_effect=interrupt), self.assertRaises(OSError):
+                    tool(self.repo, record=record)
+                edited = dict(editor=True, permissions=dict(allow=["Bash(ls)"] if retained else []))
+                self.target.write_text(json.dumps(edited))
+                self.assertEqual(tool(self.repo, record=record)["status"], "undone")
+                self.assertEqual(json.loads(self.target.read_bytes()),
+                                 dict(editor=True, permissions=dict(allow=[])))
+                self.assertEqual(tool(self.repo, "ls -a")["status"], "applied")
+
+    def test_replaced_directory_rebinds_only_without_applied_grants(self):
+        tool = self.transaction()
+        state = tool.__globals__
+        action = self.broker_action(self.repo, "ls")
+
+        def interrupt(*_):
+            raise OSError("fixture interruption")
+
+        with patch.dict(state, write_effect=interrupt), self.assertRaises(OSError):
+            tool(self.repo, "ls", action_id=action)
+        self.target.parent.rename(self.repo / "before-grant")
+        write(self.target, '{"editor":1}')
+        with self.assertRaises(state["Refused"]):
+            tool(self.repo, "ls", action_id=action)
+        record = tool(self.repo, "ls -a")["record"]
+        self.target.parent.rename(self.repo / "after-grant")
+        write(self.target, '{"editor":2}')
+        with self.assertRaisesRegex(state["Refused"], "replaced"):
+            tool(self.repo, record=record)
+        self.assertEqual(json.loads(self.add().stdout)["status"], "proposal-only")
+        self.assertEqual(self.target.read_text(), '{"editor":2}')
+
+    def test_cancelled_broker_action_requires_fresh_generation(self):
+        tool = self.transaction()
+        state = tool.__globals__
+        action = self.broker_action(self.repo, "ls")
+
+        def interrupt(*_):
+            raise OSError("fixture interruption")
+
+        with patch.dict(state, write_effect=interrupt), self.assertRaises(OSError):
+            tool(self.repo, "ls", action_id=action)
+        self.target.write_text('{"editor":true}')
+        with self.assertRaisesRegex(state["Refused"], "cancelled"):
+            tool(self.repo, "ls", action_id=action)
+        self.extract(self.row(accepted=11))
+        fresh = self.broker_action(self.repo, "ls")
+        self.assertNotEqual(fresh, action)
+        with self.assertRaisesRegex(state["Refused"], "cancelled"):
+            tool(self.repo, "ls", action_id=action)
+        self.assertEqual(tool(self.repo, "ls", action_id=fresh)["record"], fresh)
+
     def test_journal_loss_or_forgery_never_adopts_existing_permission(self):
         tool = self.transaction()
         record = tool(self.repo, "ls")["record"]
@@ -497,6 +618,81 @@ class AllowRuleTests(SecurityCase):
             tool(self.repo, "ls")
         staged, = self.target.parent.glob("settings.kaizen-*.json")
         self.assertEqual(staged.read_text(), '{"permissions":{"allow":["Bash(*)"]}}')
+
+    def test_publication_restores_preimage_after_final_staged_swap(self):
+        tool = self.transaction()
+        state = tool.__globals__
+        original = '{"editor":1}'
+        write(self.target, original)
+        same_version = state["same_version"]
+        publish = state["write_effect"]
+        checks = 0
+
+        def race(directory, name, stamp):
+            nonlocal checks
+            verified = same_version(directory, name, stamp)
+            if name == self.target.name:
+                checks += 1
+            if name == self.target.name and checks == 2:
+                staged, = self.target.parent.glob("settings.kaizen-*.json")
+                staged.rename(staged.with_name("parked"))
+                write(staged, '{"permissions":{"allow":["Bash(*)"]}}')
+            return verified
+
+        def interrupted_publication(*args):
+            with patch.dict(state, same_version=race):
+                publish(*args)
+
+        with patch.dict(state, write_effect=interrupted_publication), self.assertRaises(state["Refused"]):
+            tool(self.repo, "ls")
+        self.assertEqual(self.target.read_text(), original)
+
+    def test_publication_preserves_edit_after_final_settings_check(self):
+        tool = self.transaction()
+        state = tool.__globals__
+        write(self.target, '{"editor":1}')
+        same_version = state["same_version"]
+        publish = state["write_effect"]
+        checks = 0
+
+        def race(directory, name, stamp):
+            nonlocal checks
+            verified = same_version(directory, name, stamp)
+            if name == self.target.name:
+                checks += 1
+            if name == self.target.name and checks == 2:
+                write(self.target.with_name("editor.json"), '{"editor":2}').replace(self.target)
+            return verified
+
+        def interrupted_publication(*args):
+            with patch.dict(state, same_version=race):
+                publish(*args)
+
+        with patch.dict(state, write_effect=interrupted_publication), self.assertRaises(state["Refused"]):
+            tool(self.repo, "ls")
+        self.assertEqual(self.target.read_text(), '{"editor":2}')
+
+    def test_publication_rolls_back_swap_inside_rename_window(self):
+        tool = self.transaction()
+        state = tool.__globals__
+        original = '{"editor":1}'
+        write(self.target, original)
+        native_rename = state["rename_effect"]
+        swapped = False
+
+        def race(directory, source, target, **options):
+            nonlocal swapped
+            if not swapped:
+                swapped = True
+                staged = self.target.parent / source
+                staged.rename(staged.with_name("parked"))
+                write(staged, '{"permissions":{"allow":["Bash(*)"]}}')
+            return native_rename(directory, source, target, **options)
+
+        with patch.dict(state, rename_effect=race), self.assertRaisesRegex(state["Refused"], "raced"):
+            tool(self.repo, "ls")
+        self.assertTrue(swapped)
+        self.assertEqual(self.target.read_text(), original)
 
     def test_settings_conflicts_and_undo_leave_bytes_alone(self):
         self.extract(self.row())
