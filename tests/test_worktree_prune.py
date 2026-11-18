@@ -1,3 +1,5 @@
+import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -8,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zlib
 from unittest.mock import patch
 
 
@@ -24,6 +27,7 @@ class WorktreePruneTests(unittest.TestCase):
         self.journal = self.home / 'audits/worktree-prunes'
         self.old = int(time.time()) - 3 * 86400
         self.env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+        self.env.pop('KAIZEN_GIT', None)
         self.env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
                         CLAUDE_CONFIG_DIR=str(self.home), GIT_AUTHOR_NAME='Fixture',
                         GIT_COMMITTER_NAME='Fixture', GIT_AUTHOR_EMAIL='test@example.invalid',
@@ -214,6 +218,43 @@ class WorktreePruneTests(unittest.TestCase):
         self.age()
         self.refused('index has hidden entries')
 
+    def test_blob_must_exist_with_matching_type_and_size(self):
+        oid = self.git(self.target, 'rev-parse', 'HEAD:tracked')
+        blob = self.common / 'objects' / oid[:2] / oid[2:]
+        blob.unlink()
+        self.refused('blob is missing')
+        for data in (b'blob 1\0x', b'tree 0\0'):
+            with self.subTest(data=data):
+                blob.write_bytes(zlib.compress(data))
+                self.refused('unexpected type or size')
+
+    def test_index_extensions_refuse_private_or_unknown_data(self):
+        index = self.admin / 'index'
+        for version in (2, 4):
+            self.git(self.target, 'update-index', '--index-version', version)
+            original = index.read_bytes()
+            oid = bytes.fromhex(self.git(self.target, 'rev-parse', 'HEAD:tracked'))
+            for name, data in ((b'REUC', b'tracked\0' + b'100644\0' * 3 + oid * 3),
+                               (b'ABCD', b'\0')):
+                with self.subTest(version=version, name=name):
+                    raw = original[:-20] + name + len(data).to_bytes(4, 'big') + data
+                    index.write_bytes(raw + hashlib.sha1(raw).digest())
+                    self.age()
+                    self.refused('index extension ' + name.decode())
+            index.write_bytes(original)
+        self.git(self.target, 'update-index', '--split-index')
+        self.age()
+        self.refused('index extension link')
+
+    def test_private_config_and_reflogs(self):
+        for name in ('config.worktree', 'logs/refs/arbitrary/value', 'logs/SECONDARY'):
+            with self.subTest(name=name):
+                path = self.admin / name
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b'')
+                self.refused(name)
+                path.unlink()
+
     def test_private_refs_and_shared_stash(self):
         tip = self.git(self.target, 'rev-parse', 'HEAD')
         self.git(self.primary, 'update-ref', 'refs/stash', tip)
@@ -248,11 +289,70 @@ class WorktreePruneTests(unittest.TestCase):
         self.git(self.target, 'config', 'core.hooksPath', commands)
         self.git(self.target, 'config', 'core.fsmonitor', command)
         self.age()
-        env = dict(PATH=f'{commands}{os.pathsep}{self.env["PATH"]}', KAIZEN_GIT=str(commands / 'git'))
+        env = dict(PATH=f'{commands}{os.pathsep}{self.env["PATH"]}')
         self.refused('worktree has changes', **env)
         self.git(self.target, 'config', 'filter.fixture.clean', command)
         self.refused('unsafe Git configuration', **env)
         self.assertFalse(marker.exists())
+
+    def test_git_override_must_be_external_regular_absolute_file(self):
+        sibling = self.root / 'sibling'
+        self.git(self.primary, 'worktree', 'add', '-qb', 'sibling', sibling)
+        # The registration remains even when the checkout marker is missing.
+        (sibling / '.git').unlink()
+        alias = self.root / 'alias'
+        alias.symlink_to(sibling, target_is_directory=True)
+        marker = self.root / 'executed'
+        external = self.root / 'git'
+        real = shutil.which('git')
+        external.write_text(f'#!/bin/sh\ntouch "{marker}"\nexec "{real}" "$@"\n')
+        external.chmod(0o755)
+        self.refused('eligible worktree', KAIZEN_GIT=str(external))
+        marker.unlink()
+        symlink = self.root / 'git-link'
+        symlink.symlink_to(external)
+        for directory in (self.primary, self.common, sibling):
+            shutil.copy2(external, directory / 'git')
+        for override in ('git', symlink, self.root, self.primary / 'git', self.common / 'git',
+                         alias / 'git'):
+            with self.subTest(override=override):
+                self.refused('unknown', KAIZEN_GIT=str(override))
+                self.assertFalse(marker.exists())
+
+    def test_direct_execution_ignores_pythonpath_startup_hooks(self):
+        marker = self.root / 'startup-executed'
+        (self.root / 'sitecustomize.py').write_text(f'open({str(marker)!r}, "w").close()\n')
+        self.refused('eligible worktree', PYTHONPATH=str(self.root))
+        self.assertFalse(marker.exists())
+
+    def test_live_scan_refuses_untracked_xattrs(self):
+        for path in (self.target / 'tracked', self.target):
+            with self.subTest(path=path):
+                if hasattr(os, 'setxattr'):
+                    os.setxattr(path, 'user.fixture', b'private')
+                elif sys.platform == 'darwin':
+                    subprocess.run(['xattr', '-w', 'com.apple.quarantine', 'fixture', str(path)], check=True)
+                    self.refused('eligible worktree')
+                    subprocess.run(['xattr', '-w', 'user.fixture', 'private', str(path)], check=True)
+                else:
+                    self.skipTest('no xattr setter for this platform')
+                self.refused(f'extended attributes at {str(path.relative_to(self.target))!r}')
+                if hasattr(os, 'removexattr'):
+                    os.removexattr(path, 'user.fixture')
+                else:
+                    subprocess.run(['xattr', '-d', 'user.fixture', str(path)], check=True)
+
+    def test_unavailable_xattrs_are_a_json_residual(self):
+        functions = self.script_functions()
+        argv = [str(SCRIPT), 'apply', '--project', str(self.primary), '--path', str(self.target)]
+        with patch.dict(functions, {'xattr_reader': lambda: None}), patch.object(sys, 'argv', argv):
+            with patch.object(sys, 'stderr', io.StringIO()) as err, self.assertRaises(SystemExit) as raised:
+                functions['main']()
+        self.assertEqual(raised.exception.code, 2)
+        message, separator, residual = err.getvalue().partition('{')
+        self.assertIn('eligible worktree', message)
+        self.assertTrue(separator, err.getvalue())
+        self.assertEqual(json.loads(separator + residual), {'xattrs': 'unchecked'})
 
     def script_functions(self):
         with patch.object(sys, 'path', [str(SCRIPT.parent), *sys.path]):
@@ -260,7 +360,8 @@ class WorktreePruneTests(unittest.TestCase):
 
     def test_git_resolver_uses_absolute_path(self):
         resolve_git = self.script_functions()['resolve_git']
-        with patch.dict(os.environ, {'PATH': str(self.target), 'KAIZEN_GIT': 'git'}):
+        with patch.dict(os.environ, {'PATH': str(self.target)}):
+            os.environ.pop('KAIZEN_GIT', None)
             locations = ('/usr/bin/git', '/opt/homebrew/bin/git', '/usr/local/bin/git')
             self.assertIn(resolve_git(self.primary), [Path(path).resolve() for path in locations])
 

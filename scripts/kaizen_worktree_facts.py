@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 import select
+import shutil
 import stat
 import subprocess
 import time
@@ -67,32 +68,52 @@ def repository_dirs(directory):
 
 
 def resolve_git(directory, *protected):
-    override = Path(os.environ.get('KAIZEN_GIT', ''))
+    override = os.environ.get('KAIZEN_GIT')
     directory = Path(directory).resolve(strict=True)
     try:
         roots = repository_dirs(directory)
     except (OSError, ValueError, RuntimeError):
         roots = ()
     protected_ids = {file_id(p.stat()) for p in (directory, *roots, *protected)}
-    for index, requested in enumerate((override, *map(Path, GIT_PATHS))):
-        if not requested.is_absolute() or (index == 0 and not roots):
-            continue
+
+    def outside(requested):
         try:
             candidate = requested.resolve(strict=True)
-            if not candidate.is_file() or not os.access(candidate, os.X_OK):
-                continue
-            if any(within(candidate, identity) for identity in protected_ids):
-                continue
-            if index == 0 and any(file_id(p.stat()) in protected_ids
-                                  for p in repository_dirs(candidate.parent)):
-                continue
-            return candidate
+            if (candidate.is_file() and os.access(candidate, os.X_OK)
+                    and not any(within(candidate, identity) for identity in protected_ids)):
+                return candidate
         except (OSError, ValueError, RuntimeError):
-            continue
-    return None
+            pass
+
+    fixed = next(filter(None, map(outside, map(Path, GIT_PATHS))), None)
+    if override is None:
+        return fixed
+    requested = Path(override)
+    try:
+        if not roots or not requested.is_absolute() or not stat.S_ISREG(requested.lstat().st_mode):
+            return None
+        candidate = outside(requested)
+        if candidate is None:
+            return None
+        # Use the fixed Git to establish scope before running the override.
+        entries = records(partial(git, fixed), directory)
+        if not entries:
+            return None
+        for entry in entries:
+            path = Path(os.fsdecode(entry[b'worktree']))
+            if not path.is_absolute():
+                return None
+            path = path.resolve()
+            if candidate.is_relative_to(path) or (path.exists() and within(candidate, file_id(path.stat()))):
+                return None
+        if any(file_id(p.stat()) in protected_ids for p in repository_dirs(candidate.parent)):
+            return None
+        return candidate
+    except (OSError, ValueError, RuntimeError):
+        return None
 
 
-def git(executable, directory, *args):
+def git(executable, directory, *args, input_data=b''):
     if executable is None:
         return None
     process = None
@@ -100,16 +121,29 @@ def git(executable, directory, *args):
         config = [arg for value in GIT_CONFIG for arg in ('-c', value)]
         process = subprocess.Popen([str(executable), '--no-pager', '--no-optional-locks',
                                     '-C', str(directory), *config, *args], env=GIT_ENV,
-                                   stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stdin=subprocess.PIPE if input_data else subprocess.DEVNULL,
+                                   stdout=subprocess.PIPE,
                                    stderr=subprocess.DEVNULL)
         deadline = time.monotonic() + TIMEOUT
         output = bytearray()
+        pending = memoryview(input_data)
         while True:
             remaining = deadline - time.monotonic()
-            if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
+            if remaining <= 0:
                 return None
+            readers, writers, _ = select.select([process.stdout], [process.stdin] if pending else [], [], remaining)
+            if not readers and not writers:
+                return None
+            if writers:
+                pending = pending[os.write(process.stdin.fileno(), pending[:select.PIPE_BUF]):]
+                if not pending:
+                    process.stdin.close()
+            if not readers:
+                continue
             chunk = os.read(process.stdout.fileno(), min(65536, MAX_OUTPUT + 1 - len(output)))
             if not chunk:
+                if pending:
+                    return None
                 break
             output.extend(chunk)
             if len(output) > MAX_OUTPUT:
@@ -123,6 +157,8 @@ def git(executable, directory, *args):
                 process.kill()
             process.wait()
             process.stdout.close()
+            if process.stdin is not None:
+                process.stdin.close()
 
 
 def records(run, directory):
@@ -162,9 +198,13 @@ def read_facts(directory, read_status):
     must not be used alone to authorize deletion.
     """
     try:
-        run = partial(git, resolve_git(directory))
+        executable = resolve_git(directory)
     except (OSError, ValueError, RuntimeError):
         return None
+    path_fallback = executable is None and 'KAIZEN_GIT' not in os.environ
+    if path_fallback:
+        executable = shutil.which('git')
+    run = partial(git, executable)
     entries = records(run, directory)
     if not entries:
         return None
@@ -198,4 +238,6 @@ def read_facts(directory, read_status):
                           tip=os.fsdecode(tip) if valid_tip(tip) else None, primary=index == 0,
                           linked=index != 0, locked=b'locked' in entry, detached=detached,
                           clean=clean, merged=merged))
+        if path_fallback:
+            facts[-1]['git_source'] = 'path'
     return facts

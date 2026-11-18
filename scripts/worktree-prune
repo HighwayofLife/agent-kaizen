@@ -1,5 +1,7 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S python3 -I
 """Check whether a linked worktree can be removed or restored."""
+# Explicit `python3 worktree-prune` without -I honours the caller's PYTHONPATH
+# at interpreter startup. The re-exec guard isolates the rest of the command.
 import os
 import sys
 
@@ -8,12 +10,14 @@ if __name__ == '__main__' and not sys.flags.isolated:
               {k: v for k, v in os.environ.items() if not k.startswith('PYTHON')})
 
 import argparse
+import errno
 from functools import partial
 import hashlib
 import json
 from pathlib import Path
 import re
 import stat
+import struct
 import time
 
 if __name__ == '__main__':
@@ -25,11 +29,14 @@ from kaizen_worktree_facts import file_id, git, records, regular_bytes, resolve_
 MIN_IDLE_SECONDS = 86400
 MAX_WALK_ENTRIES = 200000
 MAX_BYTES = 512 * 1024 * 1024
+MAX_INDEX_BYTES = 16 * 1024 * 1024
 DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
 OID = rb'(?:[0-9a-f]{40}|[0-9a-f]{64})'
 INDEX_DEBUG = re.compile(rb'(?:  [^\n]*\n){4}  size: [0-9]+\tflags: ([0-9a-f]+)\n')
 # Git's skip-worktree, intent-to-add and assume-unchanged bits.
 UNSAFE_INDEX_FLAGS = (1 << 30) | (1 << 29) | (1 << 15)
+SAFE_INDEX_EXTENSIONS = {b'TREE', b'UNTR', b'FSMN', b'EOIE', b'IEOT'}
+SAFE_XATTRS = {'com.apple.provenance', 'com.apple.quarantine', 'com.apple.lastuseddate#PS'}
 PENDING = 'worktree changes are disabled pending journal and recovery support (P12b)'
 
 
@@ -48,7 +55,7 @@ def exact_target(value):
     if not os.path.isabs(value) or value != os.path.realpath(value):
         raise Refused('target must be absolute with no symlink or path aliases')
     path = Path(value)
-    for part in reversed((path, *path.parents[:-1])):
+    for part in reversed((path, *tuple(path.parents)[:-1])):
         if part.name not in os.listdir(part.parent) or not stat.S_ISDIR(part.lstat().st_mode):
             raise Refused('target has a case or symlink alias, or is not a directory')
     return path
@@ -132,6 +139,8 @@ def linked_admin(run, path, common):
 
 
 def check_metadata(admin, common):
+    if os.path.lexists(admin / 'config.worktree'):
+        raise Refused('worktree has private config.worktree')
     for directory in (admin, common):
         with os.scandir(directory) as entries:
             for entry in entries:
@@ -144,17 +153,17 @@ def check_metadata(admin, common):
                         'MERGE_AUTOSTASH', 'BISECT_EXPECTED_REV', 'NOTES_MERGE_PARTIAL', 'NOTES_MERGE_REF')
                         or (entry.name != 'ORIG_HEAD' and entry.name.endswith('_HEAD'))):
                     raise Refused('worktree has private refs')
-    refs = admin / 'refs'
-    if os.path.lexists(refs):
-        pending = [refs]
+    for name, kind in (('refs', 'refs'), ('logs', 'reflogs')):
+        root = admin / name
+        pending = [root] if os.path.lexists(root) else []
         while pending:
             directory = pending.pop()
+            if directory == admin / 'logs/HEAD':
+                continue
             if not stat.S_ISDIR(directory.lstat().st_mode):
-                raise Refused('worktree has private refs')
+                raise Refused(f'worktree has private {kind} at {str(directory.relative_to(admin))!r}')
             with os.scandir(directory) as entries:
                 pending.extend(Path(entry.path) for entry in entries)
-    if os.path.lexists(admin / 'logs/refs/stash'):
-        raise Refused('worktree has a private stash')
 
 
 def check_reflog(run, primary, admin, tip, primary_tip):
@@ -188,6 +197,51 @@ def object_hash(algorithm, kind, data):
     return digest
 
 
+def check_index_extensions(path, oid_size):
+    data = regular_bytes(path, MAX_INDEX_BYTES)
+    end = len(data) - oid_size
+    invalid = 'cannot parse worktree index extensions'
+    if end < 12:
+        raise Refused(invalid)
+    magic, version, count = struct.unpack_from('>4sII', data)
+    if magic != b'DIRC' or version not in (2, 3, 4) or count > MAX_WALK_ENTRIES:
+        raise Refused(invalid)
+    offset = 12
+    for _ in range(count):
+        start = offset
+        # Entries start with ten 32-bit stat fields, an OID and 16-bit flags.
+        offset += 40 + oid_size + 2
+        if offset > end:
+            raise Refused(invalid)
+        flags = int.from_bytes(data[offset - 2:offset], 'big')
+        if flags & 0x4000:
+            offset += 2  # Extended flags in index v3/v4.
+        if version == 4:
+            # A variable-length prefix removal count precedes the path suffix.
+            while offset < end and data[offset] & 0x80:
+                offset += 1
+            nul = data.find(b'\0', offset + 1, end)
+        elif (flags & 0xfff) == 0xfff:
+            nul = data.find(b'\0', offset, end)
+        else:
+            nul = offset + (flags & 0xfff)
+        if not offset <= nul < end or data[nul] != 0:
+            raise Refused(invalid)
+        offset = nul + 1 if version == 4 else start + ((nul + 1 - start + 7) & ~7)
+    if offset > end:
+        raise Refused(invalid)
+    while offset < end:
+        if end - offset < 8:
+            raise Refused(invalid)
+        name, size = struct.unpack_from('>4sI', data, offset)
+        if name not in SAFE_INDEX_EXTENSIONS:
+            label = name.decode('ascii') if all(32 <= byte < 127 for byte in name) else repr(name)
+            raise Refused(f'unsafe index extension {label}')
+        offset += 8 + size
+        if offset > end:
+            raise Refused(invalid)
+
+
 def checkout_tree(run, path, tip, admin, common):
     sparse = read(run, path, 'config', '--type=bool', '--get-regexp',
                   r'^core\.sparsecheckout(cone)?$', codes=(0, 1))
@@ -219,6 +273,7 @@ def checkout_tree(run, path, tip, admin, common):
     if any(object_hash(algorithm, b'tree', raw).hexdigest().encode() != oid
            for oid, raw in directories.values()):
         raise Refused('HEAD tree does not match its object ID')
+    check_index_extensions(admin / 'index', len(tip) // 2)
     index = read(run, path, 'ls-files', '-v', '-s', '--sparse', '--debug', '-z')
     remaining = tree.copy()
     offset = 0
@@ -246,6 +301,33 @@ def checked_open(name, flags, info, directory=None):
     return fd
 
 
+def xattr_reader():
+    if hasattr(os, 'listxattr'):
+        return partial(os.listxattr, follow_symlinks=False)
+    if sys.platform != 'darwin':
+        return None
+    import ctypes
+
+    listxattr = ctypes.CDLL(None, use_errno=True).listxattr
+    listxattr.argtypes = (ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    listxattr.restype = ctypes.c_ssize_t
+
+    def names(path):
+        nofollow = 1  # XATTR_NOFOLLOW
+        size = listxattr(path, None, 0, nofollow)
+        if size == 0:
+            return ()
+        if size > 0:
+            buffer = ctypes.create_string_buffer(size)
+            size = listxattr(path, buffer, size, nofollow)
+            if size >= 0:
+                return buffer.raw[:size].split(b'\0')[:-1]
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+    return names
+
+
 def check_live(path, info, tree, algorithm, cutoff):
     directories = {b''}
     for name in tree:
@@ -254,6 +336,23 @@ def check_live(path, info, tree, algorithm, cutoff):
             directories.add(parent)
             parent = parent.rpartition(b'/')[0]
     count, total = 0, 0
+    blobs = {}
+    list_xattrs = xattr_reader()
+    residuals = {} if list_xattrs else {'xattrs': 'unchecked'}
+    root_path = os.fsencode(path)
+
+    def check_xattrs(relative):
+        if list_xattrs is None:
+            return
+        try:
+            names = list_xattrs(os.path.join(root_path, relative))
+        except OSError as error:
+            if error.errno not in (errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP):
+                raise
+            residuals['xattrs'] = 'unchecked'
+            return
+        if any(os.fsdecode(name) not in SAFE_XATTRS for name in names):
+            raise Refused(f'worktree has extended attributes at {os.fsdecode(relative)!r}')
 
     def walk(fd, prefix):
         nonlocal count, total
@@ -269,9 +368,10 @@ def check_live(path, info, tree, algorithm, cutoff):
                 if meta.st_mtime > cutoff:
                     raise Refused('worktree is not idle for 24 hours')
                 name = os.fsencode(entry.name)
+                relative = prefix + name
+                check_xattrs(relative)
                 if not prefix and name == b'.git':
                     continue
-                relative = prefix + name
                 if name.lower() == b'.git':
                     raise Refused('worktree has nested Git metadata')
                 if stat.S_ISDIR(meta.st_mode) and relative in directories:
@@ -284,12 +384,14 @@ def check_live(path, info, tree, algorithm, cutoff):
                 mode, expected = tree.pop(relative, (None, None))
                 if mode == b'120000' and stat.S_ISLNK(meta.st_mode):
                     data = os.readlink(name, dir_fd=fd)
-                    total += len(data)
+                    size = len(data)
+                    total += size
                     if total > MAX_BYTES:
                         raise Refused('worktree is too large to check')
                     digest = object_hash(algorithm, b'blob', data)
                 elif (mode in (b'100644', b'100755') and stat.S_ISREG(meta.st_mode)
                       and bool(meta.st_mode & stat.S_IXUSR) == (mode == b'100755')):
+                    size = meta.st_size
                     stream_fd = checked_open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, meta, fd)
                     with os.fdopen(stream_fd, 'rb') as stream:
                         start = total
@@ -308,14 +410,26 @@ def check_live(path, info, tree, algorithm, cutoff):
                     raise Refused('worktree has changes or entries outside its checkout')
                 if digest.hexdigest().encode('ascii') != expected:
                     raise Refused('worktree has changes to tracked bytes')
+                if blobs.setdefault(expected, size) != size:
+                    raise Refused('worktree has conflicting blob sizes')
 
     root = checked_open(path, DIR_FLAGS, info)
     try:
+        check_xattrs(b'.')
         walk(root, b'')
     finally:
         os.close(root)
     if tree:
         raise Refused('worktree is missing tracked entries')
+    return blobs, residuals
+
+
+def check_blobs(run, path, blobs):
+    if blobs:
+        request = b''.join(oid + b'\n' for oid in blobs)
+        expected = b''.join(b'%s blob %d\n' % item for item in blobs.items())
+        if run(path, 'cat-file', '--batch-check', input_data=request) != (0, expected):
+            raise Refused('Git blob is missing or has an unexpected type or size')
 
 
 def preflight(run, project, path, cutoff):
@@ -357,22 +471,27 @@ def preflight(run, project, path, cutoff):
     if int(commit) > cutoff or any(p.lstat().st_mtime > cutoff for p in times if os.path.lexists(p)):
         raise Refused('worktree is not idle for 24 hours')
     tree, algorithm = checkout_tree(run, path, tip, admin, common)
-    check_live(path, meta, tree, algorithm, cutoff)
+    blobs, residuals = check_live(path, meta, tree, algorithm, cutoff)
+    check_blobs(run, path, blobs)
     if identity != (inode(path), inode(admin), inode(common), file_id((path / '.git').lstat())):
         raise Refused('worktree identity changed during preflight')
-    return branch, tip, primary_branch, primary_tip, identity, history
+    return branch, tip, primary_branch, primary_tip, identity, history, residuals
 
 
 def apply(args):
     project = Path(args.project).resolve(strict=True)
     path = exact_target(args.path)
-    run = partial(git, resolve_git(project, path))
+    executable = resolve_git(project, path)
+    if executable is None:
+        raise Refused('Git executable is unknown')
+    run = partial(git, executable)
     cutoff = time.time() - MIN_IDLE_SECONDS
     checked = preflight(run, project, path, cutoff)
     # Keep the live comparison at the mutation boundary when recovery is added.
     if preflight(run, project, path, cutoff) != checked:
         raise Refused('worktree identity or retained history changed during preflight')
-    raise Refused('eligible worktree. ' + PENDING)
+    residuals = checked[-1]
+    raise Refused('eligible worktree. ' + PENDING + (' ' + json.dumps(residuals) if residuals else ''))
 
 
 def private_record(value):
@@ -407,7 +526,10 @@ def undo(args):
             or not all(isinstance(data.get(key), str) and data[key] for key in fields)):
         raise Refused('invalid journal record')
     project = Path(args.project).resolve(strict=True)
-    run = partial(git, resolve_git(project))
+    executable = resolve_git(project)
+    if executable is None:
+        raise Refused('Git executable is unknown')
+    run = partial(git, executable)
     primary, common, trees = registration(run, project)
     if (data['project'], data['common']) != (str(primary), str(common)):
         raise Refused('journal record belongs to a different repository')

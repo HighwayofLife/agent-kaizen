@@ -127,7 +127,8 @@ def main():
                     def value(item):
                         return 'unknown' if item is None else str(item).lower() if isinstance(item, bool) else str(item)
                     print(' '.join(f'{key}={value(fact[key])}' for key in
-                                   ('path', 'branch', 'tip', 'primary', 'linked', 'locked', 'detached', 'clean', 'merged')))
+                                   ('path', 'branch', 'tip', 'primary', 'linked', 'locked', 'detached',
+                                    'clean', 'merged', 'git_source') if key in fact))
                 if selected is not None and selected not in shown:
                     print(f'{directory}: unknown')
     return 0
