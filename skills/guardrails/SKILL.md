@@ -69,10 +69,13 @@ removing the `Agent` entry, clearing `agentTiers`, or setting global `enabled` t
 
 The counter tracks allowed PreToolUse requests even if the spawn later fails.
 The config directory must be owner-owned and not group- or world-writable, or the guard silently stays off.
-A held lock is treated as stale after 30 seconds.
+A lock can be reclaimed when its owner exits or its PID belongs to a different
+process. If a live owner holds the lock past the short wait, the request is allowed.
 Owner-only state lives in `<Claude config dir>/kaizen-tier-guard/`. Log entries
 contain only a timestamp, rule and supplied reason. Keep sensitive details out
 of the reason. Input, config, dependency, state and lock errors allow the request.
+After a decision, the guard prunes counters and logs older than 30 days when it
+can take their locks.
 
 ## Done when
 
