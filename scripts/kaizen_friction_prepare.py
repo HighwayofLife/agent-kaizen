@@ -8,11 +8,13 @@ import json
 import math
 import fnmatch
 import hashlib
+import hmac
 import os
 from pathlib import Path
 import re
 import runpy
 import stat
+import warnings
 from datetime import datetime, timedelta, timezone
 
 
@@ -61,7 +63,6 @@ def compare_flags(project, window, thresholds, basis, flags, acknowledged):
     if not isinstance(old, dict):
         raise ValueError("invalid acknowledged cohort")
     proposed = dict(old)
-    seen = set()
     new = []
     for flag in flags:
         if (not isinstance(flag, dict) or not isinstance(flag.get("id"), str)
@@ -72,9 +73,6 @@ def compare_flags(project, window, thresholds, basis, flags, acknowledged):
                 or (isinstance(value, float) and not math.isfinite(value))):
             raise ValueError("invalid flag value")
         ident = json.dumps([flag["id"], flag["subject"]], ensure_ascii=True, separators=(",", ":"))
-        if ident in seen:
-            raise ValueError("duplicate flag identity")
-        seen.add(ident)
         bucket = math.floor(math.log2(value))
         previous = old.get(ident)
         if previous is not None and type(previous) is not int:
@@ -108,19 +106,26 @@ def _json(raw, host):
     return value
 
 
-def _read(path, host, current=None, age=None):
+def _read(path, host, current=None, age=None, limit=LIMIT):
     """No symlink components, devices, writable foreign files or unbounded reads."""
     with host["_directory"](path.parent) as directory:
         fd = os.open(path.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
-        with os.fdopen(fd, "rb") as stream:
-            info = os.fstat(stream.fileno())
-            if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
-                    or info.st_nlink != 1 or info.st_mode & 0o022):
+        try:
+            info = os.fstat(fd)
+            if not stat.S_ISREG(info.st_mode):
                 raise ValueError("unsafe evidence file")
-            host["_check_acl"](stream.fileno(), "evidence")
-            raw = stream.read(LIMIT + 1)
-            after = os.fstat(stream.fileno())
-    if (len(raw) > LIMIT or (info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+            stream = os.fdopen(fd, "rb")
+            fd = None
+            with stream:
+                if (info.st_uid != os.geteuid() or info.st_nlink != 1 or info.st_mode & 0o022):
+                    raise ValueError("unsafe evidence file")
+                host["_check_acl"](stream.fileno(), "evidence")
+                raw = stream.read(limit + 1)
+                after = os.fstat(stream.fileno())
+        finally:
+            if fd is not None:
+                os.close(fd)
+    if (len(raw) > limit or (info.st_size, info.st_mtime_ns, info.st_ctime_ns)
             != (after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
         raise ValueError("oversized or changing evidence")
     if age is not None and not 0 <= current.timestamp() - info.st_mtime <= age:
@@ -197,9 +202,22 @@ def _evidence(report, audits, project, cfg, current, host):
     return scope, block, identities
 
 
-def prepare(audits, backups, project, report, cfg, mode, current, canonical_project, project_key):
-    """Freeze a private receipt and a redacted view; never import, verify or ack."""
+def _encode(value):
+    return (json.dumps(value, ensure_ascii=True, separators=(",", ":"), sort_keys=True,
+                       allow_nan=False) + "\n").encode()
+
+
+def _signature(receipt, secret):
+    return hmac.new(secret, _encode({k: v for k, v in receipt.items() if k != "signature"}),
+                    hashlib.sha256).hexdigest()
+
+
+def prepare(audits, backups, project, report, cfg, mode, current, canonical_project, project_key,
+            *, interactive=False, retain=False, _check=None, _complete=None):
+    """Freeze bounded inputs, or re-derive them under the generation lock for reconciliation."""
     if cfg["enabled"]["value"] is False or cfg["friction"]["value"] == "off":
+        if _check is not None:
+            raise ValueError("friction is disabled")
         return None
     if mode not in ("propose-only", "auto"):
         raise ValueError("unsupported preparation mode")
@@ -221,26 +239,31 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
         for folder in folders:
             for candidate in _files(folder, r"token-audit-[\w.-]+\.md", host):
                 try:
-                    evidence = _evidence(candidate, audits, project, cfg, current, host)
-                    candidates.append((evidence[2]["report"]["mtime_ns"], candidate.name, evidence))
-                except (OSError, ValueError, KeyError, TypeError):
+                    info = candidate.lstat()
+                    if stat.S_ISREG(info.st_mode) and info.st_size <= LIMIT:
+                        candidates.append((info.st_mtime_ns, candidate.name, candidate))
+                except OSError:
                     continue
-        if not candidates:
+        for _, _, candidate in sorted(candidates, reverse=True)[:8]:
+            try:
+                scope, block, identities = _evidence(candidate, audits, project, cfg, current, host)
+                break
+            except (OSError, ValueError, KeyError, TypeError):
+                continue
+        else:
             raise ValueError("no fresh scoped audit")
-        scope, block, identities = max(candidates, key=lambda item: item[:2])[2]
-    if block is None:
-        return None
-    probes = _files(project.folder, r"host-probe-[\w.-]+\.json", host)
-    if not probes:
-        raise ValueError("no recent probe")
-    probe_raw, identities["probe"] = _read(max(probes), host, current, PROBE_AGE)
-    probe = _json(probe_raw, host)
-    if (probe.get("project") != str(project.canonical)
-            or not 0 <= (current - _stamp(probe["generated_at"])).total_seconds() <= PROBE_AGE
-            or not isinstance(probe.get("findings"), list) or not isinstance(probe.get("regenerable_dirs"), list)):
-        raise ValueError("invalid probe")
+    probe = {"findings": [], "regenerable_dirs": []}
+    if cfg["hostActions"]["value"] != "off":
+        probes = _files(project.folder, r"host-probe-[\w.-]+\.json", host)
+        if not probes:
+            raise ValueError("no recent probe")
+        probe_raw, identities["probe"] = _read(max(probes), host, current, PROBE_AGE)
+        probe = _json(probe_raw, host)
+        if (probe.get("project") != str(project.canonical)
+                or not 0 <= (current - _stamp(probe["generated_at"])).total_seconds() <= PROBE_AGE
+                or not isinstance(probe.get("findings"), list) or not isinstance(probe.get("regenerable_dirs"), list)):
+            raise ValueError("invalid probe")
     store = host["HostActions"](audits, backups, canonical_project, project_key)
-    rows = {row["id"]: row for row in store.scoped(project.canonical)}
     catalog_path = next((here / name for name in ("kaizen-friction-catalog.json", "friction-catalog.json")
                          if (here / name).is_file()), None)
     catalog_raw, identities["catalog"] = _read(catalog_path, host)
@@ -256,15 +279,40 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
         if (state.get("project") != str(project.canonical) or type(generation) is not int
                 or not 0 <= generation < 10**20 - 1):
             raise ValueError("invalid preparation generation")
+        rows = {row["id"]: row for row in store.scoped(project.canonical)}
+        baseline, imported = state.get("acknowledged"), None
+        secret = store._secret(create=_check is None)
+        if _check is not None:
+            if (not hmac.compare_digest(_check.get("signature", ""), _signature(_check, secret))
+                    or _check.get("channel") != "interactive"
+                    or _check.get("generation") != f"{generation:020d}"
+                    or not 0 <= (current - _stamp(_check["created"])).total_seconds() <= PROBE_AGE):
+                raise ValueError("invalid, stale or noninteractive preparation receipt")
+            baseline = _check["baseline"]
+            if state.get("acknowledged") != baseline and not (
+                    state.get("acknowledged_generation") == _check["generation"]
+                    and state.get("acknowledged") == _check["comparison"]):
+                raise ValueError("preparation comparison state changed")
+            try:
+                with host["_directory"](store.path.parent) as actions_directory:
+                    _, _, receipts = store._load(actions_directory)
+                generations = receipts.get(str(project.canonical), {})
+                imported = generations.get("interactive:" + _check["generation"])
+                if any(value == "pending" for receipt in generations.values() for value in receipt.values()):
+                    raise ValueError("pending host actions require runner reconciliation")
+            except FileNotFoundError:
+                pass
+            if imported is not None and (not set(imported) <= set(_check["allowed"])
+                                         or any(value != "terminal" for value in imported.values())):
+                raise ValueError("unmatched interactive import receipt")
         cohort = json.dumps([str(project.canonical), scope], sort_keys=True, separators=(",", ":"))
-        if (not isinstance(block.get("flags"), list)
+        if block is not None and (not isinstance(block.get("flags"), list)
                 or any(not isinstance(flag, dict) or flag.get("id") not in LABELS
                        or not isinstance(flag.get("subject"), str) or len(flag["subject"]) > 4096
                        for flag in block["flags"])):
             raise ValueError("unsupported flag")
-        flags, snapshot = compare_flags(cohort, block["window"], block["thresholds"], block["basis"],
-                                        block.get("flags"), state.get("acknowledged"))
-        secret = store._secret(create=True)
+        flags, snapshot = (compare_flags(cohort, block["window"], block["thresholds"], block["basis"],
+                                         block.get("flags"), baseline) if block is not None else ([], baseline))
         visible_flags, allowed, actions = [], {}, []
         for flag in flags:
             ident = host["_id"](secret, str(project.canonical), flag["id"], flag["subject"])
@@ -281,16 +329,30 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
             if finding["id"] in ("indexed-output", "sprawl"):
                 if not selector.startswith("/"):
                     raise ValueError("expected a path selector")
-                _, target = canonical_project(project.canonical, selector=selector)
-                if str(target) != selector:
-                    raise ValueError("noncanonical selector")
+                try:
+                    _, target = canonical_project(project.canonical, selector=selector)
+                except (ValueError, OSError):
+                    if finding["id"] != "indexed-output":
+                        raise
+                    warnings.warn("dropping indexed-output finding with invalid selector")
+                    continue
+                selector = str(target)
                 if finding["id"] == "sprawl" and target != project.canonical:
                     raise ValueError("invalid sprawl selector")
-                if finding["id"] == "indexed-output" and not any(
-                        isinstance(row, dict) and row.get("path") == selector
-                        and row.get("size_bytes") == finding["evidence"].get("size_bytes")
-                        for row in probe["regenerable_dirs"]):
-                    raise ValueError("missing regenerable-directory provenance")
+                if finding["id"] == "indexed-output":
+                    matched = False
+                    for row in probe["regenerable_dirs"]:
+                        try:
+                            if (isinstance(row, dict) and isinstance(row.get("path"), str)
+                                    and canonical_project(project.canonical, selector=row["path"])[1] == target
+                                    and row.get("size_bytes") == finding["evidence"].get("size_bytes")):
+                                matched = True
+                                break
+                        except (ValueError, OSError):
+                            continue
+                    if not matched:
+                        warnings.warn("dropping indexed-output finding without matching provenance")
+                        continue
             elif (entry["id"], selector) not in (("low-disk", "project-volume"), ("inotify-limit", "inotify")) and not (
                     entry["id"] == "cloud-sync-repo" and selector in project.canonical.parts
                     and any(fnmatch.fnmatchcase(selector, pattern) for pattern in catalog_data["cloud_sync_names"])):
@@ -300,30 +362,127 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
             if len(evidence) > host["EVIDENCE_LIMIT"]:
                 raise ValueError("oversized candidate evidence")
             old = rows.get(ident, {})
+            # Only this generation's terminal suggestion can suppress its own retry.
+            if (imported is not None and ident in imported and not old.get("pending")
+                    and old.get("status") == "open" and old.get("evidence") == evidence):
+                old = {}
+            if old.get("flaps", 0) >= 2:
+                continue
             if not old.get("pending") and (old.get("status") == "dismissed"
                     or old.get("status") in ("open", "done") and old.get("evidence") == evidence):
                 continue
             if ident in allowed:
                 raise ValueError("duplicate candidate identity")
             allowed[ident] = dict(canonical_project=str(project.canonical), catalog_id=entry["id"],
-                                 selector_key=selector, evidence=evidence, intents=["suggest"], provenance=finding)
+                                 selector_key=selector, evidence=evidence,
+                                 intents=(["suggest", "apply"] if not interactive and mode == "auto"
+                                          and cfg["hostActions"]["value"] == "apply" else ["suggest"]),
+                                 provenance=finding)
             actions.append(dict(id=ident, label=entry["problem"], evidence=list(finding["evidence"].values())))
         if not visible_flags and not actions:
+            if _check is not None:
+                raise ValueError("empty interactive gate")
             return None
-        generation = f"{generation + 1:020d}"
-        receipt = dict(v=1, generation=generation, created=current.isoformat(), project=str(project.canonical), scope=scope,
-                       identities=identities, policy=dict(mode=mode, window=block["window"],
-                       thresholds=block["thresholds"], basis=block["basis"], hostActions=cfg["hostActions"]["value"]),
-                       comparison=snapshot, allowed=allowed, permission_provenance=block.get("permission_acceptance", []))
+        generation = _check["generation"] if _check is not None else f"{generation + 1:020d}"
+        receipt = dict(v=1, generation=generation, created=_check["created"] if _check else current.isoformat(),
+                       channel="interactive" if interactive else "scheduled", baseline=baseline,
+                       project=str(project.canonical), scope=scope,
+                       identities=identities, policy=dict(mode=mode, window=block["window"] if block else None,
+                       thresholds=block["thresholds"] if block else None, basis=block["basis"] if block else None, hostActions=cfg["hostActions"]["value"]),
+                       comparison=snapshot, allowed=allowed, permission_provenance=block.get("permission_acceptance", []) if block else [])
+        if retain and _check is None and state.get("acknowledged_generation") != f"{state['generation']:020d}":
+            try:
+                previous = _json(host["_read"](directory, "receipt-" + project.key + "-" + f"{state['generation']:020d}" + ".json", LIMIT), host)
+                ignored = {"generation", "created", "signature", "view_sha256"}
+                same = all(previous.get(name) == value for name, value in receipt.items() if name not in ignored)
+                if (same and previous.get("channel") == "scheduled"
+                        and hmac.compare_digest(previous.get("signature", ""), _signature(previous, secret))
+                        and 0 <= (current - _stamp(previous["created"])).total_seconds() <= PROBE_AGE):
+                    generation = previous["generation"]
+                    receipt["generation"] = generation
+                    receipt["created"] = previous["created"]
+            except (OSError, ValueError, KeyError, TypeError):
+                pass
         view = dict(v=1, generation=generation, flags=visible_flags, actions=actions)
-        encode = lambda value: (json.dumps(value, ensure_ascii=True, separators=(",", ":"), allow_nan=False) + "\n").encode()
-        frozen, public = encode(receipt), encode(view)
+        public = _encode(view)
+        receipt["view_sha256"] = hashlib.sha256(public).hexdigest()
+        receipt["signature"] = _signature(receipt, secret)
+        frozen = _encode(receipt)
         if max(len(frozen), len(public)) > LIMIT:
             raise ValueError("preparation exceeds size limit")
+        if _check is not None:
+            if receipt != _check:
+                raise ValueError("preparation no longer matches live scope, policy or evidence")
+            for identity in identities.values():
+                if _read(Path(identity["path"]), host)[1] != identity:
+                    raise ValueError("evidence changed during reconciliation")
+            if canonical_project(project.canonical) != project.canonical:
+                raise ValueError("project scope changed during reconciliation")
+            return _complete(store, host, directory, state_name, state, receipt, imported)
         state["generation"] = int(generation)
-        host["_replace"](directory, state_name, encode(state))
+        host["_replace"](directory, state_name, _encode(state))
         host["_replace"](directory, "receipt-" + project.key + "-" + generation + ".json", frozen)
         path = project.folder / ("friction-inputs-" + generation + ".json")
         with host["_directory"](path.parent, True) as output:
             host["_replace"](output, path.name, public)
-        return path
+        return (path, receipt) if retain else path
+
+
+def acknowledge_scheduled(store, project, receipt):
+    host = runpy.run_path(str(Path(__file__).resolve().parent / "kaizen_friction_actions.py"))
+    with host["_directory"](store.friction, private=True) as directory, host["_locked"](directory, "prepare"):
+        name = "prepare-" + project.key + ".json"
+        state = _json(host["_read"](directory, name, LIMIT), host)
+        if (state.get("project") != str(project.canonical)
+                or state.get("generation") != int(receipt["generation"])
+                or state.get("acknowledged") != receipt["baseline"]):
+            raise ValueError("scheduled comparison state changed")
+        with host["_directory"](store.path.parent) as actions_directory:
+            _, _, receipts = store._load(actions_directory)
+        generations = receipts.get(str(project.canonical), {})
+        if ("scheduled:" + receipt["generation"] not in generations
+                or any(value == "pending" for row in generations.values() for value in row.values())):
+            raise ValueError("pending or missing scheduled import")
+        state["acknowledged"] = receipt["comparison"]
+        state["acknowledged_generation"] = receipt["generation"]
+        host["_replace"](directory, name, _encode(state))
+
+
+def reconcile(audits, backups, project, inputs, cfg, current, canonical_project, project_key,
+              actions=None):
+    """Re-derive private authority before importing suggestions or acknowledging work."""
+    host = runpy.run_path(str(Path(__file__).resolve().parent / "kaizen_friction_actions.py"))
+    store = host["HostActions"](audits, backups, canonical_project, project_key)
+    inputs = Path(inputs).expanduser().absolute()
+    match = re.fullmatch(r"friction-inputs-([0-9]{20})\.json", inputs.name)
+    if inputs.parent != project.folder or match is None:
+        raise ValueError("inputs outside current project preparation scope")
+    public, _ = _read(inputs, host)
+    name = "receipt-" + project.key + "-" + match[1] + ".json"
+    with host["_directory"](store.friction, private=True) as directory:
+        receipt = _json(host["_read"](directory, name, LIMIT), host)
+    if (receipt.get("project") != str(project.canonical) or receipt.get("generation") != match[1]
+            or receipt.get("view_sha256") != hashlib.sha256(public).hexdigest()
+            or not hmac.compare_digest(receipt.get("signature", ""), _signature(receipt, store._secret()))):
+        raise ValueError("unmatched or forged preparation view or receipt")
+    block = None
+    if actions is not None:
+        raw, _ = _read(Path(actions).expanduser().absolute(), host, limit=8192)
+        block = raw.decode("utf-8").removesuffix("\n")
+        requests = host["_requests"](block)
+        if any(intent != "suggest" for intent in requests.values()):
+            raise ValueError("interactive import permits suggestions only")
+
+    def complete(store, host, directory, state_name, state, checked, imported):
+        if block is not None:
+            return store.import_actions(block, checked["allowed"], project.canonical,
+                                        "interactive:" + checked["generation"])
+        if imported is None:
+            raise ValueError("acknowledgement requires a successful validated import")
+        state["acknowledged"] = checked["comparison"]
+        state["acknowledged_generation"] = checked["generation"]
+        host["_replace"](directory, state_name, _encode(state))
+
+    return prepare(audits, backups, project, Path(receipt["identities"]["report"]["path"]), cfg,
+                   "propose-only", current, canonical_project, project_key, interactive=True,
+                   _check=receipt, _complete=complete)

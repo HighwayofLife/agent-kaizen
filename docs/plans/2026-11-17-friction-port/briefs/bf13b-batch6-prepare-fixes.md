@@ -28,3 +28,7 @@ Owned files: `scripts/kaizen_friction_prepare.py`, `scripts/kaizen-scheduled` (o
 ## Report
 
 Each finding: fixed or not, and its test name. Files changed with line counts. Check results.
+
+## Delta (after P20b landed, 0f9a3d8)
+
+P20b changed `scripts/kaizen_friction_prepare.py` (+125 lines: signed receipts, live re-derivation, import/acknowledge). The line numbers above are stale: re-locate each finding in the current code. If P20b already fixed one, say so in the report with the test that covers it; otherwise fix it. Do ALL eight items. Keep P20b's tests passing.
