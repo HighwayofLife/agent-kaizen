@@ -1437,6 +1437,7 @@ def review_command(options, mode, report, session_id, project_dir=None, audits=N
 
 # Patterns are relative to audits; each wildcard matches one path component.
 RETENTION_KINDS = {
+    "samples": {"patterns": ("samples/*.tsv",), "days": 14, "maxMB": 50},
     "extracts": {"patterns": ("extracts/*.extract.json", "projects/*/*.extract.json",
                               "projects/*/host-probe-*.json", "projects/*/friction-inputs-*.json"),
                  "days": 30, "maxMB": 200},
@@ -1493,6 +1494,37 @@ def retention_stat(root, path):
         return info
     except OSError:
         return None
+
+
+def delete_sample(audits, path, identity, current):
+    """Coordinate with sampler writers and recheck both pinned file identities."""
+    if fcntl is None or path.name >= datetime.fromtimestamp(current, timezone.utc).strftime("%Y-%m-%d.tsv"):
+        raise OSError("sample day is protected")
+    flags = os.O_RDWR | getattr(os, "O_NOFOLLOW", 0) | os.O_NONBLOCK
+    directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0))
+    try:
+        lock = os.open(".lock", flags | os.O_CREAT, 0o600, dir_fd=directory)
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fd = os.open(path.name, flags, dir_fd=directory)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                info = os.fstat(fd)
+                named = os.stat(path.name, dir_fd=directory, follow_symlinks=False)
+                lock_info = os.fstat(lock)
+                named_lock = os.stat(".lock", dir_fd=directory, follow_symlinks=False)
+                if (not stat.S_ISREG(lock_info.st_mode) or not os.path.samestat(lock_info, named_lock)
+                        or not os.path.samestat(info, named)
+                        or (info.st_ino, info.st_dev, info.st_mtime_ns) != identity
+                        or retention_stat(audits, path) is None):
+                    raise OSError("sample changed")
+                os.unlink(path.name, dir_fd=directory)
+            finally:
+                os.close(fd)
+        finally:
+            os.close(lock)
+    finally:
+        os.close(directory)
 
 
 def housekeep(audits, cfg, dry_run=False, now=None):
@@ -1567,6 +1599,15 @@ def housekeep(audits, cfg, dry_run=False, now=None):
                         continue
                     if family == "cycle" and path.name.endswith(".failed.md"):
                         continue
+                    if kind == "samples":
+                        try:
+                            day = datetime.strptime(path.name, "%Y-%m-%d.tsv").replace(tzinfo=timezone.utc)
+                        except ValueError:
+                            continue
+                        if day.strftime("%Y-%m-%d.tsv") != path.name:
+                            continue
+                        if day.date() >= datetime.fromtimestamp(current, timezone.utc).date():
+                            protected.add(path)
                     info = retention_stat(audits, path)
                     if info is not None:
                         files[path] = info
@@ -1577,7 +1618,11 @@ def housekeep(audits, cfg, dry_run=False, now=None):
                                             reverse=True)[:5])
         for path in sorted(files, key=lambda p: (files[p].st_mtime, p.as_posix())):
             info = files[path]
-            if path not in protected and current - info.st_mtime > window:
+            age_origin = (datetime.strptime(path.name, "%Y-%m-%d.tsv")
+                          .replace(tzinfo=timezone.utc).timestamp() + 86400
+                          if kind == "samples" else info.st_mtime)
+            if path not in protected and (current - age_origin >= window if kind == "samples"
+                                          else current - age_origin > window):
                 add(path, info, kind, "age")
                 if kind == "reports":
                     marker = path.with_suffix(".reviewed")
@@ -1603,7 +1648,10 @@ def housekeep(audits, cfg, dry_run=False, now=None):
                 if info is None or (info.st_ino, info.st_dev, info.st_mtime_ns) != identities[path]:
                     log(f"housekeep: skipped {entry['path']}: file changed or missing")
                     continue
-                path.unlink()
+                if entry["kind"] == "samples":
+                    delete_sample(audits, path, identities[path], current)
+                else:
+                    path.unlink()
             except OSError as error:
                 log(f"housekeep: skipped {entry['path']}: {error}")
                 continue
