@@ -7,6 +7,9 @@ argument-hint: "[propose|safe|auto|yolo|propose-only]"
 
 # Check for new models
 
+**Plugin root:** `${CLAUDE_PLUGIN_ROOT}`. If that is still a `${...}` placeholder, use the folder that contains `skills/` (this file is `skills/<name>/SKILL.md`), and substitute that path, in quotes, wherever this skill uses `CLAUDE_PLUGIN_ROOT`.
+**Not in Claude Code?** Read `docs/hosts.md` in the plugin root first. Skip steps that only work in Claude Code, and follow its propose-only rule before changing any host configuration.
+
 New models often change the best choice for a routing row: a newer small model can take over work from a mid-tier one, or a new top model can make an escalation rung unnecessary. Run this monthly, or when a provider announces a release.
 
 **Changes:** none until you approve. With `propose-only`, write the proposal to the project report folder as `models-<yyyy-mm-dd>.md` and stop.

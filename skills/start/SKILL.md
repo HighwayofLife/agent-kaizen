@@ -7,6 +7,9 @@ argument-hint: "[propose|safe|auto|yolo]"
 
 # Start the loop
 
+**Plugin root:** `${CLAUDE_PLUGIN_ROOT}`. If that is still a `${...}` placeholder, use the folder that contains `skills/` (this file is `skills/<name>/SKILL.md`), and substitute that path, in quotes, wherever this skill uses `CLAUDE_PLUGIN_ROOT`.
+**Not in Claude Code?** Read `docs/hosts.md` in the plugin root first. Skip steps that only work in Claude Code, and follow its propose-only rule before changing any host configuration.
+
 Set up the files that turn one-off tune-ups into a loop that keeps improving: an improvements ledger and a baseline.
 
 **Changes:** creates `docs/kaizen/` and writes `schedule` and `scheduledAutonomy` to `docs/kaizen/config.json` when you answer; `auto` also adds the project to the global `autoProjects`.

@@ -7,6 +7,9 @@ argument-hint: "[propose|safe|auto|yolo|re-evaluate]"
 
 # Build your agent roster: who does what, with fallbacks and escalation
 
+**Plugin root:** `${CLAUDE_PLUGIN_ROOT}`. If that is still a `${...}` placeholder, use the folder that contains `skills/` (this file is `skills/<name>/SKILL.md`), and substitute that path, in quotes, wherever this skill uses `CLAUDE_PLUGIN_ROOT`.
+**Not in Claude Code?** Read `docs/hosts.md` in the plugin root first. Skip steps that only work in Claude Code, and follow its propose-only rule before changing any host configuration.
+
 The best routing depends on what *you* have. For example, a vendor with strong web search can be your research agent, and a long-context model can take very long documents. Codex can take most coding off your Claude usage, and a local model can do bulk text transforms for free. None of that matters if you don't have the subscription. This skill:
 - finds out what you have;
 - researches each model's strengths from current sources;

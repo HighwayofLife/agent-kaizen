@@ -7,6 +7,9 @@ argument-hint: "[propose|safe|auto|yolo]"
 
 # A planning pipeline with right-sized planners
 
+**Plugin root:** `${CLAUDE_PLUGIN_ROOT}`. If that is still a `${...}` placeholder, use the folder that contains `skills/` (this file is `skills/<name>/SKILL.md`), and substitute that path, in quotes, wherever this skill uses `CLAUDE_PLUGIN_ROOT`.
+**Not in Claude Code?** Read `docs/hosts.md` in the plugin root first. Skip steps that only work in Claude Code, and follow its propose-only rule before changing any host configuration.
+
 Multi-step work is planned once, in files that every agent can read, by the cheapest planner that fits. Engineers get standalone briefs instead of reconstructing context from the conversation.
 
 **Changes:** templates, planner agent definitions and instruction rules, after you approve.
