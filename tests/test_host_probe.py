@@ -55,7 +55,13 @@ if os.environ.get('SIGNIN'):
 if os.environ.get('MARKET_FAIL'):
     print('marketplace unavailable'); sys.exit(1)
 if sys.argv[1:3] == ['plugin', 'install']:
-    pathlib.Path(os.environ['COPILOT_HOME'], 'installed-plugins/agent-kaizen-tools/agent-kaizen').mkdir(parents=True)
+    mode = os.environ.get('INSTALL_MODE', 'copied')
+    if mode == 'copied':
+        pathlib.Path(os.environ['COPILOT_HOME'], 'installed-plugins/agent-kaizen-tools/agent-kaizen').mkdir(parents=True)
+    elif mode == 'live':
+        print('It is loaded live from ' + str(pathlib.Path(os.environ['HOME']).parent / 'export') + ', so edits take effect on the next session — nothing was copied.')
+    elif mode == 'wrong-path':
+        print('It is loaded live from /other/plugin, so edits take effect on the next session — nothing was copied.')
 '''
 
 
@@ -139,6 +145,19 @@ class HostProbeTest(unittest.TestCase):
         self.assertEqual(run.returncode, 0, run.stdout)
         self.assertNotIn('needs sign-in', run.stdout)
         self.assertEqual(run.stdout.count('PASS'), 3)
+
+    def test_copilot_install_modes(self):
+        self.stub('copilot', COPILOT)
+        for mode in ('live', 'copied'):
+            with self.subTest(mode=mode):
+                run = self.run_probe('--host', 'copilot', INSTALL_MODE=mode)
+                self.assertEqual(run.returncode, 0, run.stdout + run.stderr)
+                self.assertIn('PASS copilot installed:', run.stdout)
+        for mode in ('missing', 'wrong-path'):
+            with self.subTest(mode=mode):
+                run = self.run_probe('--host', 'copilot', INSTALL_MODE=mode)
+                self.assertEqual(run.returncode, 1, run.stdout + run.stderr)
+                self.assertIn('FAIL copilot installed: installation missing', run.stdout)
 
     def test_failures_and_worktree(self):
         self.stub('codex', CODEX)

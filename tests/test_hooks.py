@@ -322,6 +322,63 @@ class HookTests(unittest.TestCase):
                     self.assertEqual(run_raw('bash-burst.sh', reset, env).stdout, '')
                     self.assertIsNone(run('bash-burst.sh', payload, env))
 
+    def test_host_trace_opt_in(self):
+        for host in ('claude', 'codex', 'copilot'):
+            fixture_host = 'codex' if host == 'claude' else host
+            for fixture in sorted((ROOT / 'tests/fixtures/hooks').glob(fixture_host + '_*.json')):
+                payload = json.loads(fixture.read_text())
+                names = ('audit-notice.sh', 'session-audit.sh') if 'sessionstart' in fixture.name else ('bash-burst.sh',)
+                for name in names:
+                    with self.subTest(host=host, fixture=fixture.name, hook=name):
+                        config = self.tmp / (host + fixture.stem + name)
+                        trace = config / 'agent-kaizen/host-trace'
+                        env = {'CLAUDE_CONFIG_DIR': str(config), 'KAIZEN_HOST': host,
+                               'KAIZEN_BASH_BURST': '999999', 'TMPDIR': str(self.tmp)}
+                        off = run_raw(name, payload, env)
+                        self.assertFalse((trace / 'trace.jsonl').exists())
+                        trace.mkdir(parents=True)
+                        (trace / 'on').touch()
+                        on = run_raw(name, payload, env)
+                        self.assertEqual((on.stdout, on.returncode), (off.stdout, off.returncode))
+                        lines = (trace / 'trace.jsonl').read_text().splitlines()
+                        self.assertEqual(len(lines), 1)
+                        data = json.loads(lines[0])
+                        self.assertEqual(data['host'], host)
+                        self.assertEqual(data['event'], payload.get('hook_event_name'))
+                        self.assertEqual(data['tool'], payload.get('tool_name'))
+                        self.assertEqual(data['keys'], sorted(payload))
+
+    def test_trace_rejects_payload_strings(self):
+        config = self.tmp / 'config'
+        trace = config / 'agent-kaizen/host-trace'
+        trace.mkdir(parents=True)
+        (trace / 'on').touch()
+        payload = {'hook_event_name': 'private value', 'tool_name': 'x' * 65, 'bad key': 1}
+        run_raw('bash-burst.sh', payload, {'CLAUDE_CONFIG_DIR': str(config)})
+        data = json.loads((trace / 'trace.jsonl').read_text())
+        self.assertEqual((data['event'], data['tool']), ('<other>', '<other>'))
+        self.assertIn('<other>', data['keys'])
+
+    def test_inherited_trace_state_and_missing_home(self):
+        payload = {'session_id': 'inherited', 'hook_event_name': 'PostToolUse', 'tool_name': 'Bash'}
+        env = self.burst_env(KAIZEN_BASH_BURST='1', kaizen_tracing='1', kaizen_input='')
+        result = run_raw('bash-burst.sh', payload, env)
+        self.assertTrue(result.stdout)
+        project, audits, _, notice_env = self.notice_setup()
+        (audits / 'token-audit-1.md').write_text('audit')
+        notice_env.update(kaizen_tracing='1', kaizen_input='')
+        notice = run_raw('audit-notice.sh', {'cwd': str(project)}, notice_env)
+        self.assertIn('unreviewed usage audit', notice.stdout)
+        base = {k: v for k, v in os.environ.items() if k not in ('HOME', 'CLAUDE_CONFIG_DIR')}
+        base.update(TMPDIR=str(self.tmp / 'missing'), KAIZEN_BASH_BURST='1')
+        Path(base['TMPDIR']).mkdir()
+        missing = subprocess.run(['bash', str(HOOKS / 'bash-burst.sh')], input=json.dumps(payload), text=True, capture_output=True, env=base)
+        base['TMPDIR'] = str(self.tmp / 'baseline')
+        Path(base['TMPDIR']).mkdir()
+        base['CLAUDE_CONFIG_DIR'] = str(self.tmp / 'off')
+        off = subprocess.run(['bash', str(HOOKS / 'bash-burst.sh')], input=json.dumps(payload), text=True, capture_output=True, env=base)
+        self.assertEqual((missing.stdout, missing.returncode), (off.stdout, off.returncode))
+
     def test_host_helpers_identical(self):
         helpers = []
         for name in ('audit-notice.sh', 'session-audit.sh', 'bash-burst.sh'):

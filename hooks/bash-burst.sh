@@ -34,6 +34,15 @@ kaizen_context() {
     fi
 }
 # --- end host helper ---
+kaizen_tracing=0
+kaizen_input=
+if [[ -f ${CLAUDE_CONFIG_DIR:-${HOME:-}/.claude}/agent-kaizen/host-trace/on ]]; then
+    # shellcheck source=hooks/lib/trace.sh
+    source "$(dirname "${BASH_SOURCE[0]}")/lib/trace.sh"
+    kaizen_input=$(cat)
+    kaizen_trace "$kaizen_input"
+    kaizen_tracing=1
+fi
 [[ ${KAIZEN_BASH_BURST-} == 0 ]] && exit 0
 command -v jq >/dev/null 2>&1 || exit 0
 config=${CLAUDE_CONFIG_DIR:-${HOME-}/.claude}/agent-kaizen.json
@@ -43,7 +52,7 @@ if [[ -r $config ]]; then
         [[ $(jq -r '.enabled == false' <<<"$settings" 2>/dev/null) == true ]] && exit 0
     fi
 fi
-in=$(cat)
+if [[ ${kaizen_tracing:-0} == 1 ]]; then in=$kaizen_input; else in=$(cat); fi
 IFS='|' read -r event tool agent interrupt session < <(jq -r 'select(type == "object") |
     [(.hook_event_name | strings // "-"), (.tool_name | strings // "-"), (has("agent_id") | tostring),
      (.is_interrupt == true | tostring), (.session_id | strings | select(length > 0) // "")] | join("|")' <<<"$in" 2>/dev/null)

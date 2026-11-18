@@ -179,7 +179,10 @@ def main():
                             installed = False
                         if installed:
                             path = tmp / 'copilot/installed-plugins/agent-kaizen-tools/agent-kaizen'
-                            add('PASS' if path.is_dir() else 'FAIL', 'copilot', 'installed', 'installation found' if path.is_dir() else 'installation missing')
+                            output = results[-1]['detail']
+                            live = re.search(r'loaded live from <tmp>/export(?=/|[,\s—]|$)', output, re.I)
+                            found = path.is_dir() or bool(live)
+                            add('PASS' if found else 'FAIL', 'copilot', 'installed', 'installation found' if found else 'installation missing')
                         else:
                             add('SKIP', 'copilot', 'installed', 'plugin install did not succeed')
     finally:

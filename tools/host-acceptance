@@ -1,0 +1,275 @@
+#!/usr/bin/env python3
+"""Two-session acceptance check for supported plugin hosts."""
+import argparse
+import datetime
+import json
+import os
+import re
+import signal
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+
+ROOT = Path(__file__).resolve().parent.parent
+HOME = Path.home()
+CONFIG = Path(os.environ.get('CLAUDE_CONFIG_DIR') or HOME / '.claude') / 'agent-kaizen'
+TRACE = CONFIG / 'host-trace'
+VERSION = json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version']
+
+
+def run(args, **kwargs):
+    return subprocess.run([str(x) for x in args], text=True, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, timeout=60, **kwargs)
+
+
+def export_source(dest):
+    listing = run(['git', '-C', ROOT, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], check=True).stdout
+    if dest.exists():
+        shutil.rmtree(dest)
+    dest.mkdir(parents=True)
+    for name in set(listing.split('\0')) - {''}:
+        parts = Path(name).parts
+        src = ROOT / name
+        if not any((ROOT / Path(*parts[:i])).is_symlink() for i in range(1, len(parts) + 1)) and src.is_file():
+            target = dest / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src, target)
+
+
+def safe_trace(value):
+    return value if isinstance(value, str) and re.fullmatch(r'[A-Za-z0-9_.:-]{1,64}', value, flags=re.ASCII) else '<other>'
+
+
+def redact(value):
+    if isinstance(value, str):
+        value = value.replace(str(HOME), '~')
+        return re.sub(r'/(?:Users|home)/[^/\n]+', '~', value)
+    if isinstance(value, list):
+        return [redact(item) for item in value]
+    if isinstance(value, dict):
+        return {redact(key): redact(item) for key, item in value.items()}
+    return value
+
+
+def observe(value):
+    name, sep, result = value.partition('=')
+    status, _, note = result.partition(':')
+    if not sep or name not in ('skill_invoked', 'notice_seen', 'skills_not_preloaded') or status not in ('pass', 'fail', 'skip'):
+        raise argparse.ArgumentTypeError('expected NAME=pass|fail|skip[:note]')
+    return name, status.upper(), note
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest='action', required=True)
+    for action in ('status', 'install', 'check', 'cleanup'):
+        p = sub.add_parser(action)
+        p.add_argument('--host', required=True, choices=('codex', 'copilot-cli', 'vscode'))
+        if action == 'install':
+            p.add_argument('--source', choices=('local', 'github'), default='local')
+        if action == 'check':
+            p.add_argument('--install-dir', type=Path)
+            p.add_argument('--observe', action='append', type=observe, default=[],
+                           help='skill_invoked is required: run agent-kaizen:scan --demo; report pass or fail[:note]')
+    args = parser.parse_args()
+    statefile = CONFIG / 'host-acceptance' / (args.host + '.json')
+    try:
+        state = json.loads(statefile.read_text())
+    except (OSError, ValueError):
+        state = {}
+    cli = 'codex' if args.host == 'codex' else 'copilot'
+    if args.action == 'status':
+        report = Path(state['report']).resolve() if isinstance(state.get('report'), str) else None
+        reportdir = (ROOT / 'out/host-acceptance').resolve()
+        valid_report = report and report.is_file() and reportdir in report.parents
+        print('Done: report at ' + redact(str(report)) if valid_report else
+              'Phase 2: start a new session, then run `check`' if state.get('installed_at') else
+              'Phase 1: run `install`')
+        return 0
+    if args.action == 'cleanup':
+        (TRACE / 'on').unlink(missing_ok=True)
+        print('Trace disabled. Uninstall with: {} plugin {} agent-kaizen@agent-kaizen-tools'.format(cli, 'remove' if cli == 'codex' else 'uninstall'))
+        return 0
+    if args.action == 'install':
+        manual = args.host == 'vscode' and not shutil.which(cli)
+        source = 'HighwayofLife/agent-kaizen'
+        if args.source == 'local':
+            source = Path(os.environ.get('XDG_CACHE_HOME') or HOME / '.cache') / 'agent-kaizen-acceptance/source'
+            export_source(source)
+        if manual:
+            print('In VS Code enable chat.plugins.enabled, choose the Copilot session target, and run Chat: Install Plugin from Source using {}.'.format(source))
+        else:
+            if not shutil.which(cli):
+                print('Missing {} CLI; install it and sign in first.'.format(cli), file=sys.stderr)
+                return 1
+            # Discover removal syntax from the CLI rather than assuming it.
+            helptext = run([cli, 'plugin', 'marketplace', '--help']).stdout
+            if 'remove' in helptext:
+                run([cli, 'plugin', 'marketplace', 'remove', 'agent-kaizen-tools'])
+            else:
+                print('If the marketplace already exists, remove it using {} plugin marketplace --help first.'.format(cli))
+            for command in ([cli, 'plugin', 'marketplace', 'add', source],
+                            [cli, 'plugin', 'add' if cli == 'codex' else 'install', 'agent-kaizen@agent-kaizen-tools']):
+                result = run(command)
+                if result.returncode:
+                    print(result.stdout + result.stderr, file=sys.stderr)
+                    return 1
+        TRACE.mkdir(parents=True, exist_ok=True)
+        (TRACE / 'trace.jsonl').write_text('')
+        (TRACE / 'on').touch()
+        state = {'installed_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'install': 'manual' if manual else args.source}
+        statefile.parent.mkdir(parents=True, exist_ok=True)
+        statefile.write_text(json.dumps(state, indent=2) + '\n')
+        nxt = {'codex': 'quit Codex, start a new Codex session in this folder, run /hooks and trust the Agent Kaizen hooks.',
+               'copilot-cli': 'quit Copilot CLI and start a new Copilot CLI session in this folder.',
+               'vscode': 'run "Developer: Reload Window" in VS Code, then open a new Copilot chat session.'}[args.host]
+        print('Phase 1 done. Stop here and tell the human to ' + nxt + ' Then paste the same prompt again to run phase 2.')
+        return 0
+    return check(args, state, statefile, cli)
+
+
+def check(args, state, statefile, cli):
+    rows = []
+    def add(name, status, detail):
+        rows.append(dict(id=name, status=status, detail=str(detail)))
+    binary = shutil.which(cli)
+    version = 'unavailable'
+    if binary:
+        result = run([cli, '--version'])
+        version = (result.stdout or result.stderr).strip()
+        add('cli', 'PASS' if result.returncode == 0 else 'FAIL', version)
+    else:
+        add('cli', 'SKIP' if args.host == 'vscode' else 'FAIL', 'CLI not found')
+    base = Path(os.environ.get('CODEX_HOME') or HOME / '.codex') / 'plugins/cache/agent-kaizen-tools/agent-kaizen' / VERSION if cli == 'codex' else Path(os.environ.get('COPILOT_HOME') or HOME / '.copilot') / 'installed-plugins/agent-kaizen-tools/agent-kaizen'
+    installed = args.install_dir or base
+    try:
+        actual = json.loads((installed / '.claude-plugin/plugin.json').read_text())['version']
+        add('installed', 'PASS' if actual == VERSION else 'FAIL', 'installed {}, checkout {}'.format(actual, VERSION))
+    except (OSError, ValueError, KeyError) as exc:
+        add('installed', 'FAIL', exc)
+    files = list(ROOT.glob('skills/*/SKILL.md')) + list(ROOT.glob('hooks/*.sh')) + list(ROOT.glob('hooks/lib/*.sh')) + [ROOT / 'hooks/hooks.json']
+    if cli == 'codex':
+        files += list(ROOT.glob('skills/*/agents/openai.yaml'))
+    missing = [str(p.relative_to(ROOT)) for p in files if not (installed / p.relative_to(ROOT)).is_file()]
+    if not missing and (installed / 'hooks/hooks.json').read_bytes() != (ROOT / 'hooks/hooks.json').read_bytes():
+        missing.append('hooks/hooks.json differs')
+    add('files', 'FAIL' if missing else 'PASS', ', '.join(missing) or 'installed files present')
+    errors = []
+    for script in ('kaizen-doctor', 'kaizen-scan', 'token-audit'):
+        try:
+            if run([sys.executable, installed / 'scripts' / script, '--help']).returncode:
+                errors.append(script)
+        except (OSError, subprocess.SubprocessError):
+            errors.append(script)
+    add('scripts', 'FAIL' if errors else 'PASS', ', '.join(errors) or 'help commands passed')
+    manual = args.host == 'vscode' and (state.get('install') == 'manual' or args.install_dir is not None)
+    try:
+        result = run([sys.executable, installed / 'scripts/kaizen-doctor'])
+        match = 'Codex: plugin version' if cli == 'codex' else 'Copilot: plugin installed'
+        passed = result.returncode == 0 and any('PASS' in line and match in line for line in result.stdout.splitlines())
+        add('doctor', 'PASS' if passed else 'SKIP' if manual else 'FAIL',
+            'manual install; kaizen-doctor checks the Copilot CLI location only' if manual and not passed else match)
+    except (OSError, subprocess.SubprocessError) as exc:
+        add('doctor', 'SKIP' if manual else 'FAIL',
+            'manual install; kaizen-doctor checks the Copilot CLI location only' if manual else exc)
+    errors = []
+    with tempfile.TemporaryDirectory() as tmp:
+        # Copilot's session hook detaches the scheduler. Keep this offline
+        # fixture read-only so it cannot race temporary-directory cleanup.
+        (Path(tmp) / 'agent-kaizen.json').write_text('{"autoAudit": false}\n')
+        env = {k: v for k, v in os.environ.items() if not k.startswith(('KAIZEN_', 'CLAUDE_', 'CODEX_', 'COPILOT_'))}
+        env.update(HOME=tmp, TMPDIR=tmp, CODEX_HOME=tmp, COPILOT_HOME=tmp,
+                   CLAUDE_CONFIG_DIR=tmp, PLUGIN_ROOT=str(installed), KAIZEN_HOST=cli,
+                   PYTHONDONTWRITEBYTECODE='1')
+        if cli == 'copilot':
+            env.update(COPILOT_PLUGIN_ROOT=str(installed), CLAUDE_PLUGIN_ROOT=str(installed))
+        for fixture in sorted((ROOT / 'tests/fixtures/hooks').glob(cli + '_*.json')):
+            scripts = ('audit-notice.sh', 'session-audit.sh') if 'sessionstart' in fixture.name else ('bash-burst.sh',)
+            for script in scripts:
+                try:
+                    if cli == 'copilot' and script == 'session-audit.sh':
+                        # The hook detaches its scheduler; keep the fixture home
+                        # until every process in its group has exited.
+                        proc = subprocess.Popen(['bash', str(installed / 'hooks' / script)],
+                                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                                stderr=subprocess.PIPE, text=True, env=env,
+                                                start_new_session=True)
+                        stdout, stderr = proc.communicate(fixture.read_text(), timeout=60)
+                        deadline = time.monotonic() + 60
+                        while True:
+                            try:
+                                os.killpg(proc.pid, 0)
+                            except ProcessLookupError:
+                                break
+                            if time.monotonic() >= deadline:
+                                os.killpg(proc.pid, signal.SIGKILL)
+                                raise subprocess.TimeoutExpired(proc.args, 60)
+                            time.sleep(0.01)
+                        result = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+                    else:
+                        result = run(['bash', installed / 'hooks' / script], input=fixture.read_text(), env=env)
+                    data = json.loads(result.stdout) if result.stdout.strip() else {}
+                    if result.returncode or not isinstance(data, dict) or (data and not (('additionalContext' if cli == 'copilot' else 'hookSpecificOutput') in data)):
+                        errors.append(fixture.name + ':' + script)
+                except (OSError, ValueError, subprocess.SubprocessError):
+                    errors.append(fixture.name + ':' + script)
+    add('hooks-offline', 'FAIL' if errors else 'PASS', ', '.join(errors) or 'fixture outputs valid')
+    traces = []
+    try:
+        since = datetime.datetime.fromisoformat(state['installed_at'].replace('Z', '+00:00'))
+        for line in (TRACE / 'trace.jsonl').read_text().splitlines():
+            item = json.loads(line)
+            if datetime.datetime.fromisoformat(item['ts'].replace('Z', '+00:00')) >= since.replace(microsecond=0):
+                traces.append(item)
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+    hosts = sorted({safe_trace(t.get('host')) for t in traces})
+    traces = [t for t in traces if t.get('host') == cli]
+    for item in traces:
+        for key in ('event', 'tool'):
+            if item.get(key) is not None:
+                item[key] = safe_trace(item[key])
+        item['keys'] = [safe_trace(k) for k in item['keys']] if isinstance(item.get('keys'), list) else None
+        item['env'] = [safe_trace(k) for k in item['env']] if isinstance(item.get('env'), list) else None
+    seen = sorted(set((str(t.get('event')), str(t.get('tool'))) for t in traces))
+    sessions = sum(str(t.get('event', '')).lower() == 'sessionstart' for t in traces)
+    for event in ('sessionStart', 'userPromptSubmit', 'postToolUse'):
+        found = any(str(t.get('event', '')).lower() == event.lower() and (event != 'postToolUse' or str(t.get('tool', '')).lower() in ('bash', 'shell', 'shell_command', 'powershell')) for t in traces)
+        hint = ('seen: ' + str(seen) if traces else
+                'no {} lines; seen hosts: {}'.format(cli, ', '.join(hosts)) if hosts else
+                'hooks not trusted in /hooks or session started before install' if cli == 'codex' else 'hooks not loaded')
+        detail = 'observed' if found else hint
+        if event == 'sessionStart':
+            detail += '; {} sessionStart lines{}'.format(sessions, ' (multiple sessions contributed)' if sessions > 1 else '')
+        add('hooks-live:' + event, 'PASS' if found else 'FAIL', detail)
+    observations = {name: (status, note) for name, status, note in args.observe}
+    for name in ('skill_invoked', 'notice_seen', 'skills_not_preloaded'):
+        status, detail = observations.get(name, ('FAIL' if name == 'skill_invoked' else 'SKIP', 'not reported'))
+        if name == 'skill_invoked' and status == 'SKIP':
+            status, detail = 'FAIL', 'required observation skipped: ' + detail
+        add(name, status, detail or 'reported')
+    combinations = sorted(set(json.dumps({k: t.get(k) for k in ('event', 'tool', 'keys', 'env')}, sort_keys=True, ensure_ascii=False) for t in traces))
+    counts = {s: sum(r['status'] == s for r in rows) for s in ('PASS', 'FAIL', 'SKIP')}
+    outcome = 'FAIL' if counts['FAIL'] else 'PASS'
+    commit = run(['git', '-C', ROOT, 'rev-parse', 'HEAD']).stdout.strip()
+    reportdir = ROOT / 'out/host-acceptance'
+    reportdir.mkdir(parents=True, exist_ok=True)
+    path = reportdir / (args.host + '-' + datetime.datetime.now(datetime.timezone.utc).strftime('%Y%m%dT%H%M%SZ'))
+    data = dict(result=outcome, host=args.host, cli_version=version, plugin_version=VERSION, commit=commit, checks=rows, trace_combinations=[json.loads(c) for c in combinations])
+    path.with_suffix('.json').write_text(json.dumps(redact(data), indent=2, ensure_ascii=False) + '\n')
+    lines = ['RESULT: ' + outcome, '', 'Host: ' + args.host, 'CLI version: ' + version, 'Plugin version: ' + VERSION, 'Git commit: ' + commit, '', '| Check | Result | Detail |', '| --- | --- | --- |']
+    lines += ['| {} | {} | {} |'.format(r['id'], r['status'], r['detail'].replace('|', '\\|').replace('\n', ' ')) for r in rows]
+    lines += ['', 'Trace combinations:', ''] + ['- `' + c + '`' for c in combinations]
+    path.with_suffix('.md').write_text(redact('\n'.join(lines)) + '\n')
+    state['report'] = str(path.with_suffix('.md'))
+    statefile.parent.mkdir(parents=True, exist_ok=True)
+    statefile.write_text(json.dumps(state, indent=2) + '\n')
+    print('RESULT: {} ({} pass, {} fail, {} skip) report: {}'.format(outcome, counts['PASS'], counts['FAIL'], counts['SKIP'], redact(str(path.with_suffix('.md')))))
+    return int(outcome == 'FAIL')
+
+
+if __name__ == '__main__':
+    sys.exit(main())
