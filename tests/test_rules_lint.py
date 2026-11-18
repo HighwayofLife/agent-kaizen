@@ -51,11 +51,14 @@ class RulesLintTest(unittest.TestCase):
         result = self.run_lint("--repo", self.repo, "--json")
         self.assertEqual(result.returncode, 1, result.stderr)
         hits = json.loads(result.stdout)["hits"]
-        self.assertEqual(len(hits), 4)
+        self.assertEqual(len(hits), 5)
         self.assertEqual({(Path(h["path"]).name, h["line"]) for h in hits},
-                         {("CLAUDE.md", 2), ("CLAUDE.md", 3), ("AGENTS.md", 1), ("AGENTS.md", 2)})
+                         {("CLAUDE.md", 2), ("CLAUDE.md", 3), ("CLAUDE.md", 4),
+                          ("AGENTS.md", 1), ("AGENTS.md", 2)})
         self.assertIn(r"project-repos\.txt", {h["pattern"] for h in hits})
         self.assertIn("copies the runner, token-audit", {h["pattern"] for h in hits})
+        self.assertIn(r"Outward-facing actions: commits, pushes, PRs, publishing, messages\.",
+                      {h["pattern"] for h in hits})
 
     def test_skill_description_wording(self):
         write(self.repo / "CLAUDE.md", "All skills are user-triggered (`disable-model-invocation: true`), so their descriptions don't cost context on every turn.\n")

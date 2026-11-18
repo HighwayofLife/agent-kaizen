@@ -2,7 +2,7 @@
 name: undo
 description: "Reverse a change Agent Kaizen applied: the last one, a specific change folder, or the whole last run."
 disable-model-invocation: true
-argument-hint: "[last|run|<change folder>]"
+argument-hint: "[last|run|<change folder>|<action ID>]"
 ---
 
 # Undo an applied change
@@ -15,6 +15,10 @@ Every change applied in `safe` or `auto` mode has a backup folder under `KAIZEN_
 ## Task
 
 Use the script, not hand-copying: `<Claude config dir>/bin/kaizen-backup` if it exists, otherwise `${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-backup`. Use one plain command per Bash call.
+
+For an explicit broker action ID (`fa1_` followed by 64 lowercase hex digits), first show the matching scoped record and its status. Run `python3 "${CLAUDE_PLUGIN_ROOT}/scripts/kaizen-scheduled" actions undo <ID> --for .` only for that ID in the enrolled project. Show the outcome; a refusal, missing record, different project or failed verification is not a revert. The tool verifies the inverse and marks its matching ledger row; do not mark another row yourself.
+
+For all other targets:
 
 1. Run `kaizen-backup list` and show me the target:
    - `last` (the default): the newest change that hasn't been reverted;
