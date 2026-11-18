@@ -2234,7 +2234,7 @@ def main(argv=None):
             if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", args.date):
                 raise ValueError("expected YYYY-MM-DD")
             day = datetime.strptime(args.date, "%Y-%m-%d").date()
-            if day > datetime.now(timezone.utc).date():
+            if day > datetime.now().date():
                 raise ValueError("date cannot be in the future")
             with config_lock(path):
                 try:

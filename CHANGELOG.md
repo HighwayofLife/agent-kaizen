@@ -2,7 +2,7 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
-## 0.12.0 (2026-11-17)
+## 0.12.0 (2026-11-18)
 
 Codex CLI and GitHub Copilot support: the same plugin installs on Codex CLI and the Copilot runtime. Claude Code behaviour is unchanged.
 
@@ -36,6 +36,10 @@ Codex CLI and GitHub Copilot support: the same plugin installs on Codex CLI and 
 
 - The README quick start has install steps for Codex CLI (tested on 0.167.0) and, marked experimental, for Copilot CLI and VS Code with the Copilot harness, plus a table of what works on each host.
 - The plugin and marketplace descriptions now mention Codex CLI and GitHub Copilot support.
+
+`checks record`:
+
+- No longer refuses the local date in time zones ahead of UTC.
 
 Updating on Codex: run `/hooks` again and trust the changed hooks; hooks do nothing until you do.
 

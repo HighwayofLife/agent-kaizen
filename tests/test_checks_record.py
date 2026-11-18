@@ -1,5 +1,7 @@
 """Tests for per-project completed check bookkeeping."""
 import json
+from datetime import datetime, timezone
+from unittest.mock import patch
 import os
 from pathlib import Path
 import runpy
@@ -56,6 +58,20 @@ class ChecksRecordTests(unittest.TestCase):
                                         capture_output=True, text=True, env=self.env)
                 self.assertNotIn('invalid or future date', result.stdout + result.stderr)
                 self.assertNotIn('models: never run', result.stdout)
+
+    def test_record_pinned_local_date_ahead_of_utc(self):
+        class Clock(datetime):
+            @classmethod
+            def now(cls, tz=None):
+                return cls(2026, 1, 1, 12, tzinfo=timezone.utc) if tz else cls(2026, 1, 2, 2)
+
+        module = runpy.run_path(str(SCRIPT))
+        main = module['main']
+        with patch.dict(os.environ, self.env), patch.dict(main.__globals__, datetime=Clock):
+            self.assertEqual(main(['checks', 'record', '--for', str(self.project), 'models']), 0)
+            self.assertEqual(main(['checks', 'record', '--for', str(self.project), 'models',
+                                   '--date', '2026-01-03']), 2)
+        self.assertEqual(json.loads(self.path().read_text())['models'], '2026-01-02')
 
     def test_concurrent_writers(self):
         path = self.path()
