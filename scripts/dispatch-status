@@ -57,6 +57,11 @@ def dirty_row(directory):
     return f'{directory}: {len(paths)} paths, {age}, {subject}'
 
 
+def advisory_status(run, path):
+    return run(path, '-c', 'status.showUntrackedFiles=all', 'status', '--porcelain=v1',
+               '-z', '--untracked-files=all', '--ignored=matching')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directories', nargs='*', type=Path, help='repository/worktree paths (default: current directory)')
@@ -105,7 +110,7 @@ def main():
         else:
             shown = set()
             for directory in args.directories or [Path.cwd()]:
-                facts = read_facts(directory.expanduser())
+                facts = read_facts(directory.expanduser(), advisory_status)
                 if facts is None:
                     print(f'{directory}: unknown')
                     continue
@@ -122,7 +127,8 @@ def main():
                     def value(item):
                         return 'unknown' if item is None else str(item).lower() if isinstance(item, bool) else str(item)
                     print(' '.join(f'{key}={value(fact[key])}' for key in
-                                   ('path', 'branch', 'tip', 'primary', 'linked', 'locked', 'detached', 'clean', 'merged')))
+                                   ('path', 'branch', 'tip', 'primary', 'linked', 'locked', 'detached',
+                                    'clean', 'merged', 'git_source') if key in fact))
                 if selected is not None and selected not in shown:
                     print(f'{directory}: unknown')
     return 0

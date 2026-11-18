@@ -1,9 +1,15 @@
 """Offline checks for dirty worktree reporting."""
+from contextlib import redirect_stdout
+import io
 import os
+import runpy
 import shutil
 import subprocess
+import sys
 import time
 from pathlib import Path
+from unittest.mock import patch
+
 from tests.test_scripts import StubCase
 
 
@@ -70,6 +76,21 @@ class DispatchStatusTests(StubCase):
         selected = self.run_script('dispatch-status', '--worktree-facts', other).stdout
         self.assertNotIn('primary=true', selected.split('WORKTREE FACTS (advisory)')[1])
 
+    def test_advisory_facts_fall_back_to_path_git(self):
+        script = Path(__file__).resolve().parents[1] / 'scripts/dispatch-status'
+        wrapper = self.bin / 'git'
+        wrapper.symlink_to(shutil.which('git'))
+        output = io.StringIO()
+        with patch.object(sys, 'path', [str(script.parent), *sys.path]):
+            import kaizen_worktree_facts
+            with patch.object(kaizen_worktree_facts, 'GIT_PATHS', ()), patch.dict(os.environ, self.env):
+                os.environ.pop('KAIZEN_GIT', None)
+                self.assertIsNone(kaizen_worktree_facts.resolve_git(self.work))
+                with patch.object(sys, 'argv', [str(script), '--worktree-facts', str(self.work)]):
+                    with redirect_stdout(output):
+                        runpy.run_path(str(script))['main']()
+        self.assertIn('clean=true merged=true git_source=path', output.getvalue())
+
     def test_detached_and_unmerged(self):
         other = self.root / 'linked'
         self.git('worktree', 'add', '-qb', 'topic', str(other))
@@ -91,6 +112,7 @@ class DispatchStatusTests(StubCase):
         wrapper.write_text('#!/bin/sh\ncase "$*" in *"worktree list"*" -z"*) exit 129;; esac\n'
                            'exec "%s" "$@"\n' % real)
         wrapper.chmod(0o755)
+        self.env['KAIZEN_GIT'] = str(wrapper)
         output = self.run_script('dispatch-status', '--worktree-facts').stdout
         self.assertIn(': unknown', output.split('WORKTREE FACTS (advisory)')[1])
         wrapper.write_text('#!/bin/sh\nexit 127\n')
@@ -110,6 +132,7 @@ class DispatchStatusTests(StubCase):
         wrapper.write_text('#!/bin/sh\ncase "$*" in *"worktree list"*" -z"*) exit 129;; esac\n'
                            'exec "%s" "$@"\n' % real)
         wrapper.chmod(0o755)
+        self.env['KAIZEN_GIT'] = str(wrapper)
         output = self.run_script('dispatch-status', '--worktree-facts').stdout
         self.assertIn(str(other), output.split('WORKTREE FACTS (advisory)')[1])
 

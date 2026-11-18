@@ -1,0 +1,570 @@
+#!/usr/bin/env -S python3 -I
+"""Check whether a linked worktree can be removed or restored."""
+# Explicit `python3 worktree-prune` without -I honours the caller's PYTHONPATH
+# at interpreter startup. The re-exec guard isolates the rest of the command.
+import os
+import sys
+
+if __name__ == '__main__' and not sys.flags.isolated:
+    os.execve(sys.executable, [sys.executable, '-I', os.path.abspath(__file__), *sys.argv[1:]],
+              {k: v for k, v in os.environ.items() if not k.startswith('PYTHON')})
+
+import argparse
+import errno
+from functools import partial
+import hashlib
+import json
+from pathlib import Path
+import re
+import stat
+import struct
+import time
+
+if __name__ == '__main__':
+    sys.dont_write_bytecode = True
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+from kaizen_worktree_facts import file_id, git, records, regular_bytes, resolve_git, within
+
+
+MIN_IDLE_SECONDS = 86400
+MAX_WALK_ENTRIES = 200000
+MAX_BYTES = 512 * 1024 * 1024
+MAX_INDEX_BYTES = 16 * 1024 * 1024
+DIR_FLAGS = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+OID = rb'(?:[0-9a-f]{40}|[0-9a-f]{64})'
+INDEX_DEBUG = re.compile(rb'(?:  [^\n]*\n){4}  size: [0-9]+\tflags: ([0-9a-f]+)\n')
+# Git's skip-worktree, intent-to-add and assume-unchanged bits.
+UNSAFE_INDEX_FLAGS = (1 << 30) | (1 << 29) | (1 << 15)
+SAFE_INDEX_EXTENSIONS = {b'TREE', b'UNTR', b'FSMN', b'EOIE', b'IEOT'}
+SAFE_XATTRS = {'com.apple.provenance', 'com.apple.quarantine', 'com.apple.lastuseddate#PS'}
+PENDING = 'worktree changes are disabled pending journal and recovery support (P12b)'
+
+
+class Refused(Exception):
+    pass
+
+
+def read(run, directory, *args, codes=(0,)):
+    result = run(directory, *args)
+    if result is None or result[0] not in codes:
+        raise Refused('Git check failed or exceeded its limits')
+    return result[1]
+
+
+def exact_target(value):
+    if not os.path.isabs(value) or value != os.path.realpath(value):
+        raise Refused('target must be absolute with no symlink or path aliases')
+    path = Path(value)
+    for part in reversed((path, *tuple(path.parents)[:-1])):
+        if part.name not in os.listdir(part.parent) or not stat.S_ISDIR(part.lstat().st_mode):
+            raise Refused('target has a case or symlink alias, or is not a directory')
+    return path
+
+
+def inode(path):
+    return file_id(path.stat())
+
+
+def layout(run, path):
+    output = read(run, path, 'rev-parse', '--path-format=absolute', '--show-toplevel',
+                  '--git-common-dir', '--absolute-git-dir').splitlines()
+    if len(output) != 3 or not all(p.startswith(b'/') for p in output):
+        raise Refused('cannot identify canonical Git directories')
+    return tuple(Path(os.fsdecode(p)).resolve(strict=True) for p in output)
+
+
+def registration(run, project):
+    _, common, _ = layout(run, project)
+    entries = records(run, project)
+    if not entries:
+        raise Refused('cannot read worktree registration')
+    trees = {Path(os.fsdecode(e[b'worktree'])): e for e in entries}
+    primary = next(iter(trees))
+    if len(trees) != len(entries) or not all(p.is_absolute() for p in trees):
+        raise Refused('worktree registration has ambiguous paths')
+    if b'bare' in trees[primary] or tuple(map(inode, layout(run, primary))) != (
+            inode(primary), inode(common), inode(common)):
+        raise Refused('primary worktree has inconsistent Git directories')
+    return primary, common, trees
+
+
+def branch_tip(run, path, branch):
+    if (not branch.startswith(b'refs/heads/') or b'..' in branch
+            or re.search(rb'[\x00-\x20\x7f~^:?*\[\\]|@\{', branch)):
+        raise Refused('cannot verify a local branch tip')
+    tip = read(run, path, 'rev-parse', '--verify', '--end-of-options', branch + b'^{commit}').rstrip(b'\n')
+    if not re.fullmatch(OID, tip):
+        raise Refused('cannot verify a local branch tip')
+    return tip
+
+
+def checked_head(run, path, entry, admin):
+    branch = entry.get(b'branch', b'')
+    if any(flag in entry for flag in (b'bare', b'detached', b'locked', b'prunable')):
+        raise Refused('worktree is bare, detached, locked or prunable')
+    tip = branch_tip(run, path, branch)
+    if entry.get(b'HEAD') != tip or regular_bytes(admin / 'HEAD', 8192) != b'ref: ' + branch + b'\n':
+        raise Refused('worktree HEAD changed or disagrees with registration')
+    return branch, tip
+
+
+def check_config(run, path):
+    # Reject promisor repositories even on Git versions without GIT_NO_LAZY_FETCH.
+    if read(run, path, 'config', '--includes', '--name-only', '--get-regexp',
+            r'^(filter\.|remote\..*\.promisor$|extensions\.partialclone$|core\.worktree$)',
+            codes=(0, 1)):
+        raise Refused('unsafe Git configuration')
+
+
+def pointer(path, prefix=b''):
+    value = regular_bytes(path, 8192)
+    if not value.startswith(prefix) or not value.endswith(b'\n') or b'\n' in value[:-1]:
+        raise Refused('invalid worktree registration pointer')
+    return path.parent / os.fsdecode(value[len(prefix):-1])
+
+
+def linked_admin(run, path, common):
+    marker, registry = path / '.git', common / 'worktrees'
+    admin = Path(os.path.abspath(pointer(marker, b'gitdir: ')))
+    meta = admin.lstat()
+    if (not stat.S_ISDIR(registry.lstat().st_mode) or not stat.S_ISDIR(meta.st_mode)
+            or inode(admin.parent) != inode(registry) or inode(pointer(admin / 'commondir')) != inode(common)):
+        raise Refused('linked worktree has inconsistent Git directories')
+    backlink = pointer(admin / 'gitdir')
+    if (backlink.name != '.git' or inode(backlink.parent) != inode(path)
+            or file_id(backlink.lstat()) != file_id(marker.lstat())
+            or tuple(map(inode, layout(run, path))) != (inode(path), inode(common), file_id(meta))):
+        raise Refused('linked worktree has inconsistent Git directories or backlink')
+    return admin, file_id(meta)
+
+
+def check_metadata(admin, common):
+    if os.path.lexists(admin / 'config.worktree'):
+        raise Refused('worktree has private config.worktree')
+    for directory in (admin, common):
+        with os.scandir(directory) as entries:
+            for entry in entries:
+                if entry.name.endswith('.lock') or entry.name in (
+                    'locked', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'REVERT_HEAD', 'BISECT_START',
+                    'rebase-merge', 'rebase-apply', 'sequencer'
+                ):
+                    raise Refused('Git metadata is locked or an operation is in progress')
+                if directory == admin and (entry.name in ('packed-refs', 'reftable', 'AUTO_MERGE',
+                        'MERGE_AUTOSTASH', 'BISECT_EXPECTED_REV', 'NOTES_MERGE_PARTIAL', 'NOTES_MERGE_REF')
+                        or (entry.name != 'ORIG_HEAD' and entry.name.endswith('_HEAD'))):
+                    raise Refused('worktree has private refs')
+    for name, kind in (('refs', 'refs'), ('logs', 'reflogs')):
+        root = admin / name
+        pending = [root] if os.path.lexists(root) else []
+        while pending:
+            directory = pending.pop()
+            if directory == admin / 'logs/HEAD':
+                continue
+            if not stat.S_ISDIR(directory.lstat().st_mode):
+                raise Refused(f'worktree has private {kind} at {str(directory.relative_to(admin))!r}')
+            with os.scandir(directory) as entries:
+                pending.extend(Path(entry.path) for entry in entries)
+
+
+def check_reflog(run, primary, admin, tip, primary_tip):
+    commits = set()
+    # Some Git versions create ORIG_HEAD when adding a worktree.
+    original = admin / 'ORIG_HEAD'
+    original_oid = regular_bytes(original, 65) if os.path.lexists(original) else None
+    if original_oid is not None:
+        if not re.fullmatch(OID + rb'\n', original_oid) or len(original_oid) != len(tip) + 1:
+            raise Refused('cannot parse worktree ORIG_HEAD')
+        commits.add(original_oid[:-1])
+    path = admin / 'logs/HEAD'
+    data = regular_bytes(path, 1024 * 1024) if os.path.lexists(path) else None
+    for line in (data or b'').splitlines(keepends=True):
+        match = re.fullmatch(rb'(' + OID + rb') (' + OID + rb') '
+                             rb'[^<>\0\n]* <[^<>\0\n]*> [0-9]+ [+-][0-9]{4}(?:\t[^\0\n]*)?\n', line)
+        if not match or any(len(oid) != len(tip) for oid in match.groups()):
+            raise Refused('cannot parse worktree HEAD reflog')
+        commits.update(oid for oid in match.groups() if oid.strip(b'0'))
+    if len(commits) > 2048:
+        raise Refused('worktree HEAD reflog is too large to check')
+    if commits and read(run, primary, 'rev-list', '--max-count=1', b'^' + tip, b'^' + primary_tip,
+                        *(oid + b'^{commit}' for oid in sorted(commits)), '--'):
+        raise Refused('worktree HEAD reflog has unretained commits')
+    return original_oid, data
+
+
+def object_hash(algorithm, kind, data):
+    digest = hashlib.new(algorithm, b'%s %d\0' % (kind, len(data)))
+    digest.update(data)
+    return digest
+
+
+def check_index_extensions(path, oid_size):
+    data = regular_bytes(path, MAX_INDEX_BYTES)
+    end = len(data) - oid_size
+    invalid = 'cannot parse worktree index extensions'
+    if end < 12:
+        raise Refused(invalid)
+    magic, version, count = struct.unpack_from('>4sII', data)
+    if magic != b'DIRC' or version not in (2, 3, 4) or count > MAX_WALK_ENTRIES:
+        raise Refused(invalid)
+    offset = 12
+    for _ in range(count):
+        start = offset
+        # Entries start with ten 32-bit stat fields, an OID and 16-bit flags.
+        offset += 40 + oid_size + 2
+        if offset > end:
+            raise Refused(invalid)
+        flags = int.from_bytes(data[offset - 2:offset], 'big')
+        if flags & 0x4000:
+            offset += 2  # Extended flags in index v3/v4.
+        if version == 4:
+            # A variable-length prefix removal count precedes the path suffix.
+            while offset < end and data[offset] & 0x80:
+                offset += 1
+            nul = data.find(b'\0', offset + 1, end)
+        elif (flags & 0xfff) == 0xfff:
+            nul = data.find(b'\0', offset, end)
+        else:
+            nul = offset + (flags & 0xfff)
+        if not offset <= nul < end or data[nul] != 0:
+            raise Refused(invalid)
+        offset = nul + 1 if version == 4 else start + ((nul + 1 - start + 7) & ~7)
+    if offset > end:
+        raise Refused(invalid)
+    while offset < end:
+        if end - offset < 8:
+            raise Refused(invalid)
+        name, size = struct.unpack_from('>4sI', data, offset)
+        if name not in SAFE_INDEX_EXTENSIONS:
+            label = name.decode('ascii') if all(32 <= byte < 127 for byte in name) else repr(name)
+            raise Refused(f'unsafe index extension {label}')
+        offset += 8 + size
+        if offset > end:
+            raise Refused(invalid)
+
+
+def checkout_tree(run, path, tip, admin, common):
+    sparse = read(run, path, 'config', '--type=bool', '--get-regexp',
+                  r'^core\.sparsecheckout(cone)?$', codes=(0, 1))
+    if (b'true' in sparse.split() or any(os.path.lexists(d / name) for d in (admin, common)
+                                       for name in ('info/sparse-checkout', 'sparse-checkout'))):
+        raise Refused('worktree uses sparse checkout')
+    algorithm = read(run, path, 'rev-parse', '--show-object-format').strip().decode('ascii')
+    if algorithm not in ('sha1', 'sha256') or len(tip) != hashlib.new(algorithm).digest_size * 2:
+        raise Refused('unsupported Git object format')
+    # Authenticate the listing against the captured HEAD, including each subtree.
+    commit = read(run, path, 'cat-file', 'commit', tip)
+    root = re.fullmatch(rb'tree (' + OID + rb')', commit.partition(b'\n')[0])
+    if not root or object_hash(algorithm, b'commit', commit).hexdigest().encode() != tip:
+        raise Refused('HEAD commit does not match its object ID')
+    directories = {b'': (root[1], bytearray())}
+    tree = {}
+    for item in read(run, path, 'ls-tree', '-r', '-t', '-z', '--full-tree', tip).split(b'\0')[:-1]:
+        header, _, name = item.partition(b'\t')
+        match = re.fullmatch(rb'(100644 blob|100755 blob|120000 blob|040000 tree) (' + OID + rb')', header)
+        parent, _, basename = name.rpartition(b'/')
+        if not match or not basename or parent not in directories or name in tree or name in directories:
+            raise Refused('HEAD has submodules or unsupported tree entries')
+        mode, oid = match[1].split()[0], match[2]
+        directories[parent][1].extend(mode.lstrip(b'0') + b' ' + basename + b'\0' + bytes.fromhex(oid.decode()))
+        if mode == b'040000':
+            directories[name] = (oid, bytearray())
+        else:
+            tree[name] = mode, oid
+    if any(object_hash(algorithm, b'tree', raw).hexdigest().encode() != oid
+           for oid, raw in directories.values()):
+        raise Refused('HEAD tree does not match its object ID')
+    check_index_extensions(admin / 'index', len(tip) // 2)
+    index = read(run, path, 'ls-files', '-v', '-s', '--sparse', '--debug', '-z')
+    remaining = tree.copy()
+    offset = 0
+    while offset < len(index):
+        end = index.index(b'\0', offset)
+        header, _, name = index[offset:end].partition(b'\t')
+        match = re.fullmatch(rb'H (100644|100755|120000) (' + OID + rb') 0', header)
+        debug = INDEX_DEBUG.match(index, end + 1)
+        if not match or not debug or int(debug[1], 16) & UNSAFE_INDEX_FLAGS:
+            raise Refused('index has hidden entries, staged conflicts or submodules')
+        if match.groups() != remaining.pop(name, None):
+            raise Refused('index does not equal HEAD')
+        offset = debug.end()
+    if remaining:
+        raise Refused('index does not equal HEAD')
+    return tree, algorithm
+
+
+def checked_open(name, flags, info, directory=None):
+    fd = os.open(name, flags, dir_fd=directory)
+    current = os.fstat(fd)
+    if file_id(current) != file_id(info) or current.st_mode != info.st_mode:
+        os.close(fd)
+        raise Refused('worktree identity or mode changed during scan')
+    return fd
+
+
+def xattr_reader():
+    if hasattr(os, 'listxattr'):
+        return partial(os.listxattr, follow_symlinks=False)
+    if sys.platform != 'darwin':
+        return None
+    import ctypes
+
+    listxattr = ctypes.CDLL(None, use_errno=True).listxattr
+    listxattr.argtypes = (ctypes.c_char_p, ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int)
+    listxattr.restype = ctypes.c_ssize_t
+
+    def names(path):
+        nofollow = 1  # XATTR_NOFOLLOW
+        size = listxattr(path, None, 0, nofollow)
+        if size == 0:
+            return ()
+        if size > 0:
+            buffer = ctypes.create_string_buffer(size)
+            size = listxattr(path, buffer, size, nofollow)
+            if size >= 0:
+                return buffer.raw[:size].split(b'\0')[:-1]
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+    return names
+
+
+def check_live(path, info, tree, algorithm, cutoff):
+    directories = {b''}
+    for name in tree:
+        parent = name.rpartition(b'/')[0]
+        while parent not in directories:
+            directories.add(parent)
+            parent = parent.rpartition(b'/')[0]
+    count, total = 0, 0
+    blobs = {}
+    list_xattrs = xattr_reader()
+    residuals = {} if list_xattrs else {'xattrs': 'unchecked'}
+    root_path = os.fsencode(path)
+
+    def check_xattrs(relative):
+        if list_xattrs is None:
+            return
+        try:
+            names = list_xattrs(os.path.join(root_path, relative))
+        except OSError as error:
+            if error.errno not in (errno.ENOSYS, errno.ENOTSUP, errno.EOPNOTSUPP):
+                raise
+            residuals['xattrs'] = 'unchecked'
+            return
+        if any(os.fsdecode(name) not in SAFE_XATTRS for name in names):
+            raise Refused(f'worktree has extended attributes at {os.fsdecode(relative)!r}')
+
+    def walk(fd, prefix):
+        nonlocal count, total
+        if (prefix + b'HEAD' in tree and all(prefix + name in directories or prefix + name in tree
+                                            for name in (b'objects', b'refs'))):
+            raise Refused('worktree has a nested Git repository')
+        with os.scandir(fd) as entries:
+            for entry in entries:
+                count += 1
+                if count > MAX_WALK_ENTRIES:
+                    raise Refused('worktree is too large to check')
+                meta = entry.stat(follow_symlinks=False)
+                if meta.st_mtime > cutoff:
+                    raise Refused('worktree is not idle for 24 hours')
+                name = os.fsencode(entry.name)
+                relative = prefix + name
+                check_xattrs(relative)
+                if not prefix and name == b'.git':
+                    continue
+                if name.lower() == b'.git':
+                    raise Refused('worktree has nested Git metadata')
+                if stat.S_ISDIR(meta.st_mode) and relative in directories:
+                    child = checked_open(entry.name, DIR_FLAGS, meta, fd)
+                    try:
+                        walk(child, relative + b'/')
+                    finally:
+                        os.close(child)
+                    continue
+                mode, expected = tree.pop(relative, (None, None))
+                if mode == b'120000' and stat.S_ISLNK(meta.st_mode):
+                    data = os.readlink(name, dir_fd=fd)
+                    size = len(data)
+                    total += size
+                    if total > MAX_BYTES:
+                        raise Refused('worktree is too large to check')
+                    digest = object_hash(algorithm, b'blob', data)
+                elif (mode in (b'100644', b'100755') and stat.S_ISREG(meta.st_mode)
+                      and bool(meta.st_mode & stat.S_IXUSR) == (mode == b'100755')):
+                    size = meta.st_size
+                    stream_fd = checked_open(entry.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, meta, fd)
+                    with os.fdopen(stream_fd, 'rb') as stream:
+                        start = total
+                        digest = hashlib.new(algorithm, b'blob %d\0' % meta.st_size)
+                        if total + meta.st_size > MAX_BYTES:
+                            raise Refused('worktree is too large to check')
+                        while chunk := stream.read(min(65536, MAX_BYTES - total + 1)):
+                            total += len(chunk)
+                            if total > MAX_BYTES:
+                                raise Refused('worktree is too large to check')
+                            digest.update(chunk)
+                        after = os.fstat(stream_fd)
+                        if total - start != meta.st_size or after.st_ctime_ns != meta.st_ctime_ns:
+                            raise Refused('worktree changed during scan')
+                else:
+                    raise Refused('worktree has changes or entries outside its checkout')
+                if digest.hexdigest().encode('ascii') != expected:
+                    raise Refused('worktree has changes to tracked bytes')
+                if blobs.setdefault(expected, size) != size:
+                    raise Refused('worktree has conflicting blob sizes')
+
+    root = checked_open(path, DIR_FLAGS, info)
+    try:
+        check_xattrs(b'.')
+        walk(root, b'')
+    finally:
+        os.close(root)
+    if tree:
+        raise Refused('worktree is missing tracked entries')
+    return blobs, residuals
+
+
+def check_blobs(run, path, blobs):
+    if blobs:
+        request = b''.join(oid + b'\n' for oid in blobs)
+        expected = b''.join(b'%s blob %d\n' % item for item in blobs.items())
+        if run(path, 'cat-file', '--batch-check', input_data=request) != (0, expected):
+            raise Refused('Git blob is missing or has an unexpected type or size')
+
+
+def preflight(run, project, path, cutoff):
+    path = exact_target(str(path))
+    meta = path.lstat()
+    target_id = file_id(meta)
+    if within(Path.cwd().resolve(), target_id):
+        raise Refused('target contains the current directory')
+    if within(project, target_id):
+        raise Refused('target contains the supplied project')
+    primary, common, trees = registration(run, project)
+    matches = [p for p in trees if p.exists() and inode(p) == target_id]
+    if (len(matches) != 1 or matches[0] == primary or within(path, inode(common))
+            or within(common, target_id)):
+        raise Refused('target is not an eligible linked worktree')
+    registered, = matches
+    if any(other != registered and (within(other.resolve(), target_id)
+           or (other.exists() and within(path, inode(other)))) for other in trees):
+        raise Refused('target overlaps another registered worktree')
+    admin, admin_id = linked_admin(run, path, common)
+    identity = target_id, admin_id, inode(common), file_id((path / '.git').lstat())
+    check_metadata(admin, common)
+    for location in (primary, path):
+        check_config(run, location)
+    branch, tip = checked_head(run, path, trees[registered], admin)
+    primary_branch, primary_tip = checked_head(run, primary, trees[primary], common)
+    if any(p != registered and e.get(b'branch') == branch for p, e in trees.items()):
+        raise Refused('branch is checked out in another worktree')
+    if any(os.path.lexists(common / (os.fsdecode(ref) + '.lock')) for ref in (branch, primary_branch)):
+        raise Refused('a branch is locked')
+    if os.path.lexists(common / 'info/grafts') or run(
+            primary, 'merge-base', '--is-ancestor', tip, primary_tip) != (0, b''):
+        raise Refused('branch is not provably merged into the live primary branch')
+    history = check_reflog(run, primary, admin, tip, primary_tip)
+    # Inactivity is advisory. The repository can forge timestamps.
+    commit = read(run, path, 'log', '-1', '--no-show-signature', '--format=%ct', tip, '--')
+    times = [path, admin / 'HEAD', admin / 'index', admin / 'logs/HEAD',
+             common / 'logs' / os.fsdecode(branch)]
+    if int(commit) > cutoff or any(p.lstat().st_mtime > cutoff for p in times if os.path.lexists(p)):
+        raise Refused('worktree is not idle for 24 hours')
+    tree, algorithm = checkout_tree(run, path, tip, admin, common)
+    blobs, residuals = check_live(path, meta, tree, algorithm, cutoff)
+    check_blobs(run, path, blobs)
+    if identity != (inode(path), inode(admin), inode(common), file_id((path / '.git').lstat())):
+        raise Refused('worktree identity changed during preflight')
+    return branch, tip, primary_branch, primary_tip, identity, history, residuals
+
+
+def apply(args):
+    project = Path(args.project).resolve(strict=True)
+    path = exact_target(args.path)
+    executable = resolve_git(project, path)
+    if executable is None:
+        raise Refused('Git executable is unknown')
+    run = partial(git, executable)
+    cutoff = time.time() - MIN_IDLE_SECONDS
+    checked = preflight(run, project, path, cutoff)
+    # Keep the live comparison at the mutation boundary when recovery is added.
+    if preflight(run, project, path, cutoff) != checked:
+        raise Refused('worktree identity or retained history changed during preflight')
+    residuals = checked[-1]
+    raise Refused('eligible worktree. ' + PENDING + (' ' + json.dumps(residuals) if residuals else ''))
+
+
+def private_record(value):
+    home = Path(os.environ.get('CLAUDE_CONFIG_DIR') or Path.home() / '.claude').resolve()
+    root = home / 'audits/worktree-prunes'
+    record = Path(value)
+    if record.parent.resolve() != root:
+        raise Refused('record is outside the private journal')
+    directory = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        meta = os.fstat(directory)
+        if meta.st_uid != os.getuid() or meta.st_mode & 0o077:
+            raise Refused('journal directory is not private')
+        fd = os.open(record.name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        with os.fdopen(fd, 'rb') as stream:
+            meta = os.fstat(stream.fileno())
+            if not stat.S_ISREG(meta.st_mode) or meta.st_uid != os.getuid() or meta.st_mode & 0o077:
+                raise Refused('journal record is not a private regular file')
+            raw = stream.read(65537)
+    finally:
+        os.close(directory)
+    if len(raw) > 65536:
+        raise Refused('journal record is too large')
+    return json.loads(raw)
+
+
+def undo(args):
+    data = private_record(args.record)
+    fields = ('project', 'common', 'path', 'branch', 'branch_tip')
+    if (not isinstance(data, dict) or type(data.get('v')) is not int or data['v'] != 1
+            or data.get('phase') != 'removed'
+            or not all(isinstance(data.get(key), str) and data[key] for key in fields)):
+        raise Refused('invalid journal record')
+    project = Path(args.project).resolve(strict=True)
+    executable = resolve_git(project)
+    if executable is None:
+        raise Refused('Git executable is unknown')
+    run = partial(git, executable)
+    primary, common, trees = registration(run, project)
+    if (data['project'], data['common']) != (str(primary), str(common)):
+        raise Refused('journal record belongs to a different repository')
+    check_config(run, primary)
+    path = Path(data['path'])
+    if (not path.is_absolute() or path.resolve() != path or not path.parent.is_dir()
+            or os.path.lexists(path) or path.is_relative_to(common)
+            or any(other.is_relative_to(path) for other in trees)):
+        raise Refused('restore path is unavailable or unsafe')
+    branch = os.fsencode(data['branch'])
+    if branch_tip(run, primary, branch) != os.fsencode(data['branch_tip']):
+        raise Refused('branch tip no longer equals the recorded tip')
+    if any(e.get(b'branch') == branch for e in trees.values()):
+        raise Refused('branch is already checked out')
+    raise Refused(PENDING)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    commands = parser.add_subparsers(dest='command', required=True)
+    remove, restore = (commands.add_parser(name) for name in ('apply', 'undo'))
+    for command in (remove, restore):
+        command.add_argument('--project', required=True)
+    remove.add_argument('--path', required=True)
+    remove.set_defaults(handler=apply)
+    restore.add_argument('record')
+    restore.set_defaults(handler=undo)
+    args = parser.parse_args()
+    try:
+        args.handler(args)
+    except Refused as error:
+        parser.exit(2, f'worktree-prune: refused: {error}\n')
+    except (OSError, ValueError, RuntimeError):
+        parser.exit(2, 'worktree-prune: refused: cannot safely read Git or journal state\n')
+
+
+if __name__ == '__main__':
+    main()
