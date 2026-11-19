@@ -697,7 +697,7 @@ class KaizenBackupTests(unittest.TestCase):
             self.assertIn(str(root / name / 'manifest.json'), result.stderr)
             self.assertNotIn('Traceback', result.stderr)
 
-    def test_backup_folders_are_private_and_restore_keeps_the_file_mode(self):
+    def test_backup_folders_are_private_and_restore_keeps_the_live_file_mode(self):
         self.env.pop('KAIZEN_BACKUP_DIR')
         self.env['CLAUDE_CONFIG_DIR'] = str(self.tmp / 'config')
         root = self.tmp / 'config' / 'kaizen-backups'
@@ -712,10 +712,11 @@ class KaizenBackupTests(unittest.TestCase):
         self.assertEqual(root.stat().st_mode & 0o777, 0o700)
         self.assertEqual(change.stat().st_mode & 0o777, 0o700)
         self.assertEqual((change / 'files').stat().st_mode & 0o777, 0o700)
+        self.assertEqual((change / 'files/1').stat().st_mode & 0o777, 0o640)
         target.chmod(0o600)
         self.run_script('undo', 'last')
         self.assertEqual(target.read_text(), 'original')
-        self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+        self.assertEqual(target.stat().st_mode & 0o777, 0o600)
 
     def test_user_chosen_existing_backup_root_keeps_its_mode(self):
         root = self.tmp / 'backups'

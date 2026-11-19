@@ -510,10 +510,76 @@ class BackupCommitTests(unittest.TestCase):
         self.target.write_text("after")
         self.script("finish", change)
 
-        self.main("undo", change)
+        error = self.main("undo", change, expected=2)
         self.assertTrue(self.target.samefile(alias))
         self.assertEqual((self.target.read_text(), alias.read_text()), ("before", "before"))
+        recovery, = self.backups.glob(".kaizen-recovery-*")
+        self.assertIn(str(recovery), error)
+        self.assertEqual(recovery.read_text(), "after")
+        self.assertIsNone(self.manifest(change)["reverted"])
+        self.main("undo", change, "--force")
         self.assertIsNotNone(self.manifest(change)["reverted"])
+        self.assertEqual(list(self.backups.glob(".kaizen-recovery-*")), [recovery])
+
+    def test_ordinary_undo_preserves_live_mode_and_ownership(self):
+        self.target.chmod(0o644)
+        change = self.begin()
+        self.target.write_text("after")
+        self.script("finish", change)
+        self.target.chmod(0o600)
+        if os.geteuid() == 0:
+            os.chown(self.target, 12345, 12345)
+        else:
+            groups = set(os.getgroups()) - {self.target.stat().st_gid}
+            if groups:
+                os.chown(self.target, -1, min(groups))
+        live = self.target.stat()
+
+        self.main("undo", change)
+        restored = self.target.stat()
+        self.assertEqual(self.target.read_text(), "before")
+        self.assertEqual(stat.S_IMODE(restored.st_mode), 0o600)
+        self.assertEqual((restored.st_uid, restored.st_gid), (live.st_uid, live.st_gid))
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS extended ACLs")
+    def test_ordinary_undo_preserves_live_acl(self):
+        change = self.begin()
+        self.target.write_text("after")
+        self.script("finish", change)
+        result = subprocess.run(["/bin/chmod", "+a", "everyone deny write", str(self.target)],
+                                capture_output=True, text=True)
+        if result.returncode:
+            self.skipTest("cannot set ACL: " + result.stderr.strip())
+        command = ["/bin/ls", "-len", str(self.target)]
+        live_acl = subprocess.check_output(command, text=True).splitlines()[1:]
+        self.assertTrue(any("deny write" in entry for entry in live_acl), live_acl)
+
+        self.main("undo", change)
+        self.assertEqual(self.target.read_text(), "before")
+        self.assertEqual(subprocess.check_output(command, text=True).splitlines()[1:], live_acl)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS extended ACLs")
+    def test_ordinary_undo_does_not_inherit_a_directory_acl(self):
+        change = self.begin()
+        self.target.write_text("after")
+        self.script("finish", change)
+        self.target.chmod(0o600)
+        result = subprocess.run(["/bin/chmod", "+a", "everyone allow read,file_inherit", str(self.repo)],
+                                capture_output=True, text=True)
+        if result.returncode:
+            self.skipTest("cannot set inheritable ACL: " + result.stderr.strip())
+        live = self.target.stat()
+        command = ["/bin/ls", "-len", str(self.target)]
+        live_acl = subprocess.check_output(command, text=True).splitlines()[1:]
+
+        error = self.main("undo", change, expected=2)
+        recovery, = self.backups.glob(".kaizen-recovery-*")
+        self.assertIn(str(recovery), error)
+        self.assertEqual(recovery.read_text(), "after")
+        self.assertEqual(self.target.read_text(), "before")
+        self.assertTrue(os.path.samestat(live, self.target.stat()))
+        self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o600)
+        self.assertEqual(subprocess.check_output(command, text=True).splitlines()[1:], live_acl)
 
     def test_ordinary_undo_restores_file_in_read_only_parent(self):
         parent = self.repo / "read-only"
@@ -535,9 +601,12 @@ class BackupCommitTests(unittest.TestCase):
 
         if os.access(parent, os.W_OK):  # Root can stage even in a 0555 directory.
             with patch.object(os, "open", stage_without_parent_write):
-                self.main("undo", change)
+                error = self.main("undo", change, expected=2)
         else:
-            self.main("undo", change)
+            error = self.main("undo", change, expected=2)
+        recovery, = self.backups.glob(".kaizen-recovery-*")
+        self.assertIn(str(recovery), error)
+        self.assertEqual(recovery.read_text(), "after")
         self.assertEqual(self.target.read_text(), "before")
         self.assertEqual(self.target.stat().st_ino, inode)
         self.assertEqual(stat.S_IMODE(parent.stat().st_mode), 0o555)
@@ -559,6 +628,28 @@ class BackupCommitTests(unittest.TestCase):
         self.assertIn(str(recovery), error)
         self.assertEqual(recovery.read_text(), "after")
         self.assertEqual(self.target.read_text(), "editor save")
+        self.assertIsNone(self.manifest(change)["reverted"])
+
+    def test_in_place_undo_keeps_recovery_for_save_after_final_recheck(self):
+        alias = self.tmp / "hard-link"
+        os.link(self.target, alias)
+        change = self.begin()
+        self.target.write_text("after!")
+        self.script("finish", change)
+        copy = self.helpers["copy_undo_backup"]
+
+        def save_after_recheck(source, fd, *, recheck, **kwargs):
+            def check_then_save():
+                recheck()
+                alias.write_text("editor")
+
+            copy(source, fd, recheck=check_then_save, **kwargs)
+
+        error = self.main("undo", change, expected=2, copy_undo_backup=save_after_recheck)
+        self.assertIn("intervening editor save", error)
+        recovery, = self.backups.glob(".kaizen-recovery-*")
+        self.assertIn(str(recovery), error)
+        self.assertEqual(recovery.read_text(), "after!")
         self.assertIsNone(self.manifest(change)["reverted"])
 
     def test_in_place_undo_keeps_save_to_tail_before_truncation(self):
