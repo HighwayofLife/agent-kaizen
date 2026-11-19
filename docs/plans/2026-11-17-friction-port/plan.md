@@ -259,7 +259,7 @@ From P24's Sol high security review (2026-11-18). These are fail-closed while S3
 - G10 (S7) `scripts/kaizen-backup` scheduled commit: a hard crash after Git prepares the ref update can leave its `.lock` file behind. Recovery then waits on that same lock and stays pending until someone cleans it up by hand. Detect a stale lock that belongs to the broker's own transaction and recover it safely.
 
 ## 0.13 known-issue fixes (FX) and remaining known issues
-On 2026-11-19, FX1–FX8 fixed the 0.14 known-issue list from the 0.13 final audit: the FA review residuals and every "regression found after round 3" against `518da76`. Each FX packet had two rounds. One Sol review of the merged result followed, then FXFIX, FXFIX-A, FXFIX-B and FXFIX-C fixed the cross-packet test failures and the regressions it found. The fixes landed on release-0.13 with green `tools/ci-local` on the default Python and on 3.9.
+On 2026-11-19, FX1–FX8 fixed the 0.14 known-issue list from the 0.13 final audit: the FA review residuals and every "regression found after round 3" against `518da76`. Each FX packet had two rounds. One Sol review of the merged result followed, then FXFIX, FXFIX-A, FXFIX-B and FXFIX-C fixed the cross-packet test failures and the regressions it found. FXFIX-D fixed the two remaining gate failures (an identical retry of a completed 518da76 apply, and the Python 3.9 framework interpreter in the prune tests), and FXFIX-E made a signed broker reservation override that retry fallback after a Sol review. The fixes landed on release-0.13 with green `tools/ci-local` on the default Python and on 3.9.
 
 Still open for 0.14. Each item is a race that has no portable fix, a behaviour unchanged since release-0.13, or a path that 0.13 keeps disabled:
 
