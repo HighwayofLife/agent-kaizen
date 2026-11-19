@@ -461,6 +461,31 @@ class AllowRuleTests(SecurityCase):
             tool(self.repo, record=action)
         self.assertIn("Bash(ls)", self.target.read_text())
 
+    def test_editor_grant_with_missing_stage_is_not_adopted(self):
+        def interrupt(*_):
+            raise OSError("fixture interruption before publication")
+
+        for move in (False, True):
+            self.repo = self.project(f"missing-stage-{move}")
+            self.target = self.repo / ".claude/settings.local.json"
+            tool = self.transaction()
+            state = tool.__globals__
+            action = self.broker_action(self.repo, "ls")
+            with patch.dict(state, write_effect=interrupt), self.assertRaises(OSError):
+                tool(self.repo, "ls", action_id=action)
+            staged, = self.target.parent.glob("settings.kaizen-*.json")
+            contents = staged.read_bytes()
+            if move:
+                staged.rename(self.target)
+            else:
+                self.target.write_bytes(contents)
+                staged.unlink()
+            with self.assertRaisesRegex(state["Refused"], "publication was not verified"):
+                tool(self.repo, "ls", action_id=action)
+            with self.assertRaises(state["Refused"]):
+                tool(self.repo, record=action)
+            self.assertEqual(self.target.read_bytes(), contents)
+
     def test_recover_published_grant_after_editor_change(self):
         tool = self.transaction()
         state = tool.__globals__
@@ -483,26 +508,50 @@ class AllowRuleTests(SecurityCase):
         with self.assertRaisesRegex(state["Refused"], "ownership"):
             tool(self.repo, record=first)
 
-    def test_recover_published_grant_before_receipt_after_editor_change(self):
+    def test_unverified_grant_before_receipt_is_left_after_editor_change(self):
         tool = self.transaction()
         state = tool.__globals__
         action = self.broker_action(self.repo, "ls")
         publish = state["write_effect"]
 
-        def interrupt(*args):
-            def refuse_receipt():
-                raise OSError("fixture interruption before publication receipt")
-
-            publish(*args[:-1], refuse_receipt)
+        interrupt = self.interrupt_before_receipt(publish)
 
         with patch.dict(state, write_effect=interrupt), self.assertRaises(OSError):
             tool(self.repo, "ls", action_id=action)
         edited = json.loads(self.target.read_bytes())
         edited["editor"] = True
         write(self.target.with_name("editor.json"), json.dumps(edited)).replace(self.target)
-        self.assertEqual(tool(self.repo, "ls", action_id=action), dict(status="applied", record=action))
-        self.assertEqual(tool(self.repo, record=action)["status"], "undone")
-        self.assertEqual(json.loads(self.target.read_bytes()), dict(editor=True, permissions=dict(allow=[])))
+        with self.assertRaisesRegex(state["Refused"], "publication was not verified"):
+            tool(self.repo, "ls", action_id=action)
+        with self.assertRaises(state["Refused"]):
+            tool(self.repo, record=action)
+        self.assertEqual(json.loads(self.target.read_bytes()), edited)
+
+    def interrupt_before_receipt(self, publish, legacy=False):
+        def interrupt(*args):
+            def save():
+                if args[2].get("published"):
+                    raise OSError("fixture interruption before publication receipt")
+                if legacy:
+                    args[2].pop("publishing", None)
+                args[-1]()
+            publish(*args[:-1], save)
+        return interrupt
+
+    def test_recovers_verified_publication_before_receipt_in_both_journals(self):
+        for legacy in (False, True):
+            self.repo = self.project(f"legacy-{legacy}")
+            self.target = self.repo / ".claude/settings.local.json"
+            write(self.target, '{"editor":1}')
+            tool = self.transaction()
+            state = tool.__globals__
+            action = self.broker_action(self.repo, "ls")
+            interrupt = self.interrupt_before_receipt(state["write_effect"], legacy)
+            with patch.dict(state, write_effect=interrupt), self.assertRaises(OSError):
+                tool(self.repo, "ls", action_id=action)
+            self.assertEqual(tool(self.repo, "ls", action_id=action)["status"], "applied")
+            self.assertEqual(tool(self.repo, record=action)["status"], "undone")
+            self.assertEqual(json.loads(self.target.read_bytes()), dict(editor=1, permissions=dict(allow=[])))
 
     def test_recover_interrupted_undo_after_editor_change(self):
         for retained in (False, True):
@@ -708,6 +757,47 @@ class AllowRuleTests(SecurityCase):
         with patch.dict(state, write_effect=interrupted_publication), self.assertRaises(state["Refused"]):
             tool(self.repo, "ls")
         self.assertEqual(self.target.read_text(), '{"editor":2}')
+
+    def test_publication_reports_displaced_edit_before_cleanup(self):
+        tool = self.transaction()
+        state = tool.__globals__
+        write(self.target, '{"editor":1}')
+        publish = state["write_effect"]
+        edited = '{"editor":2}'
+
+        def race(*args):
+            def save():
+                args[-1]()
+                if args[2].get("published"):
+                    (self.target.parent / args[2]["temp"]).write_text(edited)
+
+            publish(*args[:-1], save)
+
+        with patch.dict(state, write_effect=race), self.assertRaisesRegex(state["Refused"], "recovery copy") as error:
+            tool(self.repo, "ls")
+        copy, = self.target.parent.glob("settings.kaizen-*.json")
+        self.assertIn(str(copy), str(error.exception))
+        self.assertEqual(copy.read_text(), edited)
+
+    def test_cleanup_reports_edit_through_open_displaced_file(self):
+        tool = self.transaction()
+        state = tool.__globals__
+        write(self.target, '{"editor":1}')
+        edited = b'{"editor":2}'
+        unlink = os.unlink
+
+        def edit_then_unlink(name, *, dir_fd=None):
+            if name.startswith("settings.kaizen-") and dir_fd is not None:
+                with os.fdopen(os.open(name, os.O_WRONLY, dir_fd=dir_fd), "wb") as editor:
+                    editor.write(edited)
+                    unlink(name, dir_fd=dir_fd)
+                return
+            unlink(name, dir_fd=dir_fd)
+
+        with patch.object(os, "unlink", edit_then_unlink), self.assertRaisesRegex(state["Refused"], "recovery copy"):
+            tool(self.repo, "ls")
+        copy, = self.target.parent.glob("settings.kaizen-*.json")
+        self.assertEqual(copy.read_bytes(), edited)
 
     def test_publication_rolls_back_swap_inside_rename_window(self):
         tool = self.transaction()

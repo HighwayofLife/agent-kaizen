@@ -22,12 +22,23 @@ class WorktreePruneTests(unittest.TestCase):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name).resolve()
+        # Exercise the PATH shebang with a private, trusted interpreter even
+        # when the test runner's installation is group-writable.
+        binary_dir = self.root / 'bin'
+        binary_dir.mkdir()
+        interpreter = binary_dir / 'python3'
+        shutil.copyfile(Path(sys.executable).resolve(), interpreter)
+        interpreter.chmod(0o755)
+        executable = patch.object(sys, 'executable', str(interpreter))
+        executable.start()
+        self.addCleanup(executable.stop)
         self.primary, self.target = self.root / 'primary', self.root / 'target'
         self.home = self.root / 'home'
         self.journal = self.home / '.claude/audits/worktree-prunes'
         self.config = self.root / 'config'
         self.old = int(time.time()) - 3 * 86400
         self.env = {key: value for key, value in os.environ.items() if not key.startswith('GIT_')}
+        self.env['PATH'] = str(binary_dir) + os.pathsep + os.environ.get('PATH', os.defpath)
         self.env.pop('KAIZEN_GIT', None)
         self.env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull,
                         HOME=str(self.home), CLAUDE_CONFIG_DIR=str(self.config), GIT_AUTHOR_NAME='Fixture',
@@ -84,6 +95,29 @@ class WorktreePruneTests(unittest.TestCase):
     def test_shebang_uses_path_interpreter_in_isolated_mode(self):
         with SCRIPT.open('rb') as script:
             self.assertEqual(script.readline(), b'#!/usr/bin/env -S python3 -I\n')
+
+    def test_apply_refuses_writable_interpreter_or_launcher(self):
+        functions = self.script_functions()
+        fake = self.root / 'writable'
+        fake.touch(mode=0o755)
+        fake.chmod(0o775)
+        args = type('Args', (), dict(project=str(self.primary), path=str(self.target)))
+        with patch.object(sys, 'executable', str(fake)):
+            with self.assertRaisesRegex(functions['Refused'], 'unsafe Python interpreter'):
+                functions['apply'](args)
+        with patch.dict(functions, __file__=str(fake)):
+            with self.assertRaisesRegex(functions['Refused'], 'unsafe worktree-prune script'):
+                functions['apply'](args)
+
+    def test_path_interpreter_with_unsafe_mode_is_refused(self):
+        interpreter = Path(sys.executable)
+        for mode in (0o775, 0o757):
+            with self.subTest(mode=oct(mode)):
+                interpreter.chmod(mode)
+                try:
+                    self.refused('unsafe Python interpreter')
+                finally:
+                    interpreter.chmod(0o755)
 
     def test_eligible_apply_and_protected_directories(self):
         self.refused('eligible worktree')
