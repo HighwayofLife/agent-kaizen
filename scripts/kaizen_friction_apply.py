@@ -2,6 +2,7 @@
 import argparse
 import base64
 from contextlib import ExitStack, contextmanager, redirect_stdout
+import ctypes
 from datetime import date, datetime, timedelta, timezone
 import errno
 from functools import cached_property
@@ -118,6 +119,19 @@ def ledger_headers(lines):
                 yield index
         for marker in re.findall(r"<!--|-->", line):
             comment = marker == "<!--"
+
+
+def swap_ledger_entries(backups, name, directory, target):
+    libc = ctypes.CDLL(None, use_errno=True)
+    function = {"darwin": "renameatx_np", "linux": "renameat2"}.get(sys.platform, "")
+    swap = getattr(libc, function, None)
+    if swap is None:
+        raise ValueError("safe broker ledger exchange is unavailable")
+    swap.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    swap.restype = ctypes.c_int
+    if swap(backups, os.fsencode(name), directory, os.fsencode(target), 2) != 0:  # RENAME_SWAP / RENAME_EXCHANGE
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
 
 
 class BrokerLedger:
@@ -364,50 +378,130 @@ class BrokerLedger:
                 raise ValueError("broker ledger changed while being read")
         return raw, (info.st_dev, info.st_ino, info.st_mode, info.st_gid, info.st_mtime_ns, info.st_ctime_ns)
 
+    def ledger_backup_path(self, ledger_device):
+        name = self.lock_name.removesuffix(".lock") + "-ledger"
+        if os.fstat(self.state).st_dev == ledger_device:
+            return self.store.friction / name
+        # An exchange needs one filesystem. Git metadata can hold the old inode
+        # when the configured backup volume differs from the ledger volume.
+        runner, _ = self.live_scope()
+        common = runner["git_common_dir"](self.project)
+        checkout = runner["checkout_root"](self.project)
+        if (common is not None and checkout is not None and common.stat().st_dev == ledger_device
+                and (common == checkout / ".git" or not common.is_relative_to(checkout))):
+            return common / name
+        if common is None and checkout is None:
+            return self.path.parent / LEDGER_BACKUPS
+        raise ValueError("broker ledger requires a private backup directory on its filesystem")
+
     def recover_ledger_backups(self, ident, record):
+        device = self.path.parent.stat().st_dev
+        preferred = self.ledger_backup_path(device)
+        legacy = self.path.parent / LEDGER_BACKUPS
+        pending = record.get("ledger_exchange") if record is not None else None
+        if pending:
+            path, dev, ino, name = pending
+            try:
+                paths = self.recover_ledger_copies(Path(path), ident, exchange=(dev, ino, name))
+            except FileNotFoundError as error:
+                raise ValueError("broker ledger backup directory changed during publication") from error
+        else:
+            paths = self.recover_ledger_copies(preferred, ident) if os.path.lexists(preferred) else []
+        # Finish the bound exchange before moving any legacy files.
+        if not pending and preferred != legacy and os.path.lexists(legacy):
+            with self.writable_ledger_backups(preferred, device, create=True) as destination:
+                paths += self.recover_ledger_copies(legacy, ident, move_to=(preferred, destination))
+        if record is not None:
+            kept = set(record.get("ledger_backups", ())) | set(paths)
+            if preferred != legacy:
+                kept.difference_update(str(legacy / Path(path).name) for path in paths
+                                       if Path(path).parent == preferred)
+            kept = sorted(kept)
+            if kept != record.get("ledger_backups", []):
+                record["ledger_backups"] = kept
+                if not pending:  # Save bound copies with the final phase.
+                    self.save(record, record["phase"])
+
+    def finish_ledger_exchange(self, record, phase):
+        if pending := record.get("ledger_exchange"):
+            path, dev, ino, _ = pending
+            try:
+                info = os.stat(path, follow_symlinks=False)
+            except FileNotFoundError as error:
+                raise ValueError("broker ledger backup directory changed during publication") from error
+            if (info.st_dev, info.st_ino) != (dev, ino):
+                raise ValueError("broker ledger backup directory changed during publication")
+            del record["ledger_exchange"]
+        self.save(record, phase)
+
+    def recover_ledger_copies(self, directory, ident, *, exchange=None, move_to=None):
         # The same name holds the staged row before the swap and the displaced
         # ledger afterwards. Either can remain after an interrupted write.
-        directory = self.path.parent / LEDGER_BACKUPS
-        if not os.path.lexists(directory):
-            return
         pattern = re.compile(re.escape(ident) + r"-[a-f0-9]{32}\.md")
         paths = []
         with self.host["_directory"](directory, private=True) as backups:
+            opened = os.fstat(backups)
+            if exchange and (opened.st_dev, opened.st_ino) != exchange[:2]:
+                raise ValueError("broker ledger backup directory changed during publication")
             self.check_acl(backups, "backup directory", "system.posix_acl_access")
-            for name in sorted(os.listdir(backups)):
+            for name in [exchange[2]] if exchange else sorted(os.listdir(backups)):
                 if not pattern.fullmatch(name):
                     continue
-                path = str(directory / name)
+                info = os.stat(name, dir_fd=backups, follow_symlinks=False)
+                safe = stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
+                if exchange and not safe:
+                    raise ValueError("unsafe broker ledger backup file")
+                folder, owner_fd = directory, backups
+                if move_to and safe:
+                    target, target_fd = move_to
+                    try:
+                        os.stat(name, dir_fd=target_fd, follow_symlinks=False)
+                    except FileNotFoundError:
+                        try:
+                            os.rename(name, name, src_dir_fd=backups, dst_dir_fd=target_fd)
+                        except OSError as error:
+                            if error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS, errno.EXDEV):
+                                raise
+                        else:
+                            folder, owner_fd = target, target_fd
+                    else:
+                        raise ValueError("conflicting legacy broker ledger backup")
+                path = str(folder / name)
                 paths.append(path)
                 if path not in self.reported_backups:
                     print(f"Broker ledger copy preserved at {path!r}", flush=True)
                     self.reported_backups.add(path)
-                info = os.stat(name, dir_fd=backups, follow_symlinks=False)
-                if (stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
-                        and stat.S_IMODE(info.st_mode) != 0o600):
+                if safe and stat.S_IMODE(info.st_mode) != 0o600:
                     try:
-                        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=backups)
+                        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=owner_fd)
                     except PermissionError:
                         continue  # The directory still protects an unreadable displaced file.
                     try:
                         live = os.fstat(fd)
                         if os.path.samestat(info, live) and live.st_uid == os.geteuid() and live.st_nlink == 1:
-                            os.fchmod(fd, 0o600)
-                            os.fsync(fd)
+                            try:
+                                os.fchmod(fd, 0o600)
+                            except OSError as error:
+                                # A retained legacy copy is already inside a private directory.
+                                if not (move_to and owner_fd == backups and error.errno == errno.EROFS):
+                                    raise
+                            else:
+                                os.fsync(fd)
                     finally:
                         os.close(fd)
+            if move_to:
+                os.fsync(move_to[1])
             os.fsync(backups)
-        if record is not None:
-            kept = sorted(set(record.get("ledger_backups", ())) | set(paths))
-            if kept != record.get("ledger_backups", []):
-                record["ledger_backups"] = kept
-                self.save(record, record["phase"])
+            if exchange and not os.path.samestat(opened, os.stat(directory, follow_symlinks=False)):
+                raise ValueError("broker ledger backup directory changed during publication")
+        return paths
 
     @contextmanager
-    def writable_ledger_backups(self, path, *, create=False):
+    def writable_ledger_backups(self, path, ledger_device, *, create=False):
         with self.host["_directory"](path, create=create, private=True) as backups:
-            if (getattr(os.fstat(backups), "st_flags", 0) & UNWRITABLE_FLAGS
-                    or not os.access(path, os.W_OK | os.X_OK)):
+            info = os.fstat(backups)
+            if (info.st_dev != ledger_device or getattr(info, "st_flags", 0) & UNWRITABLE_FLAGS
+                    or not os.access(".", os.W_OK | os.X_OK, dir_fd=backups)):
                 raise ValueError("broker ledger backup directory is not writable")
             self.check_acl(backups, "backup directory", "system.posix_acl_access")
             self.check_acl(backups, "backup directory", "system.posix_acl_default")
@@ -448,18 +542,17 @@ class BrokerLedger:
             matches = [i for i, line in enumerate(lines) if ident in line]
             if len(matches) > 1 or matches and not (width == 8 and start + 2 <= matches[0] < end):
                 raise ValueError("conflicting broker action ledger rows")
-            backup_path = self.path.parent / LEDGER_BACKUPS
-            if os.path.lexists(backup_path):
-                with self.writable_ledger_backups(backup_path):
-                    pass
+            device = os.fstat(directory).st_dev
+            backup_path = self.ledger_backup_path(device)
+            with self.writable_ledger_backups(backup_path, device, create=True):
+                pass
 
             def write():
                 updated = "".join(lines).encode("utf-8")
                 if len(updated) > LEDGER_LIMIT:
                     raise ValueError("broker ledger exceeds size limit")
-                with self.writable_ledger_backups(backup_path, create=True) as backups:
+                with self.writable_ledger_backups(backup_path, device) as backups:
                     name = ident + "-" + os.urandom(16).hex() + ".md"
-                    temporary = f"{LEDGER_BACKUPS}/{name}"
                     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
                     fd = os.open(name, flags, 0o600, dir_fd=backups)
                     with os.fdopen(fd, "wb") as stream:
@@ -471,15 +564,22 @@ class BrokerLedger:
                         stream.flush()
                         os.fsync(stream.fileno())
                     os.fsync(backups)
+                    if record is not None:
+                        info = os.fstat(backups)
+                        record["ledger_exchange"] = [str(backup_path), info.st_dev, info.st_ino, name]
+                        self.save(record, record["phase"])
                     with self.host["_directory"](self.path.parent) as live:
                         if not os.path.samestat(os.fstat(live), os.fstat(directory)):
                             raise ValueError("broker ledger changed during transaction")
                         if (self.snapshot(live) != before
-                                or not os.path.samestat(staged, os.stat(temporary, dir_fd=live, follow_symlinks=False))):
+                                or not os.path.samestat(staged, os.stat(name, dir_fd=backups,
+                                                                       follow_symlinks=False))):
                             raise ValueError("broker ledger changed during transaction")
-                        verified = self.exchange_ledger(live, temporary, staged, before, updated)
+                        verified = self.exchange_ledger(live, backups, name, staged, before, updated)
                     os.fsync(backups)
                     os.fsync(directory)
+                    if not os.path.samestat(os.fstat(backups), os.stat(backup_path, follow_symlinks=False)):
+                        raise ValueError("broker ledger backup directory changed during publication")
                 self.recover_ledger_backups(ident, record)
                 if not verified:
                     raise ValueError("broker ledger changed during publication")
@@ -487,21 +587,17 @@ class BrokerLedger:
             os.fsync(directory)  # A prior attempt may have stopped after rename.
             yield lines, start, end, width, matches[0] if matches else None, write
 
-    def exchange_ledger(self, directory, temporary, staged, before, updated):
+    def exchange_ledger(self, directory, backups, name, staged, before, updated):
         # The swap parks the actual live inode in the private backup directory.
         # Leave it linked there so an editor can finish writing after verification.
         target = self.path.name
-        tool = self.allow_rule
         info = os.stat(target, dir_fd=directory, follow_symlinks=False)
         if (info.st_dev, info.st_ino, info.st_ctime_ns) != (*before[1][:2], before[1][-1]):
             raise ValueError("broker ledger changed during transaction")
-        try:
-            tool["rename_effect"](directory, temporary, target, exchange=True)
-        except tool["Refused"] as error:
-            raise ValueError(str(error)) from error
+        swap_ledger_entries(backups, name, directory, target)
         try:
             result, installed = self.snapshot(directory)
-            raw, version = self.snapshot(directory, temporary)
+            raw, version = self.snapshot(backups, name)
             # Rename can change ctime on the parked inode.
             return (installed[:2] == (staged.st_dev, staged.st_ino) and result == updated
                     and version[:-1] == before[1][:-1] and raw == before[0])
@@ -580,7 +676,7 @@ class BrokerLedger:
                 write()
             elif cells(lines[match]) != expected:
                 raise ValueError("broker ledger row conflicts with verified effect")
-        self.save(record, "recorded")
+        self.finish_ledger_exchange(record, "recorded")
         return "recorded"
 
     def cancel_unstarted_marker(self, record):
@@ -695,7 +791,7 @@ class BrokerLedger:
             if phase == "effect-verified":
                 if row != expected:
                     raise ValueError("broker ledger row conflicts with verified effect")
-                self.save(record, "recorded")
+                self.finish_ledger_exchange(record, "recorded")
                 phase = "recorded"
             status = hashlib.sha256(row[5].encode("utf-8")).hexdigest()
             undo_date = record.get("undo_date") or date.today().isoformat()
@@ -724,7 +820,7 @@ class BrokerLedger:
                 self.save(record, "undo-verified")
             if update:
                 write()
-        self.save(record, "reverted")
+        self.finish_ledger_exchange(record, "reverted")
 
 
 def observe_review(run, command, version, *, backup, scope, project, **kwargs):

@@ -2,6 +2,7 @@
 import base64
 from contextlib import redirect_stdout
 from datetime import date, datetime, timedelta, timezone
+import errno
 import hashlib
 import hmac
 import io
@@ -284,17 +285,191 @@ class BrokerLedgerTests(unittest.TestCase):
         editor.write_text(updated)
         with self.locked() as journal, journal.table(ident) as (lines, _, _, _, _, write):
             lines.append("\nBroker wrote here.\n")
-            exchange = journal.allow_rule["rename_effect"]
+            exchange = apply.swap_ledger_entries
 
             def save_after_exchange(*args, **kwargs):
                 exchange(*args, **kwargs)
                 if editor.exists():
                     editor.replace(self.ledger)
 
-            with patch.dict(journal.allow_rule, rename_effect=save_after_exchange):
+            with patch.object(apply, "swap_ledger_entries", side_effect=save_after_exchange):
                 with self.assertRaisesRegex(ValueError, "ledger changed"):
                     write()
             self.assertEqual(self.ledger.read_text(), updated)
+
+    def test_replaced_backup_directory_cannot_redirect_ledger_exchange(self):
+        ident = "fa1_" + "1" * 64
+        updated = self.table + "\nBroker wrote here.\n"
+        moved = self.root / "moved-backups"
+        with self.locked() as journal, journal.table(ident) as (lines, _, _, _, _, write):
+            lines.append(updated[len(self.table):])
+            exchange = journal.exchange_ledger
+
+            def replace_backup_directory(*args):
+                staged, = self.root.rglob(f"{ident}-*.md")
+                staged.parent.rename(moved)
+                staged.parent.mkdir(mode=0o700)
+                staged.write_text("decoy")
+                return exchange(*args)
+
+            with patch.object(journal, "exchange_ledger", side_effect=replace_backup_directory), \
+                    self.assertRaisesRegex(ValueError, "ledger.*changed"):
+                write()
+        saved, = moved.iterdir()
+        self.assertEqual(self.ledger.read_text(), updated)
+        self.assertEqual(saved.read_text(), self.table)
+        decoy, = (path for path in self.root.rglob(f"{ident}-*.md") if path != saved)
+        self.assertEqual(decoy.read_text(), "decoy")
+
+    def test_ledger_publication_leaves_no_untracked_git_files(self):
+        def git(*args):
+            return subprocess.check_output(["git", "-C", str(self.project), *args], text=True)
+
+        git("init", "-q")
+        git("add", str(apply.LEDGER))
+        with self.locked() as journal, journal.table("fa1_" + "1" * 64) as (lines, _, _, _, _, write):
+            lines.append("\nBroker wrote here.\n")
+            write()
+        git("add", str(apply.LEDGER))
+        git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "--no-gpg-sign",
+            "-qm", "ledger")
+        self.assertEqual(git("status", "--porcelain", "--untracked-files=all"), "")
+
+    def test_recovery_refuses_replacement_backup_directory(self):
+        moved = self.root / "moved-backups"
+        with self.locked() as journal:
+            ident = self.ledger_effect(journal)
+            exchange = apply.swap_ledger_entries
+
+            def replace_directory(backups, name, directory, target):
+                exchange(backups, name, directory, target)
+                path = journal.ledger_backup_path(self.ledger.stat().st_dev)
+                path.rename(moved)
+                path.mkdir(mode=0o700)
+                (path / name).write_text("decoy")
+
+            with patch.object(apply, "swap_ledger_entries", side_effect=replace_directory), \
+                    self.assertRaisesRegex(ValueError, "backup directory changed"):
+                journal.reconcile(ident)
+        with self.locked() as journal:
+            with self.assertRaisesRegex(ValueError, "backup directory changed"):
+                journal.reconcile(ident)
+            record = journal.load(ident)
+            self.assertEqual(record["phase"], "effect-verified")
+            self.assertFalse(record.get("ledger_backups"))
+            path = journal.ledger_backup_path(self.ledger.stat().st_dev)
+            shutil.rmtree(path)
+            moved.rename(path)
+            report = io.StringIO()
+            with redirect_stdout(report):
+                self.assertEqual(journal.reconcile(ident), "recorded")
+            self.assert_ledger_backup(journal, ident, self.table, report)
+
+    def test_failed_final_save_keeps_backup_directory_bound(self):
+        with self.locked() as journal:
+            ident = self.ledger_effect(journal)
+            save = journal.save
+
+            def fail_final_save(record, phase):
+                if phase == "recorded":
+                    raise OSError("before final receipt save")
+                return save(record, phase)
+
+            with patch.object(journal, "save", side_effect=fail_final_save), \
+                    self.assertRaisesRegex(OSError, "before final receipt save"):
+                journal.reconcile(ident)
+            path = journal.ledger_backup_path(self.ledger.stat().st_dev)
+            backup, = path.iterdir()
+            path.rename(self.root / "moved-backups")
+            path.mkdir(mode=0o700)
+            backup.write_text("decoy")
+        with self.locked() as journal:
+            with self.assertRaisesRegex(ValueError, "backup directory changed"):
+                journal.reconcile(ident)
+            self.assertEqual(journal.load(ident)["phase"], "effect-verified")
+
+    def test_git_cross_device_ledger_refuses_local_backup(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        with self.locked() as journal:
+            with self.assertRaisesRegex(ValueError, "requires a private backup directory"):
+                journal.ledger_backup_path(self.ledger.stat().st_dev + 1)
+
+    def test_non_git_cross_device_ledger_uses_private_local_backup(self):
+        with self.locked() as journal:
+            ident = self.ledger_effect(journal)
+            fstat = os.fstat
+
+            def other_state_device(fd):
+                info = fstat(fd)
+                if fd == journal.state:
+                    return SimpleNamespace(st_dev=info.st_dev + 1)
+                return info
+
+            with patch.object(os, "fstat", side_effect=other_state_device):
+                self.assertEqual(journal.reconcile(ident), "recorded")
+                journal.undo(ident, lambda *_: None)
+            record = journal.load(ident)
+            self.assertEqual(record["phase"], "reverted")
+            self.assertEqual({Path(path).parent for path in record["ledger_backups"]},
+                             {self.ledger.parent / apply.LEDGER_BACKUPS})
+
+    def test_recovery_moves_legacy_backup_out_of_checkout(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        legacy = self.ledger.parent / apply.LEDGER_BACKUPS
+        legacy.mkdir(mode=0o700)
+        with self.locked() as journal:
+            ident = self.ledger_effect(journal)
+            displaced = legacy / (ident + "-" + "1" * 32 + ".md")
+            displaced.write_text("older ledger copy")
+            record = journal.load(ident)
+            record["ledger_backups"] = [str(displaced)]
+            journal.save(record, record["phase"])
+            self.assertEqual(journal.reconcile(ident), "recorded")
+            paths = [Path(path) for path in journal.load(ident)["ledger_backups"]]
+            self.assertEqual({path.read_text() for path in paths}, {self.table, "older ledger copy"})
+            self.assertFalse(any(path.is_relative_to(self.project) for path in paths))
+            self.assertEqual(list(legacy.iterdir()), [])
+
+    def test_reconcile_and_undo_keep_read_only_legacy_backup(self):
+        legacy = self.ledger.parent / apply.LEDGER_BACKUPS
+        legacy.mkdir(mode=0o700)
+        with self.locked() as journal:
+            ident = self.ledger_effect(journal)
+            displaced = legacy / (ident + "-" + "1" * 32 + ".md")
+            displaced.write_text("older ledger copy")
+            with patch.object(os, "rename", side_effect=PermissionError(errno.EACCES, "read-only legacy directory")):
+                self.assertEqual(journal.reconcile(ident), "recorded")
+                journal.undo(ident, lambda *_: None)
+            record = journal.load(ident)
+            self.assertEqual(record["phase"], "reverted")
+            self.assertIn(str(displaced), record["ledger_backups"])
+            self.assertEqual(displaced.read_text(), "older ledger copy")
+
+    def test_reconcile_and_undo_keep_legacy_backup_on_read_only_mount(self):
+        legacy = self.ledger.parent / apply.LEDGER_BACKUPS
+        legacy.mkdir(mode=0o700)
+        with self.locked() as journal:
+            ident = self.ledger_effect(journal)
+            displaced = legacy / (ident + "-" + "1" * 32 + ".md")
+            displaced.write_text("older ledger copy")
+            displaced.chmod(0o644)
+            original = displaced.stat()
+            fchmod = os.fchmod
+
+            def chmod_on_mount(fd, mode):
+                if os.path.samestat(os.fstat(fd), original):
+                    raise OSError(errno.EROFS, "read-only legacy mount")
+                return fchmod(fd, mode)
+
+            with patch.object(os, "rename", side_effect=OSError(errno.EROFS, "read-only legacy mount")), \
+                    patch.object(os, "fchmod", side_effect=chmod_on_mount):
+                self.assertEqual(journal.reconcile(ident), "recorded")
+                journal.undo(ident, lambda *_: None)
+            record = journal.load(ident)
+            self.assertEqual(record["phase"], "reverted")
+            self.assertIn(str(displaced), record["ledger_backups"])
+            self.assertEqual(displaced.read_text(), "older ledger copy")
+            self.assertEqual(displaced.stat().st_mode & 0o777, 0o644)
 
     def ledger_effect(self, journal):
         self.signed_extract([self.project])
@@ -335,14 +510,14 @@ class BrokerLedgerTests(unittest.TestCase):
         edited = self.table + "\nEditor saved before the swap.\n"
         with self.locked() as journal:
             ident = self.ledger_effect(journal)
-            exchange = journal.allow_rule["rename_effect"]
+            exchange = apply.swap_ledger_entries
 
             def crash_after_exchange(*args, **kwargs):
                 self.ledger.write_text(edited)
                 exchange(*args, **kwargs)
                 raise OSError("after ledger exchange")
 
-            with patch.dict(journal.allow_rule, rename_effect=crash_after_exchange):
+            with patch.object(apply, "swap_ledger_entries", side_effect=crash_after_exchange):
                 with self.assertRaisesRegex(OSError, "after ledger exchange"):
                     journal.reconcile(ident)
             self.assertEqual(journal.load(ident)["phase"], "effect-verified")
@@ -615,7 +790,8 @@ for index, event in enumerate(events):
                 fix.write_text(fix_source.replace(publication, publication + '''
     (Path(os.environ["CLAUDE_CONFIG_DIR"]) / "agent-kaizen.json").write_text('{"maxChangesPerRun":false}')
 '''))
-                command(runner, *review, KAIZEN_SKIP_CHECKS="1")
+                # This policy-change review exceeded 30 seconds in the full sandbox suite.
+                command(runner, *review, timeout=90, KAIZEN_SKIP_CHECKS="1")
                 self.assertFalse(marker.exists())
                 policy.write_text(enabled)
                 fix.write_text(fix_source)
@@ -711,7 +887,7 @@ for index, event in enumerate(events):
 
                 project_policy = project / "docs/kaizen/config.json"
                 if fault == "config-created":
-                    statement = '        self.save(record, "recorded")'
+                    statement = '        self.finish_ledger_exchange(record, "recorded")'
                     runtime.write_text(runtime_source.replace(
                         statement, statement + '\n        (self.project / "docs/kaizen/config.json").write_text("{}")', 1))
                 command(runner, *review, KAIZEN_SKIP_CHECKS="1")
@@ -765,8 +941,7 @@ for index, event in enumerate(events):
                     statement = '                    record = ledger.reserve_commit('
                     runner.write_text(runner_source.replace(statement, '                    os._exit(77)\n' + statement))
                 elif case == "timeout":
-                    statement = '                         timeout=30, stoppable=True, terminate_grace=True,'
-                    runner.write_text(runner_source.replace(statement, statement.replace("30", "15")))
+                    # The 15-second fixture limit expired before journaling under sandbox load.
                     statement = '                exchange("commit\\n", b"commit: ok\\n")'
                     backup.write_text(native.replace(statement, '                time.sleep(60)\n' + statement))
                 elif case == "after-cas":
@@ -775,11 +950,14 @@ for index, event in enumerate(events):
                     statement = '                    terminal(ident, applied=finish_commit(record) == "recorded")'
                     runner.write_text(runner_source.replace(statement, '                    os._exit(77)'))
                 elif case == "after-row":
-                    statement = '        self.save(record, "recorded")'
+                    statement = '        self.finish_ledger_exchange(record, "recorded")'
                     runtime.write_text(runtime_source.replace(statement, statement +
                         '\n        if record["operation"] == LOCAL_COMMIT:\n            os._exit(77)', 1))
                 interrupted = case.startswith(("before-", "after-"))
+                # These initial local-commit reviews exceeded 30 seconds in sandbox runs.
+                review_timeout = 90 if case in ("valid", "timeout", "after-cas", "after-row") else 30
                 command(runner, *review, code=77 if interrupted else 0,
+                        timeout=review_timeout,
                         FIXTURE_COMMIT=case, FIXTURE_LEDGER=fixture, KAIZEN_SKIP_CHECKS="1")
                 backup.write_text(native)
                 runner.write_text(runner_source)
@@ -803,7 +981,8 @@ for index, event in enumerate(events):
                 if case == "valid":
                     ident = re.search(r"\[action:(fa1_[a-f0-9]{64})\]", ledger.read_text())[1]
                     undo = ("actions", "undo", ident, "--for", project)
-                    command(runner, *undo)
+                    # The first local-commit undo exceeded 30 seconds in the full sandbox suite.
+                    command(runner, *undo, timeout=90)
                     command(runner, *undo)
                     self.assertEqual((project / "tracked").read_text(), "before")
                     self.assertEqual(git("diff", "--name-only", "HEAD", refs), "")
@@ -828,9 +1007,9 @@ for index, event in enumerate(events):
             for name in ("KAIZEN_RUN_ID", "KAIZEN_SESSION_ID", "CLAUDE_PLUGIN_ROOT"):
                 env.pop(name, None)
 
-            def command(path, *args, code=0, **extra_env):
+            def command(path, *args, code=0, timeout=30, **extra_env):
                 result = subprocess.run([sys.executable, "-I", str(path), *map(str, args)], env=dict(env, **extra_env),
-                                        cwd=root, capture_output=True, text=True, timeout=30)
+                                        cwd=root, capture_output=True, text=True, timeout=timeout)
                 self.assertEqual(result.returncode, code, result.stdout + result.stderr)
 
             command(scripts / "install-schedule", "--apply", "--scheduler", "cron")
@@ -901,7 +1080,15 @@ for index, event in enumerate(events):
                     receipt = journal.load(ident)
                     self.assertEqual(receipt, dict(pending, verification=verification, phase="effect-verified"))
                     ledger.write_text(six)
-                    with patch.object(journal, "save", side_effect=OSError("after row")), self.assertRaises(OSError):
+                    save = journal.save
+
+                    def fail_after_row(record, phase):
+                        if record.get("ledger_backups"):
+                            raise OSError("after row")
+                        return save(record, phase)
+
+                    with patch.object(journal, "save", side_effect=fail_after_row), \
+                            self.assertRaisesRegex(OSError, "after row"):
                         journal.reconcile(ident)
                     if enabled:
                         self.assertEqual(journal.reconcile(ident), "recorded")

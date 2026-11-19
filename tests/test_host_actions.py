@@ -406,6 +406,159 @@ class HostActionsTests(unittest.TestCase):
         self.store.import_actions(suggest, frozen, self.project, "changed-2")
         self.assertEqual(self.store.scoped(self.project), before)
 
+    def test_completed_apply_replays_without_changing_intent(self):
+        ident = self.record()
+        row, = self.store.scoped(self.project)
+        frozen = {ident: dict(row, intents=["suggest", "apply"])}
+        request = block((ident, "apply"))
+        self.store.import_actions(request, frozen, self.project, "review")
+        with actions._directory(self.store.path.parent) as directory:
+            rows, _, receipts = self.store._load(directory)
+            receipts[str(self.project)]["review"][ident] = "terminal"
+            self.store._save(directory, rows, receipts)
+        before = self.store.path.read_bytes()
+        self.assertEqual(self.store.import_actions(request, frozen, self.project, "review"), {ident: "terminal"})
+        with self.assertRaisesRegex(ValueError, "different requests"):
+            self.store.import_actions(block((ident, "suggest")), frozen, self.project, "review")
+        self.assertEqual(self.store.path.read_bytes(), before)
+
+    def test_completed_apply_writes_release_compatible_receipt(self):
+        ident = self.record()
+        row, = self.store.scoped(self.project)
+        frozen = {ident: dict(row, intents=["apply"])}
+        self.store.import_actions(block((ident, "apply")), frozen, self.project, "review")
+        limits = (actions.STORE_LIMIT, self.store.path.stat().st_size + 1)
+        with actions._directory(self.store.path.parent) as directory:
+            rows, _, receipts = self.store._load(directory)
+            receipts[str(self.project)]["review"][ident] = "terminal"
+            for limit in limits:
+                with self.subTest(limit=limit), patch.object(actions, "STORE_LIMIT", limit):
+                    self.store._save(directory, rows, receipts)
+                    raw = self.store.path.read_bytes()
+                    self.assertLessEqual(len(raw), limit)
+                    saved = json.loads(raw)
+                    self.assertEqual(set(saved), {"v", "actions", "receipts"})
+                    self.assertEqual(saved["v"], 1)
+                    self.assertEqual(saved["receipts"], {str(self.project): {"review": {ident: "terminal"}}})
+
+    def test_legacy_pending_store_can_close_receipts_under_size_cap(self):
+        ident = self.record()
+        row, = self.store.scoped(self.project)
+        project = str(self.project)
+        document = json.loads(self.store.path.read_text())
+        document["receipts"] = {project: {f"scheduled:{i:020d}": {ident: "pending"} for i in range(9000)}}
+        self.store.path.write_text(json.dumps(document, separators=(",", ":")))
+        self.assertLessEqual(self.store.path.stat().st_size, actions.STORE_LIMIT)
+        with actions._directory(self.store.path.parent) as directory:
+            rows, _, receipts = self.store._load(directory)
+            self.store._save(directory, rows, receipts)
+            self.assertNotIn("apply_intents", json.loads(self.store.path.read_bytes()))
+            for receipt in receipts[project].values():
+                receipt[ident] = "terminal"
+            replace = actions._replace
+
+            def interrupt_shared_store(directory, name, raw):
+                if name == self.store.path.name:
+                    raise OSError("before shared store replacement")
+                return replace(directory, name, raw)
+
+            with patch.object(actions, "_replace", side_effect=interrupt_shared_store), \
+                    self.assertRaisesRegex(OSError, "before shared store replacement"):
+                self.store._save(directory, rows, receipts)
+            _, _, recovered = self.store._load(directory)
+            self.assertEqual(recovered[project], {name: {ident: "pending"} for name in receipts[project]})
+            self.store._save(directory, rows, receipts)
+        saved = json.loads(self.store.path.read_bytes())
+        self.assertLessEqual(self.store.path.stat().st_size, actions.STORE_LIMIT)
+        self.assertEqual(set(saved), {"v", "actions", "receipts"})
+        self.assertTrue(all(state == "terminal" for receipt in saved["receipts"][project].values()
+                            for state in receipt.values()))
+        frozen = {ident: dict(row, intents=["suggest", "apply"])}
+        generation = "scheduled:" + "0" * 20
+        self.assertEqual(self.store.import_actions(block((ident, "apply")), frozen, self.project, generation),
+                         {ident: "terminal"})
+        with self.assertRaisesRegex(ValueError, "different requests"):
+            self.store.import_actions(block((ident, "suggest")), frozen, self.project, generation)
+
+    def test_receipt_metadata_survives_legacy_writer_and_interrupted_save(self):
+        ident = self.record()
+        row, = self.store.scoped(self.project)
+        frozen = {ident: dict(row, intents=["suggest", "apply"])}
+        request = block((ident, "apply"))
+        self.store.import_actions(request, frozen, self.project, "first")
+        with actions._directory(self.store.path.parent) as directory:
+            rows, _, receipts = self.store._load(directory)
+            receipts[str(self.project)]["first"][ident] = "terminal"
+            self.store._save(directory, rows, receipts)
+        self.store.import_actions(request, frozen, self.project, "second")
+        before = self.store.path.read_bytes()
+        with actions._directory(self.store.path.parent) as directory:
+            rows, _, receipts = self.store._load(directory)
+            receipts[str(self.project)]["second"][ident] = "terminal"
+            replace = actions._replace
+
+            def interrupt_shared_store(directory, name, raw):
+                if name == self.store.path.name:
+                    raise OSError("before shared store replacement")
+                return replace(directory, name, raw)
+
+            with patch.object(actions, "_replace", side_effect=interrupt_shared_store), self.assertRaises(OSError):
+                self.store._save(directory, rows, receipts)
+            self.assertEqual(self.store.path.read_bytes(), before)
+            _, _, recovered = self.store._load(directory)
+            self.assertEqual(recovered[str(self.project)], {"first": {ident: "terminal"}, "second": {ident: "pending"}})
+        document = json.loads(before)
+        document["actions"][ident]["evidence"] = "legacy writer update"
+        self.store.path.write_text(json.dumps(document))
+        self.assertEqual(self.store.import_actions(request, frozen, self.project, "first"), {ident: "terminal"})
+        self.assertEqual(self.store.import_actions(request, frozen, self.project, "second"), {ident: "pending"})
+
+    def test_import_prunes_old_empty_and_acknowledged_generations(self):
+        ident = self.record()
+        row, = self.store.scoped(self.project)
+        frozen = {ident: dict(row, intents=["suggest", "apply"])}
+        request = block((ident, "suggest"))
+        generations = [f"scheduled:{i:020d}" for i in (1, 2, 4, 5, 6)]
+        self.store.import_actions(block(), {}, self.project, generations[0])
+        for generation in (generations[1], "interactive:" + f"{3:020d}", generations[2]):
+            self.store.import_actions(request, frozen, self.project, generation)
+        other = self.record(self.other)
+        other_row, = self.store.scoped(self.other)
+        self.store.import_actions(block((other, "apply")), {other: dict(other_row, intents=["apply"])},
+                                  self.other, generations[0])
+        state = self.secret.parent / ("prepare-" + row["projects"][0] + ".json")
+        state.touch(mode=0o600)
+        state.write_text(json.dumps(dict(v=1, project=str(self.project),
+                                         acknowledged_generation=generations[1].split(":")[1])))
+        for generation in generations[3:]:
+            self.store.import_actions(block(), {}, self.project, generation)
+        stored = json.loads(self.store.path.read_bytes())["receipts"]
+        self.assertEqual(stored[str(self.project)], {generations[2]: {ident: "terminal"}, generations[4]: {}})
+        self.assertEqual(stored[str(self.other)], {generations[0]: {other: "pending"}})
+
+    def test_localsearch_verifies_linked_outputs(self):
+        main, (member,) = self.linked("worktree")
+        main = main / member.name
+        (main / "docs/kaizen").mkdir(parents=True)
+        for project in (main, member):
+            (project / "build").mkdir()
+        ident = self.store.record(member, "linux-localsearch", member / "build", "observed", path=True)
+        (main / "build/.nomedia").touch()
+        with patch.object(actions.sys, "platform", "linux"):
+            self.assertEqual(self.store.verify(main), {ident: "open"})
+            (member / "build/.nomedia").touch()
+            self.assertEqual(self.store.verify(main), {ident: "done"})
+
+    def test_inotify_verification_uses_tracked_file_threshold(self):
+        ident = self.store.record(self.project, "inotify-limit", "inotify", "observed", allowed=["inotify"])
+        row, = self.store.scoped(self.project)
+        probe = SimpleNamespace(read_proc=lambda _: 120000, git=lambda *_: "f\0" * 100000)
+        with patch.object(actions.sys, "platform", "linux"), \
+                patch.object(runpy, "run_path", return_value={"Probe": lambda *_: probe, "sibling": lambda *_: None}):
+            self.assertFalse(self.store._probe(str(self.project), row)[0])
+            probe.read_proc = lambda _: 200000
+            self.assertTrue(self.store._probe(str(self.project), row)[0])
+
     def test_cli_marks_unknown_and_disabled(self):
         ident = self.record(self.project / "docs")
         with patch.object(actions, "_id", return_value=ident), self.assertRaisesRegex(ValueError, "collision"):
@@ -589,9 +742,13 @@ class HostActionsTests(unittest.TestCase):
         key_lock = self.secret.with_suffix(".key.lock")
         rows_lock = self.store.path.with_suffix(".json.lock")
         before = self.store.path.read_bytes()
-        for path in (self.store.path.parent, self.store.path, rows_lock, self.secret.parent, self.secret, key_lock):
+        for path in (self.store.path.parent.parent, self.secret.parent.parent, self.store.path.parent,
+                     self.store.path, rows_lock, self.secret.parent, self.secret, key_lock):
             use = second if path == key_lock else self.store
-            grant = "group:everyone allow " + ("list" if path.is_dir() else "read")
+            if path in (self.store.path.parent.parent, self.secret.parent.parent):
+                grant = "group:everyone allow delete_child"
+            else:
+                grant = "group:everyone allow " + ("list" if path.is_dir() else "read")
             subprocess.run(["chmod", "+a", grant, str(path)], check=True)
             try:
                 with self.subTest(path=path.name), self.assertRaisesRegex(ValueError, "ACL"):
@@ -604,6 +761,16 @@ class HostActionsTests(unittest.TestCase):
         self.assertEqual(self.store.path.read_bytes(), before)
         self.assertFalse(second.path.exists())
         self.assertEqual(len(self.store.scoped(self.project)), 1)
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin extended ACLs")
+    def test_darwin_deny_only_ancestor_acl_allows_store_access(self):
+        parent = self.store.path.parent.parent
+        parent.mkdir()
+        subprocess.run(["chmod", "+a", "group:everyone deny delete", str(parent)], check=True)
+        try:
+            self.assertEqual(self.record(), self.store.scoped(self.project)[0]["id"])
+        finally:
+            subprocess.run(["chmod", "-N", str(parent)], check=True)
 
     def test_failed_git_probe_leaves_linked_scope_unknown(self):
         _, (member, peer) = self.linked("worktree", "peer")
@@ -727,6 +894,23 @@ class HostActionsTests(unittest.TestCase):
         self.assertEqual(saved["receipts"][str(self.project)], document["receipts"][str(self.project)])
         self.assertEqual(saved["actions"][good]["status"], "done")
 
+    def test_skipped_pending_receipt_does_not_restore_completed_sibling(self):
+        bad, good = self.record(), self.record(literal="ls -a")
+        document = json.loads(self.store.path.read_text())
+        document["actions"][bad]["projects"] = ["legacy-key"]
+        document["receipts"] = {str(self.project): {"generation": {bad: "pending", good: "pending"}}}
+        escaped = r'"p\u0065nding"'
+        self.store.path.write_text(json.dumps(document).replace(f'"{bad}": "pending"', f'"{bad}": {escaped}'))
+        with actions._directory(self.store.path.parent) as directory:
+            rows, _, receipts = self.store._load(directory)
+            receipts[str(self.project)]["generation"][good] = "terminal"
+            rows[good].update(status="done", done_by="verify")
+            self.store._save(directory, rows, receipts)
+            rows, _, receipts = self.store._load(directory)
+        self.assertEqual(rows[good]["status"], "done")
+        self.assertEqual(receipts[str(self.project)]["generation"], {bad: "pending", good: "terminal"})
+        self.assertIn(f'"{bad}":{escaped}', self.store.path.read_text())
+
     def test_mark_refuses_scope_change_after_lock(self):
         main, (member,) = self.linked("worktree")
         ident = self.record(member)
@@ -845,7 +1029,7 @@ class HostActionsTests(unittest.TestCase):
             identity = path.stat()
             with self.subTest(path=path.name), patch.object(sys, "platform", "darwin"), \
                     patch.object(actions, "_has_extended_acl",
-                                 side_effect=lambda fd: os.path.samestat(os.fstat(fd), identity)):
+                                 side_effect=lambda fd, **_: os.path.samestat(os.fstat(fd), identity)):
                 with self.assertRaisesRegex(ValueError, "ACL"):
                     self.record(literal="ls -a")
                 with self.assertRaisesRegex(ValueError, "ACL"):

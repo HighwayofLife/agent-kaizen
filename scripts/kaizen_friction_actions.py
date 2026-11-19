@@ -8,6 +8,7 @@ import json
 import os
 from pathlib import Path
 import re
+import runpy
 import stat
 import subprocess
 import sys
@@ -18,12 +19,15 @@ except ImportError:
     fcntl = None
 
 STORE_LIMIT = 1024 * 1024
+RECEIPT_LIMIT = 2 * STORE_LIMIT
 EVIDENCE_LIMIT = 500
 CREATE_RETRIES = 100
 STATES = {"done": "done", "dismiss": "dismissed", "reopen": "open"}
 CATALOG_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 ACTION_ID = re.compile(r"fa1_[0-9a-f]{64}")
 INTENTS = {"suggest": "terminal", "apply": "pending"}
+COMPACT_APPLY = "a"  # Accept compact closed receipts from earlier builds on read.
+RECEIPT_STATES = (*INTENTS.values(), COMPACT_APPLY)
 BLOCK_PREFIX = "<!-- kaizen-host-actions "
 ROW_OPTIONAL = {"steps", "metric_at_done", "flaps"}
 ROW_FIELDS = set("canonical_project catalog_id selector_key subject projects status first_seen updated_at "
@@ -43,7 +47,7 @@ def _id(secret, project, catalog_id, selector):
     return "fa1_" + hmac.new(secret, payload.encode("utf-8"), hashlib.sha256).hexdigest()
 
 
-def _has_extended_acl(fd):
+def _has_extended_acl(fd, *, allow_deny_only=False):
     # Mirrors kaizen_friction_sample.has_extended_acl: Darwin ACLs can grant access the mode bits hide.
     try:
         import ctypes
@@ -56,8 +60,26 @@ def _has_extended_acl(fd):
     free_acl.argtypes = (ctypes.c_void_p,)
     acl = get_acl(fd, 0x100)  # ACL_TYPE_EXTENDED in sys/acl.h
     if acl:
-        free_acl(acl)
-        return True
+        try:
+            if not allow_deny_only:
+                return True
+            # A deny-only ACL (including the default on macOS home folders) cannot grant access.
+            get_entry, get_tag = libc.acl_get_entry, libc.acl_get_tag_type
+            get_entry.argtypes = (ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p))
+            get_tag.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_int))
+            entry, tag = ctypes.c_void_p(), ctypes.c_int()
+            ctypes.set_errno(0)
+            result = get_entry(acl, 0, ctypes.byref(entry))  # ACL_FIRST_ENTRY
+            while result == 0:
+                if get_tag(entry, ctypes.byref(tag)) != 0 or tag.value != 2:  # ACL_EXTENDED_DENY
+                    return True
+                ctypes.set_errno(0)
+                result = get_entry(acl, -1, ctypes.byref(entry))  # ACL_NEXT_ENTRY
+            if ctypes.get_errno() != errno.EINVAL:  # No more entries.
+                raise OSError("cannot verify host-action ancestor ACL")
+            return False
+        finally:
+            free_acl(acl)
     error = ctypes.get_errno()
     if error != errno.ENOENT:  # Darwin returns ENOENT for an inode without an ACL.
         raise OSError(error, "cannot verify host-action ACL")
@@ -79,6 +101,8 @@ def _check_directory(fd, owner=False, private=False, store=False):
         raise ValueError("unsafe host-action directory")
     if store:
         _check_acl(fd, "directory")
+    elif sys.platform == "darwin" and _has_extended_acl(fd, allow_deny_only=True):
+        raise ValueError("extended ACL on host-action ancestor directory")
 
 
 @contextmanager
@@ -209,7 +233,13 @@ def _object_values(raw):
 
 
 class _Rows(dict):
-    pass
+    def __init__(self, *args):
+        super().__init__(*args)
+        self.apply_intents = {}
+        self.preserved = {}
+        self.preserved_receipts = {}
+        self.receipt_metadata = {}
+        self.loaded_generations = set()
 
 
 def _text(value, limit, *, path=False):
@@ -259,6 +289,12 @@ def _pending(generations):
     return {ident for receipt in generations.values() for ident, state in receipt.items() if state == "pending"}
 
 
+def _terminal_slots(generations):
+    for generation, receipt in sorted(generations.items()):
+        for ident in sorted(ident for ident, state in receipt.items() if state == "terminal"):
+            yield generation, ident
+
+
 class HostActions:
     def __init__(self, audits, backups, canonical_project, project_key):
         self.path = Path(audits) / "host-actions.json"
@@ -290,16 +326,39 @@ class HostActions:
         return secret
 
     def _load(self, directory):
-        try:
-            raw = _read(directory, self.path.name, STORE_LIMIT, replaced=True)
-        except FileNotFoundError:
-            return {}, None, {}
+        for _ in range(CREATE_RETRIES):
+            try:
+                raw = _read(directory, self.path.name, STORE_LIMIT, replaced=True)
+            except FileNotFoundError:
+                return _Rows(), None, {}
+            try:
+                versions = json.loads(_read(directory, self.path.name + ".receipts", RECEIPT_LIMIT,
+                                            replaced=True), object_pairs_hook=_unique)
+            except FileNotFoundError:
+                versions = {}
+            except (ValueError, RecursionError):
+                raise ValueError("invalid host-action receipt metadata") from None
+            if not versions or raw == _read(directory, self.path.name, STORE_LIMIT, replaced=True):
+                break
+        else:
+            raise ValueError("host-action store changed during read")
+        if (not isinstance(versions, dict) or len(versions) > 2
+                or any(not re.fullmatch(r"[0-9a-f]{64}", digest) or not isinstance(saved, dict)
+                       or set(saved) != {"receipts", "apply_intents"}
+                       or not isinstance(saved["receipts"], dict) or not isinstance(saved["apply_intents"], dict)
+                       for digest, saved in versions.items())):
+            raise ValueError("invalid host-action receipt metadata")
+        digest = hashlib.sha256(raw).hexdigest()
+        matched = digest in versions
+        # An older runner can update the shared v1 file without touching the sidecar.
+        metadata = [versions[digest]] if matched else list(versions.values())
         try:
             store = json.loads(raw, object_pairs_hook=_unique)
         except (ValueError, RecursionError):
             raise ValueError("invalid host-action store JSON") from None
-        if (not isinstance(store, dict) or set(store) - {"receipts"} != {"v", "actions"}
+        if (not isinstance(store, dict) or set(store) - {"receipts", "apply_intents"} != {"v", "actions"}
                 or not isinstance(store.get("receipts", {}), dict)
+                or not isinstance(store.get("apply_intents", {}), dict)
                 or type(store["v"]) is not int or store["v"] != 1 or not isinstance(store["actions"], dict)):
             raise ValueError("invalid host-action store format")
         rows = store["actions"]
@@ -317,6 +376,33 @@ class HostActions:
         if skipped:
             print(f"host actions: skipped {len(skipped)} row(s) with unreadable project keys", file=sys.stderr)
         receipts = store.get("receipts", {})
+        intents, archived = {}, {}
+        for saved in metadata:
+            for project, generations in saved["receipts"].items():
+                if not isinstance(generations, dict):
+                    raise ValueError("invalid host-action receipt metadata")
+                for generation, receipt in generations.items():
+                    if not isinstance(receipt, dict) or any(state != "terminal" for state in receipt.values()):
+                        raise ValueError("invalid host-action receipt metadata")
+                    current = receipts.setdefault(project, {})
+                    if not isinstance(current, dict):
+                        raise ValueError("invalid host-action receipt scope")
+                    if generation not in current and (matched or all(ident in rows for ident in receipt)):
+                        current[generation] = receipt
+                        archived.setdefault(project, {})[generation] = receipt
+            for project, generations in saved["apply_intents"].items():
+                if not isinstance(generations, dict):
+                    raise ValueError("invalid host-action receipt metadata")
+                for generation, ids in generations.items():
+                    if not isinstance(ids, list) or any(not isinstance(ident, str) for ident in ids):
+                        raise ValueError("invalid host-action receipt metadata")
+                    current = receipts.get(project, {})
+                    if not isinstance(current, dict) or not isinstance(current.get(generation, {}), dict):
+                        raise ValueError("invalid host-action receipt")
+                    current = current.get(generation, {})
+                    if matched and (not ids or len(set(ids)) != len(ids) or not set(ids) <= current.keys()):
+                        raise ValueError("invalid host-action receipt metadata")
+                    intents.setdefault(project, {}).setdefault(generation, set()).update(set(ids) & current.keys())
         for project, generations in receipts.items():
             if not (_text(project, 4096, path=True) and Path(project).is_absolute()
                     and project == os.path.normpath(project) and isinstance(generations, dict)):
@@ -324,22 +410,55 @@ class HostActions:
             for generation, receipt in generations.items():
                 if (not _text(generation, 128) or not isinstance(receipt, dict) or len(receipt) > 16
                         or any(ident not in rows or rows[ident]["canonical_project"] != project
-                               or state not in INTENTS.values()
+                               or state not in RECEIPT_STATES
                                or (state == "pending" and rows[ident]["status"] != "open")
                                for ident, state in receipt.items())):
                     raise ValueError("invalid host-action receipt")
         rows = _Rows((ident, row) for ident, row in rows.items() if ident not in skipped)
-        rows.preserved = {}
-        rows.preserved_receipts = {}
+        saved_intents = {project: {generation: sorted(ids) for generation, ids in generations.items()}
+                         for project, generations in intents.items()}
+        rows.receipt_metadata = {digest: dict(receipts=archived, apply_intents=saved_intents)} if versions else {}
+        rows.loaded_generations = {(project, generation) for project, generations in receipts.items()
+                                   for generation in generations}
+        rows.apply_intents = intents
+        for project, saved in store.get("apply_intents", {}).items():
+            if project not in receipts:
+                raise ValueError("invalid host-action import intents")
+            if isinstance(saved, str) and re.fullmatch(r"[1-9a-f][0-9a-f]*", saved):
+                slots = list(_terminal_slots(receipts[project]))
+                mask = int(saved, 16)
+                if mask.bit_length() > len(slots):
+                    raise ValueError("invalid host-action import intents")
+                for bit, (generation, ident) in enumerate(slots):
+                    if mask & (1 << bit):
+                        rows.apply_intents.setdefault(project, {}).setdefault(generation, set()).add(ident)
+                continue
+            if not isinstance(saved, dict):
+                raise ValueError("invalid host-action import intents")
+            for generation, ids in saved.items():
+                receipt = receipts[project].get(generation, {})
+                if (not isinstance(ids, list) or not ids or len(ids) > len(receipt)
+                        or any(not isinstance(ident, str) or ident not in receipt for ident in ids)
+                        or len(set(ids)) != len(ids) or _pending({generation: receipt}) - set(ids)):
+                    raise ValueError("invalid host-action import intents")
+                rows.apply_intents.setdefault(project, {})[generation] = set(ids)
+        # Both pending and compact closed receipts encode their original apply intent.
+        for project, generations in receipts.items():
+            for generation, receipt in generations.items():
+                for ident, state in receipt.items():
+                    if state in ("pending", COMPACT_APPLY):
+                        rows.apply_intents.setdefault(project, {}).setdefault(generation, set()).add(ident)
+                    if state == COMPACT_APPLY:
+                        receipt[ident] = "terminal"
         if skipped:
             fields = _object_values(raw.decode("utf-8"))
             row_values = _object_values(fields["actions"])
             rows.preserved = {ident: row_values[ident] for ident in skipped}
             receipt_values = _object_values(fields.get("receipts", "{}"))
             for project, generations in receipts.items():
-                raw_generations = _object_values(receipt_values[project])
+                raw_generations = _object_values(receipt_values.get(project, "{}"))
                 for generation, receipt in generations.items():
-                    if skipped.intersection(receipt):
+                    if skipped.intersection(receipt) and generation in raw_generations:
                         rows.preserved_receipts[(project, generation)] = raw_generations[generation]
         return rows, secret, receipts
 
@@ -375,14 +494,58 @@ class HostActions:
         output_rows.update((ident, marker(value)) for ident, value in getattr(rows, "preserved", {}).items())
         output_receipts = {project: dict(generations) for project, generations in receipts.items()}
         for (project, generation), value in getattr(rows, "preserved_receipts", {}).items():
-            output_receipts[project][generation] = marker(value)
-        text = json.dumps({"v": 1, "actions": output_rows, "receipts": output_receipts}, separators=(",", ":"))
-        for token, value in preserved.items():
-            text = text.replace(token, value)
-        raw = (text + "\n").encode("utf-8")
+            receipt = output_receipts[project][generation]
+            original = json.loads(value)
+            if receipt == original:
+                output_receipts[project][generation] = marker(value)
+            else:
+                output_receipts[project][generation] = dict(receipt, **{
+                    ident: marker(raw) for ident, raw in _object_values(value).items()
+                    if ident in rows.preserved and original[ident] != COMPACT_APPLY})
+        # Older installed runners share this store and require the release v1 fields and states.
+        output = {"v": 1, "actions": output_rows, "receipts": output_receipts}
+        def encode():
+            text = json.dumps(output, separators=(",", ":"))
+            for token, value in preserved.items():
+                text = text.replace(token, value)
+            return (text + "\n").encode("utf-8")
+
+        raw = encode()
+        archived = {}
+        excess = len(raw) - STORE_LIMIT
+        for project, generations in output_receipts.items():
+            for generation, receipt in list(generations.items()):
+                if excess <= 0:
+                    break
+                if ((project, generation) in rows.loaded_generations
+                        and (project, generation) not in rows.preserved_receipts
+                        and isinstance(receipt, dict) and "pending" not in receipt.values()):
+                    archived.setdefault(project, {})[generation] = generations.pop(generation)
+                    excess -= len(json.dumps(generation)) + len(json.dumps(receipt, separators=(",", ":"))) + 1
+        if archived:
+            raw = encode()
         if len(raw) > STORE_LIMIT:
             raise ValueError("host-action store exceeds size limit")
+        completed = {}
+        for project, generations in receipts.items():
+            for generation, receipt in generations.items():
+                ids = rows.apply_intents.get(project, {}).get(generation, ())
+                closed = sorted(ident for ident in ids if receipt.get(ident) == "terminal")
+                if closed:
+                    completed.setdefault(project, {})[generation] = closed
+        metadata = dict(receipts=archived, apply_intents=completed)
+        digest = hashlib.sha256(raw).hexdigest()
+        versions = dict(rows.receipt_metadata, **{digest: metadata})
+        if archived or completed or rows.receipt_metadata:
+            encoded = json.dumps(versions, separators=(",", ":")).encode("utf-8")
+            if len(encoded) > RECEIPT_LIMIT:
+                raise ValueError("host-action receipt metadata exceeds size limit")
+            # Keep the previous metadata until the shared file is durably replaced.
+            _replace(directory, self.path.name + ".receipts", encoded)
         _replace(directory, self.path.name, raw)
+        rows.receipt_metadata = {digest: metadata} if archived or completed else {}
+        rows.loaded_generations = {(project, generation) for project, generations in receipts.items()
+                                   for generation in generations}
 
     def _new_row(self, identity, evidence, stamp):
         project, catalog_id, selector = identity
@@ -433,6 +596,31 @@ class HostActions:
                 for ident, row in sorted(rows.items())
                 if row["canonical_project"] == project]
 
+    def _prune_receipts(self, rows, project, generations, generation):
+        current = re.fullmatch(r"(?:interactive|scheduled):([0-9]{20})", generation)
+        if current is None:
+            return
+        acknowledged = ""
+        key = self.project_key(project, resolved=True)
+        try:
+            with _directory(self.friction, private=True) as directory:
+                state = json.loads(_read(directory, "prepare-" + key + ".json", STORE_LIMIT), object_pairs_hook=_unique)
+            if (state["project"] == project and type(state["v"]) is int and state["v"] == 1
+                    and re.fullmatch(r"[0-9]{20}", state["acknowledged_generation"])):
+                acknowledged = state["acknowledged_generation"]
+        except (OSError, ValueError, TypeError, KeyError, RecursionError):
+            pass
+        for name, receipt in list(generations.items()):
+            old = re.fullmatch(r"(?:(?:interactive|scheduled):([0-9]{20})|scheduled-local:([0-9]{20}):.+)", name)
+            if old is None or (project, name) in rows.preserved_receipts:
+                continue
+            number = old[1] or old[2]
+            # A superseded interactive generation can no longer be acknowledged.
+            if (number < current[1] and "pending" not in receipt.values()
+                    and (not receipt or number <= acknowledged or name.startswith("interactive:"))):
+                del generations[name]
+                rows.apply_intents.get(project, {}).pop(name, None)
+
     def import_actions(self, block, frozen_map, project, generation):
         """Use the private map's identity, comparable evidence text and mode-filtered intents."""
         requests = _requests(block)
@@ -462,9 +650,11 @@ class HostActions:
                 raise ValueError("host-action machine key changed")
             generations = receipts.setdefault(project, {})
             if generation in generations:
-                if generations[generation] != receipt:
+                saved = generations[generation]
+                applied = rows.apply_intents.get(project, {}).get(generation, ())
+                if saved.keys() != receipt.keys() or set(applied) != _pending({generation: receipt}):
                     raise ValueError("different requests for an imported host-action generation")
-                return receipt
+                return saved
             pending = _pending(generations)
             stamp = datetime.now(timezone.utc).isoformat()
             for ident, (identity, evidence) in candidates.items():
@@ -479,6 +669,9 @@ class HostActions:
                 if receipt[ident] == "pending" and (row["status"] != "open" or row.get("flaps", 0) >= 2):
                     raise ValueError("host action requires manual resolution")
             generations[generation] = receipt
+            if apply_ids := _pending({generation: receipt}):
+                rows.apply_intents.setdefault(project, {})[generation] = apply_ids
+            self._prune_receipts(rows, project, generations, generation)
             self._save(directory, rows, receipts)
         return receipt
 
@@ -504,27 +697,54 @@ class HostActions:
             pass
         return None
 
+    def _localsearch_excluded(self, project, selector):
+        runner = self.canonical_project.__globals__
+        (scope,), _ = runner["discover"](None, None, {}, [project])
+        if scope.unknown or scope.canonical != project or selector.resolve() != selector:
+            return None
+        relative = selector.relative_to(project)
+        found = False
+        for anchor in scope.anchors:
+            target = anchor / relative
+            if not target.exists():
+                continue
+            if target.resolve(strict=True) != target or not target.is_dir():
+                return None
+            owner = runner["enrolled_project"](target)
+            if owner is not None and self._scope(owner) != project:
+                return None
+            try:
+                if not stat.S_ISREG((target / ".nomedia").lstat().st_mode):
+                    return False
+            except FileNotFoundError:
+                return False
+            found = True
+        return True if found else None
+
     def _probe(self, project, row):
         name, selector = row["catalog_id"], Path(row["selector_key"])
         try:
             if name == "inotify-limit" and sys.platform.startswith("linux"):
-                with Path("/proc/sys/fs/inotify/max_user_watches").open("rb") as stream:
-                    value = int(stream.read(32))
-                return value >= 100000, dict(kind="probe", key="facts.inotify_max_user_watches", value=value)
-            if ((name == "linux-localsearch" and sys.platform.startswith("linux"))
-                    or (name == "timemachine-output" and sys.platform == "darwin")) and selector.is_absolute():
+                here = Path(__file__).resolve().parent
+                tool = here / "kaizen-host-probe"
+                probe = runpy.run_path(str(tool if tool.is_file() else here / "host-probe"))
+                check = probe["Probe"](Path(project), "linux", Path("/proc"), probe["sibling"](
+                    "kaizen-friction-catalog.json", "friction-catalog.json"))
+                value = check.read_proc("sys/fs/inotify/max_user_watches")
+                files = check.git(project, "ls-files", "-z")
+                if value is not None and files is not None:
+                    return value >= 2 * min(500000, files.count("\0")), dict(
+                        kind="probe", key="facts.inotify_max_user_watches", value=value)
+            if name == "linux-localsearch" and sys.platform.startswith("linux") and selector.is_absolute():
+                return self._localsearch_excluded(Path(project), selector), None
+            if name == "timemachine-output" and sys.platform == "darwin" and selector.is_absolute():
                 if self.canonical_project(project, selector=selector) != (Path(project), selector):
                     return None, None
-                if name == "linux-localsearch":
-                    try:
-                        return stat.S_ISREG((selector / ".nomedia").lstat().st_mode), None
-                    except FileNotFoundError:
-                        return False, None
                 check = subprocess.run(["/usr/bin/tmutil", "isexcluded", str(selector)], capture_output=True,
                                        stdin=subprocess.DEVNULL, timeout=5)
                 if check.returncode == 0 and re.match(rb"^\[(Excluded|Included)\](?:\s|$)", check.stdout):
                     return check.stdout.startswith(b"[Excluded]"), None
-        except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired):
+        except (OSError, ValueError, RuntimeError, AttributeError, KeyError, subprocess.TimeoutExpired):
             pass
         return None, None
 
