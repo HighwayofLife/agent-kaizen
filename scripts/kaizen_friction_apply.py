@@ -479,8 +479,14 @@ class BrokerLedger:
                     try:
                         live = os.fstat(fd)
                         if os.path.samestat(info, live) and live.st_uid == os.geteuid() and live.st_nlink == 1:
-                            os.fchmod(fd, 0o600)
-                            os.fsync(fd)
+                            try:
+                                os.fchmod(fd, 0o600)
+                            except OSError as error:
+                                # A retained legacy copy is already inside a private directory.
+                                if not (move_to and owner_fd == backups and error.errno == errno.EROFS):
+                                    raise
+                            else:
+                                os.fsync(fd)
                     finally:
                         os.close(fd)
             if move_to:

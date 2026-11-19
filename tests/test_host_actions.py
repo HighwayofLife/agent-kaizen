@@ -422,6 +422,25 @@ class HostActionsTests(unittest.TestCase):
             self.store.import_actions(block((ident, "suggest")), frozen, self.project, "review")
         self.assertEqual(self.store.path.read_bytes(), before)
 
+    def test_completed_apply_writes_release_compatible_receipt(self):
+        ident = self.record()
+        row, = self.store.scoped(self.project)
+        frozen = {ident: dict(row, intents=["apply"])}
+        self.store.import_actions(block((ident, "apply")), frozen, self.project, "review")
+        limits = (actions.STORE_LIMIT, self.store.path.stat().st_size + 1)
+        with actions._directory(self.store.path.parent) as directory:
+            rows, _, receipts = self.store._load(directory)
+            receipts[str(self.project)]["review"][ident] = "terminal"
+            for limit in limits:
+                with self.subTest(limit=limit), patch.object(actions, "STORE_LIMIT", limit):
+                    self.store._save(directory, rows, receipts)
+                    raw = self.store.path.read_bytes()
+                    self.assertLessEqual(len(raw), limit)
+                    saved = json.loads(raw)
+                    self.assertEqual(set(saved), {"v", "actions", "receipts"})
+                    self.assertEqual(saved["v"], 1)
+                    self.assertEqual(saved["receipts"], {str(self.project): {"review": {ident: "terminal"}}})
+
     def test_legacy_pending_store_can_close_receipts_under_size_cap(self):
         ident = self.record()
         row, = self.store.scoped(self.project)
@@ -436,13 +455,63 @@ class HostActionsTests(unittest.TestCase):
             self.assertNotIn("apply_intents", json.loads(self.store.path.read_bytes()))
             for receipt in receipts[project].values():
                 receipt[ident] = "terminal"
+            replace = actions._replace
+
+            def interrupt_shared_store(directory, name, raw):
+                if name == self.store.path.name:
+                    raise OSError("before shared store replacement")
+                return replace(directory, name, raw)
+
+            with patch.object(actions, "_replace", side_effect=interrupt_shared_store), \
+                    self.assertRaisesRegex(OSError, "before shared store replacement"):
+                self.store._save(directory, rows, receipts)
+            _, _, recovered = self.store._load(directory)
+            self.assertEqual(recovered[project], {name: {ident: "pending"} for name in receipts[project]})
             self.store._save(directory, rows, receipts)
+        saved = json.loads(self.store.path.read_bytes())
+        self.assertLessEqual(self.store.path.stat().st_size, actions.STORE_LIMIT)
+        self.assertEqual(set(saved), {"v", "actions", "receipts"})
+        self.assertTrue(all(state == "terminal" for receipt in saved["receipts"][project].values()
+                            for state in receipt.values()))
         frozen = {ident: dict(row, intents=["suggest", "apply"])}
         generation = "scheduled:" + "0" * 20
         self.assertEqual(self.store.import_actions(block((ident, "apply")), frozen, self.project, generation),
                          {ident: "terminal"})
         with self.assertRaisesRegex(ValueError, "different requests"):
             self.store.import_actions(block((ident, "suggest")), frozen, self.project, generation)
+
+    def test_receipt_metadata_survives_legacy_writer_and_interrupted_save(self):
+        ident = self.record()
+        row, = self.store.scoped(self.project)
+        frozen = {ident: dict(row, intents=["suggest", "apply"])}
+        request = block((ident, "apply"))
+        self.store.import_actions(request, frozen, self.project, "first")
+        with actions._directory(self.store.path.parent) as directory:
+            rows, _, receipts = self.store._load(directory)
+            receipts[str(self.project)]["first"][ident] = "terminal"
+            self.store._save(directory, rows, receipts)
+        self.store.import_actions(request, frozen, self.project, "second")
+        before = self.store.path.read_bytes()
+        with actions._directory(self.store.path.parent) as directory:
+            rows, _, receipts = self.store._load(directory)
+            receipts[str(self.project)]["second"][ident] = "terminal"
+            replace = actions._replace
+
+            def interrupt_shared_store(directory, name, raw):
+                if name == self.store.path.name:
+                    raise OSError("before shared store replacement")
+                return replace(directory, name, raw)
+
+            with patch.object(actions, "_replace", side_effect=interrupt_shared_store), self.assertRaises(OSError):
+                self.store._save(directory, rows, receipts)
+            self.assertEqual(self.store.path.read_bytes(), before)
+            _, _, recovered = self.store._load(directory)
+            self.assertEqual(recovered[str(self.project)], {"first": {ident: "terminal"}, "second": {ident: "pending"}})
+        document = json.loads(before)
+        document["actions"][ident]["evidence"] = "legacy writer update"
+        self.store.path.write_text(json.dumps(document))
+        self.assertEqual(self.store.import_actions(request, frozen, self.project, "first"), {ident: "terminal"})
+        self.assertEqual(self.store.import_actions(request, frozen, self.project, "second"), {ident: "pending"})
 
     def test_import_prunes_old_empty_and_acknowledged_generations(self):
         ident = self.record()

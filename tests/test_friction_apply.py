@@ -445,6 +445,32 @@ class BrokerLedgerTests(unittest.TestCase):
             self.assertIn(str(displaced), record["ledger_backups"])
             self.assertEqual(displaced.read_text(), "older ledger copy")
 
+    def test_reconcile_and_undo_keep_legacy_backup_on_read_only_mount(self):
+        legacy = self.ledger.parent / apply.LEDGER_BACKUPS
+        legacy.mkdir(mode=0o700)
+        with self.locked() as journal:
+            ident = self.ledger_effect(journal)
+            displaced = legacy / (ident + "-" + "1" * 32 + ".md")
+            displaced.write_text("older ledger copy")
+            displaced.chmod(0o644)
+            original = displaced.stat()
+            fchmod = os.fchmod
+
+            def chmod_on_mount(fd, mode):
+                if os.path.samestat(os.fstat(fd), original):
+                    raise OSError(errno.EROFS, "read-only legacy mount")
+                return fchmod(fd, mode)
+
+            with patch.object(os, "rename", side_effect=OSError(errno.EROFS, "read-only legacy mount")), \
+                    patch.object(os, "fchmod", side_effect=chmod_on_mount):
+                self.assertEqual(journal.reconcile(ident), "recorded")
+                journal.undo(ident, lambda *_: None)
+            record = journal.load(ident)
+            self.assertEqual(record["phase"], "reverted")
+            self.assertIn(str(displaced), record["ledger_backups"])
+            self.assertEqual(displaced.read_text(), "older ledger copy")
+            self.assertEqual(displaced.stat().st_mode & 0o777, 0o644)
+
     def ledger_effect(self, journal):
         self.signed_extract([self.project])
         ident = self.action("ls", [self.project])

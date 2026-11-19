@@ -19,13 +19,14 @@ except ImportError:
     fcntl = None
 
 STORE_LIMIT = 1024 * 1024
+RECEIPT_LIMIT = 2 * STORE_LIMIT
 EVIDENCE_LIMIT = 500
 CREATE_RETRIES = 100
 STATES = {"done": "done", "dismiss": "dismissed", "reopen": "open"}
 CATALOG_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 ACTION_ID = re.compile(r"fa1_[0-9a-f]{64}")
 INTENTS = {"suggest": "terminal", "apply": "pending"}
-COMPACT_APPLY = "a"  # On disk only, for a closed apply receipt.
+COMPACT_APPLY = "a"  # Accept compact closed receipts from earlier builds on read.
 RECEIPT_STATES = (*INTENTS.values(), COMPACT_APPLY)
 BLOCK_PREFIX = "<!-- kaizen-host-actions "
 ROW_OPTIONAL = {"steps", "metric_at_done", "flaps"}
@@ -237,6 +238,8 @@ class _Rows(dict):
         self.apply_intents = {}
         self.preserved = {}
         self.preserved_receipts = {}
+        self.receipt_metadata = {}
+        self.loaded_generations = set()
 
 
 def _text(value, limit, *, path=False):
@@ -323,10 +326,32 @@ class HostActions:
         return secret
 
     def _load(self, directory):
-        try:
-            raw = _read(directory, self.path.name, STORE_LIMIT, replaced=True)
-        except FileNotFoundError:
-            return _Rows(), None, {}
+        for _ in range(CREATE_RETRIES):
+            try:
+                raw = _read(directory, self.path.name, STORE_LIMIT, replaced=True)
+            except FileNotFoundError:
+                return _Rows(), None, {}
+            try:
+                versions = json.loads(_read(directory, self.path.name + ".receipts", RECEIPT_LIMIT,
+                                            replaced=True), object_pairs_hook=_unique)
+            except FileNotFoundError:
+                versions = {}
+            except (ValueError, RecursionError):
+                raise ValueError("invalid host-action receipt metadata") from None
+            if not versions or raw == _read(directory, self.path.name, STORE_LIMIT, replaced=True):
+                break
+        else:
+            raise ValueError("host-action store changed during read")
+        if (not isinstance(versions, dict) or len(versions) > 2
+                or any(not re.fullmatch(r"[0-9a-f]{64}", digest) or not isinstance(saved, dict)
+                       or set(saved) != {"receipts", "apply_intents"}
+                       or not isinstance(saved["receipts"], dict) or not isinstance(saved["apply_intents"], dict)
+                       for digest, saved in versions.items())):
+            raise ValueError("invalid host-action receipt metadata")
+        digest = hashlib.sha256(raw).hexdigest()
+        matched = digest in versions
+        # An older runner can update the shared v1 file without touching the sidecar.
+        metadata = [versions[digest]] if matched else list(versions.values())
         try:
             store = json.loads(raw, object_pairs_hook=_unique)
         except (ValueError, RecursionError):
@@ -351,6 +376,33 @@ class HostActions:
         if skipped:
             print(f"host actions: skipped {len(skipped)} row(s) with unreadable project keys", file=sys.stderr)
         receipts = store.get("receipts", {})
+        intents, archived = {}, {}
+        for saved in metadata:
+            for project, generations in saved["receipts"].items():
+                if not isinstance(generations, dict):
+                    raise ValueError("invalid host-action receipt metadata")
+                for generation, receipt in generations.items():
+                    if not isinstance(receipt, dict) or any(state != "terminal" for state in receipt.values()):
+                        raise ValueError("invalid host-action receipt metadata")
+                    current = receipts.setdefault(project, {})
+                    if not isinstance(current, dict):
+                        raise ValueError("invalid host-action receipt scope")
+                    if generation not in current and (matched or all(ident in rows for ident in receipt)):
+                        current[generation] = receipt
+                        archived.setdefault(project, {})[generation] = receipt
+            for project, generations in saved["apply_intents"].items():
+                if not isinstance(generations, dict):
+                    raise ValueError("invalid host-action receipt metadata")
+                for generation, ids in generations.items():
+                    if not isinstance(ids, list) or any(not isinstance(ident, str) for ident in ids):
+                        raise ValueError("invalid host-action receipt metadata")
+                    current = receipts.get(project, {})
+                    if not isinstance(current, dict) or not isinstance(current.get(generation, {}), dict):
+                        raise ValueError("invalid host-action receipt")
+                    current = current.get(generation, {})
+                    if matched and (not ids or len(set(ids)) != len(ids) or not set(ids) <= current.keys()):
+                        raise ValueError("invalid host-action receipt metadata")
+                    intents.setdefault(project, {}).setdefault(generation, set()).update(set(ids) & current.keys())
         for project, generations in receipts.items():
             if not (_text(project, 4096, path=True) and Path(project).is_absolute()
                     and project == os.path.normpath(project) and isinstance(generations, dict)):
@@ -363,6 +415,12 @@ class HostActions:
                                for ident, state in receipt.items())):
                     raise ValueError("invalid host-action receipt")
         rows = _Rows((ident, row) for ident, row in rows.items() if ident not in skipped)
+        saved_intents = {project: {generation: sorted(ids) for generation, ids in generations.items()}
+                         for project, generations in intents.items()}
+        rows.receipt_metadata = {digest: dict(receipts=archived, apply_intents=saved_intents)} if versions else {}
+        rows.loaded_generations = {(project, generation) for project, generations in receipts.items()
+                                   for generation in generations}
+        rows.apply_intents = intents
         for project, saved in store.get("apply_intents", {}).items():
             if project not in receipts:
                 raise ValueError("invalid host-action import intents")
@@ -398,9 +456,9 @@ class HostActions:
             rows.preserved = {ident: row_values[ident] for ident in skipped}
             receipt_values = _object_values(fields.get("receipts", "{}"))
             for project, generations in receipts.items():
-                raw_generations = _object_values(receipt_values[project])
+                raw_generations = _object_values(receipt_values.get(project, "{}"))
                 for generation, receipt in generations.items():
-                    if skipped.intersection(receipt):
+                    if skipped.intersection(receipt) and generation in raw_generations:
                         rows.preserved_receipts[(project, generation)] = raw_generations[generation]
         return rows, secret, receipts
 
@@ -425,14 +483,6 @@ class HostActions:
                 and row["eligible"] is False)
 
     def _save(self, directory, rows, receipts):
-        raw = self._encode(rows, receipts)
-        if len(raw) > STORE_LIMIT:
-            raw = self._encode(rows, receipts, compact=True)
-        if len(raw) > STORE_LIMIT:
-            raise ValueError("host-action store exceeds size limit")
-        _replace(directory, self.path.name, raw)
-
-    def _encode(self, rows, receipts, *, compact=False):
         # Mark preserved values before serializing, then restore their exact original JSON bytes.
         preserved = {}
         def marker(value):
@@ -442,40 +492,60 @@ class HostActions:
 
         output_rows = dict(rows)
         output_rows.update((ident, marker(value)) for ident, value in getattr(rows, "preserved", {}).items())
-        output_receipts = {project: {generation: dict(receipt) for generation, receipt in generations.items()}
-                           for project, generations in receipts.items()}
-        for (project, generation), value in getattr(rows, "preserved_receipts", {}).items():
-            output_receipts[project][generation].update(
-                (ident, state) for ident, state in json.loads(value).items()
-                if ident in rows.preserved and state == COMPACT_APPLY)
-        # At the cap, encode closed applies in place to avoid growing legacy pending receipts.
-        apply_intents = {}
-        for project, generations in getattr(rows, "apply_intents", {}).items():
-            mask, bit = 0, 0
-            for generation, ident in _terminal_slots(output_receipts[project]):
-                if ident in generations.get(generation, ()):
-                    if compact and ident not in rows.preserved:
-                        output_receipts[project][generation][ident] = COMPACT_APPLY
-                        continue
-                    mask |= 1 << bit
-                bit += 1
-            if mask:
-                apply_intents[project] = format(mask, "x")
+        output_receipts = {project: dict(generations) for project, generations in receipts.items()}
         for (project, generation), value in getattr(rows, "preserved_receipts", {}).items():
             receipt = output_receipts[project][generation]
-            if receipt == json.loads(value):
+            original = json.loads(value)
+            if receipt == original:
                 output_receipts[project][generation] = marker(value)
             else:
                 output_receipts[project][generation] = dict(receipt, **{
-                    ident: marker(raw) for ident, raw in _object_values(value).items() if ident in rows.preserved})
+                    ident: marker(raw) for ident, raw in _object_values(value).items()
+                    if ident in rows.preserved and original[ident] != COMPACT_APPLY})
+        # Older installed runners share this store and require the release v1 fields and states.
         output = {"v": 1, "actions": output_rows, "receipts": output_receipts}
-        if apply_intents:
-            output["apply_intents"] = apply_intents
-        text = json.dumps(output, separators=(",", ":"))
-        for token, value in preserved.items():
-            text = text.replace(token, value)
-        raw = text.encode("utf-8")
-        return raw + b"\n" if len(raw) < STORE_LIMIT else raw
+        def encode():
+            text = json.dumps(output, separators=(",", ":"))
+            for token, value in preserved.items():
+                text = text.replace(token, value)
+            return (text + "\n").encode("utf-8")
+
+        raw = encode()
+        archived = {}
+        excess = len(raw) - STORE_LIMIT
+        for project, generations in output_receipts.items():
+            for generation, receipt in list(generations.items()):
+                if excess <= 0:
+                    break
+                if ((project, generation) in rows.loaded_generations
+                        and (project, generation) not in rows.preserved_receipts
+                        and isinstance(receipt, dict) and "pending" not in receipt.values()):
+                    archived.setdefault(project, {})[generation] = generations.pop(generation)
+                    excess -= len(json.dumps(generation)) + len(json.dumps(receipt, separators=(",", ":"))) + 1
+        if archived:
+            raw = encode()
+        if len(raw) > STORE_LIMIT:
+            raise ValueError("host-action store exceeds size limit")
+        completed = {}
+        for project, generations in receipts.items():
+            for generation, receipt in generations.items():
+                ids = rows.apply_intents.get(project, {}).get(generation, ())
+                closed = sorted(ident for ident in ids if receipt.get(ident) == "terminal")
+                if closed:
+                    completed.setdefault(project, {})[generation] = closed
+        metadata = dict(receipts=archived, apply_intents=completed)
+        digest = hashlib.sha256(raw).hexdigest()
+        versions = dict(rows.receipt_metadata, **{digest: metadata})
+        if archived or completed or rows.receipt_metadata:
+            encoded = json.dumps(versions, separators=(",", ":")).encode("utf-8")
+            if len(encoded) > RECEIPT_LIMIT:
+                raise ValueError("host-action receipt metadata exceeds size limit")
+            # Keep the previous metadata until the shared file is durably replaced.
+            _replace(directory, self.path.name + ".receipts", encoded)
+        _replace(directory, self.path.name, raw)
+        rows.receipt_metadata = {digest: metadata} if archived or completed else {}
+        rows.loaded_generations = {(project, generation) for project, generations in receipts.items()
+                                   for generation in generations}
 
     def _new_row(self, identity, evidence, stamp):
         project, catalog_id, selector = identity
