@@ -214,6 +214,25 @@ def _unique(pairs):
     return result
 
 
+def _read_broker_record(state, ident, secret):
+    try:
+        raw = _read(state, "broker-" + ident + ".json", 64 << 10, replaced=True)
+    except FileNotFoundError:
+        return None
+    record = json.loads(raw, object_pairs_hook=_unique)
+    mac = record.pop("mac", None) if isinstance(record, dict) else None
+    payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("ascii")
+    expected = hmac.digest(secret, b"broker-ledger-v1\0" + payload, "sha256").hex()
+    if not isinstance(mac, str) or not mac.isascii() or not hmac.compare_digest(mac, expected):
+        raise ValueError("invalid legacy host-action broker record")
+    return record
+
+
+def _broker_scope_matches(record, ident, project):
+    info = os.stat(project, follow_symlinks=False)
+    return record.get("id") == ident and record.get("scope") == [project, info.st_dev, info.st_ino]
+
+
 def _object_values(raw):
     """Keep the original JSON value text for fields that must remain untouched."""
     decoder = json.JSONDecoder()
@@ -720,21 +739,29 @@ class HostActions:
         applied = set()
         with _directory(self.friction, private=True) as state:
             for ident in ids:
-                try:
-                    raw = _read(state, "broker-" + ident + ".json", 64 << 10, replaced=True)
-                except FileNotFoundError:
-                    continue
-                record = json.loads(raw, object_pairs_hook=_unique)
-                mac = record.pop("mac", None) if isinstance(record, dict) else None
-                payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("ascii")
-                expected = hmac.digest(secret, b"broker-ledger-v1\0" + payload, "sha256").hex()
-                if not isinstance(mac, str) or not mac.isascii() or not hmac.compare_digest(mac, expected):
-                    raise ValueError("invalid legacy host-action broker record")
-                if record.get("operation") == "host-fix" and generation == f"scheduled:{record.get('generation')}":
-                    info = os.stat(project, follow_symlinks=False)
-                    if record.get("id") != ident or record.get("scope") != [project, info.st_dev, info.st_ino]:
+                record = _read_broker_record(state, ident, secret)
+                if (record is not None and record.get("operation") == "host-fix"
+                        and generation == f"scheduled:{record.get('generation')}"):
+                    if not _broker_scope_matches(record, ident, project):
                         raise ValueError("legacy host-action broker scope changed")
                     applied.add(ident)
+        return applied
+
+    def _legacy_marker_applies(self, project, generation, ids, secret):
+        if not ids:
+            return set()
+        applied = set()
+        with _directory(self.friction, private=True) as state:
+            for ident in ids:
+                try:
+                    record = _read_broker_record(state, ident, secret)
+                except (OSError, ValueError, RecursionError):
+                    record = None
+                if record is not None and record.get("operation") == "host-fix":
+                    if (generation != f"scheduled:{record.get('generation')}"
+                            or not _broker_scope_matches(record, ident, project)):
+                        continue
+                applied.add(ident)
         return applied
 
     def import_actions(self, block, frozen_map, project, generation):
@@ -771,6 +798,7 @@ class HostActions:
                     raise ValueError("different requests for an imported host-action generation")
                 applied = set(rows.apply_intents.get(project, {}).get(generation, ()))
                 requested_apply = _pending({generation: receipt})
+                marker_retries = set()
                 if (all(state == "terminal" for state in saved.values())
                         and re.fullmatch(r"scheduled:[0-9]{20}", generation)):
                     for ident in saved.keys() - applied:
@@ -780,8 +808,10 @@ class HostActions:
                         if (row.get("catalog_id") == "linux-localsearch" and row.get("done_by") == "verify"
                                 and "metric_at_done" not in row and row["evidence"] == candidates[ident][1]
                                 and not any(ident in other for name, other in generations.items() if name != generation)):
-                            applied.add(ident)
-                applied.update(self._legacy_applies(project, generation, saved.keys() - applied, stored_secret))
+                            marker_retries.add(ident)
+                applied.update(self._legacy_marker_applies(project, generation, marker_retries, stored_secret))
+                legacy_ids = saved.keys() - applied - marker_retries
+                applied.update(self._legacy_applies(project, generation, legacy_ids, stored_secret))
                 if applied != requested_apply:
                     raise ValueError("different requests for an imported host-action generation")
                 return saved

@@ -1,4 +1,5 @@
 """Scheduled friction preparation and transactional reconciliation."""
+import hmac
 import json
 import runpy
 from contextlib import nullcontext
@@ -149,7 +150,7 @@ class ScheduledFrictionTests(PreparationTests):
             with self.assertRaisesRegex(ValueError, "different requests"):
                 reconcile(audits, self.obj, output, receipt)
 
-    def test_completed_518da76_apply_accepts_identical_review_retry(self):
+    def completed_518da76_request(self):
         _, ident, output, receipt = self.marker_request()
         audits = self.config / "audits"
         scripts = self.mixed_scripts("kaizen-scheduled", "kaizen_friction_actions.py")
@@ -174,9 +175,16 @@ class ScheduledFrictionTests(PreparationTests):
                     patch.object(runpy, "run_path", side_effect=[host, runtime]):
                 broker(audits, self.obj, runner["command_options"](SimpleNamespace()))
         self.assertEqual(store.scoped(self.project)[0]["status"], "done")
-        before = store.path.read_bytes()
-        self.assertEqual(json.loads(before)["receipts"][str(self.project)][generation], {ident: "terminal"})
+        saved = json.loads(store.path.read_text())
+        self.assertEqual(saved["receipts"][str(self.project)][generation], {ident: "terminal"})
         self.assertFalse(store.path.with_suffix(".json.receipts").exists())
+        return store, ident, output, receipt
+
+    def test_completed_518da76_apply_accepts_identical_review_retry(self):
+        store, ident, output, receipt = self.completed_518da76_request()
+        audits = self.config / "audits"
+        request = output.read_text()
+        before = store.path.read_bytes()
         reconcile = self.runner["reconcile_scheduled"]
         with patch.dict(reconcile.__globals__, scheduled_action_refusal=lambda _: None):
             self.assertEqual(reconcile(audits, self.obj, output, receipt), (True, False))
@@ -186,6 +194,37 @@ class ScheduledFrictionTests(PreparationTests):
             with self.assertRaisesRegex(ValueError, "different requests"):
                 reconcile(audits, self.obj, output, receipt)
         self.assertEqual(store.path.read_bytes(), before)
+
+    def test_completed_518da76_retry_checks_signed_reservation(self):
+        store, ident, output, receipt = self.completed_518da76_request()
+        audits = self.config / "audits"
+        before = store.path.read_bytes()
+        request = output.read_text()
+        reconcile = self.runner["reconcile_scheduled"]
+        journal = store.friction / ("broker-" + ident + ".json")
+        journal.chmod(0o600)
+        info = self.project.stat()
+        scope = [str(self.project), info.st_dev, info.st_ino]
+        other_generation = f"{int(receipt['generation']) + 1:020d}"
+        cases = ((other_generation, scope, False),
+                 (receipt["generation"], [str(self.project), info.st_dev, info.st_ino + 1], False),
+                 (receipt["generation"], scope, True))
+        for generation, project_scope, matches in cases:
+            with self.subTest(generation=generation, scope=project_scope), \
+                    patch.dict(reconcile.__globals__, scheduled_action_refusal=lambda _: None):
+                record = dict(id=ident, operation="host-fix", phase="recorded", generation=generation,
+                              reservation="fixture-run", scope=project_scope)
+                payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("ascii")
+                record["mac"] = hmac.digest(store._secret(), b"broker-ledger-v1\0" + payload, "sha256").hex()
+                journal.write_text(json.dumps(record))
+                self.write(output, request)
+                if matches:
+                    self.assertEqual(reconcile(audits, self.obj, output, receipt), (True, False))
+                else:
+                    with self.assertRaisesRegex(ValueError, "different requests"):
+                        reconcile(audits, self.obj, output, receipt)
+                    self.assertEqual(output.read_text(), request)
+                self.assertEqual(store.path.read_bytes(), before)
 
     def test_malformed_output_cannot_acknowledge(self):
         _, receipt = self.scheduled()
