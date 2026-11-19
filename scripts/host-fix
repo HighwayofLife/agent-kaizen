@@ -38,6 +38,7 @@ MAX_DEPTH = 64
 UNKNOWN = 'recorded output directory path unknown. A manual check is required'
 QUARANTINE = r'\.kaizen-marker-[0-9a-f]{32}'
 CLEANUP = r'\.kaizen-cleanup-[0-9a-f]{32}'
+UNDO_SECONDS = 20
 
 if __name__ == '__main__':
     sys.dont_write_bytecode = True
@@ -367,24 +368,124 @@ def write_record(state, name, store, record):
     _replace(state, name, json.dumps(signed).encode('ascii') + b'\n')
 
 
-def rename_exclusive(directory, source, target):
+def rename_exclusive(directory, source, target, destination=None):
     # Never overwrite another writer's marker, even when restoring a raced rename.
     libc = ctypes.CDLL(None, use_errno=True)
     if sys.platform == 'darwin':
         rename, flags = libc.renameatx_np, 4  # RENAME_EXCL
     else:
         rename, flags = libc.renameat2, 1  # RENAME_NOREPLACE
-    if rename(directory, os.fsencode(source), directory, os.fsencode(target), flags):
+    destination = directory if destination is None else destination
+    if rename(directory, os.fsencode(source), destination, os.fsencode(target), flags):
         code = ctypes.get_errno()
         raise OSError(code, os.strerror(code))
 
 
-def restore_entry(directory, source, target):
+def restore_entry(directory, source, target, *, destination=None, source_path=None):
     try:
-        rename_exclusive(directory, source, target)
+        if destination is None:
+            rename_exclusive(directory, source, target)
+        else:
+            rename_exclusive(directory, source, target, destination)
     except OSError:
-        raise Refused(f'marker changed or replaced. Check {source} and {target} for recovery') from None
+        raise Refused(f'marker changed or replaced. Check {source_path or source} and {target} for recovery') from None
     os.fsync(directory)
+    if destination is not None:
+        os.fsync(destination)
+
+
+def dispose_marker(directory, record, scope_check):
+    cleanup, quarantine = record['cleanup'], record['quarantine']
+    holding = cleanup + '.d'
+    held_marker = holding + '/marker'
+    public = marker_present(directory, cleanup)
+    if public:
+        try:
+            marker_version(directory, record, cleanup)
+        except (Refused, OSError, ValueError):
+            scope_check()
+            restore_entry(directory, cleanup, quarantine)
+            raise Refused(f'marker changed or replaced. Entry retained at {quarantine}') from None
+    scope_check()
+    try:
+        os.mkdir(holding, 0o700, dir_fd=directory)
+    except FileExistsError:
+        pass
+    slot = os.open(holding, DIR_FLAGS, dir_fd=directory)
+    conflict = f'marker changed or replaced during cleanup. Check {cleanup}, {holding} and {quarantine}'
+
+    def check_slot():
+        scope_check()
+        try:
+            named = os.stat(holding, dir_fd=directory, follow_symlinks=False)
+            if file_id(named) == file_id(os.fstat(slot)):
+                return
+        except FileNotFoundError:
+            pass
+        raise Refused(f'marker holding directory identity changed. Check {holding}')
+
+    try:
+        _check_directory(slot, owner=True, private=True, store=True)
+        if marker_present(slot, 'recovered'):
+            raise Refused(f'marker recovery copy retained at {holding}/recovered')
+        if public:
+            os.fsync(directory)
+            check_slot()
+            try:
+                rename_exclusive(directory, cleanup, 'marker', slot)
+            except (FileNotFoundError, FileExistsError):
+                raise Refused(conflict) from None
+            os.fsync(slot)
+            os.fsync(directory)
+            try:
+                check_slot()
+            except Refused as error:
+                restore_entry(slot, 'marker', cleanup, destination=directory, source_path=held_marker)
+                raise Refused(f'{error}. Marker retained at {cleanup}') from None
+        if marker_present(slot, 'marker'):
+            with ExitStack() as stack:
+                try:
+                    fd, version = stack.enter_context(checked_marker(slot, record, 'marker'))
+                except (Refused, OSError, ValueError):
+                    restore_entry(slot, 'marker', quarantine, destination=directory, source_path=held_marker)
+                    raise Refused(f'marker changed or replaced. Entry retained at {quarantine}') from None
+                check_slot()
+                try:
+                    if list(marker_identity(os.stat('marker', dir_fd=slot, follow_symlinks=False))) != version:
+                        raise Refused(conflict)
+                    os.unlink('marker', dir_fd=slot)
+                except FileNotFoundError:
+                    raise Refused(conflict) from None
+                os.fsync(slot)
+                try:
+                    check_slot()
+                except Refused as error:
+                    # The authenticated record already contains every byte of the verified marker.
+                    try:
+                        copy = os.open('recovered', os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                                       0o600, dir_fd=slot)
+                        with os.fdopen(copy, 'wb') as stream:
+                            stream.write(record['stamp'].encode('ascii'))
+                            stream.flush()
+                            os.fsync(stream.fileno())
+                        os.fsync(slot)
+                    except OSError:
+                        raise Refused(f'{error}. Recover the marker from the transaction record stamp') from None
+                    raise Refused(f'{error}. Marker recovery copy written to {holding}/recovered '
+                                  'in the pinned directory. The transaction record also contains the stamp') from None
+                if os.fstat(fd).st_nlink or marker_present(slot, 'marker'):
+                    raise Refused(conflict)
+        else:
+            check_slot()
+        try:
+            os.rmdir(holding, dir_fd=directory)
+        except OSError:
+            raise Refused(conflict) from None
+    finally:
+        os.close(slot)
+    os.fsync(directory)
+    if marker_present(directory, cleanup) or marker_present(directory, quarantine):
+        raise Refused(conflict)
 
 
 def retire_marker(directory, record, persist, scope_check=None):
@@ -408,7 +509,7 @@ def retire_marker(directory, record, persist, scope_check=None):
         raise Refused('invalid marker quarantine name')
     if cleanup is not None and (not quarantine or not re.fullmatch(CLEANUP, cleanup)):
         raise Refused('invalid marker cleanup name')
-    if not (cleanup and marker_present(directory, cleanup)):
+    if not (cleanup and (marker_present(directory, cleanup) or marker_present(directory, cleanup + '.d'))):
         if not (quarantine and marker_present(directory, quarantine)):
             if record['phase'] == 'undone' or (quarantine and record['phase'] == 'undo-pending'):
                 return record
@@ -438,23 +539,7 @@ def retire_marker(directory, record, persist, scope_check=None):
         move(quarantine, cleanup)
     if scope_check:
         scope_check()
-    try:
-        with ExitStack() as stack:
-            try:
-                fd, _ = stack.enter_context(checked_marker(directory, record, cleanup))
-            except (Refused, OSError, ValueError):
-                restore_entry(directory, cleanup, quarantine)
-                raise Refused(f'marker changed or replaced. Entry retained at {quarantine}') from None
-            try:
-                os.unlink(cleanup, dir_fd=directory)
-            except FileNotFoundError:
-                raise Refused(f'marker changed or replaced during cleanup. Check {cleanup}') from None
-            if os.fstat(fd).st_nlink or marker_present(directory, cleanup):
-                raise Refused(f'marker changed or replaced during cleanup. Check {cleanup} and {quarantine}')
-    finally:
-        os.fsync(directory)
-    if marker_present(directory, quarantine):
-        raise Refused(f'marker changed or replaced. Entry retained at {quarantine}')
+    dispose_marker(directory, record, scope_check or (lambda: None))
     return record
 
 
@@ -589,12 +674,21 @@ def locate_output(record, deadline):
         try:
             if not avoid_mounts.isdisjoint((root, *root.parents)):
                 raise Refused('recovery root is remote or automounted')
-            with checked_directory(root, deadline=deadline) as directory:
-                if list(file_id(os.fstat(directory))) != record['recovery_identity']:
-                    raise Refused(UNKNOWN)
-                found = find_output(directory, root, identity, deadline, mounts)
-            if found is not None:
-                return found
+            # Search local mounts on the recorded path separately. The worktree walk
+            # still skips every mount, including unrelated bind mounts on the same device.
+            anchors = [parent for parent in path.parents
+                       if root in parent.parents and parent in mounts
+                       and avoid_mounts.isdisjoint((parent, *parent.parents))]
+            for anchor in (*anchors, root):
+                with checked_directory(anchor, deadline=deadline,
+                                       recovery=record if anchor != root else None) as directory:
+                    if anchor == root and list(file_id(os.fstat(directory))) != record['recovery_identity']:
+                        raise Refused(UNKNOWN)
+                    if anchor != root and os.fstat(directory).st_dev != identity[0]:
+                        raise Refused(UNKNOWN)
+                    found = find_output(directory, anchor, identity, deadline, mounts)
+                if found is not None:
+                    return found
         except Refused as error:
             if str(error) == UNKNOWN:
                 raise
@@ -608,45 +702,58 @@ def locate_output(record, deadline):
     raise Refused(UNKNOWN)
 
 
-def recover_output(record, deadline):
-    # A mount can appear after the snapshot. Isolate blocking I/O without inheriting the state lock.
+def undo(args):
+    if not LINUX_WRITES:
+        raise Refused(PENDING)
+    deadline = time.monotonic() + UNDO_SECONDS
+    # A mount can appear after lookup. Keep reopening, scope checks, and writes in
+    # the timed worker, which holds its own lock until it exits.
     check_deadline(deadline)
-    process = subprocess.Popen([sys.executable, '-I', __file__, '--recover-output'],
+    process = subprocess.Popen([sys.executable, '-I', __file__, '--undo-worker'],
                                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                close_fds=True)
     try:
-        result, _ = process.communicate(json.dumps([record, deadline]).encode('ascii'),
+        # macOS Python 3.9 uses a process-relative monotonic clock.
+        remaining = max(0, deadline - time.monotonic())
+        request = [os.fspath(args.project), os.fspath(args.record), remaining]
+        result, _ = process.communicate(json.dumps(request).encode('ascii'),
                                         timeout=max(0, deadline - time.monotonic()))
-    except subprocess.TimeoutExpired:
+    except BaseException as error:
         process.kill()
         # Reap a killed worker without waiting on a filesystem syscall in the caller.
         threading.Thread(target=process.wait, daemon=True).start()
-        raise Refused(f'{UNKNOWN} (recovery deadline exceeded)') from None
+        if isinstance(error, subprocess.TimeoutExpired):
+            raise Refused(f'{UNKNOWN} (recovery deadline exceeded)') from None
+        raise
     finally:
         process.stdin.close()
         process.stdout.close()
     check_deadline(deadline)
     if process.returncode:
         raise Refused(UNKNOWN)
-    result = json.loads(result)
-    if isinstance(result, str):
-        raise Refused(result)
-    path, info = result
-    return (Path(path), os.stat_result(info)) if path is not None else (None, None)
+    ok, message = json.loads(result)
+    if not ok:
+        raise Refused(message)
+    if message:
+        print(message)
 
 
-def recovery_worker():
+def undo_worker():
     try:
-        path, info = locate_output(*json.load(sys.stdin))
+        project, record, remaining = json.load(sys.stdin)
+        message = undo_transaction(argparse.Namespace(project=project, record=record), time.monotonic() + remaining)
     except Refused as error:
-        print(json.dumps(str(error)))
+        print(json.dumps([False, str(error)]))
+    except (OSError, ValueError, RuntimeError, KeyError, TypeError, AttributeError):
+        print(json.dumps([False, 'cannot safely read project, policy or action state']))
     else:
-        print(json.dumps([str(path) if path is not None else None, info]))
+        print(json.dumps([True, message]))
 
 
-def runtime():
+def runtime(deadline=None):
     executable = next((name for name in GIT_PATHS if os.access(name, os.X_OK)), None)
-    deadline = time.monotonic() + 20
+    if deadline is None:
+        deadline = time.monotonic() + 20
     run = partial(git, executable, deadline=deadline)
     runner = runpy.run_path(str(sibling('kaizen-scheduled')))
     scope = runner['action_project']
@@ -781,13 +888,13 @@ def apply(args, *, action_id=None):
         return root / name
 
 
-def undo(args):
+def undo_transaction(args, deadline):
     if not LINUX_WRITES:
         raise Refused(PENDING)
     _, cloud = marker_catalog(CATALOG_ID)
     project = exact_path(args.project)
     project_info = project.lstat()
-    _, store, run, deadline = runtime()
+    _, store, run, _ = runtime(deadline)
     root = store.friction / 'host-fixes'
     target = Path(args.record).absolute()
     if target.parent != root.absolute() or not re.fullmatch(KEY + r'\.json', target.name):
@@ -801,15 +908,17 @@ def undo(args):
         if record['phase'] not in ('apply-pending', 'applied', 'retire-pending', 'undo-pending', 'undone'):
             raise Refused('invalid marker transaction phase')
         persist = partial(write_record, state, target.name, store)
-        path, info = recover_output(record, deadline)
+        path, info = locate_output(record, deadline)
         if path is None:
             if record['phase'] != 'undone':
                 persist(dict(record, phase='undone'))
-                print('host-fix: marker absent. Check for a quarantined marker if the directory moved.')
+                return 'host-fix: marker absent. Check for a quarantined marker if the directory moved.'
             return
         with checked_directory(path, info, deadline=deadline, recovery=record) as directory:
             quarantined = any(marker_present(directory, record[key]) for key in ('quarantine', 'cleanup')
                               if key in record)
+            if 'cleanup' in record:
+                quarantined = quarantined or marker_present(directory, record['cleanup'] + '.d')
             if marker_present(directory) or quarantined:
                 if record['phase'] == 'undone' and not quarantined:
                     raise Refused('marker appeared after undo')
@@ -852,7 +961,7 @@ def main(argv=None):
 
 
 if __name__ == '__main__':
-    if sys.argv[1:] == ['--recover-output']:
-        recovery_worker()
+    if sys.argv[1:] == ['--undo-worker']:
+        undo_worker()
     else:
         main()
