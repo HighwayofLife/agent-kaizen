@@ -66,7 +66,7 @@ class StubCase(unittest.TestCase):
         executable(self.bin / 'codex', FAKE_CODEX)
         self.record = self.root / 'calls.jsonl'
         self.env = dict(os.environ, HOME=str(self.home), PATH=str(self.bin) + os.pathsep + os.environ['PATH'], RECORD=str(self.record), PYTHONDONTWRITEBYTECODE='1')
-        for name in ('CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'COPILOT_HOME', 'CODEX_DISPATCH_MODEL', 'CODEX_REVIEW_MODEL', 'CODEX_LOOK_MODEL', 'FINAL', 'SCENARIO', 'CODEMAP_TIMEOUT', 'DISPATCH_ROUND', 'DISPATCH_PASS'):
+        for name in ('KAIZEN_BACKUP_DIR', 'KAIZEN_USAGE_DB', 'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'COPILOT_HOME', 'CODEX_DISPATCH_MODEL', 'CODEX_REVIEW_MODEL', 'CODEX_LOOK_MODEL', 'FINAL', 'SCENARIO', 'CODEMAP_TIMEOUT', 'DISPATCH_ROUND', 'DISPATCH_PASS'):
             self.env.pop(name, None)
         self.brief = write(self.work / 'task.md', 'Fix the example.\n')
 
@@ -89,6 +89,36 @@ class StubCase(unittest.TestCase):
 
 
 class ScriptTests(StubCase):
+    def test_fixture_scrubs_inherited_kaizen_paths(self):
+        with mock.patch.dict(os.environ, KAIZEN_BACKUP_DIR='/nonexistent', KAIZEN_USAGE_DB='/nonexistent'):
+            fixture = StubCase()
+            fixture.setUp()
+            self.addCleanup(fixture.doCleanups)
+        self.assertFalse('KAIZEN_BACKUP_DIR' in fixture.env)
+        self.assertFalse('KAIZEN_USAGE_DB' in fixture.env)
+
+    def test_ci_local_scrubs_paths_from_subprocesses(self):
+        seen = []
+        real_run = subprocess.run
+
+        def check_child(command, **kwargs):
+            result = real_run([sys.executable, '-c',
+                "import os; assert 'KAIZEN_BACKUP_DIR' not in os.environ; "
+                "assert 'KAIZEN_USAGE_DB' not in os.environ"], capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            seen.append(command)
+            return subprocess.CompletedProcess(command, 0)
+
+        with mock.patch.dict(os.environ, KAIZEN_BACKUP_DIR='/nonexistent', KAIZEN_USAGE_DB='/nonexistent'), \
+                mock.patch.object(sys, 'argv', ['ci-local', '--skip-tests']), \
+                mock.patch('subprocess.run', side_effect=check_child), \
+                mock.patch('subprocess.check_output', return_value=''), \
+                mock.patch('shutil.which', return_value=None):
+            with self.assertRaises(SystemExit) as exit_code:
+                runpy.run_path(str(SCRIPTS.parent / 'tools/ci-local'), run_name='__main__')
+        self.assertEqual(exit_code.exception.code, 0)
+        self.assertTrue(seen)
+
     def test_help_and_invalid_arguments(self):
         for name in ('codex-dispatch', 'codex-run', 'codex-review', 'token-audit', 'dispatch-status'):
             self.run_script(name, '--help')

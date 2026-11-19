@@ -3,6 +3,7 @@ from datetime import timedelta
 import json
 from pathlib import Path
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -104,6 +105,35 @@ class FrictionCodexTests(unittest.TestCase):
         self.assertFalse(any(isinstance(args[0], bytes) and len(args[0]) > AUDIT['LINE_LIMIT']
                              for args, _ in loads.call_args_list))
         self.assertEqual(data['format_canary']['1.2.3']['records'], 1)
+
+    def test_oversized_output_requires_valid_json_for_canary(self):
+        large = result('one', output='x' * 4_000_000)
+        raw = json.dumps(dict(type=large['type'], payload=large['payload'], timestamp=large['timestamp']))
+        self.assertEqual(AUDIT['envelope_timestamp'](raw.encode(), require_closed_envelope=True),
+                         large['timestamp'])
+        invalid = (raw.replace('"}, "timestamp"', '"], "timestamp"'),
+                   raw.replace('"output":', '"output"'),
+                   raw.replace('xxxx', r'\q', 1),
+                   json.dumps(large)[:-2] + ',}}')
+        jsonl(self.rollout, [self.meta])
+        with self.rollout.open('a') as stream:
+            for record in invalid:
+                stream.write(record + '\n')
+        data = self.collect(cwd=[self.work])
+        self.assertEqual(data['format_canary'].get('1.2.3', {}).get('records', 0), 0)
+
+    def test_oversized_utf8_canary_is_fast_and_rejects_invalid_utf8(self):
+        large = result('one', output='é🌲' * 700_000)
+        raw = json.dumps(large, ensure_ascii=False).encode('utf-8')
+        jsonl(self.rollout, [self.meta])
+        with self.rollout.open('ab') as stream:
+            stream.write(raw + b'\n')
+            stream.write(raw.replace('🌲'.encode('utf-8'), b'\xed\xa0\x80', 1) + b'\n')
+        started = time.process_time()
+        data = self.collect(friction=False)
+        elapsed = time.process_time() - started
+        self.assertEqual(data['format_canary']['1.2.3']['records'], 1)
+        self.assertLess(elapsed, 0.20)
 
     def test_envelope_timestamp_skips_large_strings_with_bounded_memory(self):
         import tracemalloc

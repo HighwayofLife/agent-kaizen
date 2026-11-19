@@ -1,7 +1,7 @@
 """Runner-owned mutation evidence and recovery for scheduled friction actions."""
 import argparse
 import base64
-from contextlib import ExitStack, contextmanager, redirect_stdout
+from contextlib import ExitStack, contextmanager, nullcontext, redirect_stdout
 import ctypes
 from datetime import date, datetime, timedelta, timezone
 import errno
@@ -31,6 +31,7 @@ RECEIPT_LIMIT = 64 << 10
 UNWRITABLE_FLAGS = stat.UF_IMMUTABLE | stat.UF_APPEND | stat.SF_IMMUTABLE | stat.SF_APPEND
 LEDGER = Path("docs/kaizen/LEDGER.md")
 LEDGER_BACKUPS = ".ledger-displaced"
+EXCHANGE_CHANGED = "broker ledger backup directory changed during publication"
 LOCAL_COMMIT = "local-commit"
 HEADER = "date|change|why (which audit finding)|expected effect|measured effect|keep/revert|metric command|review date".split("|")
 OPERATIONS = {
@@ -314,16 +315,15 @@ class BrokerLedger:
                     and pending["rule"] == rule and pending["undo"] is False and pending["after"]):
                 if pending.get("published"):
                     return pending["published"][1][2]
-                # A native crash just after rename can precede its publication receipt.
+                # The exact interrupted write is recoverable by undo without a publication receipt.
                 path = self.project / tool["TARGET"].parent
                 with self.host["_directory"](path) as settings:
-                    current = tool["effect_id"](*tool["snapshot"](settings))
-                    parked = tool["effect_id"](*tool["snapshot"](settings, pending["temp"]))
                     info = os.fstat(settings)
+                    current = tool["effect_id"](*tool["snapshot"](settings))
                     if (entry["bound"][1][:2] == [info.st_dev, info.st_ino]
-                            and current == pending["after"] and parked == pending["before"][1]):
+                            and tool["can_restore_preimage"](settings, pending, current)):
                         os.fsync(settings)
-                        return current[2]
+                        return pending["after"][2]
             raise ValueError("no verified native allow-rule effect")
 
     def tool_record(self, ident, operation):
@@ -394,17 +394,29 @@ class BrokerLedger:
             return self.path.parent / LEDGER_BACKUPS
         raise ValueError("broker ledger requires a private backup directory on its filesystem")
 
-    def recover_ledger_backups(self, ident, record):
+    def recover_ledger_backups(self, ident, record, files, backups=None):
         device = self.path.parent.stat().st_dev
         preferred = self.ledger_backup_path(device)
         legacy = self.path.parent / LEDGER_BACKUPS
         pending = record.get("ledger_exchange") if record is not None else None
         if pending:
             path, dev, ino, name = pending
+            if backups is None:
+                try:
+                    backups = files.enter_context(self.host["_directory"](Path(path), private=True))
+                except (OSError, ValueError) as error:
+                    self.report_displaced_ledger(None, dev, ino, name)
+                    raise ValueError(EXCHANGE_CHANGED) from error
+            self.check_ledger_exchange(backups, pending)
             try:
-                paths = self.recover_ledger_copies(Path(path), ident, exchange=(dev, ino, name))
+                paths = self.recover_ledger_copies(Path(path), ident, bound_name=name, pinned=backups)
             except FileNotFoundError as error:
-                raise ValueError("broker ledger backup directory changed during publication") from error
+                # Round one could leave a binding even after recording the displaced copy.
+                if (record["phase"] not in ("recorded", "reverted")
+                        or str(Path(path) / name) not in record.get("ledger_backups", ())):
+                    raise ValueError(EXCHANGE_CHANGED) from error
+                paths = []
+            self.check_ledger_exchange(backups, pending)
         else:
             paths = self.recover_ledger_copies(preferred, ident) if os.path.lexists(preferred) else []
         # Finish the bound exchange before moving any legacy files.
@@ -421,35 +433,78 @@ class BrokerLedger:
                 record["ledger_backups"] = kept
                 if not pending:  # Save bound copies with the final phase.
                     self.save(record, record["phase"])
+        return backups
 
-    def finish_ledger_exchange(self, record, phase):
-        if pending := record.get("ledger_exchange"):
-            path, dev, ino, _ = pending
+    def check_ledger_exchange(self, backups, pending):
+        path, dev, ino, name = pending
+        pinned = os.fstat(backups)
+        try:
+            live = os.stat(path, follow_symlinks=False)
+        except OSError:
+            live = None
+        matched = (pinned.st_dev, pinned.st_ino) == (dev, ino)
+        if not matched or live is None or not os.path.samestat(pinned, live):
+            self.report_displaced_ledger(backups if matched else None, dev, ino, name)
+            raise ValueError(EXCHANGE_CHANGED)
+
+    def finish_ledger_exchange(self, record, phase, backups):
+        pending = record.get("ledger_exchange")
+        if not pending:
+            self.save(record, phase)
+            return
+        previous = record["phase"]
+        self.check_ledger_exchange(backups, pending)
+
+        def check_after_save():
             try:
-                info = os.stat(path, follow_symlinks=False)
-            except FileNotFoundError as error:
-                raise ValueError("broker ledger backup directory changed during publication") from error
-            if (info.st_dev, info.st_ino) != (dev, ino):
-                raise ValueError("broker ledger backup directory changed during publication")
-            del record["ledger_exchange"]
-        self.save(record, phase)
+                self.check_ledger_exchange(backups, pending)
+            except ValueError:
+                record["ledger_exchange"] = pending
+                self.save(record, previous)
+                raise
 
-    def recover_ledger_copies(self, directory, ident, *, exchange=None, move_to=None):
+        if previous != phase:
+            try:
+                # Keep the recovery binding through the first publication and identity check.
+                self.save(record, phase)
+            finally:
+                check_after_save()
+        del record["ledger_exchange"]
+        try:
+            self.save(record, phase)
+        finally:
+            check_after_save()
+
+    def report_displaced_ledger(self, backups, dev, ino, name):
+        if backups is None:
+            print(f"Look for broker ledger copy {name!r} in backup directory device {dev}, inode {ino}", flush=True)
+            return
+        try:
+            if sys.platform == "darwin":
+                fcntl = self.host["fcntl"]
+                directory = os.fsdecode(fcntl.fcntl(backups, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0])
+            else:
+                directory = os.readlink(f"/proc/self/fd/{backups}")
+            if not os.path.samestat(os.fstat(backups), os.stat(directory, follow_symlinks=False)):
+                raise OSError("backup path changed")
+        except OSError:
+            print(f"Broker ledger copy {name!r} preserved in backup directory device {dev}, inode {ino}", flush=True)
+        else:
+            print(f"Broker ledger copy preserved at {str(Path(directory) / name)!r}", flush=True)
+
+    def recover_ledger_copies(self, directory, ident, *, bound_name=None, move_to=None, pinned=None):
         # The same name holds the staged row before the swap and the displaced
         # ledger afterwards. Either can remain after an interrupted write.
         pattern = re.compile(re.escape(ident) + r"-[a-f0-9]{32}\.md")
         paths = []
-        with self.host["_directory"](directory, private=True) as backups:
-            opened = os.fstat(backups)
-            if exchange and (opened.st_dev, opened.st_ino) != exchange[:2]:
-                raise ValueError("broker ledger backup directory changed during publication")
+        with (self.host["_directory"](directory, private=True) if pinned is None else nullcontext(pinned)) as backups:
             self.check_acl(backups, "backup directory", "system.posix_acl_access")
-            for name in [exchange[2]] if exchange else sorted(os.listdir(backups)):
+            for name in [bound_name] if bound_name else sorted(os.listdir(backups)):
                 if not pattern.fullmatch(name):
                     continue
                 info = os.stat(name, dir_fd=backups, follow_symlinks=False)
                 safe = stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid() and info.st_nlink == 1
-                if exchange and not safe:
+                if bound_name and not safe:
                     raise ValueError("unsafe broker ledger backup file")
                 folder, owner_fd = directory, backups
                 if move_to and safe:
@@ -469,7 +524,11 @@ class BrokerLedger:
                 path = str(folder / name)
                 paths.append(path)
                 if path not in self.reported_backups:
-                    print(f"Broker ledger copy preserved at {path!r}", flush=True)
+                    detail = ""
+                    if bound_name:
+                        identity = os.fstat(backups)
+                        detail = f" (backup directory device {identity.st_dev}, inode {identity.st_ino})"
+                    print(f"Broker ledger copy preserved at {path!r}{detail}", flush=True)
                     self.reported_backups.add(path)
                 if safe and stat.S_IMODE(info.st_mode) != 0o600:
                     try:
@@ -492,8 +551,6 @@ class BrokerLedger:
             if move_to:
                 os.fsync(move_to[1])
             os.fsync(backups)
-            if exchange and not os.path.samestat(opened, os.stat(directory, follow_symlinks=False)):
-                raise ValueError("broker ledger backup directory changed during publication")
         return paths
 
     @contextmanager
@@ -508,7 +565,7 @@ class BrokerLedger:
             yield backups
 
     @contextmanager
-    def table(self, ident, record=None):
+    def table(self, ident, record=None, files=None):
         with self.host["_directory"](self.project) as root, self.host["_directory"](self.path.parent) as directory:
             info = os.fstat(root)
             if self.identity[1:] != [info.st_dev, info.st_ino]:
@@ -551,7 +608,8 @@ class BrokerLedger:
                 updated = "".join(lines).encode("utf-8")
                 if len(updated) > LEDGER_LIMIT:
                     raise ValueError("broker ledger exceeds size limit")
-                with self.writable_ledger_backups(backup_path, device) as backups:
+                with ExitStack() as local:
+                    backups = (files or local).enter_context(self.writable_ledger_backups(backup_path, device))
                     name = ident + "-" + os.urandom(16).hex() + ".md"
                     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
                     fd = os.open(name, flags, 0o600, dir_fd=backups)
@@ -564,9 +622,10 @@ class BrokerLedger:
                         stream.flush()
                         os.fsync(stream.fileno())
                     os.fsync(backups)
+                    info = os.fstat(backups)
+                    pending = [str(backup_path), info.st_dev, info.st_ino, name]
                     if record is not None:
-                        info = os.fstat(backups)
-                        record["ledger_exchange"] = [str(backup_path), info.st_dev, info.st_ino, name]
+                        record["ledger_exchange"] = pending
                         self.save(record, record["phase"])
                     with self.host["_directory"](self.path.parent) as live:
                         if not os.path.samestat(os.fstat(live), os.fstat(directory)):
@@ -578,11 +637,11 @@ class BrokerLedger:
                         verified = self.exchange_ledger(live, backups, name, staged, before, updated)
                     os.fsync(backups)
                     os.fsync(directory)
-                    if not os.path.samestat(os.fstat(backups), os.stat(backup_path, follow_symlinks=False)):
-                        raise ValueError("broker ledger backup directory changed during publication")
-                self.recover_ledger_backups(ident, record)
-                if not verified:
-                    raise ValueError("broker ledger changed during publication")
+                    self.check_ledger_exchange(backups, pending)
+                    self.recover_ledger_backups(ident, record, files, backups=backups)
+                    if not verified:
+                        raise ValueError("broker ledger changed during publication")
+                    return backups if record is not None else None
 
             os.fsync(directory)  # A prior attempt may have stopped after rename.
             yield lines, start, end, width, matches[0] if matches else None, write
@@ -645,15 +704,23 @@ class BrokerLedger:
         return self.reconcile(ident)
 
     def reconcile(self, ident):
+        with ExitStack() as files:
+            return self._reconcile(ident, files)
+
+    def _reconcile(self, ident, files):
         record = self.load(ident)
         if record is None:
             raise ValueError("unknown verified broker effect in this project")
-        self.recover_ledger_backups(ident, record)
+        backups = self.recover_ledger_backups(ident, record, files)
         if record["phase"] == "apply-pending":
             record["verification"] = self.verify_allow_rule(record)
             self.save(record, "effect-verified")
+        elif (record["operation"] == "allow-rule" and "literal" in record
+              and record["phase"] in ("effect-verified", "recorded")):
+            # A recoverable native write can be cancelled after the first verification.
+            self.verify_allow_rule(record)
         phase = record["phase"]
-        with self.table(ident, record) as (lines, start, end, width, match, write):
+        with self.table(ident, record, files) as (lines, start, end, width, match, write):
             expected = self.row(record, legacy_metric=match is not None and not record.get("absolute_metric"))
             if phase != "effect-verified":
                 row = self.linked_row(lines, match, expected)
@@ -661,6 +728,8 @@ class BrokerLedger:
                     raise ValueError("broker ledger claims an unverified reversal")
                 if phase == "reverted" and row[5] != f"reverted ({record['undo_date']})":
                     raise ValueError("broker ledger is missing the verified reversal")
+                if record.get("ledger_exchange"):
+                    self.finish_ledger_exchange(record, phase, backups)
                 return phase
             if match is None:
                 if not record.get("absolute_metric"):
@@ -673,10 +742,10 @@ class BrokerLedger:
                 if not lines[end - 1].endswith("\n"):
                     lines[end - 1] += newline
                 lines.insert(end, row_line(expected, newline))
-                write()
+                backups = write()
             elif cells(lines[match]) != expected:
                 raise ValueError("broker ledger row conflicts with verified effect")
-        self.finish_ledger_exchange(record, "recorded")
+        self.finish_ledger_exchange(record, "recorded", backups)
         return "recorded"
 
     def cancel_unstarted_marker(self, record):
@@ -780,18 +849,22 @@ class BrokerLedger:
         return row
 
     def undo(self, ident, inverse):
+        with ExitStack() as files:
+            self._undo(ident, inverse, files)
+
+    def _undo(self, ident, inverse, files):
         record = self.load(ident)
         if record is None or record["phase"] in ("apply-pending", "marker-pending", "commit-pending", "no-effect", "cancelled"):
             raise ValueError("no verified broker effect in this project")
-        self.recover_ledger_backups(ident, record)
+        backups = self.recover_ledger_backups(ident, record, files)
         expected = self.row(record, legacy_metric=not record.get("absolute_metric"))
         phase = record["phase"]
-        with self.table(ident, record) as (lines, _, _, _, match, write):
+        with self.table(ident, record, files) as (lines, _, _, _, match, write):
             row = self.linked_row(lines, match, expected)
             if phase == "effect-verified":
                 if row != expected:
                     raise ValueError("broker ledger row conflicts with verified effect")
-                self.finish_ledger_exchange(record, "recorded")
+                self.finish_ledger_exchange(record, "recorded", backups)
                 phase = "recorded"
             status = hashlib.sha256(row[5].encode("utf-8")).hexdigest()
             undo_date = record.get("undo_date") or date.today().isoformat()
@@ -806,10 +879,14 @@ class BrokerLedger:
             if phase == "recorded":
                 if row[5].startswith("reverted"):
                     raise ValueError("broker ledger claims an unverified reversal")
+                if record.get("ledger_exchange"):
+                    self.finish_ledger_exchange(record, phase, backups)
                 record.update(undo_date=undo_date, prior_status=status)
                 self.save(record, "undo-pending")
                 phase = "undo-pending"
             if phase == "reverted" and not update:
+                if record.get("ledger_exchange"):
+                    self.finish_ledger_exchange(record, phase, backups)
                 return
             if ((phase == "undo-pending" and status != record["prior_status"])
                     or (phase == "undo-verified" and status != record["prior_status"] and row[5] != reverted)
@@ -819,8 +896,8 @@ class BrokerLedger:
                 inverse(record["operation"], record["tool_record"])
                 self.save(record, "undo-verified")
             if update:
-                write()
-        self.finish_ledger_exchange(record, "reverted")
+                backups = write()
+        self.finish_ledger_exchange(record, "reverted", backups)
 
 
 def observe_review(run, command, version, *, backup, scope, project, **kwargs):

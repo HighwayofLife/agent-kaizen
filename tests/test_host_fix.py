@@ -7,6 +7,7 @@ import runpy
 import subprocess
 import sys
 import tempfile
+import time
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -51,7 +52,11 @@ class HostFixTests(unittest.TestCase):
                             action_id=key)
 
     def undo(self, record):
-        FIX['undo'](SimpleNamespace(project=str(self.project), record=str(record)))
+        # Run fault injections inside the transaction. Worker tests exercise the subprocess boundary.
+        args = SimpleNamespace(project=str(self.project), record=str(record))
+        message = FIX['undo_transaction'](args, time.monotonic() + 20)
+        if message:
+            print(message)
 
     @contextmanager
     def writes(self):
@@ -273,6 +278,284 @@ class HostFixTests(unittest.TestCase):
                     self.undo(record)
             self.assertEqual(marker.read_text(), 'replacement')
             self.assertTrue(original.is_file())
+
+    def test_retirement_preserves_replaced_quarantine_in_undo_and_rollback(self):
+        self.record()
+        write, version, rename = (FIX[name] for name in ('write_record', 'marker_version', 'rename_exclusive'))
+        for rollback in (False, True):
+            with self.subTest(rollback=rollback), self.writes() as link:
+                target = self.root / 'moved' if rollback else self.output
+                original = target / ('rollback-original' if rollback else 'undo-original')
+                quarantine = None
+
+                def publish(directory, fd):
+                    self.output.rename(target)
+                    self.output.mkdir()
+                    link(directory, fd)
+
+                def persist(*args):
+                    nonlocal quarantine
+                    write(*args)
+                    if args[-1]['phase'] == 'undo-pending':
+                        quarantine = target / args[-1]['quarantine']
+
+                def replace(directory, record, name=FIX['MARKER']):
+                    result = version(directory, record, name)
+                    if quarantine and name == quarantine.name and not original.exists():
+                        quarantine.rename(original)
+                        quarantine.write_bytes(b'restored data')
+                        quarantine.chmod(0o600)
+                    return result
+
+                def move(directory, source, destination):
+                    rename(directory, source, destination)
+                    if rollback and quarantine and source == quarantine.name:
+                        quarantine.write_bytes(b'competing restore')
+
+                record = None if rollback else self.apply()
+                with patch.dict(FIX, write_record=persist, marker_version=replace, rename_exclusive=move):
+                    with self.assertRaisesRegex(FIX['Refused'], 'changed or replaced'):
+                        if rollback:
+                            with patch.dict(FIX, publish_marker=publish):
+                                self.apply()
+                        else:
+                            self.undo(record)
+                if rollback:
+                    self.assertEqual(quarantine.read_bytes(), b'competing restore')
+                    self.assertIn(b'restored data', [p.read_bytes() for p in target.iterdir() if p != quarantine])
+                else:
+                    self.assertEqual(quarantine.read_bytes(), b'restored data')
+                self.assertTrue(original.read_bytes().startswith(b'Agent Kaizen marker v1 '))
+
+    def test_undo_rechecks_scope_after_retire_pending_and_after_rename(self):
+        self.record()
+        moved = self.root / 'moved'
+        write, rename = FIX['write_record'], FIX['rename_exclusive']
+        marker = self.output / FIX['MARKER']
+        for during_write in (True, False):
+            with self.subTest(during_write=during_write), self.writes():
+                record = self.apply()
+                stamp = marker.read_bytes()
+
+                def persist(*args):
+                    write(*args)
+                    if during_write and args[-1]['phase'] == 'retire-pending':
+                        self.output.rename(moved)
+
+                def move(directory, source, target):
+                    if not during_write and source == marker.name:
+                        self.output.rename(moved)
+                    rename(directory, source, target)
+
+                with patch.dict(FIX, write_record=persist, rename_exclusive=move):
+                    try:
+                        with self.assertRaisesRegex(FIX['Refused'], 'directory identity changed'):
+                            self.undo(record)
+                        self.assertEqual(list(moved.iterdir()), [moved / marker.name])
+                        self.assertEqual((moved / marker.name).read_bytes(), stamp)
+                        self.assertIn(b'"retire-pending"', record.read_bytes())
+                    finally:
+                        if moved.exists():
+                            moved.rename(self.output)
+                self.undo(record)
+                self.assertFalse(marker.exists())
+
+    def test_retirement_keeps_replacement_after_cleanup_verification(self):
+        self.record()
+        checked = FIX['checked_marker']
+        for rollback in (False, True):
+            with self.subTest(rollback=rollback), self.writes() as link:
+                target = self.root / 'moved' if rollback else self.output
+                original = target / 'original'
+                replacement = None
+
+                def publish(directory, fd):
+                    self.output.rename(target)
+                    self.output.mkdir()
+                    link(directory, fd)
+
+                @contextmanager
+                def replace(directory, record, name):
+                    nonlocal replacement
+                    with checked(directory, record, name) as verified:
+                        if replacement is None and name == record.get('cleanup'):
+                            replacement = target / name
+                            replacement.rename(original)
+                            replacement.write_bytes(b'restored data')
+                            replacement.chmod(0o600)
+                        yield verified
+
+                record = None if rollback else self.apply()
+                with patch.dict(FIX, checked_marker=replace, publish_marker=publish):
+                    with self.assertRaisesRegex(FIX['Refused'], 'changed or replaced'):
+                        self.apply() if rollback else self.undo(record)
+                self.assertIsNotNone(replacement)
+                self.assertIn(b'restored data', [file.read_bytes() for file in target.rglob('*') if file.is_file()])
+                self.assertTrue(original.read_bytes().startswith(b'Agent Kaizen marker v1 '))
+
+    def test_undo_reports_scope_loss_at_unlink_and_keeps_marker_copy(self):
+        self.record()
+        moved = self.root / 'moved'
+        unlink = os.unlink
+        with self.writes():
+            record = self.apply()
+            marker = self.output / FIX['MARKER']
+            identity = FIX['file_id'](marker.stat())
+            stamp = marker.read_bytes()
+
+            def move_output(name, *, dir_fd=None):
+                if dir_fd is not None and not moved.exists():
+                    info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                    if FIX['file_id'](info) == identity:
+                        self.output.rename(moved)
+                unlink(name, dir_fd=dir_fd)
+
+            with patch.object(os, 'unlink', move_output):
+                with self.assertRaisesRegex(FIX['Refused'], 'directory identity changed.*recover'):
+                    self.undo(record)
+            self.assertTrue(moved.is_dir())
+            self.assertIn(stamp, [file.read_bytes() for file in moved.rglob('*') if file.is_file()])
+            self.assertIn(b'"undo-pending"', record.read_bytes())
+
+    def test_recovery_finds_interrupted_undo_inside_original_bind_mount(self):
+        volume = self.project / 'volume'
+        old = volume / 'build'
+        old.mkdir(parents=True)
+        self.store.record(self.project, ID, old, 'fixture evidence', path=True)
+        with self.writes():
+            path = self.apply(old)
+            with FIX['_directory'](path.parent, private=True) as state:
+                record = FIX['read_record'](state, path.name, self.store)
+                quarantine = '.kaizen-marker-' + '1' * 32
+                cleanup = '.kaizen-cleanup-' + '2' * 32
+                (old / FIX['MARKER']).rename(old / cleanup)
+                record = dict(record, phase='undo-pending', quarantine=quarantine, cleanup=cleanup)
+                FIX['write_record'](state, path.name, self.store, record)
+            new = volume / 'other' / 'build'
+            new.parent.mkdir()
+            old.rename(new)
+            with patch.dict(FIX, mount_points=lambda deadline: {volume: False}):
+                found, _ = FIX['locate_output'](record, time.monotonic() + 5)
+                self.assertEqual(found, new)
+                self.undo(path)
+            self.assertEqual(list(new.iterdir()), [])
+            self.assertIn(b'"undone"', path.read_bytes())
+
+    def test_recovery_skips_mount_points_and_other_devices(self):
+        mounted = self.project / 'mount'
+        mounted.mkdir()
+        identity = list(FIX['file_id'](mounted.stat()))
+        open_directory = os.open
+
+        def guarded_open(path, *args, **kwargs):
+            if os.fspath(path) == mounted.name:
+                self.fail('recovery opened a mount point')
+            return open_directory(path, *args, **kwargs)
+
+        with FIX['checked_directory'](self.project) as directory:
+            with patch.dict(FIX, mount_points=lambda deadline: {mounted: False}):
+                with patch.object(os, 'open', guarded_open):
+                    self.assertIsNone(FIX['find_output'](directory, self.project, identity, time.monotonic() + 5))
+            identity[0] += 1
+            with patch.object(os, 'scandir', side_effect=AssertionError('scanned a foreign device')):
+                self.assertIsNone(FIX['find_output'](directory, self.project, identity, time.monotonic() + 5))
+
+    def test_recovery_checks_deadline_after_directory_read(self):
+        identity = list(FIX['file_id'](self.output.stat()))
+        now = 0
+
+        @contextmanager
+        def delayed_read(_):
+            def entries():
+                nonlocal now
+                now = 2
+                yield from ()
+            yield entries()
+
+        with FIX['checked_directory'](self.project) as directory, patch.object(os, 'scandir', delayed_read):
+            with patch.object(time, 'monotonic', lambda: now):
+                with self.assertRaisesRegex(FIX['Refused'], 'deadline'):
+                    FIX['find_output'](directory, self.project, identity, 1)
+
+    def test_recovery_deadline_bounds_a_stalled_worker(self):
+        start_worker = subprocess.Popen
+
+        def stalled_worker(_, **kwargs):
+            return start_worker([sys.executable, '-c', 'import time; time.sleep(60)'], **kwargs)
+
+        args = SimpleNamespace(project=str(self.project), record='unused')
+        with patch.object(subprocess, 'Popen', stalled_worker), patch.dict(FIX, LINUX_WRITES=True, UNDO_SECONDS=0.2):
+            start = time.monotonic()
+            with self.assertRaisesRegex(FIX['Refused'], 'recovery deadline exceeded'):
+                FIX['undo'](args)
+            self.assertLess(time.monotonic() - start, 2)
+
+    def test_undo_deadline_bounds_reopening_recovered_path(self):
+        self.record()
+        start_worker = subprocess.Popen
+        worker = """
+import os, runpy, sys, time
+from pathlib import Path
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+fix = runpy.run_path(sys.argv[1])['main'].__globals__
+checked = fix['checked_directory']
+def reopen(*args, **kwargs):
+    signal = os.environ.get('HOST_FIX_STALL_REOPEN')
+    if signal and kwargs.get('recovery'):
+        Path(signal).touch()
+        time.sleep(3)
+    return checked(*args, **kwargs)
+fix.update(LINUX_WRITES=True, PLATFORM='linux', checked_directory=reopen)
+fix['undo_worker']()
+"""
+
+        class StartWorker(start_worker):
+            def __init__(self, command, *args, **kwargs):
+                if command[-1] == '--undo-worker':
+                    command = [sys.executable, '-I', '-c', worker, str(SCRIPTS / 'host-fix')]
+                super().__init__(command, *args, **kwargs)
+
+        with self.writes():
+            record = self.apply()
+            moved = self.project / 'moved' / 'build'
+            moved.parent.mkdir()
+            self.output.rename(moved)
+            args = SimpleNamespace(project=str(self.project), record=str(record))
+            signal = self.root / 'worker-reopening'
+            with patch.object(subprocess, 'Popen', StartWorker):
+                with patch.dict(FIX, UNDO_SECONDS=1), patch.dict(os.environ, HOST_FIX_STALL_REOPEN=str(signal)):
+                    begin = time.monotonic()
+                    with self.assertRaisesRegex(FIX['Refused'], 'recovery deadline exceeded'):
+                        FIX['undo'](args)
+                    self.assertLess(time.monotonic() - begin, 2)
+                self.assertTrue(signal.is_file())
+                self.assertTrue((moved / FIX['MARKER']).exists())
+                FIX['undo'](args)
+                self.assertEqual(list(moved.iterdir()), [])
+
+    def test_undo_resumes_legacy_quarantine_and_interrupted_cleanup(self):
+        self.record()
+        with self.writes():
+            path = self.apply()
+            with FIX['_directory'](path.parent, private=True) as state:
+                record = FIX['read_record'](state, path.name, self.store)
+                quarantine = '.kaizen-marker-' + '1' * 32
+                (self.output / FIX['MARKER']).rename(self.output / quarantine)
+                FIX['write_record'](state, path.name, self.store,
+                                    dict(record, phase='undo-pending', quarantine=quarantine))
+            unlink, identity = os.unlink, FIX['file_id']((self.output / quarantine).stat())
+
+            def interrupt(name, *, dir_fd):
+                if FIX['file_id'](os.stat(name, dir_fd=dir_fd, follow_symlinks=False)) == identity:
+                    raise InterruptedError()
+                unlink(name, dir_fd=dir_fd)
+
+            with patch.object(os, 'unlink', interrupt), self.assertRaises(InterruptedError):
+                self.undo(path)
+            self.assertFalse((self.output / quarantine).exists())
+            self.assertEqual(len(list(self.output.iterdir())), 1)
+            self.undo(path)
+            self.assertEqual(list(self.output.iterdir()), [])
 
     def test_direct_stamped_noop_under_lock(self):
         self.record()

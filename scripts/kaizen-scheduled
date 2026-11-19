@@ -23,6 +23,8 @@ import fnmatch
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 import hashlib
+import hmac
+from inspect import signature
 import json
 import math
 import os
@@ -39,6 +41,7 @@ import tempfile
 import time
 import unicodedata
 import uuid
+import warnings
 
 try:
     import fcntl
@@ -165,12 +168,18 @@ HARD_STOP_DENY = ",".join(f"Bash({command}:*)" for command in (
     "grep", "egrep", "fgrep", "rg", "find", "cat", "strings", "xxd", "od", "base64"))
 
 
+def claude_state_root():
+    # Match token-audit and allow-rule. Check private descendants without
+    # following symlinks below the configured root.
+    return Path(os.path.realpath(claude_home()))
+
+
 def audits_dir():
-    return claude_home() / "audits"
+    return claude_state_root() / "audits"
 
 
 def global_config_path():
-    return claude_home() / "agent-kaizen.json"
+    return claude_state_root() / "agent-kaizen.json"
 
 
 def project_config_path(project_dir):
@@ -286,8 +295,13 @@ def freeze_mutation_config(project, backup):
     project = Path(project)
     if canonical_path(project) != project or enrolled_project(project) != project:
         raise ValueError("mutation config scope is not the enrolled project")
+    global_path = global_config_path()
+    root_info = global_path.parent.lstat()
+    if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.getuid()
+            or root_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+        raise ValueError("mutation config root is not trusted")
     layers, stamps = [], [backup["directory_identity"](project)]
-    for path in (global_config_path(), project_config_path(project)):
+    for path in (global_path, project_config_path(project)):
         if path.resolve() != path:
             raise ValueError("mutation config path is not canonical")
         try:
@@ -341,6 +355,7 @@ def log(message):
 STEP_TIMEOUT = 600
 AUTO_AUDIT_TIMEOUT = STEP_TIMEOUT
 AUTO_AUDIT_STATE = "auto-audit-state.json"
+EXTRACT_WRITE_FAILED = 4  # token-audit wrote a usable report
 REVIEW_TIMEOUT = 3600
 LOCK_WAIT = 1800
 LOG_LIMIT = 1 << 20
@@ -1303,9 +1318,12 @@ def ledger_deny():
     return [f"{tool}({path})" for path in paths for tool in ("Edit", "Write")]
 
 
-def backup_root():
+def backup_root(*, resolve_config=True):
     # The same rule as scripts/kaizen-backup.
-    return Path(os.environ.get("KAIZEN_BACKUP_DIR") or claude_home() / "kaizen-backups").expanduser()
+    override = os.environ.get("KAIZEN_BACKUP_DIR")
+    if override:
+        return Path(override).expanduser()
+    return (claude_state_root() if resolve_config else claude_home()) / "kaizen-backups"
 
 
 def deny_roots(*paths):
@@ -1322,9 +1340,9 @@ def audit_state_deny(root):
 
 
 def backup_deny():
-    paths = dict.fromkeys(deny_path(backup_root(), resolve=resolve) for resolve in (False, True))
+    paths = deny_roots(backup_root(resolve_config=False), backup_root())
     return ([f"{tool}({path}/**)" for path in paths for tool in ("Read", "Edit", "Write")]
-            + [rule for root in deny_roots(audits_dir()) for rule in action_store_deny(root)])
+            + [rule for root in deny_roots(claude_home() / "audits") for rule in action_store_deny(root)])
 
 
 class LedgerConfigError(ValueError):
@@ -1504,7 +1522,7 @@ def review_command(options, mode, report, session_id, project_dir=None, audits=N
     if auto:
         installed = deny_path(HERE)
         add_denies(installed, [f"{tool}({installed}/**)" for tool in ("Edit", "Write")])
-    default_audits = deny_roots(audits_dir())
+    default_audits = deny_roots(claude_home() / "audits")
     overrides = (Path(path).expanduser().absolute()
                  for path in (audits, getattr(options, "audits_alias", None)) if path is not None)
     for root in dict.fromkeys((*default_audits, *deny_roots(*overrides))):
@@ -1971,11 +1989,14 @@ def _run_token_audit(audits, options):
         with (audits / "run.log").open("a", encoding="utf-8") as errors:
             result = run_group(audit_command(options, audits), stdout=subprocess.PIPE,
                                     stderr=errors, text=True, timeout=STEP_TIMEOUT)
-        if not result.returncode:
+        if result.returncode in (0, EXTRACT_WRITE_FAILED):
             report = report_path(result.stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         log(f"audit: failed ({failure_text(error)})")
         return 1, None
+    if result.returncode == EXTRACT_WRITE_FAILED:
+        log(f"audit: extract not written; using {report} (details in run.log)")
+        return 0, report
     if result.returncode:
         log(f"audit: failed (exit {result.returncode})")
         return result.returncode, None
@@ -2241,7 +2262,7 @@ def scheduled_authority(audits, project, options, command, root):
         if path.is_relative_to(project) or any(
                 path.is_relative_to(home) and not any(path.is_relative_to(home / name)
                                                      for name in ("bin", "plugins"))
-                for home in (claude_home().resolve(), codex_home().resolve())):
+                for home in (claude_state_root(), codex_home().resolve())):
             raise ValueError("broker code is in a model-writable location")
     for path in ledger_paths().values():
         for target in (path.resolve(), path.with_name(path.name + ".lock").resolve()):
@@ -2549,10 +2570,12 @@ def _run_review(audits, project_dirs, options, clock, safety):
                 result = run_group(audit_command(options, project.folder, project),
                                         stdout=subprocess.PIPE, stderr=errors, text=True,
                                         timeout=STEP_TIMEOUT)
-            if result.returncode:
+            if result.returncode not in (0, EXTRACT_WRITE_FAILED):
                 audit_error = f"audit failed (exit {result.returncode})"
             else:
                 report = report_path(result.stdout)
+                if result.returncode == EXTRACT_WRITE_FAILED:
+                    log(f"{project.canonical}: audit extract not written; using {report} (details in run.log)")
         except (OSError, ValueError, subprocess.TimeoutExpired) as error:
             audit_error = f"failed ({failure_text(error)})"
         if audit_error is not None:
@@ -2571,7 +2594,7 @@ def _run_review(audits, project_dirs, options, clock, safety):
                 probe = run_step("host-probe", options, ["--project", project.canonical, "--out", project.folder])
                 if probe is None or probe.startswith("unavailable:"):
                     raise ValueError("host probe refresh failed")
-            if recovered is not None:
+            if recovered is not None and result.returncode != EXTRACT_WRITE_FAILED:
                 prepared = friction_prepare(audits, project, report, options, cfg, mode, now, retain=True)
             if prepared is not None and (not isinstance(prepared, tuple) or len(prepared) != 2
                                          or not isinstance(prepared[0], Path) or not isinstance(prepared[1], dict)):
@@ -2722,8 +2745,12 @@ def _run_review(audits, project_dirs, options, clock, safety):
                     output.flush()
                     os.fsync(output.fileno())
                     publication_time = timestamp(clock())
-                    recover_scheduled_publication(audits, project, prepared[1], proposal, output,
-                                                  reviewed_at=publication_time)
+                    try:
+                        recover_scheduled_publication(audits, project, prepared[1], proposal, output,
+                                                      reviewed_at=publication_time)
+                    except (OSError, ValueError):
+                        recovery_failed = True
+                        raise
                 if not os.path.samestat(temporary.lstat(), os.fstat(output.fileno())):
                     raise ValueError("review output path was replaced")
                 os.replace(temporary, proposal)
@@ -2862,6 +2889,22 @@ def canonical_project(directory):
     return directory
 
 
+def primary_worktree_project(directory):
+    """Find enrollment in the registered main checkout for a linked path."""
+    checkout = checkout_root(directory)
+    if checkout is None or not (checkout / ".git").is_file():
+        return None
+    listed, _ = worktree_paths(checkout) or ([], False)
+    if checkout not in listed[1:]:
+        return None
+    primary = listed[0]
+    gitdir = _git(primary, "rev-parse", "--absolute-git-dir")
+    if (gitdir and (primary / gitdir).resolve() == git_common_dir(checkout)
+            and (primary / "docs/kaizen").is_dir()):
+        return primary
+    return None
+
+
 @contextlib.contextmanager
 def config_lock(path):
     """Serialize read-modify-write of a config file with flock on <name>.lock beside the file (beside the link when the file is a symlink)."""
@@ -2892,9 +2935,13 @@ def update_auto_projects(project, enable):
 def show_config(project_dir=None):
     if project_dir is not None:
         project_dir = canonical_project(project_dir)
+        if not (project_dir / "docs/kaizen").is_dir():
+            project_dir = primary_worktree_project(project_dir) or project_dir
     result = effective(project_dir)
     result["reports"] = (str(audits_dir() / "projects" / key(project_dir)) + "/"
                          if project_dir is not None else None)
+    if project_dir is not None:
+        result["localAudits"] = str(project_dir / "docs/kaizen")
     print(json.dumps(result, indent=2))
 
 
@@ -3019,9 +3066,9 @@ def review_helper(name):
 def friction_prepare(audits, project, report, options, cfg, mode, clock, *, interactive=False, retain=False):
     """Prepare bounded local evidence without a review or acknowledgement."""
     module = review_helper("kaizen_friction_prepare.py")
+    helpers = {"host": review_helper("kaizen_friction_actions.py")} if module.get("RUNNER_API") == 2 else {}
     return module["prepare"](Path(audits), backup_root(), project, report, cfg, mode,
-                             clock(), action_project, key, interactive=interactive, retain=retain,
-                             host=review_helper("kaizen_friction_actions.py"))
+                             clock(), action_project, key, interactive=interactive, retain=retain, **helpers)
 
 
 @contextlib.contextmanager
@@ -3077,8 +3124,9 @@ def reconcile_scheduled(audits, project, output, receipt, *, acknowledge=True, r
         block = host["BLOCK_PREFIX"] + json.dumps(
             dict(v=1, actions=[dict(id=ident, intent=intent) for ident, intent in requests.items()])) + " -->"
     store = host["HostActions"](audits, backup_root(), action_project, key)
+    helpers = {"host": host} if module.get("RUNNER_API") == 2 else {}
     imported = module["import_scheduled"](audits, backup_root(), project, receipt,
-                                          effective(project.canonical), now(), action_project, key, block, host=host)
+                                          effective(project.canonical), now(), action_project, key, block, **helpers)
     reserved = commit_run is not None and commit_intent == "apply"
     if reserved:
         # The public catalogue import has already revalidated the preparation.
@@ -3102,12 +3150,17 @@ def reconcile_scheduled(audits, project, output, receipt, *, acknowledge=True, r
     output.truncate()
     terminal = not reserved and all(value == "terminal" for value in imported.values())
     if terminal and acknowledge:
-        module["acknowledge_scheduled"](store, project, receipt, host)
+        acknowledge_review = module["acknowledge_scheduled"]
+        if "host" in signature(acknowledge_review).parameters:
+            acknowledge_review(store, project, receipt, host)
+        else:
+            acknowledge_review(store, project, receipt)
     return terminal, reserved
 
 
 def recover_scheduled_publication(audits, project, receipt=None, proposal=None, output=None, *,
                                   options=None, degraded=False, reviewed_at=None, review_state=None):
+    """Recover broker work, then make the comparison and review cutoff durable."""
     try:
         module = review_helper("kaizen_friction_prepare.py")
     except FileNotFoundError:
@@ -3116,18 +3169,43 @@ def recover_scheduled_publication(audits, project, receipt=None, proposal=None, 
         return False
     host = review_helper("kaizen_friction_actions.py")
     store = host["HostActions"](audits, backup_root(), action_project, key)
-    digest = None
+    name = "publication-" + project.key + ".json"
+    limit = 1 << 20
+
+    def publication_receipt(directory, generation):
+        if not isinstance(generation, str) or not re.fullmatch(r"[0-9]{20}", generation):
+            raise ValueError("invalid publication marker")
+        frozen = module["_json"](host["_read"](directory, "receipt-" + project.key + "-" + generation + ".json",
+                                              limit), host)
+        if (frozen.get("channel") != "scheduled" or frozen.get("project") != str(project.canonical)
+                or frozen.get("generation") != generation
+                or not hmac.compare_digest(frozen.get("signature", ""), module["_signature"](frozen, store._secret()))):
+            raise ValueError("invalid publication receipt")
+        return frozen
+
     if receipt is not None:
         with review_output(output) as stream:
             stream.flush()
             stream.seek(0)
-            raw = stream.buffer.read((1 << 20) + 1)
-            if len(raw) > 1 << 20:
+            raw = stream.buffer.read(limit + 1)
+            if len(raw) > limit:
                 raise ValueError("review output too large")
-            digest = hashlib.sha256(raw).hexdigest()
-        reviewed_at = reviewed_at or timestamp(now())
-    elif review_state is None:
-        review_state = read_state(project)
+        marker = dict(v=1, audits=str(audits), reviewed_at=reviewed_at or timestamp(now()),
+                      generation=receipt["generation"], proposal=proposal.name, sha256=hashlib.sha256(raw).hexdigest())
+        with host["_directory"](store.friction, True, private=True) as directory, host["_locked"](directory, name):
+            try:
+                previous = module["_json"](host["_read"](directory, name, limit), host)
+            except FileNotFoundError:
+                pass
+            else:
+                owner = previous.get("audits")
+                if "audits" not in previous:
+                    frozen = publication_receipt(directory, previous.get("generation"))
+                    owner = str(Path(frozen["identities"]["extract"]["path"]).parent.parent)
+                if owner != str(audits):
+                    raise ValueError("another audit root owns the earlier review publication")
+            host["_replace"](directory, name, module["_encode"](marker))
+        return False
 
     def ready():
         if not os.path.lexists(store.path):
@@ -3145,18 +3223,64 @@ def recover_scheduled_publication(audits, project, receipt=None, proposal=None, 
         return not (degraded and pending_before) and not any(
             row.get("pending") for row in store.scoped(project.canonical))
 
-    def persist(published, cutoff, report):
+    broker_ready = not project.unknown and ready()
+    with contextlib.ExitStack() as stack:
+        try:
+            directory = stack.enter_context(host["_directory"](store.friction, private=True))
+            stack.enter_context(host["_locked"](directory, name))
+            marker = module["_json"](host["_read"](directory, name, limit), host)
+        except FileNotFoundError:
+            return False
+        generation, filename = marker.get("generation"), marker.get("proposal")
+        if (not isinstance(generation, str) or not re.fullmatch(r"[0-9]{20}", generation)
+                or not isinstance(filename, str) or not re.fullmatch(r"cycle-[0-9-]+\.md", filename)):
+            raise ValueError("invalid publication marker")
+        if marker.get("audits", str(audits)) != str(audits):
+            return None  # Preserve the generation owned by another audit root.
+        frozen = publication_receipt(directory, generation)
+        if Path(frozen["identities"]["extract"]["path"]).parent.parent != audits:
+            return None
+        if project.unknown:
+            raise ValueError("cannot recover publication with unknown project scope")
+        if "reviewed_at" in marker:
+            if not isinstance(marker["reviewed_at"], str):
+                raise ValueError("invalid evidence time")
+            cutoff = module["_stamp"](marker["reviewed_at"])
+        else:
+            cutoff = datetime.fromtimestamp(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mtime, timezone.utc)
+        if not broker_ready:
+            return False
+        published = project.folder / filename
+        if not published.exists():
+            os.unlink(name, dir_fd=directory)
+            os.fsync(directory)
+            return False
+        acknowledge_review = module["acknowledge_scheduled"]
+        if "host" in signature(acknowledge_review).parameters:
+            acknowledge_review(store, project, frozen, host, proposal=published, digest=marker.get("sha256"))
+        else:
+            # The legacy helper only acknowledges the current generation.
+            state_raw = host["_read"](directory, "prepare-" + project.key + ".json", limit)
+            state = module["_json"](state_raw, host)
+            if (state.get("project") != str(project.canonical) or type(state.get("generation")) is not int
+                    or state["generation"] <= int(generation)):
+                _, identity = module["_read"](published, host)
+                if identity["sha256"] != marker.get("sha256"):
+                    warnings.warn("published review changed before acknowledgement; preserving the edited report")
+                acknowledge_review(store, project, frozen)
+
         # The in-flight review may have started with a model-writable audit root.
-        state = review_state.copy()
+        state = read_state(project) if review_state is None else review_state.copy()
         previous = parse_time(state.get("reviewed_at"))
         if previous is None or previous <= cutoff:
             for field in ("ledger_errors", "last_error", "last_error_at"):
                 state.pop(field, None)
-            state.update(reviewed_at=timestamp(cutoff), status="ok", report=report, proposal=str(published))
+            state.update(reviewed_at=timestamp(cutoff), status="ok",
+                         report=frozen["identities"]["report"]["path"], proposal=str(published))
         write_state(project, state, durable=True)
-
-    return module["scheduled_publication"](audits, store, project, host, persist, ready, receipt=receipt,
-                                           proposal=proposal, digest=digest, reviewed_at=reviewed_at)
+        os.unlink(name, dir_fd=directory)
+        os.fsync(directory)
+        return published
 
 def friction_reconcile_command(args):
     try:
@@ -3176,15 +3300,20 @@ def friction_reconcile_command(args):
 def friction_prepare_command(args):
     if args.action == "acknowledge":
         return friction_reconcile_command(args)
+    scope_error = ()
     try:
         canonical = action_project(args.project_dir)
         (project,), _ = discover(None, None, {}, [canonical])
         cfg = effective(project.canonical)
+        scope_error = review_helper("kaizen_friction_prepare.py").get("IncompleteAuditScope", ())
         path = friction_prepare(audits_dir(), project, args.report, None, cfg,
                                 "propose-only", now, interactive=True)
         if path is not None:
             print(path)
         return 0
+    except scope_error as error:
+        print(f"friction: preparation refused. {error}", file=sys.stderr)
+        return 2
     except (OSError, RuntimeError, ValueError, RecursionError, KeyError, TypeError, AttributeError):
         print("friction: preparation refused; local evidence or private state is invalid or unavailable",
               file=sys.stderr)

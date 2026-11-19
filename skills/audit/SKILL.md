@@ -70,7 +70,7 @@ Finish by recommending the first 3 changes.
 
 ## Bundled resources
 
-Start from the bundled audit script instead of writing one: `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-audit --cwd . --days 14 --out docs/kaizen/`. `--cwd` matches this project's exact path, so it never mixes in similarly named projects; `--project` is a loose substring filter.
+Run `python3 ${CLAUDE_PLUGIN_ROOT}/scripts/token-audit --cwd . --days 14 --out docs/kaizen/`. `--cwd` uses the project path. `--project` filters by substring. On exit 4, use the report and relay the extract warning.
 
 ## Done when
 

@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import time
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -48,12 +49,20 @@ class ProcessGroupTests(RobustCase):
         executable(self.claude, FORKER)
 
     def assert_helper_gone(self):
-        wait_for(self.grandchild)
+        wait_for(self.grandchild, nonempty=True)
         pid = int(self.grandchild.read_text())
         deadline = time.monotonic() + 3
         while not gone(pid) and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertTrue(gone(pid), 'the model run left a helper process behind')
+
+    def test_helper_pid_waits_for_complete_write(self):
+        self.grandchild.touch()
+        writer = threading.Thread(target=lambda: (time.sleep(0.2), self.grandchild.write_text('12345')))
+        writer.start()
+        self.addCleanup(writer.join)
+        with patch(__name__ + '.gone', return_value=True):
+            self.assert_helper_gone()
 
     def test_timeout_kills_the_whole_process_group(self):
         path = self.due('proj')
@@ -65,8 +74,8 @@ class ProcessGroupTests(RobustCase):
     def test_signal_kills_the_whole_process_group_and_exits_143(self):
         path = self.due('proj')
         process = self.start('--project-dir', path)
-        wait_for(self.pid_file)
-        wait_for(self.grandchild)
+        wait_for(self.pid_file, nonempty=True)
+        wait_for(self.grandchild, nonempty=True)
         started = time.monotonic()
         process.send_signal(signal.SIGTERM)
         out, err = process.communicate(timeout=60)
@@ -89,7 +98,7 @@ class ProcessGroupTests(RobustCase):
 
         def after_leader_exits(child, *args, **kwargs):
             # Start the timeout only after startup, with the helper holding the pipes open.
-            wait_for(self.grandchild)
+            wait_for(self.grandchild, nonempty=True)
             self.assertEqual(child.wait(timeout=10), 0)
             return communicate(child, *args, **kwargs)
 
@@ -108,8 +117,8 @@ class ProcessGroupTests(RobustCase):
         executable(self.claude, code)
         path = self.due('proj')
         process = self.start('--project-dir', path)
-        wait_for(self.pid_file)
-        wait_for(self.grandchild)
+        wait_for(self.pid_file, nonempty=True)
+        wait_for(self.grandchild, nonempty=True)
         process.kill()
         process.communicate(timeout=10)
         self.assert_helper_gone()
@@ -128,6 +137,8 @@ class ProcessGroupTests(RobustCase):
 
 class SignalWindowTests(RobustCase):
     def test_sigint_during_child_construction_has_no_untracked_window(self):
+        previous = signal.signal(signal.SIGINT, signal.SIG_DFL)
+        self.addCleanup(signal.signal, signal.SIGINT, previous)
         original = subprocess.Popen.__init__
         children = []
 
@@ -155,7 +166,7 @@ class SignalWindowTests(RobustCase):
     def test_sigint_during_protected_model_run_exits_130_after_cleanup(self):
         path = self.auto_fixture(tamper=True)
         process = self.start('--project-dir', path)
-        wait_for(self.pid_file)
+        wait_for(self.pid_file, nonempty=True)
         process.send_signal(signal.SIGINT)
         out, err = process.communicate(timeout=10)
         self.assertEqual(process.returncode, 130, out + err)
@@ -188,7 +199,7 @@ class SignalWindowTests(RobustCase):
     def test_sighup_during_the_model_run_rolls_back_and_exits_129(self):
         path = self.auto_fixture(tamper=False)
         process = self.start('--project-dir', path)
-        wait_for(self.pid_file)
+        wait_for(self.pid_file, nonempty=True)
         process.send_signal(signal.SIGHUP)
         out, err = process.communicate(timeout=60)
         self.assertEqual(process.returncode, 128 + signal.SIGHUP, out + err)
@@ -236,7 +247,7 @@ class HardKillTests(RobustCase):
 
     def kill_run(self, path):
         process = self.start('--project-dir', path)
-        wait_for(self.pid_file)
+        wait_for(self.pid_file, nonempty=True)
         process.kill()
         process.communicate(timeout=10)
         # No manual orphan kill: the watchdog must do this after pipe EOF.

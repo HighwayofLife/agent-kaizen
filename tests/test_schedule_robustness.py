@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -41,9 +42,9 @@ if os.environ.get('HANG') == '1':
 """
 
 
-def wait_for(path, seconds=30):
+def wait_for(path, seconds=30, nonempty=False):
     deadline = time.monotonic() + seconds
-    while not path.exists():
+    while not path.exists() or (nonempty and not path.read_bytes()):
         if time.monotonic() > deadline:
             raise AssertionError(f'{path} never appeared')
         time.sleep(0.05)
@@ -71,7 +72,9 @@ class RobustCase(SecurityCase):
         process = subprocess.Popen(
             [sys.executable, str(SCRIPTS / 'kaizen-scheduled'), command, '--audits', str(self.audits), *map(str, extra),
              '--token-audit', str(self.audit), '--pricing', str(self.pricing), *map(str, args)],
-            cwd=self.work, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            cwd=self.work, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            preexec_fn=lambda: (signal.signal(signal.SIGHUP, signal.SIG_DFL),
+                                signal.signal(signal.SIGINT, signal.SIG_DFL)))
         self.addCleanup(lambda: process.poll() is None and process.kill())
         return process
 
@@ -96,13 +99,96 @@ class RobustCase(SecurityCase):
         return self.audits / 'projects' / self.runner.key(path)
 
 
+class FrictionRecoveryTests(RobustCase):
+    def test_review_recovers_friction_with_symlinked_claude_config(self):
+        from scripts.kaizen_friction_actions import HostActions
+
+        project = self.due('proj', '{"scheduledAutonomy":"auto","hostActions":"apply"}')
+        write(self.global_path, json.dumps({'autoProjects': [str(project)]}))
+        config_link = self.root / 'config-link'
+        config_link.symlink_to(self.cfg, target_is_directory=True)
+        self.setenv(CLAUDE_CONFIG_DIR=str(config_link))
+        store = HostActions(self.cfg / 'audits', self.cfg / 'kaizen-backups',
+                            self.runner.action_project, self.runner.key)
+        ident = store.record(project, 'low-disk', 'ls', 'observed', allowed=('ls',))
+        row, = store.scoped(project)
+        store.import_actions('<!-- kaizen-host-actions ' + json.dumps(
+            {'v': 1, 'actions': [{'id': ident, 'intent': 'apply'}]}) + ' -->',
+            {ident: dict(row, intents=['apply'])}, project, 'scheduled:' + '1'.zfill(20))
+        self.setenv(STUB_AUDITS=str(store.path.parent))
+        result = self.script('review', '--claude', self.claude, '--token-audit', self.audit,
+                             '--pricing', self.pricing, '--project-dir', project)
+        self.assertIn('/agent-kaizen:cycle auto ', self.values(self.last_argv(), '-p')[0])
+        self.assertIn('resolved as a suggestion', result.stdout + result.stderr)
+        self.assertNotIn('pending', store.scoped(project)[0])
+
+    def mutation_authority(self, project):
+        options = self.runner.command_options(SimpleNamespace(claude=str(self.claude)))
+        audits = self.runner.audits_dir()
+        command = self.runner.review_command(options, 'auto', '', '', project, audits)
+        _, policy = self.runner.scheduled_authority(audits, project, options, command, self.runner.backup_root())
+        return policy
+
+    def test_mutation_authority_accepts_symlinked_claude_config(self):
+        project = self.due('proj', '{"scheduledAutonomy":"auto","hostActions":"apply"}')
+        write(self.global_path, json.dumps({'autoProjects': [str(project)], 'maxChangesPerRun': 2}))
+        expected = self.mutation_authority(project)
+        self.assertEqual(expected[0], 2)
+
+        config_link = self.root / 'config-link'
+        config_link.symlink_to(self.cfg, target_is_directory=True)
+        with self.subTest(root='CLAUDE_CONFIG_DIR'):
+            self.setenv(CLAUDE_CONFIG_DIR=str(config_link))
+            self.assertEqual(self.mutation_authority(project), expected)
+        with self.subTest(root='default'):
+            (self.home / '.claude').symlink_to(self.cfg, target_is_directory=True)
+            os.environ.pop('CLAUDE_CONFIG_DIR')
+            self.assertEqual(self.mutation_authority(project), expected)
+
+    def test_mutation_authority_refuses_untrusted_symlinked_claude_config(self):
+        project = self.due('proj')
+        write(self.global_path, '{"scheduledAutonomy":"auto"}')
+        config_link = self.root / 'config-link'
+        config_link.symlink_to(self.cfg, target_is_directory=True)
+        self.setenv(CLAUDE_CONFIG_DIR=str(config_link))
+        for mode in (0o770, 0o707):
+            with self.subTest(mode=oct(mode)):
+                self.cfg.chmod(mode)
+                with self.assertRaisesRegex(ValueError, 'mutation config root is not trusted'):
+                    self.mutation_authority(project)
+
+        self.cfg.chmod(0o700)
+        lstat = Path.lstat
+
+        def other_owner(path):
+            info = lstat(path)
+            if path == self.cfg:
+                return os.stat_result((*info[:4], os.getuid() + 1, *info[5:]))
+            return info
+
+        with patch.object(Path, 'lstat', other_owner):
+            with self.assertRaisesRegex(ValueError, 'mutation config root is not trusted'):
+                self.mutation_authority(project)
+
+
 class SignalTests(RobustCase):
     """S-2a: a killed runner still rolls back and checks the ledger."""
+
+    def test_launcher_resets_inherited_ignored_signals(self):
+        def ignore_signals():
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+        result = subprocess.run([sys.executable, '-m', 'unittest',
+                                 'test_schedule_robustness.SignalTests.test_signals_in_propose_mode_record_a_failed_project'],
+                                cwd=str(SCRIPTS.parent / 'tests'), env=self.env,
+                                preexec_fn=ignore_signals, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_sigterm_in_auto_mode_rolls_back_and_restores_ledger(self):
         path = self.auto_fixture()
         process = self.start('--project-dir', path)
-        wait_for(self.pid_file)
+        wait_for(self.pid_file, nonempty=True)
         process.send_signal(signal.SIGTERM)
         out, err = process.communicate(timeout=60)
         self.assertEqual(process.returncode, 128 + signal.SIGTERM, out + err)
@@ -119,7 +205,7 @@ class SignalTests(RobustCase):
 
     def test_signals_in_propose_mode_record_a_failed_project(self):
         executable(self.claude, SLEEPER)
-        for number in (signal.SIGTERM, signal.SIGHUP):
+        for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
             with self.subTest(signal=number.name):
                 self.pid_file.unlink(missing_ok=True)
                 path = self.due('proj ' + number.name.lower())
@@ -127,7 +213,7 @@ class SignalTests(RobustCase):
                 old = time.time() - 40 * 86400
                 os.utime(self.audits / 'extracts/old.extract.json', (old, old))
                 process = self.start('--project-dir', path)
-                wait_for(self.pid_file)
+                wait_for(self.pid_file, nonempty=True)
                 process.send_signal(number)
                 out, err = process.communicate(timeout=60)
                 self.assertEqual(process.returncode, 128 + number, out + err)
@@ -144,7 +230,7 @@ class SignalTests(RobustCase):
     def test_sigterm_during_audit_exits_cleanly(self):
         executable(self.audit, SLEEPER)
         process = self.start(command='audit')
-        wait_for(self.pid_file)
+        wait_for(self.pid_file, nonempty=True)
         process.send_signal(signal.SIGTERM)
         out, err = process.communicate(timeout=60)
         self.assertEqual(process.returncode, 128 + signal.SIGTERM, out + err)

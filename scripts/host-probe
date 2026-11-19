@@ -4,23 +4,39 @@ import argparse
 import csv
 from datetime import datetime, timezone
 import fnmatch
+from functools import partial
 import io
 import json
 import math
 import os
 import re
+import runpy
 from pathlib import Path
 import shutil
 import signal
 import stat
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
 
+try:
+    import resource
+except ImportError:
+    resource = None
+
 HERE = Path(__file__).resolve().parent
 LIMIT = 1024 * 1024
+STATUS_CONFIG = {
+    'core.attributesfile', 'core.autocrlf', 'core.checkroundtripencoding', 'core.checkstat',
+    'core.eol', 'core.excludesfile', 'core.filemode', 'core.ignorecase', 'core.precomposeunicode',
+    'core.safecrlf',
+    'core.sparsecheckout', 'core.sparsecheckoutcone', 'core.symlinks', 'core.trustctime',
+    'extensions.objectformat', 'extensions.refstorage', 'index.sparse',
+}
+SIZE_PARENT_FDS = 24
 
 
 def sibling(*names):
@@ -51,6 +67,14 @@ def open_directory(path, create=False):
         raise
 
 
+def index_stamp(path):
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return None
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+
+
 class Probe:
     def __init__(self, project, platform, proc, catalog):
         self.project, self.platform, self.proc = project, platform, proc
@@ -78,7 +102,7 @@ class Probe:
             self.warn('budget')
         return left
 
-    def command(self, argv):
+    def command(self, argv, *, index_records=False):
         left = self.remaining(argv[0])
         if left <= 0:
             return None
@@ -87,16 +111,28 @@ class Probe:
                                        start_new_session=(os.name == 'posix'),
                                        env=dict({k: v for k, v in os.environ.items() if not k.startswith('GIT_')},
                                                 GIT_OPTIONAL_LOCKS='0', GIT_CONFIG_NOSYSTEM='1',
-                                                GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0'))
+                                                GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0',
+                                                GIT_ALLOW_PROTOCOL='', GIT_NO_LAZY_FETCH='1'))
             buffers = [bytearray(), bytearray()]
             overflow = [False, False]
 
             def drain(stream, index):
+                tail = b''
                 with stream:
                     while True:
                         chunk = stream.read(65536)
                         if not chunk:
+                            overflow[index] |= bool(tail)
                             break
+                        if index_records and index == 0:
+                            *rows, tail = (tail + chunk).split(b'\0')
+                            if len(tail) > LIMIT:
+                                overflow[index] = True
+                                break
+                            # Keep only gitlinks and index flags that can hide modifications.
+                            chunk = b''.join(row + b'\0' for row in rows if
+                                             row[:1].islower() or row[:2] == b'S ' or
+                                             row[2:9] == b'160000 ')
                         room = max(0, LIMIT - len(buffers[index]))
                         buffers[index].extend(chunk[:room])
                         overflow[index] |= len(chunk) > room
@@ -138,7 +174,8 @@ class Probe:
             if process.returncode:
                 self.warn('command_failed')
                 return None
-            return bytes(buffers[0]).decode('utf-8', errors='replace')
+            output = bytes(buffers[0])
+            return os.fsdecode(output) if index_records else output.decode('utf-8', errors='replace')
         except OSError:
             self.warn('command_unavailable')
             return None
@@ -194,19 +231,141 @@ class Probe:
 
     def git(self, root, *args):
         if args and args[0] == 'status':
-            # Status may invoke repository-configured clean or process filters.
-            # Never inspect a working tree with those commands configured.
-            config = self.command(['git', '-c', 'core.fsmonitor=false', '-C', str(root), 'config', '--null', '--list'])
-            if '--ignore-submodules=dirty' not in args:
-                subconfig = self.command(['git', '-c', 'core.fsmonitor=false', '-C', str(root),
-                                          'submodule', 'foreach', '--quiet', '--recursive', 'git config --null --list'])
-            else:
-                subconfig = ''
-            if (config is None or subconfig is None or
-                    re.search(r'(?:^|\0)filter\.[^\n]+\.(?:clean|process)\n', config + subconfig, re.I)):
+            return self.status(Path(root), args)
+        return self.command(['git', '-c', 'core.fsmonitor=false', '-C', str(root), *args])
+
+    def status(self, root, args, config=None, *, with_index=False):
+        # Give status a private Git directory with only allowlisted configuration.
+        # Git must not read live config or recurse into a submodule's live config.
+        if config is None:
+            config = self.git(root, 'config', '--null', '--list')
+        if config is None:
+            return None
+        options = {}
+        for entry in config.split('\0'):
+            key, separator, value = entry.partition('\n')
+            key = key.lower()
+            if re.fullmatch(r'filter\..+\.(clean|process|required)', key):
+                # Raw contents cannot establish cleanliness when a filter is configured.
                 self.warn('unsafe_git_filter')
                 return None
-        return self.command(['git', '-c', 'core.fsmonitor=false', '-C', str(root), *args])
+            if key in STATUS_CONFIG:
+                options[key] = value if separator else 'true'
+        layout = self.git(root, 'rev-parse', '--absolute-git-dir', '--git-common-dir')
+        if layout is None or len(layout.splitlines()) != 2:
+            return None
+        admin, common = (root / path for path in layout.splitlines())
+        try:
+            try:
+                scratch = tempfile.TemporaryDirectory(prefix='kaizen-status-')
+            except OSError:
+                if with_index:
+                    return self.read_only_status(root, admin, common, args, options)
+                raise
+            with scratch as temporary:
+                shadow = Path(temporary)
+                config_text = '[core]\nrepositoryFormatVersion = 1\nfsmonitor = false\n'
+                for key, value in options.items():
+                    section, name = key.split('.')
+                    value = value.replace('\\', '\\\\').replace('"', '\\"').replace('\n', '\\n')
+                    config_text += f'[{section}]\n{name} = "{value}"\n'
+                (shadow / 'config').write_text(config_text, encoding='utf-8')
+                (shadow / 'HEAD').write_text(self.pointer(admin / 'HEAD') + '\n', encoding='utf-8')
+                for source, names in ((admin, ('index',)), (common, (
+                        'objects', 'refs', 'packed-refs', 'reftable', 'info'))):
+                    for name in names:
+                        (shadow / name).symlink_to(source / name)
+                # Split-index and sparse-checkout metadata carry no executable config.
+                for name in admin.glob('sharedindex.*'):
+                    if self.remaining('status') <= 0:
+                        return None
+                    (shadow / name.name).symlink_to(name)
+                if admin != common:
+                    (shadow / 'info').unlink()
+                    (shadow / 'info').mkdir()
+                    for source, name in ((common, 'exclude'), (common, 'attributes'), (admin, 'sparse-checkout')):
+                        (shadow / 'info' / name).symlink_to(source / 'info' / name)
+                git = ['git', '-C', str(root), f'--git-dir={shadow}', f'--work-tree={root}']
+                before = index_stamp(admin / 'index') if with_index else None
+                status = self.command([*git, *args, '--ignore-submodules=dirty'])
+                if status is None or not with_index:
+                    return status
+                # Check flags after status, and reject changes across both reads.
+                index = self.command([*git, 'ls-files', '-v', '--stage', '-z'], index_records=True)
+                if index_stamp(admin / 'index') != before:
+                    self.warn('index_changed')
+                    return None
+                return (status, index) if index is not None else None
+        except (OSError, ValueError):
+            self.warn('command_unavailable')
+            return None
+
+    def read_only_status(self, root, admin, common, args, options):
+        # Reuse the installed config-isolated Git directory when scratch creation
+        # fails. Read untracked and ignored paths separately so Git still uses
+        # the live repo's info/exclude without exposing its config to status.
+        helper = runpy.run_path(str(HERE / 'kaizen_worktree_facts.py'))
+        run = partial(helper['git'], shutil.which('git'), deadline=self.deadline)
+        config = [(os.fsencode(key), os.fsencode(value)) for key, value in options.items()]
+        before = index_stamp(admin / 'index')
+
+        def tracked_status(isolated_git, checkout):
+            return isolated_git(checkout, 'status', '--porcelain=v1', '-z', '--untracked-files=no')
+
+        result = helper['readonly_status'](run, tracked_status, root, admin, common, config)
+        if result is None or result[0]:
+            self.warn('command_unavailable')
+            return None
+        others = ['ls-files', '--others', '--exclude-standard', '--directory', '-z']
+        untracked = self.git(root, *others, '--no-empty-directory')
+        ignored = self.git(root, *others, '--ignored') if '--ignored=matching' in args else ''
+        index = self.command(['git', '-c', 'core.fsmonitor=false', '-C', str(root),
+                              'ls-files', '-v', '--stage', '-z'], index_records=True)
+        if index_stamp(admin / 'index') != before:
+            self.warn('index_changed')
+            return None
+        if untracked is None or ignored is None or index is None:
+            return None
+        return bool(result[1] or untracked or ignored), index
+
+    def clean(self, root, depth=0):
+        config = self.git(root, 'config', '--null', '--list')
+        modules = self.git(root, 'config', '--null', '--file', '.gitmodules', '--list') if (root / '.gitmodules').exists() else ''
+        if config is None or modules is None:
+            return None
+        if any(re.fullmatch(r'(?:diff\.ignoresubmodules|submodule\..*\.ignore)\n'
+                            r'(?:untracked|dirty|all)', entry, re.I)
+               for entry in (config + modules).split('\0')):
+            return None
+        args = ('status', '--porcelain=v1', '-z', '--untracked-files=all')
+        if not depth:
+            args += ('--ignored=matching',)
+        evidence = self.status(root, args, config, with_index=True)
+        if evidence is None:
+            return None
+        status, index = evidence
+        dirty = bool(status)
+        for entry in filter(None, index.split('\0')):
+            if entry[0].islower() or entry[0] == 'S':
+                return None
+            meta, _, relative = entry.partition('\t')
+            if not meta.endswith(' 0'):
+                continue
+            child = root / relative
+            try:
+                if root not in child.parents or child.resolve() != child:
+                    return None
+            except (OSError, RuntimeError):
+                return None
+            if not os.path.lexists(child / '.git'):
+                continue
+            if depth >= 32 or self.git(child, 'rev-parse', '--show-toplevel') != str(child) + '\n':
+                return None
+            clean = self.clean(child, depth + 1)
+            if clean is None:
+                return None
+            dirty |= not clean
+        return not dirty
 
     def pointer(self, path):
         if self.remaining('pointer') <= 0:
@@ -284,21 +443,7 @@ class Probe:
                           'last_commit_age_days': None})
         for tree in trees[1:]:
             root = tree['path']
-            status = self.git(root, 'status', '--porcelain=v1', '-z', '--untracked-files=all', '--ignored=matching')
-            index = self.git(root, 'ls-files', '-v', '-z')
-            subindex = self.git(root, 'submodule', 'foreach', '--quiet', '--recursive',
-                                'git ls-files -v -z')
-            config = self.git(root, 'config', '--null', '--list')
-            modules = self.git(root, 'config', '--null', '--file', '.gitmodules', '--list') if (Path(root) / '.gitmodules').exists() else ''
-            settings = (config or '') + (modules or '')
-            hidden = any(entry and (entry[0].islower() or entry[0] == 'S')
-                         for entry in ((index or '') + (subindex or '')).split('\0'))
-            ignored = any(re.fullmatch(r'(?:diff\.ignoresubmodules|submodule\..*\.ignore)\n'
-                                       r'(?:untracked|dirty|all)', entry, re.I)
-                          for entry in settings.split('\0'))
-            if (status is not None and index is not None and subindex is not None and config is not None
-                    and modules is not None and not hidden and not ignored):
-                tree['clean'] = not bool(status)
+            tree['clean'] = self.clean(Path(root))
             head, primary = tree['head'], trees[0]['head']
             if (head and primary and re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', head)
                     and re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', primary)):
@@ -312,11 +457,47 @@ class Probe:
 
     def size(self, path):
         total, count, queued = 0, 0, 0
-        parents = []
+        parents, held = [], {}
         fd = None
+        parent_limit = SIZE_PARENT_FDS
+        if resource is not None:
+            soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+            if soft != resource.RLIM_INFINITY:
+                # Leave room for stdio, traversal, and the descriptor used by scandir.
+                parent_limit = min(parent_limit, max(2, soft - 8))
+
+        def parent_fd(level):
+            if level in held:
+                return held[level]
+            # Restore evicted descriptors through the nearest retained ancestor.
+            anchor = max(i for i in held if i < level)
+            previous = held[anchor]
+            try:
+                for index in range(anchor + 1, level + 1):
+                    if self.remaining('size') <= 0:
+                        raise OSError('directory scan timed out')
+                    name, expected, _ = parents[index]
+                    child = os.open(name, flags, dir_fd=previous)
+                    if index - 1 not in held:
+                        os.close(previous)
+                    previous = child
+                    if not os.path.samestat(expected, os.fstat(child)):
+                        raise OSError('directory moved')
+                    if index == level or level - index < parent_limit - len(held):
+                        held[index] = child
+                return previous
+            finally:
+                if previous not in held.values():
+                    os.close(previous)
+
+        def close_parent(level):
+            if level in held:
+                os.close(held.pop(level))
+
         try:
-            fd = open_directory(path)
             flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            fd = open_directory(path)
+            name = None
             while True:
                 if self.remaining('size') <= 0:
                     return None
@@ -340,36 +521,55 @@ class Probe:
                     elif entry.is_file(follow_symlinks=False):
                         total += entry.stat(follow_symlinks=False).st_size
                 if children:
-                    info = os.fstat(fd)
-                    parents.append(((info.st_dev, info.st_ino), children))
+                    child_name = children.pop()
+                    if children or queued:
+                        if len(held) >= parent_limit:
+                            # Thin the checkpoints while keeping the root.
+                            for level in sorted(held)[1::2]:
+                                close_parent(level)
+                        parents.append((name, os.fstat(fd), children))
+                        held[len(parents) - 1] = fd
+                        fd = None
+                        fd = os.open(child_name, flags, dir_fd=held[len(parents) - 1])
+                    else:
+                        child = os.open(child_name, flags, dir_fd=fd)
+                        os.close(fd)
+                        fd = child
                     queued += len(children)
-                elif not queued:
+                    name = child_name
+                    continue
+                if not parents:
                     break
 
-                # Follow parent links only as far as the next unvisited sibling.
-                # A concurrent move can change '..', so verify it before using it.
-                while not children:
+                while parents:
                     if self.remaining('size') <= 0:
                         return None
-                    expected, children = parents[-1]
-                    fd, previous = os.open('..', flags, dir_fd=fd), fd
-                    os.close(previous)
-                    info = os.fstat(fd)
-                    if (info.st_dev, info.st_ino) != expected:
-                        self.warn('directory_unavailable')
-                        return None
-                    if not children:
-                        parents.pop()
-
-                fd, previous = os.open(children.pop(), flags, dir_fd=fd), fd
-                os.close(previous)
-                queued -= 1
+                    level = len(parents) - 1
+                    parent_name, _, siblings = parents[-1]
+                    parent = parent_fd(level)
+                    live = os.stat(name, dir_fd=parent, follow_symlinks=False)
+                    if not os.path.samestat(os.fstat(fd), live):
+                        raise OSError('directory moved')
+                    os.close(fd)
+                    fd = None
+                    if siblings:
+                        name = siblings.pop()
+                        queued -= 1
+                        fd = os.open(name, flags, dir_fd=parent)
+                        break
+                    name = parent_name
+                    parents.pop()
+                    fd = held.pop(level)
+                else:
+                    break
         except (OSError, AttributeError, NotImplementedError):
             self.warn('directory_unavailable')
             return None
         finally:
             if fd is not None:
                 os.close(fd)
+            for parent in held.values():
+                os.close(parent)
         return total
 
     def directories(self, trees):
@@ -422,14 +622,13 @@ class Probe:
             except (OSError, ValueError, AttributeError):
                 self.warn('output_config')
                 configured = []
-            # Candidate discovery only uses ignored entries in this worktree.
-            status = self.git(root, 'status', '--ignored', '--porcelain=v1', '-z',
-                              '--untracked-files=normal', '--ignore-submodules=dirty')
-            if status is None:
+            ignored_dirs = self.git(root, 'ls-files', '--others', '--ignored', '--exclude-standard',
+                                    '--directory', '-z')
+            if ignored_dirs is None:
                 return None
             names = self.catalog.get('output_dir_names', [])
-            candidates = [(e[3:-1], 'name') for e in status.split('\0')
-                          if e.startswith('!! ') and e.endswith('/') and Path(e[3:-1]).name in names]
+            candidates = [(entry[:-1], 'name') for entry in ignored_dirs.split('\0')
+                          if entry.endswith('/') and Path(entry[:-1]).name in names]
             candidates += [(entry, 'config') for entry in configured]
             if len(candidates) > 256:
                 self.warn('directory_limit')

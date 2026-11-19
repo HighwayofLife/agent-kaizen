@@ -199,8 +199,12 @@ matching `<report stem>.extract.json` file, where the stem is the report file na
 without `.md`. The report records only this file name in
 `<!-- token-audit-extract {"v": 1, "file": "<report stem>.extract.json"} -->`,
 directly after its scope comment. The scope comment still follows the headline
-comment. Extracts are written atomically. An extract write error goes to stderr;
-the audit still exits 0 if the report was written. `--json` also includes the
+comment. Extracts are published atomically without replacing an existing file.
+The Claude config directory or an explicit extract root can be a symlink to a
+directory owned by the current user.
+An extract write error goes to stderr. The audit exits 4 if it wrote the report
+but could not publish the extract. Scheduled runs log a warning and use that
+report. `--json` also includes the
 absolute `extract_path`, or null if the extract could not be written.
 
 Extract v1 has exactly `v` (1), `scope` (the report's scope dict), `since` (the

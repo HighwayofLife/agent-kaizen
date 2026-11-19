@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import re
 import runpy
+import shutil
 import stat
 import sys
 
@@ -77,11 +78,11 @@ def extract_directory(path):
     path = path.absolute()
     if ".." in path.parts:
         raise ValueError("extract path traversal")
-    check_acl = helper("kaizen_friction_actions.py")["_check_acl"]
+    actions = helper("kaizen_friction_actions.py")
     with ExitStack() as stack:
         fd = os.open(path.anchor, flags)
         stack.callback(os.close, fd)
-        for part in path.parts:
+        for depth, part in enumerate(path.parts, 1):
             if part != path.anchor:
                 fd = os.open(part, flags, dir_fd=fd)
                 stack.callback(os.close, fd)
@@ -89,7 +90,10 @@ def extract_directory(path):
             if (info.st_uid not in (0, os.geteuid())
                     or info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
                 raise ValueError("unsafe extract ancestor")
-            check_acl(fd, "extract directory")
+            if depth == len(path.parts):
+                actions["_check_acl"](fd, "extract directory")
+            elif sys.platform == "darwin" and actions["_has_extended_acl"](fd, allow_deny_only=True):
+                raise ValueError("unsafe extract ancestor ACL")
         yield fd
 
 
@@ -248,14 +252,25 @@ def grant_rule(literal):
     return f"Bash({literal})"
 
 
+def audit_paths(runner):
+    audits = runner["audits_dir"]()
+    config = Path(os.path.realpath(audits.parent))
+    backups = runner["backup_root"]()
+    if not os.environ.get("KAIZEN_BACKUP_DIR"):
+        backups = config / backups.name
+    return config / audits.name, backups
+
+
 def host_store(runner):
     actions = helper("kaizen_friction_actions.py")["HostActions"]
-    return actions(runner["audits_dir"](), runner["backup_root"](), runner["action_project"], runner["key"])
+    audits, backups = audit_paths(runner)
+    return actions(audits, backups, runner["action_project"], runner["key"])
 
 
 def evidence(runner, project, literal, secret=None):
     now = datetime.now(timezone.utc)
-    extract, stamp = find_extract(runner["audits_dir"](), project, now)
+    audits, _ = audit_paths(runner)
+    extract, stamp = find_extract(audits, project, now)
     signature = extract.pop("allow_rule_mac", None)
     payload = json.dumps(extract, sort_keys=True, separators=(",", ":")).encode("ascii")
     if secret is not None or signature is not None:
@@ -383,7 +398,7 @@ def stage(directory, name, raw, mode):
     return fd, effect_id(raw, stamp)
 
 
-def rename_effect(directory, source, target, *, exchange=False):
+def rename_effect(directory, source, target, *, exchange=False, target_directory=None):
     # An exchange keeps the actual displaced inode, including a concurrent
     # editor's replacement. No-replace handles creation and moving a deletion
     # aside without clobbering any name that appeared after our checks.
@@ -400,7 +415,8 @@ def rename_effect(directory, source, target, *, exchange=False):
         raise Refused("safe settings rename is unavailable")
     rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
     rename.restype = ctypes.c_int
-    if rename(directory, os.fsencode(source), directory, os.fsencode(target), flags) != 0:
+    destination = directory if target_directory is None else target_directory
+    if rename(directory, os.fsencode(source), destination, os.fsencode(target), flags) != 0:
         error = ctypes.get_errno()
         raise OSError(error, os.strerror(error))
 
@@ -410,6 +426,72 @@ def named_version(directory, name):
         return version(os.stat(name, dir_fd=directory, follow_symlinks=False))
     except FileNotFoundError:
         return None
+
+
+def discard_verified(directory, name, expected, path):
+    # Capture the pathname in a private directory before verification. Derive
+    # the directory from the journaled name so a retry can find the capture.
+    quarantine = name + ".cleanup"
+    try:
+        os.mkdir(quarantine, 0o700, dir_fd=directory)
+    except FileExistsError:
+        pass
+    with ExitStack() as stack:
+        cleanup = os.open(quarantine, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=directory)
+        stack.callback(os.close, cleanup)
+        info = os.fstat(cleanup)
+        if info.st_uid != os.geteuid() or info.st_mode & 0o077:
+            raise Refused(f"unsafe settings cleanup directory at {path / quarantine}")
+        if named_version(cleanup, name) is None:
+            try:
+                rename_effect(directory, name, name, target_directory=cleanup)
+            except FileNotFoundError:
+                os.rmdir(quarantine, dir_fd=directory)
+                return
+            os.fsync(directory)
+            os.fsync(cleanup)
+        discard_captured(directory, cleanup, quarantine, name, expected, path)
+    os.rmdir(quarantine, dir_fd=directory)
+    # Catch an atomic save at the original name while cleanup was in progress.
+    if named_version(directory, name) is not None:
+        raise Refused(f"staged or displaced settings replaced; recovery copy at {path / name}")
+    os.fsync(directory)
+
+
+def discard_captured(directory, cleanup, quarantine, name, expected, path):
+    def preserve():
+        recovery = stage_name()
+        rename_effect(cleanup, name, recovery, target_directory=directory)
+        os.rmdir(quarantine, dir_fd=directory)
+        os.fsync(directory)
+        raise Refused(f"staged or displaced settings changed; recovery copy at {path / recovery}")
+
+    try:
+        fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=cleanup)
+    except OSError:
+        preserve()
+    with os.fdopen(fd, "rb") as stream:
+        try:
+            raw, stamp = snapshot_fd(cleanup, name, fd)
+            verified = effect_id(raw, stamp) == expected and same_version(cleanup, name, stamp)
+        except (OSError, ValueError, Refused):
+            verified = False
+        if not verified:
+            preserve()
+        os.unlink(name, dir_fd=cleanup)
+        # An editor can still hold the displaced inode open across the rename.
+        stream.seek(0)
+        if stream.read(SETTINGS_LIMIT + 1) != raw:
+            recovery = stage_name()
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+            with os.fdopen(os.open(recovery, flags, 0o600, dir_fd=directory), "wb") as copy:
+                stream.seek(0)
+                shutil.copyfileobj(stream, copy)
+                copy.flush()
+                os.fsync(copy.fileno())
+            os.rmdir(quarantine, dir_fd=directory)
+            os.fsync(directory)
+            raise Refused(f"displaced settings edited during cleanup; recovery copy at {path / recovery}")
 
 
 def write_effect(directory, path, pending, open_dir, staged_fd, save):
@@ -422,6 +504,10 @@ def write_effect(directory, path, pending, open_dir, staged_fd, save):
             raw, staged_stamp = snapshot_fd(directory, temporary, staged_fd)
             if effect_id(raw, staged_stamp) != pending["after"]:
                 raise Refused("staged write changed before publication")
+            if not pending["undo"]:
+                pending.pop("installed", None)
+                pending["publishing"] = pending["after"][2]
+                save()
         if (preimage(*snapshot(directory)) != expected
                 or not same_version(directory, TARGET.name, expected[0])
                 or (temporary and (not matches_version(os.fstat(staged_fd), staged_stamp)
@@ -461,13 +547,16 @@ def write_effect(directory, path, pending, open_dir, staged_fd, save):
                 elif published is None and parked is not None:
                     rename_effect(directory, displaced, target)
                 os.fsync(directory)
-            raise Refused("settings publication raced with an edit or staged replacement")
+            recovery = f"; inspect recovery copy at {path / displaced}" if displaced and named_version(directory, displaced) else ""
+            raise Refused("settings publication raced with an edit or staged replacement" + recovery)
         os.fsync(directory)
+        if not pending["undo"]:
+            pending["installed"] = pending["after"][2]
+            save()
         pending["published"] = preimage(*current)
         save()
-        if displaced and same_version(directory, displaced, parked):
-            os.unlink(displaced, dir_fd=directory)
-            os.fsync(directory)
+        if displaced:
+            discard_verified(directory, displaced, expected[1], path)
 
 
 def live_writes():
@@ -601,7 +690,7 @@ def transact(directory, literal=None, *, record=None, action_id=None):
                         if undo and prior[2] == "undone":
                             return dict(status="undone", record=ident)
                     else:
-                        cancel_pending(None, entry, records, save)
+                        cancel_pending(None, target_dir, entry, records, save)
                 if any(row[0] == root and row[2] == "applied" for row in records.values()):
                     if local is None and undo and prior[2] == "applied":
                         prior[2] = "undone"
@@ -636,24 +725,30 @@ def transact(directory, literal=None, *, record=None, action_id=None):
                                    authorize, authorize_request, open_dir, save, mark)
 
 
-def remove_stage(settings, temporary, expected):
+def remove_stage(settings, temporary, expected, *, displaced_path=None):
     if settings is not None and temporary and expected is not None:
+        if named_version(settings, temporary + ".cleanup") is not None:
+            discard_verified(settings, temporary, expected, displaced_path or TARGET.parent)
+            return
         try:
-            raw, stamp = snapshot(settings, temporary)
-            if effect_id(raw, stamp) == expected and same_version(settings, temporary, stamp):
-                os.unlink(temporary, dir_fd=settings)
-                os.fsync(settings)
+            verified = effect_id(*snapshot(settings, temporary)) == expected
         except (OSError, ValueError, Refused):
-            pass  # An unverified file at that name belongs to whoever changed it.
+            verified = False
+        if verified:
+            discard_verified(settings, temporary, expected, displaced_path or TARGET.parent)
+        elif displaced_path is not None and named_version(settings, temporary) is not None:
+            # A receipt identifies the parked user file even after an edit.
+            raise Refused(f"displaced settings changed; recovery copy at {displaced_path / temporary}")
 
 
-def cancel_pending(settings, entry, records, save):
+def cancel_pending(settings, path, entry, records, save):
     pending = entry["pending"]
     if pending.get("published"):
-        remove_stage(settings, pending["temp"] or pending.get("backup"), pending["before"][1])
+        remove_stage(settings, pending["temp"] or pending.get("backup"), pending["before"][1],
+                     displaced_path=path)
     else:
         remove_stage(settings, pending["temp"], pending["after"])
-    if pending["undo"]:
+    if pending["undo"] and not pending.get("rollback"):
         entry["cancelled_undo"] = pending["id"]
     else:
         records[pending["id"]][2] = "cancelled"
@@ -693,44 +788,45 @@ def pending_add_matches(settings, pending, before, authorize):
 
 
 def publication_recorded(settings, pending, before):
-    if pending.get("published"):
-        return True
     after = pending["after"]
+    if pending.get("published"):
+        return pending["published"][1] == after
     temporary = pending["temp"]
-    if temporary:
-        if after is None:
+    parked_name = temporary or pending.get("backup")
+    if not parked_name or (temporary and after is None) or (not temporary and before[0] is not None):
+        return False
+    undo = pending["undo"]
+    staged_inode = temporary and before[0] is not None and before[0][:3] == after[0]
+    legacy = "publishing" not in pending
+    if not undo:
+        if not staged_inode:
             return False
-        parked_name = temporary
-        parked = named_version(settings, parked_name)
-        if parked is None and pending["before"][0] is None:
-            return True  # Creation consumed the staged file.
-        if parked is not None:
-            try:
-                if effect_id(*snapshot(settings, parked_name)) == pending["before"][1]:
-                    return True
-            except (OSError, ValueError, Refused):
-                pass
-        if before[0] is None or before[0][:3] != after[0]:
-            return False
-    else:
-        if before[0] is not None or not pending.get("backup"):
-            return False
-        parked_name = pending["backup"]
-    # A crash before the receipt can leave the preimage parked. Verify it
-    # before accepting a staged inode the editor may have updated in place.
+        if not legacy:
+            # Only write_effect persists this proof, after the verified rename.
+            return pending.get("installed") == pending["publishing"] == after[2]
     parked = named_version(settings, parked_name)
     if parked is None:
-        return bool(temporary)  # Creation or a completed exchange from the old journal format.
+        return bool(staged_inode and (undo or before[1] == after))
     try:
-        if effect_id(*snapshot(settings, parked_name)) == pending["before"][1]:
+        if (pending["before"][1] is not None
+                and effect_id(*snapshot(settings, parked_name)) == pending["before"][1]):
             return True
     except (OSError, ValueError, Refused):
         pass
+    if not undo or (temporary and not staged_inode):
+        return False
     if (same_version(settings, parked_name, parked)
             and same_version(settings, TARGET.name, before[0])):
         rename_effect(settings, parked_name, TARGET.name, exchange=bool(temporary))
         os.fsync(settings)
     raise Refused("interrupted publication raced with a settings edit")
+
+
+def can_restore_preimage(settings, pending, current):
+    after = pending["after"]
+    return (after is not None and current == after
+            and ("publishing" not in pending or pending["publishing"] == after[2])
+            and effect_id(*snapshot(settings, pending["temp"])) == pending["before"][1])
 
 
 def update_rule(settings, path, entry, records, ident, root, rule, undo, action_id,
@@ -742,9 +838,11 @@ def update_rule(settings, path, entry, records, ident, root, rule, undo, action_
     except (OSError, ValueError, Refused):
         if pending is not None:
             if pending.get("published"):
+                remove_stage(settings, pending["temp"] or pending.get("backup"), pending["before"][1],
+                             displaced_path=path)
                 finish_effect(entry, records, pending, pending["published"], save)
             else:
-                cancel_pending(settings, entry, records, save)
+                cancel_pending(settings, path, entry, records, save)
         raise
     before = preimage(raw, stamp)
     allow = permissions.get("allow", [])
@@ -753,16 +851,26 @@ def update_rule(settings, path, entry, records, ident, root, rule, undo, action_
                         and (ident == pending["id"] or ident is None and pending["id"].startswith("direct_")))
         count = allow.count(pending["rule"])
         published = publication_recorded(settings, pending, before)
-        # An editor can replace the published inode before the receipt is
-        # durable. Keep a managed undo record whenever the exact grant remains.
         if not pending["undo"] and count and not published:
-            cancel_pending(settings, entry, records, save)
-            if same_request:
-                raise Refused("pending grant cancelled because publication was not verified")
-            pending = None
+            parked = pending["temp"]
+            if (undo and ident == pending["id"] and rule == pending["rule"]
+                    and can_restore_preimage(settings, pending, before[1])):
+                # Reverse the exact staged image without adopting it as a grant.
+                original = pending["before"]
+                pending.update(undo=True, rollback=True, before=before, after=original[1],
+                               created=entry["created"] and entry["file"] == original)
+                if original[1] is None:
+                    pending.update(temp=None, backup=parked)
+                save()
+            else:
+                cancel_pending(settings, path, entry, records, save)
+                recovery = f"; inspect recovery copy at {path / parked}" if parked and named_version(settings, parked) else ""
+                raise Refused(f"pending grant cancelled because publication was not verified; "
+                              f"retained settings at {path / TARGET.name}" + recovery)
         elif (pending["undo"] and not count) or (not pending["undo"] and count):
             remove_stage(settings, pending["temp"] or pending.get("backup"),
-                         pending["before"][1] if published else pending["after"])
+                         pending["before"][1] if published else pending["after"],
+                         displaced_path=path if published else None)
             os.fsync(settings)
             result = finish_effect(entry, records, pending, before, save,
                                    edited=before[1] != pending["after"] or not published)
@@ -770,13 +878,13 @@ def update_rule(settings, path, entry, records, ident, root, rule, undo, action_
                 return result
             pending = None
         elif not pending["undo"] and not pending_add_matches(settings, pending, before, authorize):
-            cancel_pending(settings, entry, records, save)
+            cancel_pending(settings, path, entry, records, save)
             if same_request:
                 raise Refused("pending grant cancelled because settings, staged bytes, or evidence changed or expired")
             pending = None
         elif pending["undo"] and before != pending["before"]:
             distrust_other_grants(entry, records, pending["id"])
-            if same_request and count == 1 and not published:
+            if same_request and count == 1 and not published and not pending.get("rollback"):
                 # The pending undo already established ownership. Rebase only
                 # that exact removal onto the editor's current settings.
                 remove_stage(settings, pending["temp"], pending["after"])
@@ -786,7 +894,7 @@ def update_rule(settings, path, entry, records, ident, root, rule, undo, action_
                 save()
             else:
                 entry["unverified"].append(pending["id"])
-                cancel_pending(settings, entry, records, save)
+                cancel_pending(settings, path, entry, records, save)
                 if same_request:
                     raise Refused("pending undo cancelled because ownership of the current entry cannot be verified")
                 pending = None
@@ -795,7 +903,7 @@ def update_rule(settings, path, entry, records, ident, root, rule, undo, action_
                 pending.update(temp=stage_name(), after=None)
                 save()
             else:
-                cancel_pending(settings, entry, records, save)
+                cancel_pending(settings, path, entry, records, save)
                 pending = None
         elif not same_request:
             raise Refused("another settings transaction is pending")
@@ -842,6 +950,7 @@ def update_rule(settings, path, entry, records, ident, root, rule, undo, action_
         if delete:
             pending["backup"] = stage_name()
         if not undo:
+            pending["publishing"] = None
             records[ident] = [root, rule, "pending"]
         save()
 
@@ -875,7 +984,7 @@ def update_rule(settings, path, entry, records, ident, root, rule, undo, action_
             except (OSError, ValueError, TypeError, KeyError, Refused):
                 proof = None
             if proof != pending["evidence"]:
-                cancel_pending(settings, entry, records, save)
+                cancel_pending(settings, path, entry, records, save)
                 raise Refused("pending grant cancelled because evidence changed or expired")
         write_effect(settings, path, pending, open_dir, staged_fd, save)
         with open_dir(path) as live:

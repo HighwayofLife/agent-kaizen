@@ -35,16 +35,62 @@ class HostProbeTests(unittest.TestCase):
         self.assertIsNone(self.probe().git(self.project, 'status', '--porcelain'))
         self.assertFalse(marker.exists())
 
+    def filter_worktrees(self):
+        def git(root, *args):
+            return subprocess.check_output(['git', '-C', str(root), *args])
+
+        sub = self.root / 'sub'
+        sub.mkdir()
+        for root in (self.project, sub):
+            git(root, 'init', '-q')
+            (root / '.gitattributes').write_text('tracked filter=late\n')
+            (root / 'tracked').write_text('before')
+            git(root, 'add', '.')
+            git(root, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+                '-c', 'commit.gpgsign=false', 'commit', '-qm', 'initial')
+        git(self.project, '-c', 'protocol.file.allow=always', 'submodule', 'add', '-q', str(sub), 'module')
+        git(self.project, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+            '-c', 'commit.gpgsign=false', 'commit', '-qm', 'submodule')
+        linked = self.root / 'linked'
+        git(self.project, 'worktree', 'add', '-qb', 'linked', str(linked))
+        git(linked, '-c', 'protocol.file.allow=always', 'submodule', 'update', '--init', '-q')
+        return git, linked
+
     def test_submodule_filter_prevents_status(self):
-        probe = self.probe()
-        def command(args):
-            if 'foreach' in args:
-                return 'filter.evil.clean\ntouch marker\0'
-            if 'config' in args:
-                return ''
-            self.fail('status must not run with a submodule filter')
-        with mock.patch.object(probe, 'command', side_effect=command):
-            self.assertIsNone(probe.git(self.project, 'status', '--porcelain'))
+        git, linked = self.filter_worktrees()
+        module = linked / 'module'
+        (module / 'tracked').write_text('after!')
+        git(module, 'config', 'filter.late.clean', 'touch filter-ran')
+        self.assertIsNone(self.probe().worktrees()[1]['clean'])
+        self.assertFalse((module / 'filter-ran').exists())
+
+    def test_filters_cannot_run_in_linked_worktree_or_submodule(self):
+        git, linked = self.filter_worktrees()
+        for root in (linked, linked / 'module'):
+            with self.subTest(root=root.name):
+                tracked = root / 'tracked'
+                tracked.write_text('after!')
+                probe = self.probe()
+                command = probe.command
+                installed = False
+
+                def install_filter(argv, *args, **kwargs):
+                    # Install after the repository's filter check, before Git starts status.
+                    nonlocal installed
+                    if 'status' in argv and (str(root) in argv or '--ignore-submodules=dirty' not in argv):
+                        git(root, 'config', 'filter.late.clean', 'touch filter-ran')
+                        installed = True
+                    return command(argv, *args, **kwargs)
+
+                try:
+                    with mock.patch.object(probe, 'command', side_effect=install_filter):
+                        self.assertIs(probe.worktrees()[1]['clean'], False)
+                    self.assertTrue(installed)
+                    self.assertFalse((root / 'filter-ran').exists())
+                finally:
+                    if installed:
+                        git(root, 'config', '--unset', 'filter.late.clean')
+                    tracked.write_text('before')
 
     def test_status_evidence_when_staged_index_output_exceeds_command_cap(self):
         def git(*args):
@@ -69,6 +115,36 @@ class HostProbeTests(unittest.TestCase):
             trees = probe.worktrees()
             self.assertIs(trees[1]['clean'], True)
             self.assertEqual([d['size_bytes'] for d in probe.directories(trees)], [3])
+
+    def test_worktree_cleanliness_without_writable_tmpdir(self):
+        git, linked = self.filter_worktrees()
+        # A regular file as TMPDIR is unusable even when tests run as root.
+        unusable = self.root / 'unusable'
+        unusable.touch()
+        with mock.patch.dict(os.environ, TMPDIR=str(unusable)), \
+                mock.patch.object(tempfile, 'tempdir', str(unusable)):
+            self.assertIs(self.probe().worktrees()[1]['clean'], True)
+            (self.project / '.git/info/exclude').write_text('build/\n')
+            ignored = linked / 'build'
+            ignored.mkdir()
+            self.assertIs(self.probe().worktrees()[1]['clean'], False)
+            ignored.rmdir()
+            (linked / 'module' / 'tracked').write_text('dirty')
+            self.assertIs(self.probe().worktrees()[1]['clean'], False)
+            (linked / 'tracked').write_text('after!')
+            probe = self.probe()
+            command = probe.command
+            marker = self.root / 'filter-ran'
+
+            def install_filter(argv, **kwargs):
+                if '--absolute-git-dir' in argv and str(linked) in argv:
+                    git(linked, 'config', 'filter.late.clean', f'touch "{marker}"')
+                return command(argv, **kwargs)
+
+            with mock.patch.object(probe, 'command', side_effect=install_filter):
+                self.assertIs(probe.worktrees()[1]['clean'], False)
+            self.assertIn(str(marker).encode(), git(linked, 'config', 'filter.late.clean'))
+            self.assertFalse(marker.exists())
 
     def test_embedded_gitlink_without_gitmodules_keeps_directory_evidence(self):
         def git(root, *args):
@@ -114,7 +190,7 @@ class HostProbeTests(unittest.TestCase):
             return original(path)
         probe = self.probe()
         def git_result(_root, *args):
-            return {'status': '!! build/\0', 'check-ignore': 'build/\n', 'ls-files': ''}[args[0]]
+            return 'build/\0' if '--ignored' in args else {'check-ignore': 'build/\n', 'ls-files': ''}[args[0]]
         with mock.patch.object(Path, 'is_dir', replace), mock.patch.object(probe, 'git', side_effect=git_result):
             self.assertIsNone(probe.directories([{'path': str(self.project)}]))
 
@@ -162,13 +238,15 @@ class HostProbeTests(unittest.TestCase):
                 yield iter(sorted(entries, key=lambda entry: entry.name))
 
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        limit = 60 if soft == resource.RLIM_INFINITY else min(soft, 60)
         try:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (limit, hard))
-            with mock.patch.object(probe_module.os, 'scandir', ordered_scan), \
-                 mock.patch.object(probe_module.os, 'open', wraps=os.open) as open_fd:
-                self.assertEqual(self.probe().size(build), 5)
-            self.assertLessEqual(open_fd.call_count, len(build.parts) + 4 * depth)
+            for cap, opens_per_level in ((60, 4), (20, 5)):
+                with self.subTest(descriptor_limit=cap):
+                    limit = cap if soft == resource.RLIM_INFINITY else min(soft, cap)
+                    resource.setrlimit(resource.RLIMIT_NOFILE, (limit, hard))
+                    with mock.patch.object(probe_module.os, 'scandir', ordered_scan), \
+                         mock.patch.object(probe_module.os, 'open', wraps=os.open) as open_fd:
+                        self.assertEqual(self.probe().size(build), 5)
+                    self.assertLessEqual(open_fd.call_count, len(build.parts) + opens_per_level * depth)
         finally:
             resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
@@ -197,6 +275,25 @@ class HostProbeTests(unittest.TestCase):
             self.assertIsNone(probe.size(build))
         self.assertTrue(moved.is_dir())
         self.assertIn('directory_unavailable', probe.warnings)
+
+    def test_read_only_empty_child_keeps_sibling_directory_evidence(self):
+        build = self.project / 'build'
+        sibling = build / 'a-sibling'
+        sibling.mkdir(parents=True)
+        (sibling / 'data').write_bytes(b'abc')
+        empty = build / 'z-empty'
+        empty.mkdir()
+        empty.chmod(0o400)
+        self.addCleanup(empty.chmod, 0o700)
+        scandir = os.scandir
+
+        @contextmanager
+        def ordered_scan(directory):
+            with scandir(directory) as entries:
+                yield iter(sorted(entries, key=lambda entry: entry.name))
+
+        with mock.patch.object(probe_module.os, 'scandir', ordered_scan):
+            self.assertEqual(self.probe().size(build), 3)
 
     def test_output_stays_with_open_directory_after_replacement(self):
         out = self.root / 'reports'
@@ -250,6 +347,27 @@ class HostProbeTests(unittest.TestCase):
                 git(linked, 'config', key, 'all')
                 self.assertIsNone(self.probe().worktrees()[1]['clean'])
                 git(linked, 'config', '--unset', key)
+
+    def test_index_flags_added_before_status_make_cleanliness_unknown(self):
+        git, linked = self.filter_worktrees()
+        tracked = linked / 'tracked'
+        tracked.write_text('modified')
+        probe = self.probe()
+        command = probe.command
+        updated = False
+
+        def update_index(argv, *args, **kwargs):
+            nonlocal updated
+            if 'status' in argv and str(linked) in argv:
+                git(linked, 'update-index', '--assume-unchanged', tracked.name)
+                updated = True
+            return command(argv, *args, **kwargs)
+
+        with mock.patch.object(probe, 'command', side_effect=update_index):
+            self.assertIsNone(probe.worktrees()[1]['clean'])
+        self.assertTrue(updated)
+        self.assertIn('index_changed', probe.warnings)
+        self.assertEqual(tracked.read_text(), 'modified')
 
     def test_submodule_hidden_index_and_ignore_values(self):
         def git(root, *args):
@@ -502,7 +620,7 @@ class HostProbeTests(unittest.TestCase):
         probe = self.probe()
         trees = [{'path': str(self.project), 'is_main': True},
                  {'path': str(linked), 'is_main': False}]
-        with mock.patch.object(probe, 'git', side_effect=['!! build/\0', '']):
+        with mock.patch.object(probe, 'git', side_effect=['build/\0', '']):
             self.assertEqual(probe.directories(trees), [])
 
     def test_tmutil_deadline_timeout_is_unknown(self):
@@ -528,7 +646,7 @@ class HostProbeTests(unittest.TestCase):
     def test_enumeration_bounds_are_unknown(self):
         probe = self.probe()
         trees = [{'path': str(self.project), 'is_main': True}]
-        with mock.patch.object(probe, 'git', return_value='!! build/\0' * 257):
+        with mock.patch.object(probe, 'git', return_value='build/\0' * 257):
             self.assertIsNone(probe.directories(trees))
         self.assertIn('directory_limit', probe.warnings)
         with mock.patch.object(probe, 'git', return_value=None):

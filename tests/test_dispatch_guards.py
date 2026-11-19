@@ -4,6 +4,7 @@ import shlex
 import shutil
 import signal
 import subprocess
+import sys
 import time
 
 try:
@@ -416,7 +417,9 @@ class DispatchSignalTests(StubCase):
     def start(self, *args):
         process = subprocess.Popen([str(SCRIPTS / 'codex-dispatch'), '-C', str(self.work), '--allow-no-change',
                                     '-r', '0', *map(str, args), str(self.brief)], env=self.env,
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   preexec_fn=lambda: (signal.signal(signal.SIGHUP, signal.SIG_DFL),
+                                                       signal.signal(signal.SIGINT, signal.SIG_DFL)))
         self.addCleanup(process.kill)
         self.addCleanup(process.communicate)
         return process
@@ -450,6 +453,19 @@ class DispatchSignalTests(StubCase):
         process.communicate(timeout=20)
         self.assertEqual(process.returncode, expected)
         self.assert_gone(pid)
+
+    def test_launcher_resets_inherited_ignored_signals(self):
+        def ignore_signals():
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+        for name in ('test_sigint_kills_running_check', 'test_sighup_kills_running_check'):
+            with self.subTest(test=name):
+                result = subprocess.run([sys.executable, '-m', 'unittest',
+                                         'test_dispatch_guards.DispatchSignalTests.' + name],
+                                        cwd=str(SCRIPTS.parent / 'tests'), env=self.env,
+                                        preexec_fn=ignore_signals, capture_output=True, text=True, timeout=90)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_sigint_kills_running_check(self):
         self.interrupt_check(signal.SIGINT, -signal.SIGINT)

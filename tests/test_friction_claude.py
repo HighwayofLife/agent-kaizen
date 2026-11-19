@@ -50,6 +50,44 @@ class FrictionClaudeTests(StubCase):
         self.assertEqual(sum(b'private fixture output' in entry.args[0] for entry in loads.call_args_list
                              if isinstance(entry.args[0], bytes)), 1)
 
+    def test_fractional_timestamp_does_not_gate_claude_usage(self):
+        begin = start('one', 0)
+        begin['message'].update(id='usage', usage=dict(input_tokens=10, output_tokens=5))
+        for fraction in ('.1234Z', r'.12\u0033Z'):
+            with self.subTest(fraction=fraction):
+                raw = json.dumps(begin).replace('+00:00', fraction)
+                self.session.parent.mkdir(parents=True, exist_ok=True)
+                self.session.write_text(raw + '\n' + json.dumps(end('one', 3)) + '\n')
+                self.assertEqual(self.collect(friction=False)['headline']['claude_calls'], 1)
+                self.assertEqual(self.collect()['headline']['claude_calls'], 1)
+                self.assertEqual(self.collect()['friction']['summary']['samples'], 1)
+
+    def test_reordered_long_timestamp_with_whitespace_counts_usage(self):
+        stamp = '2025-01-01T00:00:01.' + '0' * 24 + 'Z'
+        begin = start('one', 0)
+        del begin['timestamp']
+        begin['message'].update(id='usage', usage=dict(input_tokens=10, output_tokens=5))
+        raw = json.dumps(begin)[:-1] + ', "timestamp" :' + ' ' * 60 + json.dumps(stamp) + '}'
+        self.session.parent.mkdir(parents=True, exist_ok=True)
+        self.session.write_text(raw + '\n' + json.dumps(end('one', 3)) + '\n')
+        self.assertEqual(AUDIT['envelope_timestamp'](raw.encode()), stamp)
+        self.assertEqual(self.collect()['headline']['claude_calls'], 1)
+        self.assertEqual(self.collect()['friction']['summary']['samples'], 1)
+
+    def test_nested_timestamp_does_not_set_claude_usage_window(self):
+        begin = start('one', 1)
+        stamp = begin.pop('timestamp')
+        begin['message'].update(id='usage', usage=dict(input_tokens=10, output_tokens=5))
+        begin['message']['timestamp'] = (SINCE - timedelta(days=1)).isoformat()
+        for key in ('"timestamp"', r'"t\u0069mestamp"'):
+            with self.subTest(key=key):
+                jsonl(self.session, [begin, end('one', 3)])
+                first, last = self.session.read_text().splitlines()
+                self.session.write_text(first[:-1] + f', {key}: "{stamp}"}}\n' + last + '\n')
+                self.assertEqual(self.collect()['headline']['claude_calls'], 1)
+                self.assertEqual(self.collect(friction=False)['headline']['claude_calls'], 1)
+                self.assertEqual(self.collect()['friction']['summary']['samples'], 1)
+
     def test_pairs_replays_conflicts_and_timing_basis(self):
         prompt = dict(source='user_permanent', decision='accept')
         rows = [

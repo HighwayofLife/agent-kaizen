@@ -9,6 +9,7 @@ import math
 import fnmatch
 import hashlib
 import hmac
+import inspect
 import os
 from pathlib import Path
 import re
@@ -17,6 +18,16 @@ import stat
 import warnings
 from contextlib import ExitStack
 from datetime import datetime, timedelta, timezone
+
+
+RUNNER_API = 2  # The runner can pass a loaded actions helper to preparation and reconciliation.
+
+
+class IncompleteAuditScope(ValueError):
+    def __init__(self):
+        super().__init__("Audit the project with all linked worktrees. Run kaizen-token-audit "
+                         "with one --cwd PATH per checkout, including the primary checkout, "
+                         "and set --out to the same report directory.")
 
 
 def comparison_key(project, window, thresholds, basis):
@@ -175,9 +186,15 @@ def _evidence(report, audits, project, cfg, current, host):
             or ref != {"v": 1, "file": name} or type(ref.get("v")) is not int
             or not isinstance(scope, dict) or set(scope) != {"v", "codex", "cwd", "project", "project_dirs", "window"}
             or type(scope["v"]) is not int or scope["v"] != 1
-            or scope["cwd"] != sorted(str(p) for p in project.paths)
             or scope["project"] is not None or scope["project_dirs"] != []
             or scope["codex"] not in ("cwd", "none")):
+        raise ValueError("invalid audit identity or scope")
+    expected_paths = sorted(str(p) for p in project.paths)
+    if scope["cwd"] != expected_paths:
+        selected = scope["cwd"]
+        if (isinstance(selected, list) and selected and all(isinstance(path, str) for path in selected)
+                and len(selected) == len(set(selected)) and set(selected) < set(expected_paths)):
+            raise IncompleteAuditScope()
         raise ValueError("invalid audit identity or scope")
     extract_raw, extract_identity = _read(audits / "extracts" / name, host, current, REPORT_AGE)
     binding = marker("friction")
@@ -218,6 +235,28 @@ def _encode(value):
 def _signature(receipt, secret):
     return hmac.new(secret, _encode({k: v for k, v in receipt.items() if k != "signature"}),
                     hashlib.sha256).hexdigest()
+
+
+def _finding_target(project, selector, canonical_project, allow_missing):
+    if allow_missing and "allow_missing" in inspect.signature(canonical_project).parameters:
+        return canonical_project(project.canonical, selector=selector, allow_missing=True)[1]
+    try:
+        return canonical_project(project.canonical, selector=selector)[1]
+    except FileNotFoundError:
+        if not allow_missing:
+            raise
+    # The old runner checked the source owner before resolving a missing mapped path.
+    source = Path(selector).resolve(strict=True)
+    anchor = max((path for path in project.anchors if path in source.parents), key=lambda path: len(path.parts))
+    target = (project.canonical / source.relative_to(anchor)).resolve()
+    if project.canonical not in target.parents:
+        raise ValueError("selector escapes canonical project")
+    if target.exists():
+        return canonical_project(project.canonical, selector=selector)[1]
+    parent = next(path for path in target.parents if path.is_dir())
+    if canonical_project(project.canonical, selector=str(parent))[1] != parent:
+        raise ValueError("selector has different project ownership")
+    return target
 
 
 def prepare(audits, backups, project, report, cfg, mode, current, canonical_project, project_key,
@@ -263,8 +302,11 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
                 scope, block, identities = _evidence(candidate, audits, project, cfg, current, host)
                 break
             except (OSError, ValueError, KeyError, TypeError) as error:
-                refusal = error
+                if not isinstance(refusal, IncompleteAuditScope):
+                    refusal = error
         else:
+            if isinstance(refusal, IncompleteAuditScope):
+                raise refusal
             raise ValueError("no fresh scoped audit" + (f" ({refusal})" if refusal else ""))
     probe = {"findings": [], "regenerable_dirs": []}
     if cfg["hostActions"]["value"] != "off":
@@ -283,7 +325,23 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
     catalog_raw, identities["catalog"] = _read(catalog_path, host)
     catalog_data = _json(catalog_raw, host)
     catalog = {row["id"]: row for row in catalog_data["actions"]}
-    with host["_directory"](store.friction, True, private=True) as directory, host["_locked"](directory, "prepare"):
+    with ExitStack() as stack:
+        directory = stack.enter_context(host["_directory"](store.friction, True, private=True))
+        new_scheduled = not interactive and _check is None
+        if new_scheduled:
+            marker_name = "publication-" + project.key + ".json"
+            stack.enter_context(host["_locked"](directory, marker_name))
+        stack.enter_context(host["_locked"](directory, "prepare"))
+        if new_scheduled:
+            # A 518da76 runner can continue after the helper reports a foreign marker.
+            # Keep the earlier generation available until its owning runner recovers it.
+            try:
+                marker = _json(host["_read"](directory, marker_name, LIMIT), host)
+            except FileNotFoundError:
+                pass
+            else:
+                if _publication_owner(directory, store, project, marker, host) != str(audits):
+                    raise ValueError("another audit root owns the earlier review publication")
         if _check is not None:
             live_cfg = canonical_project.__globals__["effective"](project.canonical)
             current = max(current, datetime.now(timezone.utc))
@@ -342,15 +400,16 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
             raise ValueError("unsupported flag")
         flags, snapshot = (compare_flags(cohort, block["window"], block["thresholds"], block["basis"],
                                          block.get("flags"), baseline) if block is not None else ([], baseline))
-        visible_flags, allowed, action_views = [], {}, {}
+        visible_flags, legacy_flags, allowed, action_views = [], [], {}, {}
         for flag in flags:
-            subject = flag["subject"]
-            view = dict(label=LABELS[flag["id"]], value=flag["value"])
+            identity = (secret, str(project.canonical), flag["id"])
+            legacy = dict(id=host["_id"](*identity, flag["subject"]), label=LABELS[flag["id"]], value=flag["value"])
+            view = legacy
             if "basis" in flag:
-                view["basis"] = flag["basis"]
-                subject = json.dumps([subject, flag["basis"]])
-            view["id"] = host["_id"](secret, str(project.canonical), flag["id"], subject)
+                subject = json.dumps([flag["subject"], flag["basis"]])
+                view = dict(legacy, id=host["_id"](*identity, subject), basis=flag["basis"])
             visible_flags.append(view)
+            legacy_flags.append(legacy)
         for finding in probe["findings"] if cfg["hostActions"]["value"] != "off" else []:
             entry = catalog.get(finding.get("catalog_id")) if isinstance(finding, dict) else None
             if (not entry or entry.get("needs_research") or finding.get("id") != entry["detect"].get("finding")
@@ -364,8 +423,7 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
                 if not selector.startswith("/"):
                     raise ValueError("expected a path selector")
                 try:
-                    _, target = canonical_project(project.canonical, selector=selector,
-                                                  allow_missing=finding["id"] == "indexed-output")
+                    target = _finding_target(project, selector, canonical_project, finding["id"] == "indexed-output")
                 except (ValueError, OSError):
                     if finding["id"] != "indexed-output":
                         raise
@@ -416,10 +474,14 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
             action_views[ident] = dict(id=ident, label=entry["problem"], evidence=list(finding["evidence"].values()))
         # Compare stored evidence only after choosing the strongest finding across worktrees.
         for ident, candidate in list(allowed.items()):
+            was_imported = imported is not None and ident in imported
+            # The action store validates a retry against the saved receipt.
+            if not interactive and was_imported:
+                continue
             evidence = candidate["evidence"]
             old = rows.get(ident, {})
             # An unpublished suggestion must remain visible in a later preparation.
-            if ((ident in unacknowledged or imported is not None and ident in imported) and not old.get("pending")
+            if ((ident in unacknowledged or was_imported) and not old.get("pending")
                     and old.get("status") == "open" and old.get("evidence") == evidence):
                 old = {}
             if old.get("flaps", 0) >= 2 or (not old.get("pending") and (old.get("status") == "dismissed"
@@ -454,7 +516,11 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
                 pass
         view = dict(v=1, generation=generation, flags=visible_flags, actions=actions)
         public = _encode(view)
-        receipt["view_sha256"] = hashlib.sha256(public).hexdigest()
+        view_digest = hashlib.sha256(public).hexdigest()
+        if _check is not None and view_digest != _check["view_sha256"] and visible_flags != legacy_flags:
+            # Both encodings used v1. The authenticated digest identifies the original view.
+            view_digest = hashlib.sha256(_encode(dict(view, flags=legacy_flags))).hexdigest()
+        receipt["view_sha256"] = view_digest
         receipt["signature"] = _signature(receipt, secret)
         frozen = _encode(receipt)
         if max(len(frozen), len(public)) > LIMIT:
@@ -478,7 +544,9 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
         return (path, receipt) if retain else path
 
 
-def acknowledge_scheduled(store, project, receipt, host, *, proposal=None, digest=None):
+def acknowledge_scheduled(store, project, receipt, host=None, *, proposal=None, digest=None):
+    if host is None:
+        host = runpy.run_path(str(Path(__file__).resolve().parent / "kaizen_friction_actions.py"))
     with host["_directory"](store.friction, private=True) as directory, host["_locked"](directory, "prepare"):
         name = "prepare-" + project.key + ".json"
         state = _json(host["_read"](directory, name, LIMIT), host)
@@ -583,52 +651,86 @@ def import_scheduled(audits, backups, project, receipt, cfg, current, canonical_
                    _check=receipt, _complete=complete, host=host)
 
 
-def scheduled_publication(audits, store, project, host, persist, ready, *, receipt=None, proposal=None,
-                          digest=None, reviewed_at=None):
-    """Track a publication until acknowledgement and review state are both durable."""
+def _publication_receipt(directory, store, project, generation, host):
+    if not isinstance(generation, str) or not re.fullmatch(r"[0-9]{20}", generation):
+        raise ValueError("invalid publication marker")
+    frozen = _json(host["_read"](directory, "receipt-" + project.key + "-" + generation + ".json", LIMIT), host)
+    if (frozen.get("channel") != "scheduled" or frozen.get("project") != str(project.canonical)
+            or frozen.get("generation") != generation
+            or not hmac.compare_digest(frozen.get("signature", ""), _signature(frozen, store._secret()))):
+        raise ValueError("invalid publication receipt")
+    return frozen
+
+
+def _publication_owner(directory, store, project, marker, host):
+    if "audits" in marker:
+        return marker["audits"]
+    frozen = _publication_receipt(directory, store, project, marker.get("generation"), host)
+    return str(Path(frozen["identities"]["extract"]["path"]).parent.parent)
+
+
+def scheduled_publication(audits, backups, project, canonical_project, project_key, ready=None,
+                          *legacy, receipt=None, proposal=None, output=None, digest=None, reviewed_at=None):
+    """Accept publication calls from both the 518da76 and release-candidate runners."""
+    if callable(ready):
+        store, host, persist = backups, canonical_project, project_key
+    else:
+        if project.unknown:
+            return False
+        if legacy:
+            receipt, proposal, output = (ready, *legacy)
+        host = runpy.run_path(str(Path(__file__).resolve().parent / "kaizen_friction_actions.py"))
+        store = host["HostActions"](audits, backups, canonical_project, project_key)
+        persist = None  # 518da76 checks broker readiness and persists its own cutoff.
+    broker_ready = not project.unknown and (receipt is not None or persist is None or ready())
     name = "publication-" + project.key + ".json"
     with ExitStack() as stack:
         try:
             directory = stack.enter_context(host["_directory"](store.friction, receipt is not None, private=True))
-            if receipt is None:
-                marker = _json(host["_read"](directory, name, LIMIT), host)
         except FileNotFoundError:
             if receipt is not None:
                 raise
-            if not project.unknown:
-                ready()
             return False
+        try:
+            stack.enter_context(host["_locked"](directory, name))
+            marker = _json(host["_read"](directory, name, LIMIT), host)
+        except FileNotFoundError:
+            if receipt is None:
+                return False
+            marker = None
         if receipt is not None:
-            host["_replace"](directory, name, _encode(dict(v=1, audits=str(audits), reviewed_at=reviewed_at,
-                                                           generation=receipt["generation"], proposal=proposal.name,
-                                                           sha256=digest)))
+            if marker is not None and _publication_owner(directory, store, project, marker, host) != str(audits):
+                raise ValueError("another audit root owns the earlier review publication")
+            if persist is None:
+                _, identity = _read(Path(output), host)
+                digest = identity["sha256"]
+            marker = dict(v=1, audits=str(audits), generation=receipt["generation"],
+                          proposal=proposal.name, sha256=digest)
+            if reviewed_at is not None:
+                marker["reviewed_at"] = reviewed_at
+            host["_replace"](directory, name, _encode(marker))
             return False
         generation, filename = marker.get("generation"), marker.get("proposal")
         if (not isinstance(generation, str) or not re.fullmatch(r"[0-9]{20}", generation)
                 or not isinstance(filename, str) or not re.fullmatch(r"cycle-[0-9-]+\.md", filename)):
             raise ValueError("invalid publication marker")
         if marker.get("audits", str(audits)) != str(audits):
-            return None  # Another audit root owns the generation until its publication is recovered.
-        frozen = _json(host["_read"](directory, "receipt-" + project.key + "-" + generation + ".json", LIMIT), host)
-        if (frozen.get("channel") != "scheduled" or frozen.get("project") != str(project.canonical)
-                or frozen.get("generation") != generation
-                or not hmac.compare_digest(frozen.get("signature", ""), _signature(frozen, store._secret()))):
-            raise ValueError("invalid publication receipt")
-        if "audits" not in marker and Path(frozen["identities"]["extract"]["path"]).parent.parent != audits:
+            return None
+        frozen = _publication_receipt(directory, store, project, generation, host)
+        if Path(frozen["identities"]["extract"]["path"]).parent.parent != audits:
             return None
         if project.unknown:
             raise ValueError("cannot recover publication with unknown project scope")
-        broker_ready = ready()
         cutoff = (_stamp(marker["reviewed_at"]) if "reviewed_at" in marker else
                   datetime.fromtimestamp(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mtime, timezone.utc))
         if not broker_ready:
             return False
         published = project.folder / filename
-        if not published.exists():
-            os.unlink(name, dir_fd=directory)
-            return False
-        acknowledge_scheduled(store, project, frozen, host, proposal=published, digest=marker.get("sha256"))
-        persist(published, cutoff, frozen["identities"]["report"]["path"])
+        exists = published.exists()
+        if exists:
+            acknowledge_scheduled(store, project, frozen, host, proposal=published, digest=marker.get("sha256"))
+            if persist is not None:
+                persist(published, cutoff, frozen["identities"]["report"]["path"])
         os.unlink(name, dir_fd=directory)
         os.fsync(directory)
-        return published
+        return published if exists else False

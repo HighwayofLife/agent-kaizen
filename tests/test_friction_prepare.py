@@ -12,6 +12,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
+from zipfile import ZipFile
 
 from test_friction_claude import end, start
 from test_schedule import CRONTAB
@@ -148,6 +149,20 @@ class PreparationTests(unittest.TestCase):
         self.write(self.extract, raw)
         self.probe_path = self.write(self.obj.folder / "host-probe-disposable.json", json.dumps(self.probe))
 
+    def mixed_scripts(self, *legacy, revision="518da76"):
+        scripts = pathlib.Path(tempfile.mkdtemp(dir=self.root)) / "scripts"
+        shutil.copytree(PATH.parent, scripts)
+        # Exact git blobs from 518da76 and 03325cd, available even in depth-one CI.
+        with ZipFile(pathlib.Path(__file__).parent / "fixtures/friction-upgrade.zip") as fixture:
+            for name in legacy:
+                (scripts / name).write_bytes(fixture.read(f"{revision}/{name}"))
+        return scripts
+
+    def test_upgrade_fixture_without_git_history(self):
+        with patch.object(subprocess, "run", side_effect=AssertionError("upgrade fixture tried to run Git")):
+            scripts = self.mixed_scripts(PATH.name)
+        self.assertIn("scheduled_publication", runpy.run_path(str(scripts / PATH.name)))
+
     def run_prepare(self, report=None, interactive=True):
         return prepare.prepare(self.config / "audits", self.backups, self.obj, report,
                                self.runner["effective"](self.project), "propose-only", self.current + timedelta(seconds=2),
@@ -231,6 +246,20 @@ class PreparationTests(unittest.TestCase):
         self.obj.paths = sorted([self.project, *paths])
         self.scope["cwd"] = list(map(str, self.obj.paths))
 
+    def test_cli_names_incomplete_linked_worktree_audit(self):
+        self.add_test_worktrees(self.root / "linked")
+        self.scope["cwd"] = [str(self.project)]
+        self.write_evidence()
+        command = [sys.executable, str(PATH.parent / "kaizen-scheduled"), "friction", "prepare",
+                   "--for", str(self.project)]
+        for selection in ([], ["--report", str(self.report)]):
+            with self.subTest(selection=selection):
+                result = subprocess.run(command + selection, env=self.environment, capture_output=True, text=True)
+                self.assertEqual((result.returncode, result.stdout), (2, ""))
+                self.assertIn("all linked worktrees", result.stderr)
+                self.assertIn("one --cwd", result.stderr)
+        self.assertFalse(self.backups.exists())
+
     def test_worktree_only_outputs_merge_and_keep_flags(self):
         linked1, linked2 = self.root / 'linked1', self.root / 'linked2'
         self.add_test_worktrees(linked1, linked2)
@@ -306,6 +335,26 @@ class PreparationTests(unittest.TestCase):
         flags = json.loads(self.run_prepare().read_text())['flags']
         self.assertEqual({flag['basis'] for flag in flags}, {'measured', 'row_gap'})
         self.assertEqual(len({flag['id'] for flag in flags}), 2)
+
+    def test_import_and_acknowledge_legacy_signed_timing_flags(self):
+        self.block.update(basis="mixed", flags=[
+            dict(id="regression", subject="private subject", value=4, basis=basis)
+            for basis in ("measured", "row_gap")])
+        self.probe["findings"] = [dict(id="low-disk", catalog_id="low-disk", subject="project-volume",
+                                       evidence=dict(free_disk_bytes=1))]
+        self.write_evidence()
+        legacy = runpy.run_path(str(self.mixed_scripts(PATH.name) / PATH.name))
+        legacy["prepare"].__globals__["__file__"] = str(PATH)  # The installed catalogue stays at the same path.
+        inputs = legacy["prepare"](self.config / "audits", self.backups, self.obj, self.report,
+                                   self.runner["effective"](self.project), "propose-only",
+                                   self.current + timedelta(seconds=2), self.runner["action_project"],
+                                   self.runner["key"], interactive=True)
+        view = json.loads(inputs.read_text())
+        self.assertTrue(all("basis" not in flag for flag in view["flags"]))
+        ident = view["actions"][0]["id"]
+        self.assertEqual(self.reconcile(inputs, self.actions([ident])), {ident: "terminal"})
+        self.reconcile(inputs)
+        self.assertIsNone(self.run_prepare())
 
     def test_flapping_action_is_held(self):
         _, ident = self.candidate()

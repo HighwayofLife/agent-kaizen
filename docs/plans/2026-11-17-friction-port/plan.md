@@ -258,36 +258,21 @@ From P24's Sol high security review (2026-11-18). These are fail-closed while S3
 - G9 (S7) `scripts/kaizen-backup` scheduled commit: a crash after the Git pin is published but before the native journal is saved makes recovery report `absent`. The broker then closes the reservation while the pin still exposes and retains the rejected commit. Recovery must detect and remove (or adopt) an orphan pin.
 - G10 (S7) `scripts/kaizen-backup` scheduled commit: a hard crash after Git prepares the ref update can leave its `.lock` file behind. Recovery then waits on that same lock and stays pending until someone cleans it up by hand. Detect a stale lock that belongs to the broker's own transaction and recover it safely.
 
-## 0.14 known issues (deferred from the 0.13 final audit)
-FA1–FA6 landed on release-0.13 on 2026-11-19, after rounds r1–r3 (FA4 also r4: runner permission rules), with green `tools/ci-local` and bench 0.96×. Round 3 was the final repair round. Anything still open is listed here.
+## 0.13 known-issue fixes (FX) and remaining known issues
+On 2026-11-19, FX1–FX8 fixed the 0.14 known-issue list from the 0.13 final audit: the FA review residuals and every "regression found after round 3" against `518da76`. Each FX packet had two rounds. One Sol review of the merged result followed, then FXFIX, FXFIX-A, FXFIX-B and FXFIX-C fixed the cross-packet test failures and the regressions it found. FXFIX-D fixed the two remaining gate failures (an identical retry of a completed 518da76 apply, and the Python 3.9 framework interpreter in the prune tests), and FXFIX-E made a signed broker reservation override that retry fallback after a Sol review. The fixes landed on release-0.13 with green `tools/ci-local` on the default Python and on 3.9.
 
-Open findings from the FA1–FA6 review rounds that round 3 did not take on. Most are residual races or design-level items. Each needs its own packet in 0.14.
+Still open for 0.14. Each item is a race that has no portable fix, a behaviour unchanged since release-0.13, or a path that 0.13 keeps disabled:
 
-- FA1: `scripts/kaizen-backup:2297` — Ordinary `undo run` still overwrites an in-place editor save made after the snapshot check and before `copy2` opens the destination — the final hash and inode checks pass, so undo exits successfully after losing the save.
-- FA1: `scripts/kaizen-backup:1099` — Reusing a renamed transaction’s original folder name makes its corrupt journal look unrelated — undo can restore files without reversing the Git ref, and prune can delete the rollback copies.
-- FA2: `scripts/token-audit:311` — The oversized Codex check accepts balanced delimiters as valid JSON — a 4 MB output with a mismatched payload closer now counts as format coverage, whereas the parent rejected it.
-- FA3: scripts/kaizen_friction_apply.py:434 — Finalization drops the directory binding before publishing the receipt — a directory replacement during the save can leave a recorded receipt pointing to a decoy.
-- FA3: scripts/kaizen_friction_actions.py:431 — Compacting a receipt can still leave the save over the cap — closing one verified action grew a valid 1,048,576-byte store to 1,048,580 bytes, leaving recovery pending.
-- FA6: `skills/cycle/SKILL.md:24` — The revert drops canonical audit lookup without recording the required deferral in the commit — linked worktrees can keep selecting stale audits and repeating refreshes.
-- FA5: item 4, interrupted-add ownership. Deferred in round 0 because an existing test conflicts with the fix.
-- FA5/FA6: the clean-filter race residual noted in round 0.
-- FA3 → prepare.py: the replay item in `kaizen_friction_prepare.py`, deferred from FA3 round 1.
-- FA5: running worktree-prune from a PATH-resolved interpreter. The shebang change was reverted in round 3.
-
-### Regressions found after round 3
-
-Each of these works at `518da76` and fails after FA. Fix them first in 0.14, or before 0.13.0 if the owner asks.
-
-- FA2: `scripts/token-audit:462` — Friction timestamp validation still gates Claude usage accounting — a valid `.1234Z` timestamp on Python 3.9, or a JSON-escaped fractional digit on 3.9 and 3.13, drops the reported call count from 1 to 0.
-- FA2: `scripts/token-audit:176` — The envelope scanner still drops valid long timestamps that extend beyond its 100-byte field slice — a reordered 45-character timestamp with legal JSON whitespace drops the reported call count from 1 to 0.
-- FA2: `scripts/token-audit:480` — Valid pre-window timestamps longer than 40 characters enter replay reconciliation as malformed — an older replay removes an in-window timing sample and turns its accepted permission into ambiguous evidence, while `518da76` preserves both.
-- FA3: `scripts/kaizen_friction_actions.py:523` — At the 1 MiB cap, the writer moves live scheduled receipts into a sidecar older runners cannot read — closing another project’s receipt can block acknowledgement of an already-published review and let the old runner accept changed requests for the same generation.
-- FA4: `scripts/kaizen-scheduled:3129` — The runner and publication helper use incompatible calling conventions across the upgrade — an old runner skips project reviews with the new helper, and a new runner forces propose-only reviews with the old helper.
-- FA4: `scripts/kaizen_friction_prepare.py:621` — Publication validation and audit-root checks can bypass broker recovery — a malformed marker or a marker owned by another audit root can strand actions that `518da76` recovered.
-- FA4: `scripts/kaizen_friction_prepare.py:463` — Reconciliation recomputes the view digest using the new flag format — valid signed v1 inputs prepared by `518da76` with timing-basis flags can no longer be imported or acknowledged after upgrading.
-- FA5: `scripts/kaizen_worktree_facts.py:217` — The full staged-index scan exceeds the 1 MiB output cap at about 18,000 short paths — affected repositories lose clean and dirty results that the release could report.
-- FA5: `scripts/kaizen_worktree_facts.py:293` — The identity guard requires a resolvable `HEAD` — newly initialized repositories report `clean=unknown` even when they contain untracked files.
-- FA6: `scripts/host-probe:355` — Backtracking through `..` requires search permission on an empty child that can be listed with mode `0400` — if a sibling remains, HEAD discards all directory evidence that `518da76` and `HEAD~1` both retain.
+- Backup undo: an edit that lands between undo's final check and the swap can still slip through, whether a save to a newly created file, an ownership or ACL change, or a cleanup of a displaced file. Undo detects what it can, keeps the recovery copy and exits non-zero.
+- Backup undo of a file that was deleted after the snapshot recreates it with the runner's ownership and the directory's inherited ACLs. This is unchanged from release-0.13.
+- token-audit: an in-place edit to a transcript during extract publication. The edit is detected and the run exits 4 with a warning.
+- Actions and apply: a process kill between the receipt rename and the identity check is detected on the next run.
+- Actions replay of 518da76 data in which one action had several pending generations: a generation without a signed reservation replays as `suggest`, never as `apply`, so it fails safe.
+- Allow-rule (live writes disabled in 0.13): a retry after a crash between the rename and the durable publication proof cancels the journal. It does not restore the exact preimage.
+- Allow-rule publication marker: the crash window between the rename and the durable proof, and the cleanup race in the private directory.
+- host-fix (live writes disabled in 0.13): a same-user replacement at the private name during cleanup, and a move during unlink.
+- host-probe fallback without a writable temporary directory: a Git config change made during the probe can affect the untracked-file scan.
+- The P19 residuals are accepted for 0.13.0 and still open: host-fix writes, worktree-prune removal and the S3 gate.
 
 ## P27 docs and release
 

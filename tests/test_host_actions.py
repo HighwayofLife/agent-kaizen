@@ -1,5 +1,8 @@
 """Offline host-action store and CLI checks using disposable projects."""
 from contextlib import ExitStack
+from datetime import datetime, timezone
+import gzip
+import hashlib
 import hmac
 import json
 import os
@@ -441,6 +444,229 @@ class HostActionsTests(unittest.TestCase):
                     self.assertEqual(saved["v"], 1)
                     self.assertEqual(saved["receipts"], {str(self.project): {"review": {ident: "terminal"}}})
 
+    def fill_store_to_cap(self, ident, *, short_stamp=False):
+        document = json.loads(self.store.path.read_bytes())
+        row = document["actions"][ident]
+        steps = row["steps"] = [""]
+        if short_stamp:
+            row["updated_at"] = "2026-11-19T00:00:00+00:00"
+
+        def encode():
+            return (json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+
+        steps[0] = "x" * (actions.STORE_LIMIT - len(encode()))
+        self.store.path.write_bytes(encode())
+        self.assertEqual(self.store.path.stat().st_size, actions.STORE_LIMIT)
+
+    def test_verified_close_at_capacity_with_pending_sibling(self):
+        ident, sibling = self.record(), self.record(literal="ls -a")
+        project, generation = str(self.project), f"scheduled:{1:020d}"
+        frozen = {row["id"]: dict(row, intents=["apply"]) for row in self.store.scoped(self.project)}
+        request = block((ident, "apply"), (sibling, "apply"))
+        self.store.import_actions(request, frozen, self.project, generation)
+        self.fill_store_to_cap(ident, short_stamp=True)
+        with actions._directory(self.store.path.parent) as directory:
+            rows, _, receipts = self.store._load(directory)
+            rows[ident].update(status="done", done_by="verify", updated_at="2026-11-19T00:00:01.123456+00:00")
+            receipts[project][generation][ident] = "terminal"
+            replace = actions._replace
+
+            def interrupt_shared_store(directory, name, raw):
+                if name == self.store.path.name:
+                    raise OSError("before shared store replacement")
+                return replace(directory, name, raw)
+
+            with patch.object(actions, "_replace", side_effect=interrupt_shared_store), self.assertRaises(OSError):
+                self.store._save(directory, rows, receipts)
+            _, _, recovered = self.store._load(directory)
+            self.assertEqual(recovered[project][generation], {ident: "pending", sibling: "pending"})
+            self.store._save(directory, rows, receipts)
+            rows, _, _ = self.store._load(directory)
+        self.assertEqual(rows[ident]["status"], "done")
+        self.assertEqual(self.store.import_actions(request, frozen, self.project, generation),
+                         {ident: "terminal", sibling: "pending"})
+        saved = json.loads(self.store.path.read_bytes())
+        self.assertEqual(saved["v"], 2)
+        self.assertEqual(saved["receipts"][project][generation], {sibling: "pending"})
+        self.assertLessEqual(self.store.path.stat().st_size, actions.STORE_LIMIT)
+
+    def legacy_store(self):
+        legacy_path = self.root / "legacy_friction_actions.py"
+        historical = subprocess.run(["git", "-C", str(SCRIPT.parent.parent), "show",
+                                     "518da76:scripts/kaizen_friction_actions.py"], capture_output=True)
+        # Shallow CI checkouts use the exact historical source from the fixture.
+        fixture = Path(__file__).parent / "fixtures/friction_actions_518da76.py.gz"
+        source = gzip.decompress(fixture.read_bytes())
+        if historical.returncode == 0:
+            self.assertEqual(source, historical.stdout)
+            source = historical.stdout
+        legacy_path.write_bytes(source)
+        shutil.copyfile(SCRIPT.parent / "friction-catalog.json", self.root / "friction-catalog.json")
+        legacy = runpy.run_path(str(legacy_path))["HostActions"](
+            self.store.path.parent, self.secret.parent.parent, RUNNER["action_project"], RUNNER["key"])
+        self.assertEqual(legacy.path, self.store.path)
+        return legacy
+
+    def test_legacy_reader_cannot_reimport_live_generation_at_capacity(self):
+        legacy = self.legacy_store()
+        ident, closing = self.record(), self.record(self.other)
+        generation = f"scheduled:{1:020d}"
+        row, = self.store.scoped(self.project)
+        other, = self.store.scoped(self.other)
+        frozen = {ident: dict(row, intents=["suggest"])}
+        legacy.import_actions(block((ident, "suggest")), frozen, self.project, generation)
+        legacy.import_actions(block((closing, "apply")), {closing: dict(other, intents=["apply"])},
+                              self.other, generation)
+        self.fill_store_to_cap(closing)
+        self.assertEqual(legacy.import_actions(block((ident, "suggest")), frozen, self.project, generation),
+                         {ident: "terminal"})
+        with actions._directory(self.store.path.parent) as directory:
+            rows, _, receipts = self.store._load(directory)
+            rows[closing].update(status="done", done_by="verify")
+            receipts[str(self.other)][generation][closing] = "terminal"
+            self.store._save(directory, rows, receipts)
+            _, _, recovered = self.store._load(directory)
+        self.assertEqual(recovered[str(self.project)][generation], {ident: "terminal"})
+        self.assertEqual(recovered[str(self.other)][generation], {closing: "terminal"})
+        before = self.store.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "different requests|invalid host-action (store format|receipt)"):
+            legacy.import_actions(block(), {}, self.project, generation)
+        self.assertEqual(self.store.path.read_bytes(), before)
+
+    def test_compact_apply_stays_guarded_after_reopen_frees_space(self):
+        legacy = self.legacy_store()
+        ident, unrelated = self.record(self.other), self.record()
+        with patch.object(actions, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 11, 19, microsecond=123456, tzinfo=timezone.utc)
+            self.store.mark(self.project, unrelated, "dismiss")
+        generation = f"scheduled:{1:020d}"
+        row, = self.store.scoped(self.other)
+        frozen = {ident: dict(row, intents=["apply", "suggest"])}
+        request = block((ident, "apply"))
+        legacy.import_actions(request, frozen, self.other, generation)
+        self.fill_store_to_cap(ident)
+        with actions._directory(self.store.path.parent) as directory:
+            rows, _, receipts = self.store._load(directory)
+            rows[ident].update(status="done", done_by="verify")
+            receipts[str(self.other)][generation][ident] = "terminal"
+            self.store._save(directory, rows, receipts)
+        self.assertEqual(json.loads(self.store.path.read_bytes())["receipts"][str(self.other)][generation],
+                         {ident: actions.COMPACT_APPLY})
+        with patch.object(actions, "datetime", wraps=datetime) as clock:
+            clock.now.return_value = datetime(2026, 11, 19, tzinfo=timezone.utc)
+            self.store.mark(self.project, unrelated, "reopen")
+        before = self.store.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "different requests|invalid host-action (store format|receipt)"):
+            legacy.import_actions(block((ident, "suggest")), frozen, self.other, generation)
+        self.assertEqual(self.store.path.read_bytes(), before)
+        self.assertEqual(self.store.import_actions(request, frozen, self.other, generation), {ident: "terminal"})
+
+    def test_close_with_full_sidecar_preserves_interrupted_and_published_receipts(self):
+        ident = self.record()
+        project, generation = str(self.project), f"scheduled:{1:020d}"
+        row, = self.store.scoped(self.project)
+        frozen = {ident: dict(row, intents=["apply"])}
+        request = block((ident, "apply"))
+        self.store.import_actions(request, frozen, self.project, generation)
+        self.fill_store_to_cap(ident)
+        document = json.loads(self.store.path.read_bytes())
+        document["v"] = 2
+        raw = json.dumps(document, ensure_ascii=False, separators=(",", ":")).encode() + b"\n"
+        self.assertEqual(len(raw), actions.STORE_LIMIT)
+        self.store.path.write_bytes(raw)
+        archived = {f"archive:{i:05d}:" + "x" * 110: {ident: "terminal"} for i in range(5100)}
+        metadata = dict(guarded=True, receipts={project: archived},
+                        apply_intents={project: {name: [ident] for name in archived}})
+        sidecar = self.store.path.with_suffix(".json.receipts")
+        encoded = json.dumps({hashlib.sha256(raw).hexdigest(): metadata}, separators=(",", ":")).encode()
+        self.assertGreater(len(encoded), actions.RECEIPT_LIMIT - 10000)
+        self.assertLessEqual(len(encoded), actions.RECEIPT_LIMIT)
+        sidecar.touch(mode=0o600)
+        sidecar.write_bytes(encoded)
+        with actions._directory(self.store.path.parent) as directory:
+            rows, _, receipts = self.store._load(directory)
+            rows[ident].update(status="done", done_by="verify")
+            receipts[project][generation][ident] = "terminal"
+            replace = actions._replace
+
+            def interrupt(directory, name, raw):
+                if name == self.store.path.name:
+                    raise OSError("before shared store replacement")
+                return replace(directory, name, raw)
+
+            with patch.object(actions, "_replace", side_effect=interrupt), \
+                    self.assertRaisesRegex(OSError, "before shared store replacement"):
+                self.store._save(directory, rows, receipts)
+            expected = receipts
+            rows, _, receipts = self.store._load(directory)
+            self.assertEqual(rows[ident]["status"], "open")
+            self.assertEqual(receipts[project][generation], {ident: "pending"})
+            rows[ident].update(status="done", done_by="verify")
+            receipts[project][generation][ident] = "terminal"
+            self.store._save(directory, rows, receipts)
+            new_rows, _, new_receipts = self.store._load(directory)
+        self.assertEqual(new_rows[ident]["status"], "done")
+        self.assertEqual(new_receipts, expected)
+        self.assertEqual(self.store.import_actions(request, frozen, self.project, generation), {ident: "terminal"})
+        for path in sidecar.parent.glob(sidecar.name + "*"):
+            self.assertLessEqual(path.stat().st_size, actions.RECEIPT_LIMIT)
+
+    def test_legacy_completed_apply_replays_from_signed_broker_generation(self):
+        legacy = self.legacy_store()
+        output = self.project / "build"
+        output.mkdir()
+        ident = self.store.record(self.project, "linux-localsearch", output, "local output", path=True)
+        suggestion = self.record()
+        frozen = {row["id"]: dict(row, intents=["apply", "suggest"]) for row in self.store.scoped(self.project)}
+        number = f"{2:020d}"
+        generation = "scheduled:" + number
+        request = block((ident, "apply"), (suggestion, "suggest"))
+        older = f"scheduled:{1:020d}"
+        legacy.import_actions(block((ident, "suggest")), frozen, self.project, older)
+        legacy.import_actions(request, frozen, self.project, generation)
+        with actions._directory(self.store.path.parent) as directory:
+            rows, _, receipts = legacy._load(directory)
+            rows[ident].update(status="done", done_by="verify")
+            receipts[str(self.project)][generation][ident] = "terminal"
+            legacy._save(directory, rows, receipts)
+        info = self.project.stat()
+        record = dict(id=ident, operation="host-fix", phase="recorded", generation=number,
+                      reservation="fixture-run", scope=[str(self.project), info.st_dev, info.st_ino])
+        payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("ascii")
+        record["mac"] = hmac.digest(self.secret.read_bytes(), b"broker-ledger-v1\0" + payload, "sha256").hex()
+        journal = self.secret.parent / f"broker-{ident}.json"
+        journal.touch(mode=0o600)
+        journal.write_text(json.dumps(record))
+        before = self.store.path.read_bytes()
+        self.assertEqual(self.store.import_actions(request, frozen, self.project, generation),
+                         {ident: "terminal", suggestion: "terminal"})
+        with self.assertRaisesRegex(ValueError, "different requests"):
+            self.store.import_actions(block((ident, "suggest"), (suggestion, "suggest")),
+                                      frozen, self.project, generation)
+        self.assertEqual(self.store.import_actions(block((ident, "suggest")), frozen, self.project, older),
+                         {ident: "terminal"})
+        with self.assertRaisesRegex(ValueError, "different requests"):
+            self.store.import_actions(block((ident, "apply")), frozen, self.project, older)
+        self.assertEqual(self.store.path.read_bytes(), before)
+
+    def test_verified_legacy_suggestion_cannot_replay_as_apply(self):
+        legacy = self.legacy_store()
+        output = self.project / "build"
+        output.mkdir()
+        ident = self.store.record(self.project, "linux-localsearch", output, "local output", path=True)
+        row, = self.store.scoped(self.project)
+        frozen = {ident: dict(row, intents=["suggest", "apply"])}
+        generation = f"scheduled:{1:020d}"
+        suggest = block((ident, "suggest"))
+        legacy.import_actions(suggest, frozen, self.project, generation)
+        with patch.object(legacy, "_probe", return_value=(True, None)):
+            self.assertEqual(legacy.verify(self.project), {ident: "done"})
+        before = self.store.path.read_bytes()
+        self.assertEqual(self.store.import_actions(suggest, frozen, self.project, generation), {ident: "terminal"})
+        with self.assertRaisesRegex(ValueError, "different requests"):
+            self.store.import_actions(block((ident, "apply")), frozen, self.project, generation)
+        self.assertEqual(self.store.path.read_bytes(), before)
+
     def test_legacy_pending_store_can_close_receipts_under_size_cap(self):
         ident = self.record()
         row, = self.store.scoped(self.project)
@@ -471,8 +697,12 @@ class HostActionsTests(unittest.TestCase):
         saved = json.loads(self.store.path.read_bytes())
         self.assertLessEqual(self.store.path.stat().st_size, actions.STORE_LIMIT)
         self.assertEqual(set(saved), {"v", "actions", "receipts"})
-        self.assertTrue(all(state == "terminal" for receipt in saved["receipts"][project].values()
-                            for state in receipt.values()))
+        # A compact close must retain every generation in the shared file.
+        self.assertEqual(saved["receipts"][project], {name: {ident: actions.COMPACT_APPLY}
+                                                      for name in receipts[project]})
+        with actions._directory(self.store.path.parent) as directory:
+            _, _, recovered = self.store._load(directory)
+        self.assertEqual(recovered, receipts)
         frozen = {ident: dict(row, intents=["suggest", "apply"])}
         generation = "scheduled:" + "0" * 20
         self.assertEqual(self.store.import_actions(block((ident, "apply")), frozen, self.project, generation),

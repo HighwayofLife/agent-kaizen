@@ -1,4 +1,8 @@
 """Contracts for the friction skill and its entry points."""
+import json
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -24,12 +28,54 @@ class FrictionSkillTests(unittest.TestCase):
 
     def test_cycle_refresh_precedes_preparation(self):
         cycle = read("skills/cycle/SKILL.md")
+        prepare = "friction prepare --for <canonical-project>"
         for phrase in ("older than 3 days", "--cwd . --days 14 --out docs/kaizen/",
                        "--no-friction", "--friction-slow-seconds", "--friction-heavy-seconds",
                        "even when friction is off or its gate is empty", "--report <selected-report>",
-                       "only the supplied report and optional prepared view"):
+                       "only the supplied report and optional prepared view", prepare):
             self.assertIn(phrase, cycle)
-        self.assertLess(cycle.index("**Measure.**"), cycle.index("friction prepare --for ."))
+        self.assertLess(cycle.index("**Measure.**"), cycle.index(prepare))
+        self.assertLess(cycle.index("review --dry-run"), cycle.index(prepare))
+        self.assertNotIn("friction prepare --for .", cycle)
+
+    def test_cycle_looks_up_canonical_audits_before_refresh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            main = Path(tmp).resolve() / "main"
+            main.mkdir()
+            linked = main.with_name("linked")
+
+            def git(*args):
+                subprocess.run(["git", "-C", str(main), *args], check=True, capture_output=True)
+
+            git("init", "-q")
+            git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "initial")
+            git("worktree", "add", "-qb", "linked", str(linked))
+            audits = main / "docs/kaizen"
+            audits.mkdir(parents=True)
+            (audits / "LEDGER.md").touch()
+            recent = audits / "token-audit-2026-11-19.md"
+            recent.touch()
+            self.assertFalse((linked / "docs/kaizen").exists())
+
+            def config_for(checkout):
+                return json.loads(subprocess.check_output([
+                    sys.executable, str(ROOT / "scripts/kaizen-scheduled"),
+                    "config", "show", "--for", str(checkout),
+                ]))
+
+            config = config_for(linked)
+            self.assertEqual(Path(config["localAudits"]), audits)
+            self.assertEqual(list(Path(config["localAudits"]).glob("token-audit-*.md")), [recent])
+            self.assertEqual(config["reports"], config_for(main)["reports"])
+            (linked / "docs/kaizen").mkdir(parents=True)
+            (linked / "docs/kaizen/LEDGER.md").touch()
+            self.assertEqual(config_for(linked), config)
+        lookup = read("skills/cycle/SKILL.md").split("**Measure.**")[0]
+        self.assertIn("newest `token-audit-*.md` across `docs/kaizen/` and `localAudits`", lookup)
+        self.assertIn("`LEDGER.md` in `docs/kaizen/` or `localAudits`", lookup)
+        self.assertLess(lookup.rindex("config show --for ."), lookup.index("`LEDGER.md`"))
+        self.assertNotIn("review --dry-run", lookup)
 
     def test_entry_points_and_policy(self):
         self.assertIn("skills/friction/SKILL.md", read("skills/review/SKILL.md"))
@@ -52,7 +98,8 @@ class FrictionSkillTests(unittest.TestCase):
 
     def test_scoped_refresh_backup_and_review(self):
         cycle = read("skills/cycle/SKILL.md")
-        for phrase in ("review --dry-run --project-dir .", "paths:", "--cwd <path>"):
+        for phrase in ("review --dry-run --project-dir <project>` with `docs/kaizen` stripped from `localAudits`",
+                       "paths:", "--cwd <path>"):
             self.assertIn(phrase, cycle)
         autonomy = read("docs/autonomy.md")
         self.assertIn('begin --skill <skill> --ledger "<ledger text>" --repo <project root>', autonomy)
