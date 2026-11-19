@@ -1,6 +1,6 @@
 {
   "name": "agent-kaizen",
-  "version": "0.13.0",
+  "version": "0.13.1",
   "description": "A self-improving workflow for Claude Code, with Codex CLI and GitHub Copilot support (experimental on Copilot): measure token use, trim context, route work to the cheapest capable model, and keep checking whether each change paid off.",
   "author": {
     "name": "HighwayofLife"

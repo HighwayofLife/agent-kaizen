@@ -2,6 +2,12 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.13.1 (2026-11-19)
+
+### Fixed
+
+- Copying or installing the plugin's scripts no longer fails or hangs when stdin is a pipe: the isolated Git helper's `/dev/stdin` links are copied as links, never opened, and the schedule installer now installs that helper.
+
 ## 0.13.0 (2026-11-18)
 
 ### Added
