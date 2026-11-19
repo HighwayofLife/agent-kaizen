@@ -2903,6 +2903,8 @@ def show_config(project_dir=None):
     result = effective(project_dir)
     result["reports"] = (str(audits_dir() / "projects" / key(project_dir)) + "/"
                          if project_dir is not None else None)
+    if project_dir is not None:
+        result["localAudits"] = str(project_dir / "docs/kaizen")
     print(json.dumps(result, indent=2))
 
 
