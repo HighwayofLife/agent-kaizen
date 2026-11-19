@@ -98,6 +98,30 @@ class RobustCase(SecurityCase):
         return self.audits / 'projects' / self.runner.key(path)
 
 
+class FrictionRecoveryTests(RobustCase):
+    def test_review_recovers_friction_with_symlinked_claude_config(self):
+        from scripts.kaizen_friction_actions import HostActions
+
+        project = self.due('proj', '{"scheduledAutonomy":"auto","hostActions":"apply"}')
+        write(self.global_path, json.dumps({'autoProjects': [str(project)]}))
+        config_link = self.root / 'config-link'
+        config_link.symlink_to(self.cfg, target_is_directory=True)
+        self.setenv(CLAUDE_CONFIG_DIR=str(config_link))
+        store = HostActions(self.cfg / 'audits', self.cfg / 'kaizen-backups',
+                            self.runner.action_project, self.runner.key)
+        ident = store.record(project, 'low-disk', 'ls', 'observed', allowed=('ls',))
+        row, = store.scoped(project)
+        store.import_actions('<!-- kaizen-host-actions ' + json.dumps(
+            {'v': 1, 'actions': [{'id': ident, 'intent': 'apply'}]}) + ' -->',
+            {ident: dict(row, intents=['apply'])}, project, 'scheduled:' + '1'.zfill(20))
+        self.setenv(STUB_AUDITS=str(store.path.parent))
+        result = self.script('review', '--claude', self.claude, '--token-audit', self.audit,
+                             '--pricing', self.pricing, '--project-dir', project)
+        self.assertIn('/agent-kaizen:cycle auto ', self.values(self.last_argv(), '-p')[0])
+        self.assertIn('resolved as a suggestion', result.stdout + result.stderr)
+        self.assertNotIn('pending', store.scoped(project)[0])
+
+
 class SignalTests(RobustCase):
     """S-2a: a killed runner still rolls back and checks the ledger."""
 
