@@ -341,6 +341,7 @@ def log(message):
 STEP_TIMEOUT = 600
 AUTO_AUDIT_TIMEOUT = STEP_TIMEOUT
 AUTO_AUDIT_STATE = "auto-audit-state.json"
+EXTRACT_WRITE_FAILED = 4  # token-audit wrote a usable report
 REVIEW_TIMEOUT = 3600
 LOCK_WAIT = 1800
 LOG_LIMIT = 1 << 20
@@ -1971,11 +1972,14 @@ def _run_token_audit(audits, options):
         with (audits / "run.log").open("a", encoding="utf-8") as errors:
             result = run_group(audit_command(options, audits), stdout=subprocess.PIPE,
                                     stderr=errors, text=True, timeout=STEP_TIMEOUT)
-        if not result.returncode:
+        if result.returncode in (0, EXTRACT_WRITE_FAILED):
             report = report_path(result.stdout)
     except (OSError, ValueError, subprocess.TimeoutExpired) as error:
         log(f"audit: failed ({failure_text(error)})")
         return 1, None
+    if result.returncode == EXTRACT_WRITE_FAILED:
+        log(f"audit: extract not written; using {report} (details in run.log)")
+        return 0, report
     if result.returncode:
         log(f"audit: failed (exit {result.returncode})")
         return result.returncode, None
@@ -2549,10 +2553,12 @@ def _run_review(audits, project_dirs, options, clock, safety):
                 result = run_group(audit_command(options, project.folder, project),
                                         stdout=subprocess.PIPE, stderr=errors, text=True,
                                         timeout=STEP_TIMEOUT)
-            if result.returncode:
+            if result.returncode not in (0, EXTRACT_WRITE_FAILED):
                 audit_error = f"audit failed (exit {result.returncode})"
             else:
                 report = report_path(result.stdout)
+                if result.returncode == EXTRACT_WRITE_FAILED:
+                    log(f"{project.canonical}: audit extract not written; using {report} (details in run.log)")
         except (OSError, ValueError, subprocess.TimeoutExpired) as error:
             audit_error = f"failed ({failure_text(error)})"
         if audit_error is not None:
@@ -2571,7 +2577,7 @@ def _run_review(audits, project_dirs, options, clock, safety):
                 probe = run_step("host-probe", options, ["--project", project.canonical, "--out", project.folder])
                 if probe is None or probe.startswith("unavailable:"):
                     raise ValueError("host probe refresh failed")
-            if recovered is not None:
+            if recovered is not None and result.returncode != EXTRACT_WRITE_FAILED:
                 prepared = friction_prepare(audits, project, report, options, cfg, mode, now, retain=True)
             if prepared is not None and (not isinstance(prepared, tuple) or len(prepared) != 2
                                          or not isinstance(prepared[0], Path) or not isinstance(prepared[1], dict)):

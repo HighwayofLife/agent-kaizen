@@ -124,6 +124,70 @@ CODEX_TIMEOUT = re.compile(r"\b(?:timed out|os error 60|(?:Process exited with c
 CODEX_LOCK = re.compile(r"\b(?:database is locked|EBUSY|(?:could not|unable to) (?:get|acquire) (?:the )?lock|waiting for .{0,60}?lock)\b", re.I)
 CODEX_INOTIFY = re.compile(r"upper limit on inotify watches reached|user limit of inotify instances reached", re.I)
 CODEX_COMMAND = re.compile(r'^(?:text\(\s*)?(?:await\s+)?(?:tools\.)?exec_command\(\s*\{\s*"?cmd"?\s*:\s*["\x27]([^"\x27\n]{1,200})')
+ENVELOPE_LEAD = re.compile(rb'^\s*\{\s*(?:"type"\s*:\s*"[^"\\]*"\s*,\s*)?"timestamp"\s*:\s*')
+ENVELOPE_VALUE = re.compile(rb'\s*:\s*')
+ENVELOPE_TOKEN = re.compile(rb'["{}\[\]]')
+JSON_SPACE = re.compile(rb'[ \t\r\n]*')
+JSON_SCALAR = re.compile(rb'true|false|null|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?')
+JSON_STRING_SPECIAL = re.compile(rb'["\\\x00-\x1f\x80-\xff]')
+JSON_ESCAPE = re.compile(rb'\\(?:["\\/bfnrt]|u[A-Fa-f0-9]{4})')
+
+
+def json_string_end(line, pos):
+    """Validate a string without allocating its decoded contents."""
+    while match := JSON_STRING_SPECIAL.search(line, pos + 1):
+        pos = match.start()
+        byte = line[pos]
+        if byte == 34:
+            return pos + 1
+        if byte == 92:
+            escape = JSON_ESCAPE.match(line, pos)
+            if not escape:
+                break
+            pos = escape.end() - 1
+        elif byte >= 0xc2:
+            width = 2 if byte < 0xe0 else 3 if byte < 0xf0 else 4
+            line[pos:pos + width].decode('utf-8')
+            pos += width - 1
+        else:
+            break
+    raise ValueError("invalid JSON string")
+
+
+def valid_large_json(line):
+    """Validate a large record without materializing its strings or containers."""
+    def value_end(pos):
+        pos = JSON_SPACE.match(line, pos).end()
+        byte = line[pos:pos + 1]
+        if byte == b'"':
+            return json_string_end(line, pos)
+        if scalar := JSON_SCALAR.match(line, pos):
+            return scalar.end()
+        if byte not in (b'{', b'['):
+            raise ValueError("invalid JSON value")
+        closer = b'}' if byte == b'{' else b']'
+        pos = JSON_SPACE.match(line, pos + 1).end()
+        if line[pos:pos + 1] == closer:
+            return pos + 1
+        while True:
+            if byte == b'{':
+                if line[pos:pos + 1] != b'"':
+                    raise ValueError("invalid JSON key")
+                pos = JSON_SPACE.match(line, json_string_end(line, pos)).end()
+                if line[pos:pos + 1] != b':':
+                    raise ValueError("missing JSON colon")
+                pos += 1
+            pos = JSON_SPACE.match(line, value_end(pos)).end()
+            if line[pos:pos + 1] == closer:
+                return pos + 1
+            if line[pos:pos + 1] != b',':
+                raise ValueError("invalid JSON delimiter")
+            pos = JSON_SPACE.match(line, pos + 1).end()
+
+    try:
+        return JSON_SPACE.match(line, value_end(0)).end() == len(line)
+    except (ValueError, RecursionError):
+        return False
 
 
 def codex_fields(prefix, pos=0, wrapped=False):
@@ -146,18 +210,23 @@ def codex_fields(prefix, pos=0, wrapped=False):
 
 
 def envelope_timestamp(line, require_closed_envelope=False):
+    if require_closed_envelope and not valid_large_json(line):
+        return None
     # The usual envelope puts the timestamp first or just after type.
-    lead = re.match(rb'^\s*\{\s*(?:"type"\s*:\s*"[^"\\]*"\s*,\s*)?"timestamp"\s*:\s*"([^"\n]+)"', line)
-    stamp = None
+    def read_stamp(pos):
+        if line[pos:pos + 1] == b'"':
+            try:
+                end = json_string_end(line, pos)
+                raw = line[pos + 1:end - 1]
+                return json.loads(line[pos:end]) if b'\\' in raw else raw.decode('utf-8')
+            except ValueError:
+                pass
+
+    if lead := ENVELOPE_LEAD.match(line):
+        return read_stamp(lead.end())
     depth, pos = 0, 0
-    if lead:
-        stamp = lead[1].decode('ascii', 'replace')
-        if not require_closed_envelope:
-            return stamp
-        depth, pos = 1, lead.end()
     # Skip nested values and strings without decoding potentially huge outputs.
-    token = re.compile(rb'["{}\[\]]')
-    while match := token.search(line, pos):
+    while match := ENVELOPE_TOKEN.search(line, pos):
         value = match.group()
         pos = match.end()
         if value == b'"':
@@ -172,18 +241,13 @@ def envelope_timestamp(line, require_closed_envelope=False):
                 pos = end + 1
                 if (end - slash) % 2 == 0:
                     break
-            if stamp is None and depth == 1 and end - start == 10 and line[start:pos] == b'"timestamp"':
-                tail = re.match(rb'\s*:\s*"([^"\n]+)"', line[pos:pos + 100])
-                if tail:
-                    stamp = tail[1].decode('ascii', 'replace')
-                    if not require_closed_envelope:
-                        return stamp
+            if depth == 1 and end - start == 10 and line[start:pos] == b'"timestamp"':
+                if tail := ENVELOPE_VALUE.match(line, pos):
+                    return read_stamp(tail.end())
         elif value in (b'{', b'['):
             depth += 1
         else:
             depth -= 1
-            if require_closed_envelope and depth == 0:
-                return stamp if value == b'}' and re.compile(rb'\s*\Z').match(line, pos) else None
     return None
 
 
@@ -290,6 +354,7 @@ def codex_evidence(value):
 
 
 UNPARSED = object()
+FRICTION_ONLY = object()
 
 
 def canary_row(line, since, counts, codex, session_version, output_type=None, row=UNPARSED, envelope_stamp=UNPARSED, nested_output=False):
@@ -301,17 +366,18 @@ def canary_row(line, since, counts, codex, session_version, output_type=None, ro
     # Their session metadata carries the version; avoid decoding their bodies.
     if output_type is not None or (match and match[1] == b"response_item" and not VERSION_FIELD.search(prefix)):
         suffix = line[-64:]
-        if (output_type is not None and nested_output and not suffix.rstrip().endswith(b'}}')
+        oversized = len(line) > LINE_LIMIT
+        if oversized:
+            if not valid_large_json(line):
+                return session_version
+        elif (output_type is not None and nested_output and not suffix.rstrip().endswith(b'}}')
                 and not re.search(rb'}\s*}\s*$', suffix)):
-            if len(line) <= LINE_LIMIT:
-                try:
-                    json.loads(line)
-                except (ValueError, RecursionError):
-                    return session_version
-            elif envelope_timestamp(line, require_closed_envelope=True) is None:
+            try:
+                json.loads(line)
+            except (ValueError, RecursionError):
                 return session_version
         stamp = envelope_timestamp(line) if envelope_stamp is UNPARSED else envelope_stamp
-        if stamp and (output_type is None or CODEX_OUTPUT_END.search(suffix)):
+        if stamp and (oversized or output_type is None or CODEX_OUTPUT_END.search(suffix)):
             try:
                 if (stamp_time := friction_stamp(stamp)) is not None and stamp_time >= since:
                     entry = counts[session_version or "unknown"]
@@ -454,45 +520,46 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                     continue
                 if keep_model and not (session_meta or b'"token_count"' in prefix or b'"user_message"' in prefix or b'"role":"user"' in prefix or b'"role": "user"' in prefix or b'"model"' in line or (bounds is not None and b'"turn_context"' in prefix)):
                     continue
-                signal_row = bounds is None and keep_signals and (b'"tool_use"' in line or b'"tool_result"' in line)
                 if bounds is not None:
                     timestamp = last_timestamp
-                elif signal_row:
-                    timestamp = envelope_timestamp(line)
-                    if timestamp is not None and len(timestamp) <= 40 and friction_stamp(timestamp) is None:
-                        timestamp = None
                 else:
                     match = TIMESTAMP.search(line)
                     timestamp = match[1].decode("ascii", "replace") if match else None
                 old = None
+                malformed = False
                 try:
                     if timestamp is not None:
-                        if timestamp.endswith(("Z", "+00:00")):
-                            old = timestamp[:19] < cutoff
-                        elif signal_row:
-                            stamp = friction_stamp(timestamp)
-                            if stamp is not None:
-                                old = stamp < since
-                        else:
-                            old = date_time(timestamp) < since
+                        old = (timestamp[:19] < cutoff if timestamp.endswith(("Z", "+00:00"))
+                               else date_time(timestamp) < since)
                 except (ValueError, TypeError):
+                    malformed = True
+                if old is not False and bounds is None and keep_signals and (b'"tool_use"' in line or b'"tool_result"' in line):
+                    # Skip old payloads unless a later literal or escaped key
+                    # could change the effective top-level timestamp.
+                    stable_old = old and line.find(b'"timestamp"', match.end()) == -1
+                    if stable_old and (escape := line.find(b'\\', match.end())) != -1:
+                        stable_old = line.find(b'\\u00', escape) == -1
+                    stamp = friction_stamp(envelope_timestamp(line)) if stable_old else None
+                    if stamp is None or stamp >= since:
+                        # Reconcile friction independently of the legacy usage gate.
+                        try:
+                            decoded = json.loads(line) if decoded is UNPARSED else decoded
+                            if isinstance(decoded, dict):
+                                stamp = friction_stamp(decoded.get("timestamp"))
+                                malformed = stamp is None
+                                if malformed or stamp >= since:
+                                    yield {**decoded, FRICTION_ONLY: True}
+                        except (ValueError, RecursionError):
+                            malformed = True
+                if malformed:
                     warnings["malformed rows"] += 1
-                if signal_row and (old is None or (old and len(timestamp) > 40)):
-                    # Reconcile malformed rows and oversized timestamps even outside the window.
-                    warnings["malformed rows"] += 1
-                    try:
-                        decoded = json.loads(line) if decoded is UNPARSED else decoded
-                        if isinstance(decoded, dict):
-                            yield dict(decoded, _invalid_friction_timestamp=True)
-                    except (ValueError, RecursionError):
-                        continue
                 if old is None:
                     continue
                 try:
                     if old and keep_tools:
                         if b'"usage"' in line and b'"assistant"' in prefix:
                             try:
-                                candidate = json.loads(line)
+                                candidate = json.loads(line) if decoded is UNPARSED else decoded
                                 message = candidate.get("message") or {}
                                 usage = message.get("usage") or {}
                                 if (message.get("model") != "<synthetic>" and isinstance(usage, dict)
@@ -873,12 +940,29 @@ def friction_signature(command):
     return "(shell)"
 
 
-@lru_cache(maxsize=256)
+FRICTION_ISO = re.compile(r'(\d{4}-\d\d-\d\d.\d\d:\d\d:\d\d)(?:[.,]([0-9]+))?'
+                          r'(Z|[+-]\d\d:\d\d(?::\d\d)?|)(?:[.,]([0-9]+))?\Z', re.ASCII)
+
+
 def friction_stamp(stamp):
-    try:
-        return date_time(stamp)
-    except (ValueError, OverflowError):
+    if not isinstance(stamp, str):
         return None
+    try:
+        # Keep unusually long source strings out of the timestamp cache.
+        return (date_time if len(stamp) <= 40 else date_time.__wrapped__)(stamp)
+    except (ValueError, OverflowError):
+        pass
+    # Python 3.9's ISO parser only accepts three or six fractional digits.
+    if match := FRICTION_ISO.fullmatch(stamp):
+        local, fraction, offset, offset_fraction = match.groups()
+        if not offset_fraction or len(offset) == 9:
+            local += "." + fraction[:6].ljust(6, "0") if fraction else ""
+            offset += "." + offset_fraction[:6].ljust(6, "0") if offset_fraction else ""
+            try:
+                return date_time(local + offset)
+            except (ValueError, OverflowError):
+                pass
+    return None
 
 
 REPLAY_ENCODER = json.JSONEncoder(separators=(",", ":"))
@@ -970,9 +1054,8 @@ def friction_block(state, row, block, start, result_count=0, row_event=None, tru
     if not (isinstance(session_id, str) and 0 < len(session_id) <= 256 and
             isinstance(tool_id, str) and 0 < len(tool_id) <= 256):
         return
-    ts = row.get("timestamp")
-    stamp = friction_stamp(ts) if isinstance(ts, str) and len(ts) <= 40 else None
-    if stamp is not None and stamp > state["until"]:
+    stamp = friction_stamp(row.get("timestamp"))
+    if stamp is not None and not state["since"] <= stamp <= state["until"]:
         return
     key = (session_id, tool_id)
     pairs = state["pairs"]
@@ -984,8 +1067,8 @@ def friction_block(state, row, block, start, result_count=0, row_event=None, tru
     pair = pairs[key]
     if pair is None and not trusted_source:
         return
-    if stamp is None or stamp < state["since"]:
-        if stamp is None and not row.get("_invalid_friction_timestamp"):
+    if stamp is None:
+        if FRICTION_ONLY not in row:
             state["warnings"]["malformed rows"] += 1
         pairs[key] = None
         if trusted_source:
@@ -1625,6 +1708,15 @@ def friction_sections(friction):
     return lines
 
 
+def friction_result_event(row, content):
+    ids = [block.get("tool_use_id") for block in content if block.get("type") == "tool_result"]
+    uuid = row.get("uuid")
+    identity = (uuid if isinstance(uuid, str) and 0 < len(uuid) <= 256
+                else (friction_stamp(row.get("timestamp")), ids[0] if len(ids) == 1
+                      and isinstance(ids[0], str) else replay_fingerprint(ids)))
+    return len(ids), (row.get("sessionId"), identity)
+
+
 def scan_claude(path, agent, since, data, seen_messages, project, source=None, trusted=True):
     main = agent is None
     counter = Counter()
@@ -1641,13 +1733,13 @@ def scan_claude(path, agent, since, data, seen_messages, project, source=None, t
     cached_command = lru_cache(maxsize=64)(command_info)
     for row in rows(path, since, data["warnings"], keep_tools=True, canary=data["format_canary"],
                     keep_signals=friction is not None, source=source):
-        if row.get("_invalid_friction_timestamp"):
+        if FRICTION_ONLY in row:
             message = row.get("message")
             content = blocks(message) if isinstance(message, dict) else []
-            results = sum(block.get("type") == "tool_result" for block in content)
+            results, event = friction_result_event(row, content)
             for block in content:
                 if block.get("type") in ("tool_use", "tool_result"):
-                    friction_block(friction, row, block, block["type"] == "tool_use", results,
+                    friction_block(friction, row, block, block["type"] == "tool_use", results, event,
                                    trusted_source=source is not None and trusted)
             continue
         if row.get("type") in ("api-request-shape", "attachment"):
@@ -1783,13 +1875,7 @@ def scan_claude(path, agent, since, data, seen_messages, project, source=None, t
             elif block.get("type") == "tool_result":
                 if friction is not None:
                     if row_event is None:
-                        ids = [item.get("tool_use_id") for item in content if item.get("type") == "tool_result"]
-                        result_count = len(ids)
-                        uuid = row.get("uuid")
-                        identity = (uuid if isinstance(uuid, str) and 0 < len(uuid) <= 256
-                                    else (friction_stamp(ts), ids[0] if result_count == 1
-                                          and isinstance(ids[0], str) else replay_fingerprint(ids)))
-                        row_event = (session_id, identity)
+                        result_count, row_event = friction_result_event(row, content)
                     friction_block(friction, row, block, False, result_count, row_event, source is not None and trusted)
                 if ("result", block.get("tool_use_id")) in seen_messages:
                     continue
@@ -2841,28 +2927,42 @@ def report(data, out, scope, extract_binding=None, extract_mac=None):
     return "\n".join(lines + extra + ["<!-- token-audit-complete -->"]) + "\n", headline + headlines
 
 
+EXTRACT_WRITE_FAILED = 4
+
+
 def write_extract(data, out, directory, scope, now=None):
     directory_fd = temporary = None
     try:
         if not all(hasattr(os, name) for name in ("O_NOFOLLOW", "O_DIRECTORY", "geteuid")):
             raise ValueError("secure extract storage unavailable on this platform")
         directory = directory.expanduser().absolute()
-        # Walk from the filesystem root without following any symlink component.
-        directory_fd = os.open(directory.anchor, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY)
-        for component in directory.parts[1:]:
-            try:
-                os.mkdir(component, 0o700, dir_fd=directory_fd)
-            except FileExistsError:
-                pass
-            next_fd = os.open(component, os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY,
-                              dir_fd=directory_fd)
-            os.close(directory_fd)
-            directory_fd = next_fd
+        config = claude_home().absolute()
+        resolved_config = Path(os.path.realpath(config))
+        audits = resolved_config / "audits"
+        default = directory in (config / "audits" / "extracts", audits / "extracts")
+        configured_root = config if default else directory
+        root = resolved_config if default else Path(os.path.realpath(configured_root))
+        directory = audits / "extracts" if default else root
+        flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_DIRECTORY
+        directory_fd = os.open(directory.anchor, flags)
+        for depth, component in enumerate(directory.parts, 1):
+            if depth > 1:
+                try:
+                    os.mkdir(component, 0o700, dir_fd=directory_fd)
+                except FileExistsError:
+                    pass
+                next_fd = os.open(component, flags, dir_fd=directory_fd)
+                os.close(directory_fd)
+                directory_fd = next_fd
+            if depth == len(root.parts):
+                root_info = os.fstat(directory_fd)
+                if root_info.st_uid != os.geteuid():
+                    raise ValueError("configured extract root is owned by another user")
         store = os.fstat(directory_fd)
         if store.st_uid != os.geteuid():
             raise ValueError("extract directory is owned by another user")
         if stat.S_IMODE(store.st_mode) != 0o700:
-            if directory != claude_home().absolute() / "audits" / "extracts":
+            if not default:
                 raise ValueError("custom extract directory must have mode 0700")
             os.fchmod(directory_fd, 0o700)
         name = out.stem + ".extract.json"
@@ -2873,7 +2973,6 @@ def write_extract(data, out, directory, scope, now=None):
             value["friction"] = friction
             if now is not None and friction["permission_acceptance"]:
                 value["friction"] = dict(friction, audited_at=now.isoformat())
-        audits = claude_home().absolute() / "audits"
         managed_store = directory == audits / "extracts" or directory.parent == audits / "projects"
         if (friction and friction["permission_acceptance"] and managed_store
                 and scope.get("cwd") and scope.get("project") is None and not scope.get("project_dirs")):
@@ -2892,8 +2991,25 @@ def write_extract(data, out, directory, scope, now=None):
         temporary = candidate
         with os.fdopen(fd, "wb") as stream:
             stream.write(raw)
-        os.replace(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd)
-        temporary = None
+            identity = os.fstat(stream.fileno())
+        # Publish without overwriting a destination created by another writer.
+        os.link(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
+        try:
+            if (not os.path.samestat(root_info, configured_root.stat())
+                    or not os.path.samestat(store, directory.lstat())
+                    or not os.path.samestat(identity, (directory / name).lstat())):
+                raise ValueError("extract path changed during publication")
+        except (OSError, ValueError) as conflict:
+            recovery, temporary = temporary, None
+            try:
+                if sys.platform == "darwin":
+                    import fcntl
+                    location = os.fsdecode(fcntl.fcntl(directory_fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0])
+                else:
+                    location = os.readlink(f"/proc/self/fd/{directory_fd}")
+            except (OSError, AttributeError):
+                location = f"original directory for {directory}"
+            raise ValueError(f"{conflict}; recovery copy {recovery} in {location}") from conflict
         return str(directory / name), dict(size=len(raw), sha256=hashlib.sha256(raw).hexdigest())
     except (OSError, ValueError) as exc:
         print(f"token-audit: extract not written ({exc})", file=sys.stderr)
@@ -2919,7 +3035,8 @@ def utc_date(value):
 
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__, epilog=(
+        f"Exit {EXTRACT_WRITE_FAILED} means the report was written and the extract could not be written."))
     period = parser.add_mutually_exclusive_group()
     period.add_argument("--days", type=int, default=3,
                         help=f"audit the last N days, 0 to {MAX_DAYS} (default: 3)")
@@ -3021,7 +3138,7 @@ def main():
             print(json.dumps(dict(report_path=None if args.no_write else str(out), extract_path=extract_path, **data), indent=2))
         else:
             print(("" if args.no_write else str(out) + "\n") + "\n".join(headline))
-        return 0
+        return EXTRACT_WRITE_FAILED if not args.no_write and extract_path is None else 0
     except (OSError, ValueError) as exc:
         print(f"token-audit: {exc}", file=sys.stderr)
         return 1

@@ -35,6 +35,16 @@ class UsageDbStepTests(SecurityCase):
         self.assertNotIn('usage-db', result.stdout)
         self.assertEqual(len(result.stdout.splitlines()), 1)
 
+    def test_extract_failure_preserves_global_audit_and_scoped_review(self):
+        project = self.due('partial-audit')
+        self.env['STUB_AUDIT_EXIT'] = '4'
+        result = self.audit_run()
+        self.assertIn('extract not written', result.stdout)
+        self.assertEqual(self.calls(), 1)
+        result = self.review('--project-dir', project)
+        self.assertIn('extract not written', result.stdout)
+        self.assertTrue(self.record.is_file())
+
     def test_failing_ingest_is_logged_and_exit_code_kept(self):
         self.db.mkdir(parents=True)
         result = self.audit_run()

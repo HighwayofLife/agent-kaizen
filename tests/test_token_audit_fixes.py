@@ -282,6 +282,27 @@ class MalformedTimestampTests(FixCase):
         self.assertEqual(data['before']['metrics']['main calls/day'], 1)
         self.assertTrue(any('malformed rows' in warning for warning in data['warnings']))
 
+    def test_clean_split_keeps_usage_after_extract_failure(self):
+        stamp = datetime(2025, 1, 1, 12, tzinfo=timezone.utc)
+        path = jsonl(self.config / 'projects/example/main.jsonl', [self.assistant(stamp.isoformat(), 'good')])
+        os.utime(path, (stamp.timestamp(), stamp.timestamp()))
+        compare = load('usage-compare')
+        argv = ['usage-compare', '--clean-split', '--cutoff', '2025-01-02', '--before-from', '2025-01-01',
+                '--after-to', '2025-01-02', '--pricing', str(self.pricing), '--json']
+        run = subprocess.run
+
+        def block_extract(command, **kwargs):
+            write(Path(command[command.index('--extract-out') + 1]), 'blocked')
+            return run(command, **kwargs)
+
+        with mock.patch.dict(os.environ, self.env), mock.patch.object(sys, 'argv', argv), \
+                mock.patch.object(subprocess, 'run', side_effect=block_extract), \
+                contextlib.redirect_stdout(io.StringIO()) as output, contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(compare.main(), 0)
+        data = json.loads(output.getvalue())
+        self.assertEqual(data['before']['calls'], 1)
+        self.assertTrue(any('extract not written' in warning for warning in data['warnings']))
+
 
 class GitEncodingTests(FixCase):
     def test_non_utf8_file_name_is_survived_and_counted(self):

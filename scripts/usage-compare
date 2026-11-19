@@ -142,7 +142,15 @@ def clean_split(args, warnings=None):
             command = [sys.executable, str(audit), '--json', '--since', since.strftime('%Y-%m-%d'),
                        '--pricing', str(args.pricing), '--out', str(root / side / 'reports'),
                        '--extract-out', str(root / side / 'extracts')]
-            run = subprocess.run(command, env=env, capture_output=True, text=True, check=True)
+            run = subprocess.run(command, env=env, capture_output=True, text=True)
+            if run.returncode == SERIES.AUDIT.EXTRACT_WRITE_FAILED:
+                warning = f'{side}: token-audit extract not written; using usage from the report'
+                if warnings is None:
+                    print(warning, file=sys.stderr)
+                else:
+                    warnings.append(warning)
+            else:
+                run.check_returncode()
             data = json.loads(run.stdout)
             triggers = data['triggers']
             calls = sum(c.get('calls', 0) for c in data['sessions'])

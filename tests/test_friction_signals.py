@@ -10,7 +10,7 @@ from test_scripts import jsonl
 
 
 class SignedTranscriptTests(SecurityCase):
-    def test_extract_store_rejects_custom_mode_and_symlink_ancestor(self):
+    def test_extract_store_resolves_configured_roots_and_checks_children(self):
         from unittest.mock import patch
         data = dict(since='2025-01-01', agent_usage={})
         custom = self.root / 'custom'
@@ -20,13 +20,25 @@ class SignedTranscriptTests(SecurityCase):
         self.assertEqual(custom.stat().st_mode & 0o777, 0o755)
         link = self.root / 'link'
         link.symlink_to(custom, target_is_directory=True)
-        self.assertIsNone(AUDIT['write_extract'](data, self.root / 'report.md', link / 'extracts', {}))
-        default = self.cfg / 'audits/extracts'
+        out = self.root / 'report.md'
+        written = AUDIT['write_extract'](data, out, link / 'extracts', {})
+        self.assertIsNotNone(written)
+        published, _ = written
+        self.assertEqual(Path(published).parent, custom / 'extracts')
+        self.cfg.symlink_to(self.root / 'config', target_is_directory=True)
+        default = self.root / 'config/audits/extracts'
         default.mkdir(parents=True, mode=0o755)
         default.chmod(0o755)
         with patch.dict(__import__('os').environ, CLAUDE_CONFIG_DIR=str(self.cfg)):
-            self.assertIsNotNone(AUDIT['write_extract'](data, self.root / 'report.md', default, {}))
-        self.assertEqual(default.stat().st_mode & 0o777, 0o700)
+            result = self.run_script('token-audit', '--json')
+            self.assertEqual(Path(json.loads(result.stdout)['extract_path']).parent, default)
+            self.assertEqual(default.stat().st_mode & 0o777, 0o700)
+            default.chmod(0o755)
+            self.assertIsNotNone(AUDIT['write_extract'](data, out, default, {}))
+            self.assertEqual(default.stat().st_mode & 0o777, 0o700)
+            default.rename(default.with_name('moved'))
+            default.symlink_to(custom / 'extracts', target_is_directory=True)
+            self.assertIsNone(AUDIT['write_extract'](data, out, self.cfg / 'audits/extracts', {}))
 
     def test_extract_missing_unix_flags_does_not_abort(self):
         from unittest.mock import patch
@@ -284,12 +296,28 @@ class FrictionSignalTests(FrictionClaudeTests):
                   toolUseResult=dict(durationMs=1000))
         no = dict(nested={'timestamp': yes['timestamp']},
                   **end('conflict', 2, cwd=root, permissionDecision=dict(source='user', decision='reject')))
-        for malformed in ('invalid', '0000-01-01T00:00:00Z', '2020-01-01T00:00:00.' + '0' * 24 + 'Z'):
+        for malformed in ('invalid', '0000-01-01T00:00:00Z', '0000-01-01T00:00:00.' + '0' * 24 + 'Z'):
             with self.subTest(timestamp=malformed):
                 no['timestamp'] = malformed
                 jsonl(self.session, [start('conflict', 0, 'ls', cwd=root), yes, no])
                 evidence = self.collect(cwd=[root])['friction']['permission_acceptance'][0]
                 self.assertEqual((evidence['accepted'], evidence['ambiguous']), (0, 1))
+
+    def test_long_pre_window_replay_preserves_timing_and_permission(self):
+        from unittest.mock import patch
+
+        root = str(self.work)
+        accept = dict(source='user', decision='accept')
+        yes = end('replay', 2, cwd=root, permissionDecision=accept, toolUseResult=dict(durationMs=1000))
+        old = dict(yes, timestamp='2020-01-01T00:00:00.' + '0' * 24 + 'Z')
+        jsonl(self.session, [start('replay', 0, 'ls', cwd=root), yes, old])
+        with patch.object(json, 'loads', wraps=json.loads) as loads:
+            friction = self.collect(cwd=[root])['friction']
+        self.assertFalse(any(isinstance(call.args[0], bytes) and old['timestamp'].encode() in call.args[0]
+                             for call in loads.call_args_list))
+        self.assertEqual(friction['summary']['samples'], 1)
+        evidence = friction['permission_acceptance'][0]
+        self.assertEqual((evidence['accepted'], evidence['ambiguous']), (1, 0))
 
     def test_long_tool_timestamp_preserves_claude_call_accounting(self):
         begin = start('long', 2)
