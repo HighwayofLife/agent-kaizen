@@ -771,8 +771,16 @@ class HostActions:
                     raise ValueError("different requests for an imported host-action generation")
                 applied = set(rows.apply_intents.get(project, {}).get(generation, ()))
                 requested_apply = _pending({generation: receipt})
-                # The historical store collapsed completed applies into ordinary terminal receipts.
-                # Only a signed reservation for this action and generation can recover that intent.
+                if (all(state == "terminal" for state in saved.values())
+                        and re.fullmatch(r"scheduled:[0-9]{20}", generation)):
+                    for ident in saved.keys() - applied:
+                        row = rows.get(ident, {})
+                        # The old marker broker omitted the metric field that verify() always wrote.
+                        # A row shared by multiple generations still needs a signed reservation.
+                        if (row.get("catalog_id") == "linux-localsearch" and row.get("done_by") == "verify"
+                                and "metric_at_done" not in row and row["evidence"] == candidates[ident][1]
+                                and not any(ident in other for name, other in generations.items() if name != generation)):
+                            applied.add(ident)
                 applied.update(self._legacy_applies(project, generation, saved.keys() - applied, stored_secret))
                 if applied != requested_apply:
                     raise ValueError("different requests for an imported host-action generation")
