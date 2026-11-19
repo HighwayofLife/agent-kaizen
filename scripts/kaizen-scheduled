@@ -1308,15 +1308,23 @@ def backup_root():
     return Path(os.environ.get("KAIZEN_BACKUP_DIR") or claude_home() / "kaizen-backups").expanduser()
 
 
-def backup_deny(*audits):
+def deny_roots(*paths):
+    return tuple(dict.fromkeys(deny_path(path, resolve=resolve) for path in paths for resolve in (False, True)))
+
+
+def action_store_deny(root):
+    return [f"{tool}({root}/{name})" for name in ("host-actions.json", "host-actions.json.*")
+            for tool in ("Read", "Edit", "Write")]
+
+
+def audit_state_deny(root):
+    return [f"{tool}({root}/projects/*/state.json)" for tool in ("Edit", "Write")]
+
+
+def backup_deny():
     paths = dict.fromkeys(deny_path(backup_root(), resolve=resolve) for resolve in (False, True))
-    private = [path + "/**" for path in paths]
-    roots = [audits_dir(), *(Path(root).expanduser().absolute() for root in audits if root is not None)]
-    audit_paths = dict.fromkeys(deny_path(root, resolve=value) for root in roots for value in (False, True))
-    for path in audit_paths:
-        private.extend((path + "/host-actions.json", path + "/host-actions.json.*"))
-    return ([f"{tool}({path})" for path in private for tool in ("Read", "Edit", "Write")]
-            + [f"{tool}({path}/projects/*/state.json)" for path in audit_paths for tool in ("Edit", "Write")])
+    return ([f"{tool}({path}/**)" for path in paths for tool in ("Read", "Edit", "Write")]
+            + [rule for root in deny_roots(audits_dir()) for rule in action_store_deny(root)])
 
 
 class LedgerConfigError(ValueError):
@@ -1483,9 +1491,28 @@ def review_command(options, mode, report, session_id, project_dir=None, audits=N
     denied = [*credential_deny(project_dir), HARD_STOP_DENY]
     if auto:
         denied.extend([*GIT_DENY, *config_home_deny(project_dir), *ledger_rules])
-        denied.extend(f"{tool}({deny_path(HERE)}/**)" for tool in ("Edit", "Write"))
-    denied.extend(backup_deny(audits, getattr(options, "audits_alias", None)))
-    command.extend(["--disallowedTools", ",".join(denied)])
+    denied.extend(backup_deny())
+    # Keep the standard deny list and attach external protections as additional
+    # values of the same CLI option. In-checkout protections stay with its rules.
+    project_roots = deny_roots(project_dir if project_dir is not None else Path.cwd())
+    external_denies = []
+
+    def add_denies(root, rules):
+        in_checkout = any(root == project or root.startswith(project + "/") for project in project_roots)
+        (denied if in_checkout else external_denies).extend(rules)
+
+    if auto:
+        installed = deny_path(HERE)
+        add_denies(installed, [f"{tool}({installed}/**)" for tool in ("Edit", "Write")])
+    default_audits = deny_roots(audits_dir())
+    overrides = (Path(path).expanduser().absolute()
+                 for path in (audits, getattr(options, "audits_alias", None)) if path is not None)
+    for root in dict.fromkeys((*default_audits, *deny_roots(*overrides))):
+        rules = audit_state_deny(root)
+        if root not in default_audits:
+            rules.extend(action_store_deny(root))
+        add_denies(root, rules)
+    command.extend(["--disallowedTools", ",".join(denied), *external_denies])
     return command + ["--permission-mode", "default" if auto else "dontAsk"]
 
 
@@ -2195,9 +2222,11 @@ def scheduled_authority(audits, project, options, command, root):
     if (audits != audits_dir().resolve() or backup_root().absolute() != root
             or root.is_relative_to(project) or project.is_relative_to(root)):
         raise ValueError("broker state is outside the protected scope")
-    denied = command[command.index("--disallowedTools") + 1].split(",")
+    deny_values = command[command.index("--disallowedTools") + 1:command.index("--permission-mode")]
+    denied = set(",".join(deny_values).split(","))
     allowed = command[command.index("--allowedTools") + 1].split(",")
-    if not set(backup_deny()) <= set(denied):
+    pinned_denies = backup_deny() + [rule for path in deny_roots(audits_dir()) for rule in audit_state_deny(path)]
+    if not set(pinned_denies) <= denied:
         raise ValueError("broker state lacks the pinned denies")
     backup_script, notes_script = HERE / "kaizen-backup", HERE / "notes-ledger"
     if any(path.resolve(strict=True) != path for path in (backup_script, notes_script)):
