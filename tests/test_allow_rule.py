@@ -534,15 +534,17 @@ class AllowRuleTests(SecurityCase):
                     raise OSError("fixture interruption before publication receipt")
                 if legacy:
                     args[2].pop("publishing", None)
+                    args[2].pop("installed", None)
                 args[-1]()
             publish(*args[:-1], save)
         return interrupt
 
     def test_recovers_verified_publication_before_receipt_in_both_journals(self):
-        for legacy in (False, True):
-            self.repo = self.project(f"legacy-{legacy}")
+        for legacy, existing in ((False, False), (False, True), (True, True)):
+            self.repo = self.project(f"legacy-{legacy}-{existing}")
             self.target = self.repo / ".claude/settings.local.json"
-            write(self.target, '{"editor":1}')
+            if existing:
+                write(self.target, '{"editor":1}')
             tool = self.transaction()
             state = tool.__globals__
             action = self.broker_action(self.repo, "ls")
@@ -551,7 +553,80 @@ class AllowRuleTests(SecurityCase):
                 tool(self.repo, "ls", action_id=action)
             self.assertEqual(tool(self.repo, "ls", action_id=action)["status"], "applied")
             self.assertEqual(tool(self.repo, record=action)["status"], "undone")
-            self.assertEqual(json.loads(self.target.read_bytes()), dict(editor=1, permissions=dict(allow=[])))
+            if existing:
+                self.assertEqual(json.loads(self.target.read_bytes()), dict(editor=1, permissions=dict(allow=[])))
+            else:
+                self.assertFalse(self.target.exists())
+
+    def test_editor_move_after_publishing_marker_is_not_adopted(self):
+        def interrupt(*args):
+            def save():
+                args[-1]()
+                if args[2].get("publishing"):
+                    if self.target.exists():
+                        state["rename_effect"](args[0], args[2]["temp"], self.target.name, exchange=True)
+                    else:
+                        (self.target.parent / args[2]["temp"]).rename(self.target)
+                    raise OSError("fixture interruption after intent")
+            publish(*args[:-1], save)
+
+        for existing in (False, True):
+            self.repo = self.project(f"editor-move-{existing}")
+            self.target = self.repo / ".claude/settings.local.json"
+            if existing:
+                write(self.target, '{"editor":1}')
+            tool = self.transaction()
+            state = tool.__globals__
+            action = self.broker_action(self.repo, "ls")
+            publish = state["write_effect"]
+            with patch.dict(state, write_effect=interrupt), self.assertRaises(OSError):
+                tool(self.repo, "ls", action_id=action)
+            with self.assertRaisesRegex(state["Refused"], "publication was not verified"):
+                tool(self.repo, "ls", action_id=action)
+            with self.assertRaises(state["Refused"]):
+                tool(self.repo, record=action)
+            self.assertEqual(json.loads(self.target.read_bytes())["permissions"]["allow"], ["Bash(ls)"])
+
+    def test_recovers_legacy_exchange_after_in_place_settings_edit(self):
+        tool = self.transaction()
+        state = tool.__globals__
+        write(self.target, '{"editor":1}')
+        action = self.broker_action(self.repo, "ls")
+        interrupt = self.interrupt_before_receipt(state["write_effect"], legacy=True)
+        with patch.dict(state, write_effect=interrupt), self.assertRaises(OSError):
+            tool(self.repo, "ls", action_id=action)
+        edited = json.loads(self.target.read_bytes())
+        edited["editor"] = 2
+        self.target.write_text(json.dumps(edited))
+        self.assertEqual(tool(self.repo, "ls", action_id=action)["status"], "applied")
+        self.assertEqual(tool(self.repo, record=action)["status"], "undone")
+        self.assertEqual(json.loads(self.target.read_bytes()), dict(editor=2, permissions=dict(allow=[])))
+
+    def test_recovery_reports_edited_backup_after_receipt(self):
+        tool = self.transaction()
+        state = tool.__globals__
+        write(self.target, '{"editor":1}')
+        action = self.broker_action(self.repo, "ls")
+        publish = state["write_effect"]
+
+        def interrupt(*args):
+            def save():
+                args[-1]()
+                if args[2].get("published"):
+                    raise OSError("fixture interruption after receipt")
+            publish(*args[:-1], save)
+
+        with patch.dict(state, write_effect=interrupt), self.assertRaises(OSError):
+            tool(self.repo, "ls", action_id=action)
+        backup, = self.target.parent.glob("settings.kaizen-*.json")
+        backup.write_text('{"editor":2}')
+        with self.assertRaisesRegex(state["Refused"], "recovery copy") as error:
+            tool(self.repo, "ls", action_id=action)
+        self.assertIn(str(backup), str(error.exception))
+        self.assertEqual(backup.read_text(), '{"editor":2}')
+        backup.rename(backup.with_name("recovered.json"))
+        self.assertEqual(tool(self.repo, "ls", action_id=action)["status"], "applied")
+        self.assertEqual(tool(self.repo, record=action)["status"], "undone")
 
     def test_recover_interrupted_undo_after_editor_change(self):
         for retained in (False, True):
@@ -797,6 +872,36 @@ class AllowRuleTests(SecurityCase):
         with patch.object(os, "unlink", edit_then_unlink), self.assertRaisesRegex(state["Refused"], "recovery copy"):
             tool(self.repo, "ls")
         copy, = self.target.parent.glob("settings.kaizen-*.json")
+        self.assertEqual(copy.read_bytes(), edited)
+
+    def test_cleanup_preserves_atomic_save_after_open_inode_verification(self):
+        tool = self.transaction()
+        state = tool.__globals__
+        write(self.target, '{"editor":1}')
+        discard = state["discard_verified"]
+        snapshot_fd = state["snapshot_fd"]
+        edited = b'{"editor":2}'
+        replaced = False
+
+        def race(directory, name, fd):
+            nonlocal replaced
+            result = snapshot_fd(directory, name, fd)
+            if not replaced:
+                with os.fdopen(os.open("editor.json", os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600,
+                                       dir_fd=directory), "wb") as editor:
+                    editor.write(edited)
+                os.replace("editor.json", name, src_dir_fd=directory, dst_dir_fd=directory)
+                replaced = True
+            return result
+
+        def cleanup(*args):
+            with patch.dict(state, snapshot_fd=race):
+                discard(*args)
+
+        with patch.dict(state, discard_verified=cleanup), self.assertRaisesRegex(state["Refused"], "recovery copy") as error:
+            tool(self.repo, "ls")
+        self.assertTrue(replaced)
+        copy = Path(str(error.exception).split("recovery copy at ", 1)[1])
         self.assertEqual(copy.read_bytes(), edited)
 
     def test_publication_rolls_back_swap_inside_rename_window(self):

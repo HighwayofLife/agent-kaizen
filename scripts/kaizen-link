@@ -45,6 +45,7 @@ SCRIPTS = {
     "kaizen-worktree-prune": "worktree-prune", "kaizen-host-fix": "host-fix",
     "kaizen-allow-rule": "allow-rule",
     "kaizen_worktree_facts.py": "kaizen_worktree_facts.py",
+    "kaizen-status-git": "kaizen-status-git",
     "kaizen_friction_actions.py": "kaizen_friction_actions.py",
     "kaizen_friction_sample.py": "kaizen_friction_sample.py",
     "kaizen_friction_prepare.py": "kaizen_friction_prepare.py",
@@ -55,6 +56,8 @@ HOOKS = ("after-compact.sh", "block-image-read.sh", "limit-big-read.sh",
 
 
 def same_copy(source, target):
+    if source.is_symlink():
+        return target.is_symlink() and target.readlink() == source.readlink()
     if source.is_dir():
         if not target.is_dir():
             return False
@@ -76,6 +79,8 @@ def status(source, target, local):
 
 def identical(source, target):
     """True when target is an exact copy of source (no missing or extra files)."""
+    if source.is_symlink():
+        return target.is_symlink() and target.readlink() == source.readlink()
     if source.is_dir():
         return (target.is_dir() and not target.is_symlink()
                 and sorted(p.name for p in source.iterdir()) == sorted(p.name for p in target.iterdir())
@@ -149,8 +154,7 @@ def stale_caches(root):
             if cache.resolve() == root:
                 continue
             try:
-                different = any(not (root / p).is_file() or not (cache / p).is_file()
-                                or (root / p).read_bytes() != (cache / p).read_bytes() for p in files)
+                different = any(not same_copy(root / p, cache / p) for p in files)
             except OSError:
                 different = True
             if different:
@@ -259,7 +263,7 @@ def main():
                 if mode == "link":
                     target.symlink_to(source, target_is_directory=source.is_dir())
                 elif source.is_dir():
-                    shutil.copytree(source, target, dirs_exist_ok=True)
+                    shutil.copytree(source, target, dirs_exist_ok=True, symlinks=True)
                 else:
                     shutil.copy2(source, target)
                 current = "OK"
