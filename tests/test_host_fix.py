@@ -52,7 +52,11 @@ class HostFixTests(unittest.TestCase):
                             action_id=key)
 
     def undo(self, record):
-        FIX['undo'](SimpleNamespace(project=str(self.project), record=str(record)))
+        # Run fault injections inside the transaction. Worker tests exercise the subprocess boundary.
+        args = SimpleNamespace(project=str(self.project), record=str(record))
+        message = FIX['undo_transaction'](args, time.monotonic() + 20)
+        if message:
+            print(message)
 
     @contextmanager
     def writes(self):
@@ -356,6 +360,87 @@ class HostFixTests(unittest.TestCase):
                 self.undo(record)
                 self.assertFalse(marker.exists())
 
+    def test_retirement_keeps_replacement_after_cleanup_verification(self):
+        self.record()
+        checked = FIX['checked_marker']
+        for rollback in (False, True):
+            with self.subTest(rollback=rollback), self.writes() as link:
+                target = self.root / 'moved' if rollback else self.output
+                original = target / 'original'
+                replacement = None
+
+                def publish(directory, fd):
+                    self.output.rename(target)
+                    self.output.mkdir()
+                    link(directory, fd)
+
+                @contextmanager
+                def replace(directory, record, name):
+                    nonlocal replacement
+                    with checked(directory, record, name) as verified:
+                        if replacement is None and name == record.get('cleanup'):
+                            replacement = target / name
+                            replacement.rename(original)
+                            replacement.write_bytes(b'restored data')
+                            replacement.chmod(0o600)
+                        yield verified
+
+                record = None if rollback else self.apply()
+                with patch.dict(FIX, checked_marker=replace, publish_marker=publish):
+                    with self.assertRaisesRegex(FIX['Refused'], 'changed or replaced'):
+                        self.apply() if rollback else self.undo(record)
+                self.assertIsNotNone(replacement)
+                self.assertIn(b'restored data', [file.read_bytes() for file in target.rglob('*') if file.is_file()])
+                self.assertTrue(original.read_bytes().startswith(b'Agent Kaizen marker v1 '))
+
+    def test_undo_reports_scope_loss_at_unlink_and_keeps_marker_copy(self):
+        self.record()
+        moved = self.root / 'moved'
+        unlink = os.unlink
+        with self.writes():
+            record = self.apply()
+            marker = self.output / FIX['MARKER']
+            identity = FIX['file_id'](marker.stat())
+            stamp = marker.read_bytes()
+
+            def move_output(name, *, dir_fd=None):
+                if dir_fd is not None and not moved.exists():
+                    info = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                    if FIX['file_id'](info) == identity:
+                        self.output.rename(moved)
+                unlink(name, dir_fd=dir_fd)
+
+            with patch.object(os, 'unlink', move_output):
+                with self.assertRaisesRegex(FIX['Refused'], 'directory identity changed.*recover'):
+                    self.undo(record)
+            self.assertTrue(moved.is_dir())
+            self.assertIn(stamp, [file.read_bytes() for file in moved.rglob('*') if file.is_file()])
+            self.assertIn(b'"undo-pending"', record.read_bytes())
+
+    def test_recovery_finds_interrupted_undo_inside_original_bind_mount(self):
+        volume = self.project / 'volume'
+        old = volume / 'build'
+        old.mkdir(parents=True)
+        self.store.record(self.project, ID, old, 'fixture evidence', path=True)
+        with self.writes():
+            path = self.apply(old)
+            with FIX['_directory'](path.parent, private=True) as state:
+                record = FIX['read_record'](state, path.name, self.store)
+                quarantine = '.kaizen-marker-' + '1' * 32
+                cleanup = '.kaizen-cleanup-' + '2' * 32
+                (old / FIX['MARKER']).rename(old / cleanup)
+                record = dict(record, phase='undo-pending', quarantine=quarantine, cleanup=cleanup)
+                FIX['write_record'](state, path.name, self.store, record)
+            new = volume / 'other' / 'build'
+            new.parent.mkdir()
+            old.rename(new)
+            with patch.dict(FIX, mount_points=lambda deadline: {volume: False}):
+                found, _ = FIX['locate_output'](record, time.monotonic() + 5)
+                self.assertEqual(found, new)
+                self.undo(path)
+            self.assertEqual(list(new.iterdir()), [])
+            self.assertIn(b'"undone"', path.read_bytes())
+
     def test_recovery_skips_mount_points_and_other_devices(self):
         mounted = self.project / 'mount'
         mounted.mkdir()
@@ -398,11 +483,55 @@ class HostFixTests(unittest.TestCase):
         def stalled_worker(_, **kwargs):
             return start_worker([sys.executable, '-c', 'import time; time.sleep(60)'], **kwargs)
 
-        with patch.object(subprocess, 'Popen', stalled_worker):
+        args = SimpleNamespace(project=str(self.project), record='unused')
+        with patch.object(subprocess, 'Popen', stalled_worker), patch.dict(FIX, LINUX_WRITES=True, UNDO_SECONDS=0.2):
             start = time.monotonic()
             with self.assertRaisesRegex(FIX['Refused'], 'recovery deadline exceeded'):
-                FIX['recover_output']({}, start + 0.2)
+                FIX['undo'](args)
             self.assertLess(time.monotonic() - start, 2)
+
+    def test_undo_deadline_bounds_reopening_recovered_path(self):
+        self.record()
+        start_worker = subprocess.Popen
+        worker = """
+import os, runpy, sys, time
+from pathlib import Path
+sys.path.insert(0, os.path.dirname(sys.argv[1]))
+fix = runpy.run_path(sys.argv[1])['main'].__globals__
+checked = fix['checked_directory']
+def reopen(*args, **kwargs):
+    signal = os.environ.get('HOST_FIX_STALL_REOPEN')
+    if signal and kwargs.get('recovery'):
+        Path(signal).touch()
+        time.sleep(3)
+    return checked(*args, **kwargs)
+fix.update(LINUX_WRITES=True, PLATFORM='linux', checked_directory=reopen)
+fix['undo_worker']()
+"""
+
+        class StartWorker(start_worker):
+            def __init__(self, command, *args, **kwargs):
+                if command[-1] == '--undo-worker':
+                    command = [sys.executable, '-I', '-c', worker, str(SCRIPTS / 'host-fix')]
+                super().__init__(command, *args, **kwargs)
+
+        with self.writes():
+            record = self.apply()
+            moved = self.project / 'moved' / 'build'
+            moved.parent.mkdir()
+            self.output.rename(moved)
+            args = SimpleNamespace(project=str(self.project), record=str(record))
+            signal = self.root / 'worker-reopening'
+            with patch.object(subprocess, 'Popen', StartWorker):
+                with patch.dict(FIX, UNDO_SECONDS=1), patch.dict(os.environ, HOST_FIX_STALL_REOPEN=str(signal)):
+                    begin = time.monotonic()
+                    with self.assertRaisesRegex(FIX['Refused'], 'recovery deadline exceeded'):
+                        FIX['undo'](args)
+                    self.assertLess(time.monotonic() - begin, 2)
+                self.assertTrue(signal.is_file())
+                self.assertTrue((moved / FIX['MARKER']).exists())
+                FIX['undo'](args)
+                self.assertEqual(list(moved.iterdir()), [])
 
     def test_undo_resumes_legacy_quarantine_and_interrupted_cleanup(self):
         self.record()
@@ -414,10 +543,10 @@ class HostFixTests(unittest.TestCase):
                 (self.output / FIX['MARKER']).rename(self.output / quarantine)
                 FIX['write_record'](state, path.name, self.store,
                                     dict(record, phase='undo-pending', quarantine=quarantine))
-            unlink, identity = os.unlink, FIX['file_id'](self.output.stat())
+            unlink, identity = os.unlink, FIX['file_id']((self.output / quarantine).stat())
 
             def interrupt(name, *, dir_fd):
-                if FIX['file_id'](os.fstat(dir_fd)) == identity:
+                if FIX['file_id'](os.stat(name, dir_fd=dir_fd, follow_symlinks=False)) == identity:
                     raise InterruptedError()
                 unlink(name, dir_fd=dir_fd)
 
