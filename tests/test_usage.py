@@ -158,13 +158,16 @@ class UsageTests(StubCase):
         self.assertEqual(Path(data['extract_path']).parent, self.root / 'x')
         self.assertEqual(list((self.root / 'x').iterdir()), [Path(data['extract_path'])])
 
-    def test_extract_failure_is_nonfatal_and_normal_stdout_unchanged(self):
+    def test_extract_failure_has_distinct_exit_and_keeps_report(self):
         blocked = write(self.root / 'blocked', 'file, not a directory')
-        result = self.run_script('token-audit', '--extract-out', blocked, '--json')
-        data = json.loads(result.stdout)
-        self.assertIsNone(data['extract_path'])
-        self.assertTrue(Path(data['report_path']).is_file())
-        self.assertIn('token-audit: extract not written (', result.stderr)
+        write(self.home / '.claude/audits/extracts', 'blocked default')
+        for flags in (('--extract-out', blocked), ()):
+            with self.subTest(flags=flags):
+                result = self.run_script('token-audit', *flags, '--json', code=4)
+                data = json.loads(result.stdout)
+                self.assertIsNone(data['extract_path'])
+                self.assertTrue(Path(data['report_path']).is_file())
+                self.assertIn('token-audit: extract not written (', result.stderr)
         normal = self.run_script('token-audit', '--extract-out', self.root / 'extracts')
         report = Path(normal.stdout.splitlines()[0])
         self.assertTrue(report.is_file())
@@ -219,14 +222,41 @@ class UsageTests(StubCase):
         self.assertEqual(blocked.read_text(), 'file, not a directory')
         self.assertEqual(snapshot(), before)
 
-    def test_atomic_replace_failure_cleans_temporary_file(self):
+    def test_atomic_publication_failure_cleans_temporary_file(self):
         directory = self.root / 'extracts'
         out = self.root / 'token-audit-test.md'
-        with mock.patch.object(AUDIT['os'], 'replace', side_effect=OSError('fixture')), \
+        with mock.patch.object(AUDIT['os'], 'link', side_effect=OSError('fixture')), \
                 mock.patch.object(AUDIT['sys'], 'stderr') as stderr:
             self.assertIsNone(AUDIT['write_extract'](dict(since='date', agent_usage=[]), out, directory, {}))
         self.assertEqual(list(directory.iterdir()), [])
         self.assertIn('extract not written', ''.join(call.args[0] for call in stderr.write.call_args_list))
+
+    def test_extract_keeps_existing_destination_and_recovers_from_store_move(self):
+        directory = self.root / 'extracts'
+        out = self.root / 'token-audit-test.md'
+        name = out.with_suffix('.extract.json').name
+        data = dict(since='date', agent_usage=[])
+        existing = write(directory / name, 'existing extract')
+        directory.chmod(0o700)
+        self.assertIsNone(AUDIT['write_extract'](data, out, directory, {}))
+        self.assertEqual(existing.read_text(), 'existing extract')
+        self.assertEqual(list(directory.iterdir()), [existing])
+        existing.unlink()
+
+        moved = directory.with_name('moved')
+        link = AUDIT['os'].link
+
+        def move_store(*args, **kwargs):
+            directory.rename(moved)
+            directory.mkdir(mode=0o700)
+            return link(*args, **kwargs)
+
+        with mock.patch.object(AUDIT['os'], 'link', side_effect=move_store), mock.patch('sys.stderr') as errors:
+            self.assertIsNone(AUDIT['write_extract'](data, out, directory, {}))
+        diagnostic = ''.join(call.args[0] for call in errors.write.call_args_list)
+        recovery = next(path for path in moved.iterdir() if path.name in diagnostic)
+        self.assertEqual(json.loads(recovery.read_text())['report'], out.name)
+        self.assertEqual(list(directory.iterdir()), [])
 
     def test_missing_and_malformed_model_and_effort(self):
         now = datetime.now(timezone.utc).isoformat()
