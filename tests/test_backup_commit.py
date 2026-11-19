@@ -155,6 +155,7 @@ class BackupCommitTests(unittest.TestCase):
         journal = self.helpers["record_path"](change)
         record = json.loads(journal.read_text())
         record.pop("legacy_modes", None)
+        journal = journal.rename(journal.with_name(self.helpers["legacy_record_name"](change.name)))
         journal.write_text(json.dumps(record))
 
         self.main("undo", change)
@@ -168,6 +169,40 @@ class BackupCommitTests(unittest.TestCase):
     def test_ordinary_undo_run_does_not_overwrite_an_editor_save(self):
         self.check_shared_restore_race(committed=False)
 
+    def test_ordinary_undo_run_preserves_save_at_publish(self):
+        change = self.begin("--run", "shared")
+        self.target.write_text("after")
+        self.script("finish", change)
+        newer = self.begin("--run", "shared")
+        self.target.write_text("newer")
+        self.script("finish", newer)
+        sync = os.fsync
+
+        def save_after_staging(fd):
+            sync(fd)
+            if stat.S_ISREG(os.fstat(fd).st_mode):
+                self.target.write_text("editor save")
+
+        with patch.object(os, "fsync", save_after_staging):
+            self.assertIn("working file changed", self.main("undo", "run", expected=2))
+        self.assertEqual(self.target.read_text(), "editor save")
+        self.assertFalse(list(self.repo.glob(".kaizen-recovery-*")))
+
+        self.target.write_text("newer")
+        exchange = self.helpers["exchange_restore"]
+
+        def save_then_exchange(*args):
+            self.target.write_text("editor save")
+            exchange(*args)
+
+        error = self.main("undo", "run", expected=2, exchange_restore=save_then_exchange)
+        recoveries = list(self.repo.glob(".kaizen-recovery-*"))
+        self.assertEqual([path.read_text() for path in recoveries], ["editor save"])
+        self.assertIn(str(recoveries[0]), error)
+        self.assertEqual(self.target.read_text(), "after")
+        for pending in (change, newer):
+            self.assertIsNone(self.manifest(pending)["reverted"])
+
     def check_shared_restore_race(self, *, committed):
         older = self.ready("shared") if committed else self.begin("--run", "shared")
         if committed:
@@ -179,16 +214,14 @@ class BackupCommitTests(unittest.TestCase):
         newer = self.begin("--run", "shared")
         self.target.write_text("newer")
         self.script("finish", newer)
-        copy = shutil.copy2
+        exchange = self.helpers["exchange_restore"]
 
-        def restore_then_edit(src, dst):
-            copied = copy(src, dst)
-            if src == newer / "files/1":
-                dst.write_text("editor save")
-            return copied
+        def restore_then_edit(*args):
+            exchange(*args)
+            self.target.write_text("editor save")
 
-        with patch.object(shutil, "copy2", restore_then_edit):
-            self.assertIn("working file changed", self.main("undo", "run", expected=2))
+        self.assertIn("working file changed",
+                      self.main("undo", "run", expected=2, exchange_restore=restore_then_edit))
         self.assertEqual((self.git("for-each-ref", "refs/kaizen/"), self.target.read_text()), (refs, "editor save"))
         self.assertIsNone(self.manifest(older)["reverted"])
 
@@ -311,6 +344,29 @@ class BackupCommitTests(unittest.TestCase):
         self.main("prune", "--older-than", 1, "--apply")
         self.assertTrue((moved / "files/1").exists())
 
+    def test_corrupt_journal_blocks_undo_and_prune_after_name_reuse(self):
+        change = self.ready()
+        (change / "manifest.json").write_text(json.dumps(dict(self.manifest(change), created_at="2000-01-01")))
+        ref = self.commit_cli(change).stdout.split()[-1]
+        tip = self.git("rev-parse", ref)
+        journal = self.helpers["record_path"](change)
+        valid = journal.read_text()
+        moved = change.rename(change.with_name("renamed"))
+        self.assertEqual(self.begin("--run", "commit"), change)
+
+        legacy = journal.with_name(self.helpers["legacy_record_name"](change.name))
+        foreign = self.helpers["record_path"](change)
+        for file, body in ((journal, "{"), (legacy, "{"), (foreign, valid)):
+            file.write_text(body)
+            file.chmod(0o600)
+            for command, options in (("undo", (moved, "--force")), ("prune", ("--older-than", "1", "--apply"))):
+                with self.subTest(journal=file.name, command=command):
+                    self.assertIn("ref record", self.main(command, *options, expected=2))
+            file.unlink()
+        self.assertEqual((self.git("rev-parse", ref), self.target.read_text()), (tip, "after"))
+        self.assertIsNone(self.manifest(moved)["reverted"])
+        self.assertEqual((moved / "files/1").read_text(), "before")
+
     def test_ref_undo_refuses_to_replace_a_hard_link(self):
         change = self.ready()
         ref = self.commit_cli(change).stdout.split()[-1]
@@ -332,11 +388,16 @@ class BackupCommitTests(unittest.TestCase):
                                  alias, self.target))
         alias.write_text("newer edit")
         self.script("finish", newer)
+        created = self.repo / "created-link"
+        newest = self.script("begin", "--run", "shared", "--skill", "trim", "--ledger", "fixture", created)
+        os.link(self.target, created)
+        self.script("finish", newest)
 
         self.main("undo", "run")
+        self.assertFalse(created.exists())
         self.assertTrue(self.target.samefile(alias))
         self.assertEqual((self.target.read_text(), alias.read_text()), ("before", "before"))
-        for change in (older, newer):
+        for change in (older, newer, Path(newest)):
             self.assertIsNotNone(self.manifest(change)["reverted"])
 
     def test_forced_ref_undo_recreates_removed_parent_directories(self):
