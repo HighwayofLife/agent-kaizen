@@ -1,15 +1,20 @@
 #!/usr/bin/env python3
 """Show running dispatch commands and the latest saved report per repository."""
 import argparse
+import ctypes
 import os
 from pathlib import Path
+import re
+import shlex
+import struct
 import subprocess
+import sys
 import time
 
 
-def git(directory, *arguments):
+def git(directory, *arguments, executable='git', env=None):
     try:
-        return subprocess.run(['git', '-C', str(directory), *arguments],
+        return subprocess.run([executable, '-C', str(directory), *arguments], env=env,
                               stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
     except OSError:
         return None
@@ -62,20 +67,107 @@ def advisory_status(run, path):
                '-z', '--untracked-files=all', '--ignored=matching')
 
 
+def process_args(pid):
+    if sys.platform.startswith('linux'):
+        raw = Path(f'/proc/{pid}/cmdline').read_bytes()
+        return [os.fsdecode(arg) for arg in raw.split(b'\0')[:-1]]
+    if sys.platform == 'darwin':
+        # CTL_KERN/KERN_PROCARGS2 returns argc, the executable, argv and env.
+        mib = (ctypes.c_int * 3)(1, 49, pid)
+        data = ctypes.create_string_buffer(os.sysconf('SC_ARG_MAX'))
+        size = ctypes.c_size_t(len(data))
+        if ctypes.CDLL(None).sysctl(mib, len(mib), data, ctypes.byref(size), None, 0) != 0:
+            return []
+        count, = struct.unpack_from('@i', data)
+        argv = data.raw[struct.calcsize('@i'):size.value].partition(b'\0')[2].lstrip(b'\0')
+        return [os.fsdecode(arg) for arg in argv.split(b'\0', count)[:count]]
+    return []
+
+
+def process_details(pid):
+    command = process_args(pid)
+    if not command:
+        return [], None
+    if sys.platform.startswith('linux'):
+        cwd = Path(os.readlink(f'/proc/{pid}/cwd'))
+    else:
+        result = subprocess.run(['/usr/sbin/lsof', '-nP', '-a', '-p', str(pid), '-d', 'cwd', '-Fn0'],
+                                capture_output=True, timeout=1, check=False)
+        cwd = next((Path(os.fsdecode(field[1:])) for field in result.stdout.split(b'\0')
+                    if field.startswith(b'n/')), None)
+    return (command, cwd) if process_args(pid) == command else ([], None)
+
+
+def repository_identity(directory):
+    directory = directory.resolve(strict=True)
+    try:
+        from kaizen_worktree_facts import repository_dirs
+    except ImportError:
+        env = dict(PATH='/usr/bin:/bin', GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
+        for executable in ('/usr/bin/git', '/opt/homebrew/bin/git', '/usr/local/bin/git'):
+            result = git(directory, 'rev-parse', '--git-common-dir', executable=executable, env=env)
+            if result is not None and result.returncode == 0 and result.stdout:
+                return (directory / os.fsdecode(result.stdout.rstrip(b'\n'))).stat()
+        return None
+    dirs = repository_dirs(directory)
+    return dirs[2 if len(dirs) > 2 else 1].stat() if len(dirs) >= 2 else None
+
+
+def running(all_processes):
+    print('RUNNING (pid, elapsed, command)')
+    try:
+        result = subprocess.run(['ps', '-ww', '-eo', 'pid=,etime=,args='],
+                                capture_output=True, text=True, errors='surrogateescape', check=False)
+    except OSError as exc:
+        print(f'Process listing unavailable: {exc}')
+        return
+    hidden = 0
+    scope = None
+    if not all_processes:
+        try:
+            scope = repository_identity(Path.cwd())
+        except (ImportError, OSError, ValueError, RuntimeError):
+            pass
+    parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False, exit_on_error=False)
+    parser.add_argument('-C', type=Path)
+    for line in result.stdout.splitlines():
+        fields = line.split(maxsplit=2)
+        if (len(fields) != 3 or not re.fullmatch(r'[0-9]+', fields[0])
+                or not re.fullmatch(r'(?:[0-9]+-)?(?:[0-9]+:)?[0-9]{2}:[0-9]{2}', fields[1])
+                or not any(os.path.basename(word) == 'codex-dispatch' for word in fields[2].split())):
+            continue
+        if all_processes:
+            print(line.strip())
+            continue
+        if scope is not None:
+            try:
+                command, cwd = process_details(int(fields[0]))
+                script = next((i for i, arg in enumerate(command[:2])
+                               if os.path.basename(arg) == 'codex-dispatch'), None)
+                if script is not None:
+                    target = parser.parse_known_args(command[script + 1:])[0].C
+                    if target is None:
+                        target = cwd
+                    elif not target.is_absolute():
+                        target = cwd / target if cwd is not None else None
+                    identity = repository_identity(target) if target is not None else None
+                    if identity is not None and os.path.samestat(scope, identity):
+                        print(fields[0], fields[1], shlex.join(command))
+                        continue
+            except (OSError, ValueError, RuntimeError, subprocess.TimeoutExpired, argparse.ArgumentError):
+                pass
+        hidden += 1
+    if hidden:
+        print(f'{hidden} other or unverified dispatches')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('directories', nargs='*', type=Path, help='repository/worktree paths (default: current directory)')
     parser.add_argument('--worktree-facts', action='store_true', help='show advisory Git worktree facts')
+    parser.add_argument('--all', action='store_true', help='show machine-wide running dispatch commands')
     args = parser.parse_args()
-    print('RUNNING (pid, elapsed, command)')
-    try:
-        result = subprocess.run(['ps', '-eo', 'pid=,etime=,args='], capture_output=True, text=True, check=False)
-        for line in result.stdout.splitlines():
-            command = line.split()[2:]
-            if any(os.path.basename(word) == 'codex-dispatch' for word in command) and 'dispatch-status' not in line:
-                print(line.strip())
-    except OSError as exc:
-        print(f'Process listing unavailable: {exc}')
+    running(args.all)
     print('\nLATEST REPORT PER DIRECTORY')
     for directory in args.directories or [Path.cwd()]:
         root = directory.expanduser().resolve()

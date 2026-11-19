@@ -98,6 +98,25 @@ class DispatchStatusTests(StubCase):
                 self.git('update-index', '--no-' + flag, 'task.md')
                 self.git('restore', 'task.md')
 
+    def test_large_index_reports_clean_and_dirty(self):
+        oid = self.git('rev-parse', 'HEAD:task.md').stdout.strip()
+        names = [f'item-{number:05d}' for number in range(19000)]
+        subprocess.run(['git', 'update-index', '--index-info'], cwd=self.work, env=self.env,
+                       input=''.join(f'100644 {oid}\t{name}\n' for name in names), text=True, check=True)
+        self.git('commit', '-qm', 'large index')
+        self.git('checkout-index', '-a')
+        for clean in ('true', 'false'):
+            self.assertIn(f'clean={clean}', self.run_script('dispatch-status', '--worktree-facts').stdout)
+            (self.work / names[0]).write_text('changed')
+
+    def test_unborn_branch_reports_clean_and_dirty(self):
+        unborn = self.root / 'unborn'
+        self.git('init', '-q', str(unborn))
+        for clean in ('true', 'false'):
+            result = self.run_script('dispatch-status', '--worktree-facts', unborn)
+            self.assertIn(f'tip=unknown primary=true linked=false locked=false detached=false clean={clean}', result.stdout)
+            (unborn / 'new').touch()
+
     def test_submodule_ignore_configuration_cannot_hide_changes(self):
         sub = self.work / 'sub'
         self.git('init', '-q', str(sub))
@@ -202,6 +221,23 @@ class DispatchStatusTests(StubCase):
         self.run_script('dispatch-status', '--worktree-facts', self.work)
         self.assertFalse((self.root / 'path-git').exists())
         self.assertFalse((self.root / 'filter-ran').exists())
+
+    def test_filter_added_during_advisory_status_never_runs(self):
+        script_dir = str(Path(__file__).resolve().parents[1] / 'scripts')
+        with patch.object(sys, 'path', [script_dir, *sys.path]):
+            import kaizen_worktree_facts as facts
+            marker = self.root / 'filter-ran'
+            (self.work / '.gitattributes').write_text('task.md filter=late\n')
+            task = self.work / 'task.md'
+            task.write_bytes(b'x' * task.stat().st_size)
+            os.utime(task, (time.time() - 60,) * 2)
+
+            def status(run, path):
+                self.git('config', 'filter.late.clean', f'touch "{marker}"; cat')
+                return run(path, 'status', '--porcelain', '-z')
+
+            self.assertFalse(facts.read_facts(self.work, status)[0]['clean'])
+            self.assertFalse(marker.exists())
 
     def test_uninitialized_submodule_does_not_hide_other_dirt(self):
         tip = self.git('rev-parse', 'HEAD').stdout.strip()
@@ -309,10 +345,45 @@ class DispatchStatusTests(StubCase):
                  subprocess.Popen(['python3', '-c', 'import time; time.sleep(5)', 'codex-dispatch.log'])]
         try:
             time.sleep(0.5)
-            running = self.run_script('dispatch-status').stdout.split('LATEST REPORT')[0]
+            running = self.run_script('dispatch-status', '--all').stdout.split('LATEST REPORT')[0]
         finally:
             for proc in procs:
                 proc.kill()
                 proc.wait()
         self.assertIn(str(fake), running)
         self.assertNotIn('codex-dispatch.log', running)
+
+    def test_running_commands_are_scoped_to_current_repository(self):
+        linked = self.root / 'linked tree'
+        self.git('worktree', 'add', '-qb', 'topic', str(linked))
+        other = self.work / 'private nested'
+        self.git('init', '-q', str(other))
+        dispatch = ['python3', '/bin/codex-dispatch']
+        processes = {11: (dispatch + ['-C', str(linked), 'linked-brief'], other),
+                     12: (dispatch + ['-C', str(other), 'private-brief'], self.work),
+                     13: (dispatch + ['current-brief'], self.work),
+                     14: (dispatch + ['unknown-brief'], None)}
+        ps = '\n'.join(f'{pid} 00:01 {" ".join(argv)}' for pid, (argv, _) in processes.items())
+        script = Path(__file__).resolve().parents[1] / 'scripts/dispatch-status'
+        main = runpy.run_path(str(script))['main']
+        original_run = subprocess.run
+
+        def run(argv, *args, **kwargs):
+            if Path(argv[0]).name == 'ps':
+                return subprocess.CompletedProcess(argv, 0, stdout=ps)
+            return original_run(argv, *args, **kwargs)
+
+        for options in ([], ['--all']):
+            output = io.StringIO()
+            with patch.object(sys, 'argv', [str(script), *options]), patch.object(Path, 'cwd', return_value=self.work), \
+                    patch.object(sys, 'path', [str(script.parent), *sys.path]):
+                with patch.dict(main.__globals__, process_details=processes.__getitem__):
+                    with patch.object(subprocess, 'run', side_effect=run), redirect_stdout(output):
+                        main()
+            listing = output.getvalue().split('LATEST REPORT')[0]
+            self.assertIn('current-brief', listing)
+            self.assertIn('linked-brief', listing)
+            for brief in ('private-brief', 'unknown-brief'):
+                self.assertEqual(brief in listing, bool(options))
+            if not options:
+                self.assertIn('2 other or unverified dispatches', listing)

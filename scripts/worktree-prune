@@ -636,6 +636,13 @@ def preflight(executable, project, path, cutoff):
 
 
 def apply(args):
+    for name, value in (('Python interpreter', sys.executable), ('worktree-prune script', __file__)):
+        try:
+            info = Path(value).resolve(strict=True).stat()
+        except (OSError, RuntimeError):
+            raise Refused(f'cannot verify {name}') from None
+        if not stat.S_ISREG(info.st_mode) or info.st_uid not in (0, os.getuid()) or info.st_mode & 0o022:
+            raise Refused(f'unsafe {name}: expected a trusted owner and mode')
     project = Path(args.project).resolve(strict=True)
     path = exact_target(args.path)
     executable = resolve_git(project, path)

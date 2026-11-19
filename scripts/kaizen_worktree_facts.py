@@ -6,6 +6,7 @@ import re
 import signal
 import stat
 import subprocess
+import tempfile
 import time
 import threading
 
@@ -22,6 +23,9 @@ GIT_CONFIG = ('core.hooksPath=/dev/null', 'core.fsmonitor=false',
               'core.untrackedCache=false', 'core.commitGraph=false',
               'core.multiPackIndex=false', 'fetch.writeCommitGraph=false',
               'diff.ignoreSubmodules=none')
+STATUS_KEYS = (rb'core\.(repositoryformatversion|filemode|ignorecase|symlinks|excludesfile|'
+               rb'attributesfile|autocrlf|eol|safecrlf|checkstat|trustctime|precomposeunicode|'
+               rb'sparsecheckout|sparsecheckoutcone)|index\.sparse|extensions\.(objectformat|refstorage)')
 
 
 def file_id(info):
@@ -115,7 +119,7 @@ def resolve_git(directory, *protected, deadline=None):
         return None
 
 
-def git(executable, directory, *args, input_data=b'', deadline=None):
+def git(executable, directory, *args, input_data=b'', deadline=None, select_record=None, status_env=None):
     if executable is None:
         return None
     timeout = TIMEOUT if deadline is None else min(TIMEOUT, deadline - time.monotonic())
@@ -124,6 +128,7 @@ def git(executable, directory, *args, input_data=b'', deadline=None):
     process = None
     reader = None
     output = bytearray()
+    incomplete = False
 
     def stop(force=False):
         if process.poll() is not None and not force:
@@ -140,10 +145,13 @@ def git(executable, directory, *args, input_data=b'', deadline=None):
     try:
         config = [arg for value in GIT_CONFIG for arg in ('-c', value)]
         # Override per-submodule ignore settings as well as diff.ignoreSubmodules.
-        if 'status' in args:
-            args = (*args, '--ignore-submodules=none')
+        status = 'status' in args
+        if status:
+            end_options = args.index('--') if '--' in args else len(args)
+            ignore = 'dirty' if status_env is not None else 'none'
+            args = (*args[:end_options], f'--ignore-submodules={ignore}', *args[end_options:])
         process = subprocess.Popen([str(executable), '--no-pager', '--no-optional-locks',
-                                    '-C', str(directory), *config, *args], env=GIT_ENV,
+                                    '-C', str(directory), *config, *args], env=status_env or GIT_ENV,
                                    stdin=subprocess.PIPE if input_data else subprocess.DEVNULL,
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                    start_new_session=(os.name == 'posix'))
@@ -151,11 +159,24 @@ def git(executable, directory, *args, input_data=b'', deadline=None):
         process.stdout = None  # The bounded reader owns this pipe, not communicate().
 
         def read_output():
+            nonlocal incomplete
+            remainder = b''
             while len(output) <= MAX_OUTPUT:
-                chunk = stdout.read(min(65536, MAX_OUTPUT + 1 - len(output)))
+                chunk = stdout.read1(65536)
                 if not chunk:
+                    incomplete = bool(remainder)
                     break
-                output.extend(chunk)
+                if status and status_env is not None:
+                    output[:] = b'1'  # Only the presence of a status record matters.
+                elif select_record is None:
+                    output.extend(chunk)
+                else:
+                    *fields, remainder = (remainder + chunk).split(b'\0')
+                    for field in fields:
+                        if select_record(field):
+                            output.extend(field + b'\0')
+                    if len(remainder) > MAX_OUTPUT:
+                        output.extend(remainder)
             if len(output) > MAX_OUTPUT:
                 stop()
             stdout.close()
@@ -165,7 +186,7 @@ def git(executable, directory, *args, input_data=b'', deadline=None):
         end = time.monotonic() + timeout
         process.communicate(input=input_data or None, timeout=timeout)
         reader.join(max(0, end - time.monotonic()))
-        if reader.is_alive() or len(output) > MAX_OUTPUT:
+        if reader.is_alive() or incomplete or len(output) > MAX_OUTPUT:
             return None
         return process.returncode, bytes(output)
     except (OSError, subprocess.TimeoutExpired):
@@ -209,39 +230,91 @@ def records(run, directory):
     return entries if entries and len(entries) <= MAX_TREES else None
 
 
-def safe_status_config(run, path, depth=0):
-    # Status descends into submodules, which have their own filter configuration.
+def index_version(admin):
+    try:
+        info = (admin / 'index').stat()
+    except FileNotFoundError:
+        return None
+    return file_id(info), info.st_ctime_ns, info.st_mtime_ns, info.st_size
+
+
+def status_inputs(run, path, dirs, depth=0):
     if depth > 16:
-        return False
-    config = run(path, 'config', '--includes', '--name-only', '--get-regexp', r'^filter\.')
-    index = run(path, 'ls-files', '--stage', '-z')
-    if config is None or config[0] != 1 or config[1] or index is None or index[0]:
-        return False
-    fields = index[1].split(b'\0')
-    if fields[-1] != b'':
-        return False
-    for item in fields[:-1]:
-        if item.startswith(b'160000 '):
-            header, sep, name = item.partition(b'\t')
-            if not sep or not name or b'..' in name.split(b'/'):
-                return False
-            try:
-                try:
-                    child = (path / os.fsdecode(name)).resolve(strict=True)
-                except (FileNotFoundError, NotADirectoryError):
+        raise ValueError('submodule depth exceeds its limit')
+    admin = dirs[1]
+    common = dirs[2] if len(dirs) > 2 else admin
+    config = run(path, 'config', '--null', '--includes', '--get-regexp',
+                 os.fsdecode(b'^(' + STATUS_KEYS + rb')$|^filter\.'))
+    if config is None or config[0] not in (0, 1) or (config[1] and not config[1].endswith(b'\0')):
+        raise ValueError('cannot read status configuration')
+    safe = bytearray()
+    for item in config[1].split(b'\0')[:-1]:
+        key, has_value, value = item.partition(b'\n')
+        if not re.fullmatch(STATUS_KEYS, key):
+            raise ValueError('cannot interpret status with configured filters')
+        section, name = key.split(b'.', 1)
+        for old, new in ((b'\\', b'\\\\'), (b'"', b'\\"'), (b'\n', b'\\n'),
+                         (b'\t', b'\\t'), (b'\b', b'\\b')):
+            value = value.replace(old, new)
+        safe.extend(b'[' + section + b']\n' + name)
+        safe.extend(b' = "' + value + b'"\n' if has_value else b'\n')
+
+    hidden = False
+    def gitlink(item):
+        nonlocal hidden
+        hidden |= not item.startswith(b'H ')
+        return item[2:].startswith(b'160000 ')
+
+    stamp = index_version(admin)
+    index = run(path, 'ls-files', '--stage', '-v', '-z', select_record=gitlink)
+    if index is None or index[0] or stamp != index_version(admin):
+        raise ValueError('cannot read stable status index')
+    entries = index[1].split(b'\0')[:-1]
+    yield path, admin, common, safe, stamp, hidden
+    for item in entries:
+        _, sep, name = item.partition(b'\t')
+        if not sep or not name or b'..' in name.split(b'/'):
+            raise ValueError('invalid submodule path')
+        try:
+            child = (path / os.fsdecode(name)).resolve(strict=True)
+        except (FileNotFoundError, NotADirectoryError):
+            continue
+        if child.is_dir() and not os.path.lexists(child / '.git'):
+            with os.scandir(child) as children:
+                if next(children, None) is None:
                     continue
-                if child.is_dir() and not os.path.lexists(child / '.git'):
-                    with os.scandir(child) as entries:
-                        if next(entries, None) is None:
-                            continue
-                dirs = repository_dirs(child)
-                if not child.is_relative_to(path) or not dirs or dirs[0] != child:
-                    return False
-            except (OSError, ValueError, RuntimeError):
+        child_dirs = repository_dirs(child)
+        if child == path or not child.is_relative_to(path) or not child_dirs or child_dirs[0] != child:
+            raise ValueError('invalid submodule checkout')
+        yield from status_inputs(run, child, child_dirs, depth + 1)
+
+
+def cleanliness(run, path, dirs, read_status):
+    try:
+        inputs = list(status_inputs(run, path, dirs))
+        clean = True
+        for checkout, admin, common, config, stamp, hidden in inputs:
+            with tempfile.TemporaryDirectory() as temporary:
+                isolated = Path(temporary)
+                # Git takes its local config from GIT_COMMON_DIR. Only data
+                # paths are shared with the live repo. Child status is explicit.
+                for name in ('objects', 'refs', 'packed-refs', 'shallow', 'info', 'reftable'):
+                    (isolated / name).symlink_to(common / name)
+                (isolated / 'config').write_bytes(config)
+                env = dict(GIT_ENV, GIT_DIR=str(admin), GIT_COMMON_DIR=temporary,
+                           GIT_WORK_TREE=str(checkout))
+                result = read_status(partial(run, status_env=env), checkout)
+            if result is None or result[0]:
+                clean = None
+            elif result[1]:
                 return False
-            if not safe_status_config(run, child, depth + 1):
-                return False
-    return True
+            elif hidden:
+                clean = None
+        if any(index_version(admin) != stamp for _, admin, _, _, stamp, _ in inputs):
+            return None
+        return clean
+    except (OSError, ValueError, RuntimeError):
+        return None
 
 
 def read_facts(directory, read_status):
@@ -290,22 +363,16 @@ def read_facts(directory, read_status):
         if same_repo:
             head = run(path, 'rev-parse', '--verify', 'HEAD')
             symbolic = run(path, 'symbolic-ref', '-q', 'HEAD')
-            same_repo = (head is not None and head[0] == 0 and head[1].strip() == tip
+            head_matches = head is not None and (
+                (head[0] == 0 and head[1].strip() == tip)
+                or (not detached and branch.startswith(b'refs/heads/')
+                    and tip in (b'0' * 40, b'0' * 64) and head == (128, b'')))
+            same_repo = (head_matches
                          and symbolic is not None and
                          ((detached and symbolic[0] == 1) or
                           (not detached and symbolic[0] == 0 and symbolic[1].strip() == branch)))
-        safe = same_repo and safe_status_config(run, path)
-        status = read_status(run, path) if safe and time.monotonic() < deadline else None
-        if status is not None and status[0] == 0:
-            if status[1]:
-                clean = False
-            flags = run(path, 'ls-files', '-v', '-z') if clean is None else None
-            if flags is not None and flags[0] == 0:
-                entries_flags = flags[1].split(b'\0')
-                if entries_flags[-1] == b'' and all(
-                        len(item) >= 3 and item[1:2] == b' ' and item[:1] == b'H'
-                        for item in entries_flags[:-1]):
-                    clean = not bool(status[1])
+        if same_repo and time.monotonic() < deadline:
+            clean = cleanliness(run, path, dirs, read_status)
         if primary_tip and valid_tip(tip):
             ancestry = run(directory, 'merge-base', '--is-ancestor', os.fsdecode(tip), os.fsdecode(primary_tip))
             if ancestry is not None and ancestry[0] in (0, 1):
