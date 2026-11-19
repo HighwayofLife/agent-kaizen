@@ -181,6 +181,8 @@ Reference sizing (source + tests): P01/P01b take 613 + 160 catalogue lines with 
 | [P27 release](briefs/27-release.md) | O | P26 | terra / medium | low | ~320 | `python3 -m unittest discover -s tests -p 'test_repo.py'` |
 | [P28 real-input-gate](briefs/28-real-input-gate.md) | P | P27 | terra / medium | normal | ~300 | `python3 -m unittest discover -s tests -p 'test_repo.py'` |
 
+P28 status (2026-11-18): agent-runnable gate run against 0.13.0 (b2bb1ff) with 0.12.0 baseline: 39 PASS, 1 FAIL (`test_friction_sampler.py --bench` is not implemented), 8 BLOCKED (needs owner); P19 host-fix residuals accepted and open; publication held. See [gate-results.md](gate-results.md).
+
 - **A** — P00.
 - **A1** — P01, P02, P03, P04.
 - **B** — P01b, P05, P08, P14.
@@ -295,7 +297,7 @@ Assemble README, command and scheduling docs, CI checks and the 0.13.0 CHANGELOG
 
 ### P28 real-input gate
 
-Use the 0.13.0 candidate on real disposable host installs and record each exit status, trimmed output, flags, base version, timing basis, negative tests and undo verification in `gate-results.md`. The packet covers new scripts and subcommands plus the previously existing commands that changed behavior. Use distinct eligible worktree, allow-rule, marker and backup fixtures, and verify a fresh scheduled review in both modes after permission persistence. Compare installed CLI extraction on/off against the installed 0.12.0 baseline for the same input. Normalize home paths to `~` and omit raw captures. Any failed advertised claim returns to P27. Repeat `tools/ci-local --python 3.9` on the integration tree. Status is pending. [Gate brief](briefs/28-real-input-gate.md)
+Use the 0.13.0 candidate on real disposable host installs and record each exit status, trimmed output, flags, base version, timing basis, negative tests and undo verification in `gate-results.md`. The packet covers new scripts and subcommands plus the previously existing commands that changed behavior. Use distinct eligible worktree, allow-rule, marker and backup fixtures, and verify a fresh scheduled review in both modes after permission persistence. Compare installed CLI extraction on/off against the installed 0.12.0 baseline for the same input. Normalize home paths to `~` and omit raw captures. Any failed advertised claim returns to P27. Repeat `tools/ci-local --python 3.9` on the integration tree. Status: see the line below the packet table and `gate-results.md`. [Gate brief](briefs/28-real-input-gate.md)
 
 ## Benchmark baseline (batch review 2, 2026-11-18)
 
