@@ -326,8 +326,9 @@ def backup_root_stamp(path, fd):
     lock = os.stat(BACKUP_LOCK, dir_fd=fd, follow_symlinks=False)
     stamp = {"path": str(path), "dev": info.st_dev, "ino": info.st_ino,
              "ctime_ns": info.st_ctime_ns, "lock": list(file_version(lock))}
-    if sys.platform == "darwin":
-        stamp["birthtime"] = info.st_birthtime
+    birthtime = getattr(info, "st_birthtime", None)
+    if birthtime is not None:
+        stamp["birthtime"] = birthtime
     return stamp
 
 

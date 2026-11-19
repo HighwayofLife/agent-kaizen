@@ -18,7 +18,9 @@ jobs:
   tests:
     name: Tests (Python ${{ matrix.python }}, ${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # macOS runs every Git call through the xcrun shim, so its serial suite is far slower;
+    # the parallel test runner planned for 0.14 brings this back down.
+    timeout-minutes: ${{ matrix.os == 'macos-latest' && 90 || 15 }}
     strategy:
       fail-fast: false
       matrix:

@@ -2,6 +2,12 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.13.2 (2026-11-19)
+
+### Fixed
+
+- `kaizen-backup` reads a file's creation time only where the system provides one, instead of assuming it from the platform name. This fixes the Linux test failure that held back 0.13.1, which was tagged but never released.
+
 ## 0.13.1 (2026-11-19)
 
 ### Fixed
