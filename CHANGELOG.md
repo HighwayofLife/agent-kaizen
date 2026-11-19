@@ -2,6 +2,12 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.13.3 (2026-11-19)
+
+### Fixed
+
+- On macOS, `kaizen-backup` and the worktree checks now run the developer tools' Git directly when it passes the same trust checks, instead of going through the `/usr/bin/git` launcher. Each Git call was taking 170–390 ms, which made a single backup step take more than 10 seconds on slower Macs. `/usr/bin/git`, Homebrew and `/usr/local` stay as fallbacks. 0.13.1 and 0.13.2 were tagged but never released: their macOS test runs failed on this.
+
 ## 0.13.2 (2026-11-19)
 
 ### Fixed

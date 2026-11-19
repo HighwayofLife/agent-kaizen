@@ -349,9 +349,11 @@ def check_backup_root(root, expected):
             raise ValueError("backup root was replaced or changed during validation")
 
 
-# Fixed locations in preference order; PATH is never consulted. On macOS the first is
-# the root-owned xcrun shim, run with a fixed environment and no xcrun cache.
-TRUSTED_GIT = ("/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git")
+# Prefer macOS toolchain Git when it passes the trust checks. The fixed fallback
+# locations still fail closed, including the /usr/bin/git xcrun shim on macOS.
+OPTIONAL_TOOLCHAIN_GIT = ("/Library/Developer/CommandLineTools/usr/bin/git",
+                          "/Applications/Xcode.app/Contents/Developer/usr/bin/git")
+TRUSTED_GIT = OPTIONAL_TOOLCHAIN_GIT + ("/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git")
 MAX_GIT_BYTES = 256 * 1024 * 1024
 
 
@@ -392,10 +394,14 @@ def resolve_git():
     """Return the identity of the first Git at a fixed location; re-verify it before each later use."""
     for candidate in TRUSTED_GIT:
         if os.path.lexists(candidate):
-            path = os.path.realpath(candidate)
-            check_trusted_parents(candidate)
-            check_trusted_parents(path)
-            return git_executable(path)
+            try:
+                path = os.path.realpath(candidate)
+                check_trusted_parents(candidate)
+                check_trusted_parents(path)
+                return git_executable(path)
+            except (OSError, ValueError):
+                if candidate not in OPTIONAL_TOOLCHAIN_GIT:
+                    raise
     raise ValueError("no Git executable at a trusted location")
 
 

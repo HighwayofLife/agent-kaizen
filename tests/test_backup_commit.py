@@ -1496,8 +1496,11 @@ class BackupCommitTests(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertIsNotNone(stamp)
         executable = stamp["git_executable"]
-        candidate = next(path for path in self.helpers["TRUSTED_GIT"] if os.path.lexists(path))
-        self.assertEqual(executable["path"], os.path.realpath(candidate))
+        self.assertIn(executable["path"], {os.path.realpath(path) for path in self.helpers["TRUSTED_GIT"]})
+        if sys.platform.startswith("linux"):
+            legacy = ("/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git")
+            candidate = next(path for path in legacy if os.path.lexists(path))
+            self.assertEqual(executable["path"], os.path.realpath(candidate))
         info = os.stat(executable["path"])
         self.assertEqual({key: executable[key] for key in ("dev", "ino", "size", "mtime_ns")},
                          dict(dev=info.st_dev, ino=info.st_ino, size=info.st_size, mtime_ns=info.st_mtime_ns))
@@ -1510,6 +1513,95 @@ class BackupCommitTests(unittest.TestCase):
             self.assertEqual(call.kwargs["env"]["PATH"], "/usr/bin:/bin")
             for name in ("LD_PRELOAD", "BASH_ENV", "DEVELOPER_DIR"):
                 self.assertNotIn(name, call.kwargs["env"])
+
+    def require_toolchain_git(self):
+        with patch.dict(self.helpers, TRUSTED_GIT=self.helpers["OPTIONAL_TOOLCHAIN_GIT"]):
+            try:
+                return self.helpers["resolve_git"]()["path"]
+            except ValueError as error:
+                self.assertEqual(str(error), "no Git executable at a trusted location")
+                self.skipTest("no trusted macOS toolchain Git installed")
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS toolchain Git")
+    def test_toolchain_git_runs_the_full_backup_lifecycle(self):
+        expected = self.require_toolchain_git()
+        self.assertEqual(self.helpers["resolve_git"]()["path"], expected)
+        self.assertNotEqual(expected, "/usr/bin/git")
+        with patch.object(subprocess, "run", wraps=subprocess.run) as run:
+            change = self.begin_in_process("toolchain")
+            self.target.write_text("after")
+            self.main("finish", change)
+            self.main("commit", change)
+            self.main("undo", change)
+        self.assertEqual({call.args[0][0] for call in run.call_args_list}, {expected})
+        self.assertEqual(self.target.read_text(), "before")
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS Git shim")
+    def test_backup_lifecycle_with_only_the_git_shim(self):
+        shim = "/usr/bin/git"
+        with patch.dict(self.helpers, TRUSTED_GIT=(shim,)), patch.object(
+                subprocess, "run", wraps=subprocess.run) as run:
+            change = self.begin_in_process("shim")
+            self.target.write_text("after")
+            self.main("finish", change)
+            self.main("commit", change)
+            self.main("undo", change)
+        self.assertEqual({call.args[0][0] for call in run.call_args_list}, {shim})
+        self.assertEqual(self.target.read_text(), "before")
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS Git shim migration")
+    def test_shim_manifest_refuses_new_commit_but_recovers_and_undoes_journal(self):
+        self.require_toolchain_git()
+        shim = "/usr/bin/git"
+        with patch.dict(self.helpers, TRUSTED_GIT=(shim,)):
+            change = self.begin_in_process("shim-upgrade")
+        self.target.write_text("after")
+        self.main("finish", change)
+        captured = self.manifest(change)["git"]["git_executable"]
+        self.assertEqual(captured["path"], shim)
+        journal = self.helpers["record_path"](change)
+        error = self.main("commit", change, expected=2)
+        self.assertIn("Git executable changed since capture", error)
+        self.assertNotIn("Traceback", error)
+        self.assertFalse(journal.exists())
+
+        save = self.helpers["save_record"]
+
+        def stop_after_ref_update(folder, record):
+            if record["commit"]["done"]:
+                raise OSError("interrupted after ref update")
+            save(folder, record)
+
+        error = self.main("commit", change, expected=2, TRUSTED_GIT=(shim,), save_record=stop_after_ref_update)
+        self.assertIn("interrupted after ref update", error)
+        record = json.loads(journal.read_text())
+        self.assertFalse(record["commit"]["done"])
+        self.assertEqual(record["state"]["git_executable"], captured)
+        with self.helpers["ref_lock"]():
+            recovered = self.helpers["recover_commit"](change, record["key"], record["request"], str(self.repo))
+        self.assertEqual(recovered, f"verified {record['commit']['new']}")
+        self.assertTrue(json.loads(journal.read_text())["commit"]["done"])
+        self.main("undo", change)
+        self.assertEqual(self.target.read_text(), "before")
+        record = json.loads(journal.read_text())
+        self.assertTrue(record["inverse"]["done"])
+        self.assertEqual(record["state"]["git_executable"], captured)
+
+    def test_untrusted_optional_git_candidates_are_skipped(self):
+        writable_dir, git_in_dir, dir_marker = self.fake_git("writable-dir")
+        _, writable_git, file_marker = self.fake_git("writable-file")
+        writable_dir.chmod(0o775)
+        writable_git.chmod(0o775)
+        optional = (str(git_in_dir), str(writable_git))
+        fallback = tuple(path for path in self.helpers["TRUSTED_GIT"]
+                         if path not in self.helpers["OPTIONAL_TOOLCHAIN_GIT"])
+        with patch.dict(self.helpers, TRUSTED_GIT=fallback):
+            expected = self.helpers["resolve_git"]()
+        with patch.dict(self.helpers, TRUSTED_GIT=optional + fallback, OPTIONAL_TOOLCHAIN_GIT=optional):
+            self.assertEqual(self.helpers["resolve_git"](), expected)
+            self.assertEqual(self.capture(self.repo)["git_executable"], expected)
+        self.assertFalse(dir_marker.exists())
+        self.assertFalse(file_marker.exists())
 
     def test_untrusted_or_replaced_git_is_never_run(self):
         fake_dir, fake_git, marker = self.fake_git()
