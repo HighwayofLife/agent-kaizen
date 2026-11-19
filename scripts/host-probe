@@ -197,13 +197,12 @@ class Probe:
             # Status may invoke repository-configured clean or process filters.
             # Never inspect a working tree with those commands configured.
             config = self.command(['git', '-c', 'core.fsmonitor=false', '-C', str(root), 'config', '--null', '--list'])
-            index = self.command(['git', '-c', 'core.fsmonitor=false', '-C', str(root), 'ls-files', '--stage', '-z'])
-            if index is not None and any(entry.startswith('160000 ') for entry in index.split('\0')):
+            if '--ignore-submodules=dirty' not in args:
                 subconfig = self.command(['git', '-c', 'core.fsmonitor=false', '-C', str(root),
                                           'submodule', 'foreach', '--quiet', '--recursive', 'git config --null --list'])
             else:
                 subconfig = ''
-            if (config is None or index is None or subconfig is None or
+            if (config is None or subconfig is None or
                     re.search(r'(?:^|\0)filter\.[^\n]+\.(?:clean|process)\n', config + subconfig, re.I)):
                 self.warn('unsafe_git_filter')
                 return None
@@ -313,20 +312,14 @@ class Probe:
 
     def size(self, path):
         total, count = 0, 0
-        pending = [()]
-        root_fd = None
+        pending = []
+        fd = None
         try:
-            root_fd = open_directory(path)
-            while pending:
-                if self.remaining('size') <= 0:
-                    return None
-                parts = pending.pop()
-                fd = os.dup(root_fd)
+            fd = open_directory(path)
+            while fd is not None:
                 try:
-                    for component in parts:
-                        child = os.open(component, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
-                        os.close(fd)
-                        fd = child
+                    if self.remaining('size') <= 0:
+                        return None
                     entries = []
                     with os.scandir(fd) as scan:
                         for entry in scan:
@@ -338,21 +331,36 @@ class Probe:
                     names = {entry.name for entry in entries}
                     if '.git' in names or {'HEAD', 'objects', 'refs'} <= names:
                         return None
+                    children = []
                     for entry in entries:
                         if self.remaining('size') <= 0:
                             return None
                         if entry.is_dir(follow_symlinks=False):
-                            pending.append(parts + (entry.name,))
+                            children.append(entry.name)
                         elif entry.is_file(follow_symlinks=False):
                             total += entry.stat(follow_symlinks=False).st_size
+                    if children:
+                        # Keep one descriptor per parent with unvisited children.
+                        pending.append((fd, children))
+                        fd = None
                 finally:
-                    os.close(fd)
+                    if fd is not None:
+                        os.close(fd)
+                        fd = None
+                if pending:
+                    parent, children = pending[-1]
+                    fd = os.open(children.pop(), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+                    if not children:
+                        pending.pop()
+                        os.close(parent)
         except (OSError, AttributeError, NotImplementedError):
             self.warn('directory_unavailable')
             return None
         finally:
-            if root_fd is not None:
-                os.close(root_fd)
+            if fd is not None:
+                os.close(fd)
+            for parent, _ in pending:
+                os.close(parent)
         return total
 
     def directories(self, trees):
@@ -405,7 +413,9 @@ class Probe:
             except (OSError, ValueError, AttributeError):
                 self.warn('output_config')
                 configured = []
-            status = self.git(root, 'status', '--ignored', '--porcelain=v1', '-z', '--untracked-files=normal')
+            # Candidate discovery only uses ignored entries in this worktree.
+            status = self.git(root, 'status', '--ignored', '--porcelain=v1', '-z',
+                              '--untracked-files=normal', '--ignore-submodules=dirty')
             if status is None:
                 return None
             names = self.catalog.get('output_dir_names', [])

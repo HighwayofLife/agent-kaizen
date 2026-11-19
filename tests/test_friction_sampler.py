@@ -192,13 +192,6 @@ class SamplerTests(unittest.TestCase):
         pid_file = self.root / "query-pid"
         for cancel in (False, True):
             with self.subTest(cancel=cancel):
-                ready_file = self.root / "query-ready"
-                query = ("import signal, time, pathlib; "
-                         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                         f"pathlib.Path({str(ready_file)!r}).touch(); "
-                         "time.sleep(3)")
-                # The query can be killed before it publishes its own PID. Record
-                # the spawn result in the parent, where cancellation only sets a flag.
                 worker = """
 import os
 from pathlib import Path
@@ -208,31 +201,32 @@ import time
 import kaizen_friction_sample as s
 
 s.metrics = lambda: ('4', '4')
-s.PROCESS_COMMAND = (sys.executable, '-c', sys.argv[1])
+s.PROCESS_COMMAND = (sys.executable, '-c', 'import time; time.sleep(3)')
 spawn = os.posix_spawn
+pid = None
 def record_spawn(*args, **kwargs):
-    pid = spawn(*args, **kwargs)
-    Path(sys.argv[2]).write_text(str(pid))
-    if sys.argv[3] == 'True':
-        ready = Path(sys.argv[2]).parent / 'query-ready'
-        end = time.monotonic() + 0.15
-        while not ready.exists() and time.monotonic() < end:
-            time.sleep(0.001)
-        assert ready.exists(), 'child did not install SIGTERM handler'
+    global pid
+    # SIG_IGN survives exec, so the child ignores SIGTERM from the start.
+    handler = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        pid = spawn(*args, **kwargs)
+    finally:
+        signal.signal(signal.SIGTERM, handler)
+    if sys.argv[2] == 'True':
         os.kill(os.getpid(), signal.SIGTERM)
     return pid
 s.os.posix_spawn = record_spawn
 start = time.monotonic()
 s.main()
+Path(sys.argv[1]).write_text(str(pid))
 assert time.monotonic() - start < s.BUDGET + 0.1
 """
                 self.command = [sys.executable, "-c",
-                                worker, query, str(pid_file), str(cancel)]
+                                worker, str(pid_file), str(cancel)]
                 self.run_hook(PYTHONPATH=str(SCRIPTS))
                 with self.assertRaises(ProcessLookupError):
                     os.kill(int(pid_file.read_text()), 0)
                 pid_file.unlink()
-                ready_file.unlink(missing_ok=True)
                 self.assertEqual(self.process_rows(), [])
                 (self.samples / sampler.LOCK_NAME).write_bytes(b"")
 

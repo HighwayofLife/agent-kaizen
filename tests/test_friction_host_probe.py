@@ -39,13 +39,60 @@ class HostProbeTests(unittest.TestCase):
         def command(args):
             if 'foreach' in args:
                 return 'filter.evil.clean\ntouch marker\0'
-            if 'ls-files' in args:
-                return '160000 abc 0\tsub\0'
             if 'config' in args:
                 return ''
             self.fail('status must not run with a submodule filter')
         with mock.patch.object(probe, 'command', side_effect=command):
             self.assertIsNone(probe.git(self.project, 'status', '--porcelain'))
+
+    def test_status_evidence_when_staged_index_output_exceeds_command_cap(self):
+        def git(*args):
+            return subprocess.check_output(['git', '-C', str(self.project), *args])
+        git('init', '-q')
+        (self.project / '.gitignore').write_text('build/\n')
+        for i in range(40):
+            (self.project / f'tracked-{i}').touch()
+        git('add', '.')
+        git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+            '-c', 'commit.gpgsign=false', 'commit', '-qm', 'initial')
+        linked = self.root / 'linked'
+        git('worktree', 'add', '-qb', 'linked', str(linked))
+        build = self.project / 'build'
+        build.mkdir()
+        (build / 'data').write_bytes(b'abc')
+        limit = 1024
+        self.assertGreater(len(git('ls-files', '--stage', '-z')), limit)
+        self.assertLess(len(git('ls-files', '-v', '-z')), limit)
+        probe = self.probe()
+        with mock.patch.object(probe_module, 'LIMIT', limit):
+            trees = probe.worktrees()
+            self.assertIs(trees[1]['clean'], True)
+            self.assertEqual([d['size_bytes'] for d in probe.directories(trees)], [3])
+
+    def test_embedded_gitlink_without_gitmodules_keeps_directory_evidence(self):
+        def git(root, *args):
+            return subprocess.check_output(['git', '-C', str(root), *args])
+        git(self.project, 'init', '-q')
+        embedded = self.project / 'embedded'
+        embedded.mkdir()
+        git(embedded, 'init', '-q')
+        (embedded / '.gitattributes').write_text('tracked filter=evil\n')
+        (embedded / 'tracked').write_text('before')
+        git(embedded, 'add', '.')
+        git(embedded, '-c', 'user.name=Test', '-c', 'user.email=test@example.invalid',
+            '-c', 'commit.gpgsign=false', 'commit', '-qm', 'initial')
+        head = git(embedded, 'rev-parse', 'HEAD').decode().strip()
+        git(self.project, 'update-index', '--add', '--cacheinfo', f'160000,{head},embedded')
+        git(embedded, 'config', 'filter.evil.clean', 'touch filter-ran')
+        (embedded / 'tracked').write_text('changed')
+        (self.project / '.gitignore').write_text('build/\n')
+        build = self.project / 'build'
+        build.mkdir()
+        (build / 'data').write_bytes(b'abc')
+        directories = self.probe().directories([{'path': str(self.project)}])
+        self.assertIsNotNone(directories)
+        self.assertEqual([d['size_bytes'] for d in directories], [3])
+        self.assertFalse((embedded / 'filter-ran').exists())
 
     def test_output_replaced_after_symlink_check_is_not_followed(self):
         def git(*args):
@@ -82,6 +129,17 @@ class HostProbeTests(unittest.TestCase):
             self.assertEqual(self.probe().size(build), 0)
         finally:
             resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+    def test_deep_tree_opens_each_directory_once(self):
+        build = path = self.project / 'build'
+        build.mkdir()
+        for _ in range(100):
+            path = path / 'd'
+            path.mkdir()
+        (path / 'data').write_bytes(b'abc')
+        with mock.patch.object(probe_module.os, 'open', wraps=os.open) as open_fd:
+            self.assertEqual(self.probe().size(build), 3)
+        self.assertEqual(open_fd.call_count, len(build.parts) + 100)
 
     def test_output_stays_with_open_directory_after_replacement(self):
         out = self.root / 'reports'
