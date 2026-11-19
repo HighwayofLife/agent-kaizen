@@ -21,8 +21,15 @@ Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace 
 - Harden backup, restore and action recovery against unsafe paths, interrupted operations and intervening edits.
 - Preserve scoped audit evidence and handle malformed or oversized inputs without blocking ordinary reviews.
 - Keep scheduled review publication, action receipts and recovery tied to the original project and audit scope.
+- Restore backups with an atomic swap that keeps the live file's owner, mode and ACLs, and keep a recovery copy whenever an edit during undo cannot be ruled out.
+- Keep token-audit usage accounting independent of friction timing checks, and accept a symlinked Claude config directory in token-audit, allow-rule and the scheduled runner.
+- Keep action receipts readable by 0.12.0 runners at the store cap, and replay a scheduled generation only with its original intent.
+- Make the scheduled runner and its publication helper compatible in both directions across the upgrade, and recover pending broker work before validating publication.
+- Report worktree facts for very large indexes, new repositories without a commit, and machines without writable temporary storage; `dispatch-status` lists only the current project unless `--all` is given.
+- Keep host-probe directory evidence when a parent has an unreadable sibling, and read Git config only from an allowlist, including in submodules.
+- Use the canonical project for audit refresh and friction preparation in linked worktrees.
 
-Known issues: residual safety and recovery work is planned for the 0.14 follow-up.
+Known issues: a few narrow races remain where a concurrent edit or a crash lands between a final check and a write; backup undo detects them where it can, keeps a recovery copy and exits non-zero. Undo that recreates a deleted file does not restore its original owner or ACLs. The full list is in the 0.13 friction-port plan.
 
 ## 0.12.0 (2026-11-18)
 
