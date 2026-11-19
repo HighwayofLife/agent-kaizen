@@ -2,6 +2,12 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.13.4 (2026-11-19)
+
+### Fixed
+
+- Release of the 0.13.3 macOS fix. 0.13.3 was tagged but never released: one of its new tests put a stand-in Git under the temporary directory, which is `/tmp` on Linux, so the trust checks rejected it there. The test now uses the host's own trusted Git as the fallback.
+
 ## 0.13.3 (2026-11-19)
 
 ### Fixed

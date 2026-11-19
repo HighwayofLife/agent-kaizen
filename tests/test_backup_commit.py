@@ -1605,12 +1605,15 @@ class BackupCommitTests(unittest.TestCase):
 
     def test_untrusted_or_replaced_git_is_never_run(self):
         fake_dir, fake_git, marker = self.fake_git()
-        _, fallback_git, fallback_marker = self.fake_git("trusted-fallback")
-        fallback_git.write_text(f"#!/bin/sh\n: > {shlex.quote(str(fallback_marker))}\nexit 0\n")
-        candidates = (str(fake_git), str(fallback_git))
+        # The host's real trusted Git is the fallback: a stand-in under the temp directory would
+        # itself be untrusted wherever that directory is /tmp (Linux). If an untrusted legacy
+        # candidate were skipped, resolve_git would return this fallback instead of raising.
+        legacy = tuple(path for path in self.helpers["TRUSTED_GIT"]
+                       if path not in self.helpers["OPTIONAL_TOOLCHAIN_GIT"])
+        with patch.dict(self.helpers, TRUSTED_GIT=legacy):
+            fallback_git = self.helpers["resolve_git"]()["path"]
+        candidates = (str(fake_git), fallback_git)
         self.assertTrue(all(path not in self.helpers["OPTIONAL_TOOLCHAIN_GIT"] for path in candidates))
-        with patch.dict(self.helpers, TRUSTED_GIT=(str(fallback_git),)):
-            self.assertEqual(self.helpers["resolve_git"]()["path"], str(fallback_git))
         for name, mode in (("group-writable dir", (fake_dir, 0o775)), ("group-writable file", (fake_git, 0o775))):
             with self.subTest(name), patch.dict(self.helpers, TRUSTED_GIT=candidates):
                 mode[0].chmod(mode[1])
@@ -1620,7 +1623,6 @@ class BackupCommitTests(unittest.TestCase):
                 self.assertIsNone(self.capture(self.repo))
                 mode[0].chmod(0o755)
         self.assertFalse(marker.exists())
-        self.assertFalse(fallback_marker.exists())
         record = self.helpers["resolve_git"]()
         for key, value in (("sha256", "0" * 64), ("ino", record["ino"] + 1), ("path", str(fake_git))):
             with self.subTest(key=key):
