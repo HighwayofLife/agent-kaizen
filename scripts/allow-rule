@@ -748,7 +748,7 @@ def cancel_pending(settings, path, entry, records, save):
                      displaced_path=path)
     else:
         remove_stage(settings, pending["temp"], pending["after"])
-    if pending["undo"]:
+    if pending["undo"] and not pending.get("rollback"):
         entry["cancelled_undo"] = pending["id"]
     else:
         records[pending["id"]][2] = "cancelled"
@@ -822,6 +822,13 @@ def publication_recorded(settings, pending, before):
     raise Refused("interrupted publication raced with a settings edit")
 
 
+def can_restore_preimage(settings, pending, current):
+    after = pending["after"]
+    return (after is not None and current == after
+            and ("publishing" not in pending or pending["publishing"] == after[2])
+            and effect_id(*snapshot(settings, pending["temp"])) == pending["before"][1])
+
+
 def update_rule(settings, path, entry, records, ident, root, rule, undo, action_id,
                 authorize, authorize_request, open_dir, save, mark):
     pending = entry["pending"]
@@ -846,10 +853,20 @@ def update_rule(settings, path, entry, records, ident, root, rule, undo, action_
         published = publication_recorded(settings, pending, before)
         if not pending["undo"] and count and not published:
             parked = pending["temp"]
-            cancel_pending(settings, path, entry, records, save)
-            recovery = f"; inspect recovery copy at {path / parked}" if parked and named_version(settings, parked) else ""
-            raise Refused(f"pending grant cancelled because publication was not verified; "
-                          f"retained settings at {path / TARGET.name}" + recovery)
+            if (undo and ident == pending["id"] and rule == pending["rule"]
+                    and can_restore_preimage(settings, pending, before[1])):
+                # Reverse the exact staged image without adopting it as a grant.
+                original = pending["before"]
+                pending.update(undo=True, rollback=True, before=before, after=original[1],
+                               created=entry["created"] and entry["file"] == original)
+                if original[1] is None:
+                    pending.update(temp=None, backup=parked)
+                save()
+            else:
+                cancel_pending(settings, path, entry, records, save)
+                recovery = f"; inspect recovery copy at {path / parked}" if parked and named_version(settings, parked) else ""
+                raise Refused(f"pending grant cancelled because publication was not verified; "
+                              f"retained settings at {path / TARGET.name}" + recovery)
         elif (pending["undo"] and not count) or (not pending["undo"] and count):
             remove_stage(settings, pending["temp"] or pending.get("backup"),
                          pending["before"][1] if published else pending["after"],
@@ -867,7 +884,7 @@ def update_rule(settings, path, entry, records, ident, root, rule, undo, action_
             pending = None
         elif pending["undo"] and before != pending["before"]:
             distrust_other_grants(entry, records, pending["id"])
-            if same_request and count == 1 and not published:
+            if same_request and count == 1 and not published and not pending.get("rollback"):
                 # The pending undo already established ownership. Rebase only
                 # that exact removal onto the editor's current settings.
                 remove_stage(settings, pending["temp"], pending["after"])

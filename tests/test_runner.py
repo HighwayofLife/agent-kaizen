@@ -382,6 +382,7 @@ class RunnerTests(StubCase):
         expected = json.loads(self.config("show").stdout)
         self.assertEqual(expected["maxChangesPerRun"], {"value": 3, "source": "default"})
         expected["reports"] = str(self.config_dir / "audits/projects" / key(self.project)) + "/"
+        expected["localAudits"] = str(self.project / "docs/kaizen")
         result = self.config("show", "--for", self.project)
         self.assertEqual(json.loads(result.stdout), expected)
 
