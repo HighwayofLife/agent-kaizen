@@ -1,4 +1,8 @@
 """Contracts for the friction skill and its entry points."""
+import json
+import subprocess
+import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -30,6 +34,32 @@ class FrictionSkillTests(unittest.TestCase):
                        "only the supplied report and optional prepared view"):
             self.assertIn(phrase, cycle)
         self.assertLess(cycle.index("**Measure.**"), cycle.index("friction prepare --for ."))
+
+    def test_cycle_looks_up_canonical_audits_before_refresh(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            main = Path(tmp).resolve() / "main"
+            main.mkdir()
+            linked = main.with_name("linked")
+
+            def git(*args):
+                subprocess.run(["git", "-C", str(main), *args], check=True, capture_output=True)
+
+            git("init", "-q")
+            audits = main / "docs/kaizen"
+            audits.mkdir(parents=True)
+            (audits / "LEDGER.md").touch()
+            git("add", ".")
+            git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                "-c", "commit.gpgsign=false", "commit", "-qm", "initial")
+            git("worktree", "add", "-qb", "linked", str(linked))
+            config = json.loads(subprocess.check_output([
+                sys.executable, str(ROOT / "scripts/kaizen-scheduled"),
+                "config", "show", "--for", str(linked),
+            ]))
+            self.assertEqual(Path(config["localAudits"]), audits)
+        lookup = read("skills/cycle/SKILL.md").split("**Measure.**")[0]
+        self.assertIn("newest `token-audit-*.md` across `docs/kaizen/` and `localAudits`", lookup)
+        self.assertNotIn("review --dry-run", lookup)
 
     def test_entry_points_and_policy(self):
         self.assertIn("skills/friction/SKILL.md", read("skills/review/SKILL.md"))
