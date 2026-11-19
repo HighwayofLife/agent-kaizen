@@ -388,6 +388,41 @@ class BrokerLedgerTests(unittest.TestCase):
                 journal.reconcile(ident)
             self.assertEqual(journal.load(ident)["phase"], "effect-verified")
 
+    def test_directory_replaced_during_final_receipt_save(self):
+        moved = self.root / "moved-backups"
+        report = io.StringIO()
+        with self.locked() as journal:
+            ident = self.ledger_effect(journal)
+            path = journal.ledger_backup_path(self.ledger.stat().st_dev)
+            save = journal.save
+
+            def replace_during_save(record, phase):
+                if phase == "recorded" and not moved.exists():
+                    path.rename(moved)
+                    path.mkdir(mode=0o700)
+                    backup, = moved.iterdir()
+                    (path / backup.name).write_text("decoy")
+                    save(record, phase)
+                    self.assertEqual(journal.load(ident)["ledger_exchange"], record["ledger_exchange"])
+                else:
+                    save(record, phase)
+
+            with patch.object(journal, "save", side_effect=replace_during_save), redirect_stdout(report), \
+                    self.assertRaisesRegex(ValueError, "backup directory changed"):
+                journal.reconcile(ident)
+            backup, = moved.iterdir()
+            self.assertEqual(backup.read_text(), self.table)
+            self.assertIn(str(backup), report.getvalue())
+            self.assertEqual((path / backup.name).read_text(), "decoy")
+        with self.locked() as journal:
+            with self.assertRaisesRegex(ValueError, "backup directory changed"):
+                journal.reconcile(ident)
+            self.assertEqual(journal.load(ident)["phase"], "effect-verified")
+            shutil.rmtree(path)
+            moved.rename(path)
+            self.assertEqual(journal.reconcile(ident), "recorded")
+            self.assertEqual(self.ledger.read_text().count(ident), 1)
+
     def test_git_cross_device_ledger_refuses_local_backup(self):
         subprocess.run(["git", "init", "-q", str(self.project)], check=True)
         with self.locked() as journal:

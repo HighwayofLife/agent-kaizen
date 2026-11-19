@@ -1,5 +1,6 @@
 """Offline host-action store and CLI checks using disposable projects."""
 from contextlib import ExitStack
+import gzip
 import hmac
 import json
 import os
@@ -441,6 +442,92 @@ class HostActionsTests(unittest.TestCase):
                     self.assertEqual(saved["v"], 1)
                     self.assertEqual(saved["receipts"], {str(self.project): {"review": {ident: "terminal"}}})
 
+    def fill_store_to_cap(self, ident, *, short_stamp=False):
+        document = json.loads(self.store.path.read_bytes())
+        row = document["actions"][ident]
+        steps = row["steps"] = [""]
+        if short_stamp:
+            row["updated_at"] = "2026-11-19T00:00:00+00:00"
+
+        def encode():
+            return (json.dumps(document, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+
+        steps[0] = "x" * (actions.STORE_LIMIT - len(encode()))
+        self.store.path.write_bytes(encode())
+        self.assertEqual(self.store.path.stat().st_size, actions.STORE_LIMIT)
+
+    def test_verified_close_at_capacity_with_pending_sibling(self):
+        ident, sibling = self.record(), self.record(literal="ls -a")
+        project, generation = str(self.project), f"scheduled:{1:020d}"
+        frozen = {row["id"]: dict(row, intents=["apply"]) for row in self.store.scoped(self.project)}
+        request = block((ident, "apply"), (sibling, "apply"))
+        self.store.import_actions(request, frozen, self.project, generation)
+        self.fill_store_to_cap(ident, short_stamp=True)
+        with actions._directory(self.store.path.parent) as directory:
+            rows, _, receipts = self.store._load(directory)
+            rows[ident].update(status="done", done_by="verify", updated_at="2026-11-19T00:00:01.123456+00:00")
+            receipts[project][generation][ident] = "terminal"
+            replace = actions._replace
+
+            def interrupt_shared_store(directory, name, raw):
+                if name == self.store.path.name:
+                    raise OSError("before shared store replacement")
+                return replace(directory, name, raw)
+
+            with patch.object(actions, "_replace", side_effect=interrupt_shared_store), self.assertRaises(OSError):
+                self.store._save(directory, rows, receipts)
+            _, _, recovered = self.store._load(directory)
+            self.assertEqual(recovered[project][generation], {ident: "pending", sibling: "pending"})
+            self.store._save(directory, rows, receipts)
+            rows, _, _ = self.store._load(directory)
+        self.assertEqual(rows[ident]["status"], "done")
+        self.assertEqual(self.store.import_actions(request, frozen, self.project, generation),
+                         {ident: "terminal", sibling: "pending"})
+        saved = json.loads(self.store.path.read_bytes())
+        self.assertEqual(saved["v"], 2)
+        self.assertEqual(saved["receipts"][project][generation], {sibling: "pending"})
+        self.assertLessEqual(self.store.path.stat().st_size, actions.STORE_LIMIT)
+
+    def test_legacy_reader_cannot_reimport_live_generation_at_capacity(self):
+        legacy_path = self.root / "legacy_friction_actions.py"
+        historical = subprocess.run(["git", "-C", str(SCRIPT.parent.parent), "show",
+                                     "518da76:scripts/kaizen_friction_actions.py"], capture_output=True)
+        # Shallow CI checkouts use the exact historical source from the fixture.
+        fixture = Path(__file__).parent / "fixtures/friction_actions_518da76.py.gz"
+        source = gzip.decompress(fixture.read_bytes())
+        if historical.returncode == 0:
+            self.assertEqual(source, historical.stdout)
+            source = historical.stdout
+        legacy_path.write_bytes(source)
+        shutil.copyfile(SCRIPT.parent / "friction-catalog.json", self.root / "friction-catalog.json")
+        legacy = runpy.run_path(str(legacy_path))["HostActions"](
+            self.store.path.parent, self.secret.parent.parent, RUNNER["action_project"], RUNNER["key"])
+        self.assertEqual(legacy.path, self.store.path)
+
+        ident, closing = self.record(), self.record(self.other)
+        generation = f"scheduled:{1:020d}"
+        row, = self.store.scoped(self.project)
+        other, = self.store.scoped(self.other)
+        frozen = {ident: dict(row, intents=["suggest"])}
+        legacy.import_actions(block((ident, "suggest")), frozen, self.project, generation)
+        legacy.import_actions(block((closing, "apply")), {closing: dict(other, intents=["apply"])},
+                              self.other, generation)
+        self.fill_store_to_cap(closing)
+        self.assertEqual(legacy.import_actions(block((ident, "suggest")), frozen, self.project, generation),
+                         {ident: "terminal"})
+        with actions._directory(self.store.path.parent) as directory:
+            rows, _, receipts = self.store._load(directory)
+            rows[closing].update(status="done", done_by="verify")
+            receipts[str(self.other)][generation][closing] = "terminal"
+            self.store._save(directory, rows, receipts)
+            _, _, recovered = self.store._load(directory)
+        self.assertEqual(recovered[str(self.project)][generation], {ident: "terminal"})
+        self.assertEqual(recovered[str(self.other)][generation], {closing: "terminal"})
+        before = self.store.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "different requests|invalid host-action (store format|receipt)"):
+            legacy.import_actions(block(), {}, self.project, generation)
+        self.assertEqual(self.store.path.read_bytes(), before)
+
     def test_legacy_pending_store_can_close_receipts_under_size_cap(self):
         ident = self.record()
         row, = self.store.scoped(self.project)
@@ -471,8 +558,12 @@ class HostActionsTests(unittest.TestCase):
         saved = json.loads(self.store.path.read_bytes())
         self.assertLessEqual(self.store.path.stat().st_size, actions.STORE_LIMIT)
         self.assertEqual(set(saved), {"v", "actions", "receipts"})
-        self.assertTrue(all(state == "terminal" for receipt in saved["receipts"][project].values()
-                            for state in receipt.values()))
+        # A compact close must retain every generation in the shared file.
+        self.assertEqual(saved["receipts"][project], {name: {ident: actions.COMPACT_APPLY}
+                                                      for name in receipts[project]})
+        with actions._directory(self.store.path.parent) as directory:
+            _, _, recovered = self.store._load(directory)
+        self.assertEqual(recovered, receipts)
         frozen = {ident: dict(row, intents=["suggest", "apply"])}
         generation = "scheduled:" + "0" * 20
         self.assertEqual(self.store.import_actions(block((ident, "apply")), frozen, self.project, generation),
