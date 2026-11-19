@@ -10,6 +10,7 @@ import signal
 import subprocess
 import sys
 import time
+import threading
 import unittest
 from unittest.mock import patch
 
@@ -48,12 +49,20 @@ class ProcessGroupTests(RobustCase):
         executable(self.claude, FORKER)
 
     def assert_helper_gone(self):
-        wait_for(self.grandchild)
+        wait_for(self.grandchild, nonempty=True)
         pid = int(self.grandchild.read_text())
         deadline = time.monotonic() + 3
         while not gone(pid) and time.monotonic() < deadline:
             time.sleep(0.05)
         self.assertTrue(gone(pid), 'the model run left a helper process behind')
+
+    def test_helper_pid_waits_for_complete_write(self):
+        self.grandchild.touch()
+        writer = threading.Thread(target=lambda: (time.sleep(0.2), self.grandchild.write_text('12345')))
+        writer.start()
+        self.addCleanup(writer.join)
+        with patch(__name__ + '.gone', return_value=True):
+            self.assert_helper_gone()
 
     def test_timeout_kills_the_whole_process_group(self):
         path = self.due('proj')
@@ -66,7 +75,7 @@ class ProcessGroupTests(RobustCase):
         path = self.due('proj')
         process = self.start('--project-dir', path)
         wait_for(self.pid_file, nonempty=True)
-        wait_for(self.grandchild)
+        wait_for(self.grandchild, nonempty=True)
         started = time.monotonic()
         process.send_signal(signal.SIGTERM)
         out, err = process.communicate(timeout=60)
@@ -89,7 +98,7 @@ class ProcessGroupTests(RobustCase):
 
         def after_leader_exits(child, *args, **kwargs):
             # Start the timeout only after startup, with the helper holding the pipes open.
-            wait_for(self.grandchild)
+            wait_for(self.grandchild, nonempty=True)
             self.assertEqual(child.wait(timeout=10), 0)
             return communicate(child, *args, **kwargs)
 
@@ -109,7 +118,7 @@ class ProcessGroupTests(RobustCase):
         path = self.due('proj')
         process = self.start('--project-dir', path)
         wait_for(self.pid_file, nonempty=True)
-        wait_for(self.grandchild)
+        wait_for(self.grandchild, nonempty=True)
         process.kill()
         process.communicate(timeout=10)
         self.assert_helper_gone()

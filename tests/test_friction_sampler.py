@@ -62,7 +62,13 @@ class SamplerTests(unittest.TestCase):
     def test_benchmark_cli_reports_timings(self):
         result = subprocess.run([sys.executable, __file__, "--bench"], capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertRegex(result.stdout, r"median.*p95")
+        self.assertRegex(result.stdout, r"N=[1-9][0-9]* warm-up=[1-9][0-9]* median=[0-9]+(?:\.[0-9]+)? ms p95=[0-9]+(?:\.[0-9]+)? ms")
+
+    def test_benchmark_contract_rejects_missing_values(self):
+        fake = subprocess.CompletedProcess([], 0, stdout='median p95', stderr='')
+        with patch.object(subprocess, 'run', return_value=fake):
+            with self.assertRaises(AssertionError):
+                self.test_benchmark_cli_reports_timings()
 
     def test_process_claim_releases_lock_and_survives_utc_rollover(self):
         ms = 1735775999999
