@@ -148,6 +148,18 @@ class PreparationTests(unittest.TestCase):
         self.write(self.extract, raw)
         self.probe_path = self.write(self.obj.folder / "host-probe-disposable.json", json.dumps(self.probe))
 
+    def mixed_scripts(self, legacy):
+        source = subprocess.run(["git", "show", "518da76:scripts/" + legacy], cwd=PATH.parent,
+                                capture_output=True)
+        if source.returncode and subprocess.check_output(
+                ["git", "rev-parse", "--is-shallow-repository"], cwd=PATH.parent).strip() == b"true":
+            self.skipTest("the 518da76 upgrade baseline is unavailable in this shallow checkout")
+        self.assertEqual(source.returncode, 0, source.stderr.decode())
+        scripts = self.root / "mixed-scripts"
+        shutil.copytree(PATH.parent, scripts)
+        (scripts / legacy).write_bytes(source.stdout)
+        return scripts
+
     def run_prepare(self, report=None, interactive=True):
         return prepare.prepare(self.config / "audits", self.backups, self.obj, report,
                                self.runner["effective"](self.project), "propose-only", self.current + timedelta(seconds=2),
@@ -231,6 +243,20 @@ class PreparationTests(unittest.TestCase):
         self.obj.paths = sorted([self.project, *paths])
         self.scope["cwd"] = list(map(str, self.obj.paths))
 
+    def test_cli_names_incomplete_linked_worktree_audit(self):
+        self.add_test_worktrees(self.root / "linked")
+        self.scope["cwd"] = [str(self.project)]
+        self.write_evidence()
+        command = [sys.executable, str(PATH.parent / "kaizen-scheduled"), "friction", "prepare",
+                   "--for", str(self.project)]
+        for selection in ([], ["--report", str(self.report)]):
+            with self.subTest(selection=selection):
+                result = subprocess.run(command + selection, env=self.environment, capture_output=True, text=True)
+                self.assertEqual((result.returncode, result.stdout), (2, ""))
+                self.assertIn("all linked worktrees", result.stderr)
+                self.assertIn("one --cwd", result.stderr)
+        self.assertFalse(self.backups.exists())
+
     def test_worktree_only_outputs_merge_and_keep_flags(self):
         linked1, linked2 = self.root / 'linked1', self.root / 'linked2'
         self.add_test_worktrees(linked1, linked2)
@@ -306,6 +332,26 @@ class PreparationTests(unittest.TestCase):
         flags = json.loads(self.run_prepare().read_text())['flags']
         self.assertEqual({flag['basis'] for flag in flags}, {'measured', 'row_gap'})
         self.assertEqual(len({flag['id'] for flag in flags}), 2)
+
+    def test_import_and_acknowledge_legacy_signed_timing_flags(self):
+        self.block.update(basis="mixed", flags=[
+            dict(id="regression", subject="private subject", value=4, basis=basis)
+            for basis in ("measured", "row_gap")])
+        self.probe["findings"] = [dict(id="low-disk", catalog_id="low-disk", subject="project-volume",
+                                       evidence=dict(free_disk_bytes=1))]
+        self.write_evidence()
+        legacy = runpy.run_path(str(self.mixed_scripts(PATH.name) / PATH.name))
+        legacy["prepare"].__globals__["__file__"] = str(PATH)  # The installed catalogue stays at the same path.
+        inputs = legacy["prepare"](self.config / "audits", self.backups, self.obj, self.report,
+                                   self.runner["effective"](self.project), "propose-only",
+                                   self.current + timedelta(seconds=2), self.runner["action_project"],
+                                   self.runner["key"], interactive=True)
+        view = json.loads(inputs.read_text())
+        self.assertTrue(all("basis" not in flag for flag in view["flags"]))
+        ident = view["actions"][0]["id"]
+        self.assertEqual(self.reconcile(inputs, self.actions([ident])), {ident: "terminal"})
+        self.reconcile(inputs)
+        self.assertIsNone(self.run_prepare())
 
     def test_flapping_action_is_held(self):
         _, ident = self.candidate()
