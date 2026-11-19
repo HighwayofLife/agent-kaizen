@@ -1,11 +1,12 @@
 """Scheduled friction preparation and transactional reconciliation."""
 import json
 import runpy
+from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
-from test_friction_prepare import PreparationTests, prepare
+from test_friction_prepare import PATH, PreparationTests, prepare
 
 
 class ScheduledFrictionTests(PreparationTests):
@@ -116,6 +117,38 @@ class ScheduledFrictionTests(PreparationTests):
         store = json.loads((self.config / "audits/host-actions.json").read_text())
         self.assertEqual(store["receipts"][str(self.project)]["scheduled:" + receipt["generation"]], {ident: "pending"})
 
+    def test_completed_scheduled_apply_accepts_identical_review_retry(self):
+        _, ident, output, receipt = self.marker_request()
+        request = output.read_text()
+        audits = self.config / "audits"
+        reconcile = self.runner["reconcile_scheduled"]
+        helper = self.runner["review_helper"]
+        host, runtime = helper("kaizen_friction_actions.py"), helper("kaizen_friction_apply.py")
+        store = host["HostActions"](audits, self.backups, self.runner["action_project"], self.runner["key"])
+        with patch.dict(reconcile.__globals__, scheduled_action_refusal=lambda _: None,
+                        scheduled_authority=Mock(return_value=(None, ()))):
+            self.assertEqual(reconcile(audits, self.obj, output, receipt, acknowledge=False), (False, False))
+            with host["_directory"](store.friction, private=True) as state:
+                record = dict(phase="marker-pending", operation="linux-localsearch", reservation="fixture",
+                              target_identity=[1, 2])
+                ledger = Mock(state=state, load=Mock(return_value=record),
+                              cancel_unstarted_marker=Mock(return_value=False),
+                              scheduled_marker=Mock(return_value="recorded"))
+                # A native reservation exists. Stub only its verified outcome.
+                self.write(store.friction / ("broker-" + ident + ".json"), "{}")
+                with patch.object(runtime["BrokerLedger"], "locked", return_value=nullcontext(ledger)):
+                    self.runner["run_scheduled_broker"](audits, self.obj, self.runner["command_options"](SimpleNamespace()))
+            self.assertEqual(store.scoped(self.project)[0]["status"], "done")
+            before = store.path.read_bytes()
+            self.write(output, request)
+            self.assertEqual(reconcile(audits, self.obj, output, receipt), (True, False))
+            self.write(output, request)
+            self.assertEqual(reconcile(audits, self.obj, output, receipt), (True, False))
+            self.assertEqual(store.path.read_bytes(), before)
+            self.write(output, self.actions([ident]).read_text())
+            with self.assertRaisesRegex(ValueError, "different requests"):
+                reconcile(audits, self.obj, output, receipt)
+
     def test_malformed_output_cannot_acknowledge(self):
         _, receipt = self.scheduled()
         output = self.write(self.obj.folder / "review.md", '<!-- kaizen-host-actions broken -->\n')
@@ -174,6 +207,22 @@ class ScheduledFrictionTests(PreparationTests):
         self.assertFalse(recover(self.config / "audits", self.obj))
         self.assertEqual(len(list(self.obj.folder.glob("cycle-*.md"))), 1)
         self.assertEqual(json.loads(next((self.backups / "friction").glob("prepare-*.json")).read_text())["acknowledged_generation"], receipt["generation"])
+
+    def test_recovers_legacy_publication_marker(self):
+        _, receipt = self.scheduled()
+        audits = self.config / "audits"
+        output = self.write(self.obj.folder / "review.tmp", "Review\n" + self.actions().read_text())
+        self.runner["reconcile_scheduled"](audits, self.obj, output, receipt, acknowledge=False)
+        proposal = self.obj.folder / "cycle-2026-11-18.md"
+        legacy = runpy.run_path(str(self.mixed_scripts(PATH.name) / PATH.name))
+        legacy["scheduled_publication"](audits, self.backups, self.obj, self.runner["action_project"],
+                                        self.runner["key"], receipt, proposal, output)
+        output.rename(proposal)
+        marker = next((self.backups / "friction").glob("publication-*.json"))
+        self.assertNotIn("reviewed_at", json.loads(marker.read_text()))
+        self.assertEqual(self.runner["recover_scheduled_publication"](audits, self.obj), proposal)
+        self.assertTrue(self.runner["read_state"](self.obj)["reviewed_at"])
+        self.assertFalse(marker.exists())
 
     def test_unpublished_suggestion_survives_new_evidence_generation(self):
         self.candidate()
@@ -298,6 +347,35 @@ class ScheduledFrictionTests(PreparationTests):
         self.assertFalse(recover(other, other_project))
         self.assertEqual(recover(audits, self.obj), proposal)
 
+    def assert_pending_recovery_precedes_marker_check(self, field, value, error=None):
+        _, ident, output, receipt = self.marker_request()
+        audits = self.config / "audits"
+        reconcile = self.runner["reconcile_scheduled"]
+        recover = self.runner["recover_scheduled_publication"]
+        with patch.dict(reconcile.__globals__, scheduled_action_refusal=lambda _: None):
+            self.assertEqual(reconcile(audits, self.obj, output, receipt, acknowledge=False), (False, False))
+        recover(audits, self.obj, receipt, self.obj.folder / "cycle-2026-11-18.md", output)
+        marker = next((self.backups / "friction").glob("publication-*.json"))
+        original = json.dumps(dict(json.loads(marker.read_text()), **{field: value}))
+        marker.write_text(original)
+        options = self.runner["command_options"](SimpleNamespace())
+        with patch.dict(recover.__globals__, scheduled_action_refusal=lambda _: "proposal-only"):
+            if error:
+                with self.assertRaisesRegex(ValueError, error):
+                    recover(audits, self.obj, options=options)
+            else:
+                self.assertIsNone(recover(audits, self.obj, options=options))
+        store = json.loads((audits / "host-actions.json").read_text())
+        self.assertEqual(store["receipts"][str(self.project)]["scheduled:" + receipt["generation"]], {ident: "terminal"})
+        self.assertEqual(marker.read_text(), original)
+        self.assertNotIn("reviewed_at", self.runner["read_state"](self.obj))
+
+    def test_invalid_marker_generation_still_recovers_broker(self):
+        self.assert_pending_recovery_precedes_marker_check("generation", "invalid", "invalid publication marker")
+
+    def test_foreign_audits_marker_still_recovers_local_broker(self):
+        self.assert_pending_recovery_precedes_marker_check("audits", str(self.root / "other-audits"))
+
     def test_degraded_recovery_does_not_acknowledge_pending_project_actions(self):
         import os
         _, _, output, receipt = self.marker_request()
@@ -417,6 +495,37 @@ if os.environ.get('REVIEW_SLEEP'): time.sleep(10)
 
     def state(self):
         return json.loads(next((self.backups / 'friction').glob('prepare-*.json')).read_text())
+
+    def assert_mixed_review_publishes_in_auto(self, legacy):
+        scripts = self.mixed_scripts(legacy)
+        linked = self.root / "linked"
+        self.add_test_worktrees(linked)
+        target = linked / "build"
+        target.mkdir()
+        self.probe["findings"] = [dict(id="indexed-output", catalog_id="spotlight-output", subject=str(target),
+                                       evidence=dict(size_bytes=1))]
+        self.probe["regenerable_dirs"] = [dict(path=str(target), size_bytes=1)]
+        self.write_evidence()
+        self.write(scripts / "host-probe", "print('fixture probe')\n")
+        self.write(self.config / "agent-kaizen.json", '{"scheduledAutonomy":"auto"}')
+        result = self.review_run(runner=scripts / "kaizen-scheduled")
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertIn("reviewed (auto)", result.stdout)
+        prompt = self.calls()[0]["argv"][1]
+        self.assertIn("friction-inputs=", prompt)
+        inputs = self.obj.folder / "friction-inputs-00000000000000000001.json"
+        self.assertEqual(len(json.loads(inputs.read_text())["actions"]), 1)
+        self.assertEqual(self.state()["acknowledged_generation"], "00000000000000000001")
+        review_state = self.runner["read_state"](self.obj)
+        self.assertTrue(review_state["reviewed_at"])
+        self.assertEqual(self.obj.folder.joinpath(review_state["proposal"]).read_text().strip(), "Review")
+        self.assertFalse(list((self.backups / "friction").glob("publication-*.json")))
+
+    def test_legacy_runner_with_new_prepare_helper(self):
+        self.assert_mixed_review_publishes_in_auto("kaizen-scheduled")
+
+    def test_new_runner_with_legacy_prepare_helper(self):
+        self.assert_mixed_review_publishes_in_auto(PATH.name)
 
     def test_unsafe_publication_directory_still_allows_ordinary_review(self):
         import os
