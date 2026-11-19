@@ -208,13 +208,15 @@ class HostProbeTests(unittest.TestCase):
                 yield iter(sorted(entries, key=lambda entry: entry.name))
 
         soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
-        limit = 60 if soft == resource.RLIM_INFINITY else min(soft, 60)
         try:
-            resource.setrlimit(resource.RLIMIT_NOFILE, (limit, hard))
-            with mock.patch.object(probe_module.os, 'scandir', ordered_scan), \
-                 mock.patch.object(probe_module.os, 'open', wraps=os.open) as open_fd:
-                self.assertEqual(self.probe().size(build), 5)
-            self.assertLessEqual(open_fd.call_count, len(build.parts) + 4 * depth)
+            for cap, opens_per_level in ((60, 4), (20, 5)):
+                with self.subTest(descriptor_limit=cap):
+                    limit = cap if soft == resource.RLIM_INFINITY else min(soft, cap)
+                    resource.setrlimit(resource.RLIMIT_NOFILE, (limit, hard))
+                    with mock.patch.object(probe_module.os, 'scandir', ordered_scan), \
+                         mock.patch.object(probe_module.os, 'open', wraps=os.open) as open_fd:
+                        self.assertEqual(self.probe().size(build), 5)
+                    self.assertLessEqual(open_fd.call_count, len(build.parts) + opens_per_level * depth)
         finally:
             resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
 
@@ -315,6 +317,27 @@ class HostProbeTests(unittest.TestCase):
                 git(linked, 'config', key, 'all')
                 self.assertIsNone(self.probe().worktrees()[1]['clean'])
                 git(linked, 'config', '--unset', key)
+
+    def test_index_flags_added_before_status_make_cleanliness_unknown(self):
+        git, linked = self.filter_worktrees()
+        tracked = linked / 'tracked'
+        tracked.write_text('modified')
+        probe = self.probe()
+        command = probe.command
+        updated = False
+
+        def update_index(argv, *args, **kwargs):
+            nonlocal updated
+            if 'status' in argv and str(linked) in argv:
+                git(linked, 'update-index', '--assume-unchanged', tracked.name)
+                updated = True
+            return command(argv, *args, **kwargs)
+
+        with mock.patch.object(probe, 'command', side_effect=update_index):
+            self.assertIsNone(probe.worktrees()[1]['clean'])
+        self.assertTrue(updated)
+        self.assertIn('index_changed', probe.warnings)
+        self.assertEqual(tracked.read_text(), 'modified')
 
     def test_submodule_hidden_index_and_ignore_values(self):
         def git(root, *args):
