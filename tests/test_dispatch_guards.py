@@ -416,7 +416,9 @@ class DispatchSignalTests(StubCase):
     def start(self, *args):
         process = subprocess.Popen([str(SCRIPTS / 'codex-dispatch'), '-C', str(self.work), '--allow-no-change',
                                     '-r', '0', *map(str, args), str(self.brief)], env=self.env,
-                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                                   preexec_fn=lambda: (signal.signal(signal.SIGHUP, signal.SIG_DFL),
+                                                       signal.signal(signal.SIGINT, signal.SIG_DFL)))
         self.addCleanup(process.kill)
         self.addCleanup(process.communicate)
         return process

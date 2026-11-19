@@ -2,6 +2,7 @@
 """Run the release checks locally."""
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -20,6 +21,8 @@ def main():
     parser.add_argument('--version-only', action='store_true', help=argparse.SUPPRESS)
     args = parser.parse_args()
     failures = []
+    for name in ("KAIZEN_BACKUP_DIR", "KAIZEN_USAGE_DB"):
+        os.environ.pop(name, None)
 
     def stage(name, fn):
         try:

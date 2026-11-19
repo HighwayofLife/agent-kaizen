@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import shutil
 import stat
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -57,6 +58,11 @@ class SamplerTests(unittest.TestCase):
     def process_rows(self):
         return [line for path in sorted(self.samples.glob("*.tsv"))
                 for line in path.read_bytes().splitlines() if line.startswith(b"P\t")]
+
+    def test_benchmark_cli_reports_timings(self):
+        result = subprocess.run([sys.executable, __file__, "--bench"], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertRegex(result.stdout, r"median.*p95")
 
     def test_process_claim_releases_lock_and_survives_utc_rollover(self):
         ms = 1735775999999
@@ -503,3 +509,35 @@ for entry in (path, path.with_name(sampler.LOCK_NAME)):
                                      side_effect=lambda fd: os.path.samestat(os.fstat(fd), identity)):
                     sampler.main()
                 self.assertEqual(path.read_bytes(), original)
+
+
+def benchmark():
+    iterations, warmup = 200, 20
+    payload = json.dumps(dict(hook_event_name="PostToolUse", tool_name="Bash",
+                              session_id="bench", tool_use_id="tool_1", duration_ms=123)).encode()
+    with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryFile() as stream:
+        stream.write(payload)
+        stream.flush()
+        directory = str(Path(directory).resolve())
+        env = {"HOME": directory, "CLAUDE_CONFIG_DIR": directory}
+        timings = []
+        with patch.dict(os.environ, env, clear=True), patch.object(sampler, "metrics", return_value=("0", "1")):
+            for index in range(warmup + iterations):
+                stream.seek(0)
+                start = time.perf_counter()
+                sampler.sample(stream.fileno())
+                elapsed = (time.perf_counter() - start) * 1000
+                if index >= warmup:
+                    timings.append(elapsed)
+        rows = list((Path(directory) / "audits" / "samples").glob("*.tsv"))
+        if sum(len(path.read_bytes().splitlines()) for path in rows) != warmup + iterations:
+            raise RuntimeError("benchmark did not record every synthetic event")
+        timings.sort()
+        print(f"N={iterations} warm-up={warmup} median={statistics.median(timings):.3f} ms p95={timings[(95 * iterations + 99) // 100 - 1]:.3f} ms")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] == ["--bench"]:
+        benchmark()
+    else:
+        unittest.main()

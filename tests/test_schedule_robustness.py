@@ -41,9 +41,9 @@ if os.environ.get('HANG') == '1':
 """
 
 
-def wait_for(path, seconds=30):
+def wait_for(path, seconds=30, nonempty=False):
     deadline = time.monotonic() + seconds
-    while not path.exists():
+    while not path.exists() or (nonempty and not path.read_bytes()):
         if time.monotonic() > deadline:
             raise AssertionError(f'{path} never appeared')
         time.sleep(0.05)
@@ -71,7 +71,9 @@ class RobustCase(SecurityCase):
         process = subprocess.Popen(
             [sys.executable, str(SCRIPTS / 'kaizen-scheduled'), command, '--audits', str(self.audits), *map(str, extra),
              '--token-audit', str(self.audit), '--pricing', str(self.pricing), *map(str, args)],
-            cwd=self.work, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            cwd=self.work, env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            preexec_fn=lambda: (signal.signal(signal.SIGHUP, signal.SIG_DFL),
+                                signal.signal(signal.SIGINT, signal.SIG_DFL)))
         self.addCleanup(lambda: process.poll() is None and process.kill())
         return process
 
@@ -102,7 +104,7 @@ class SignalTests(RobustCase):
     def test_sigterm_in_auto_mode_rolls_back_and_restores_ledger(self):
         path = self.auto_fixture()
         process = self.start('--project-dir', path)
-        wait_for(self.pid_file)
+        wait_for(self.pid_file, nonempty=True)
         process.send_signal(signal.SIGTERM)
         out, err = process.communicate(timeout=60)
         self.assertEqual(process.returncode, 128 + signal.SIGTERM, out + err)
@@ -127,7 +129,7 @@ class SignalTests(RobustCase):
                 old = time.time() - 40 * 86400
                 os.utime(self.audits / 'extracts/old.extract.json', (old, old))
                 process = self.start('--project-dir', path)
-                wait_for(self.pid_file)
+                wait_for(self.pid_file, nonempty=True)
                 process.send_signal(number)
                 out, err = process.communicate(timeout=60)
                 self.assertEqual(process.returncode, 128 + number, out + err)
@@ -144,7 +146,7 @@ class SignalTests(RobustCase):
     def test_sigterm_during_audit_exits_cleanly(self):
         executable(self.audit, SLEEPER)
         process = self.start(command='audit')
-        wait_for(self.pid_file)
+        wait_for(self.pid_file, nonempty=True)
         process.send_signal(signal.SIGTERM)
         out, err = process.communicate(timeout=60)
         self.assertEqual(process.returncode, 128 + signal.SIGTERM, out + err)
