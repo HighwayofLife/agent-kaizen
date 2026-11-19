@@ -116,6 +116,36 @@ class HostProbeTests(unittest.TestCase):
             self.assertIs(trees[1]['clean'], True)
             self.assertEqual([d['size_bytes'] for d in probe.directories(trees)], [3])
 
+    def test_worktree_cleanliness_without_writable_tmpdir(self):
+        git, linked = self.filter_worktrees()
+        # A regular file as TMPDIR is unusable even when tests run as root.
+        unusable = self.root / 'unusable'
+        unusable.touch()
+        with mock.patch.dict(os.environ, TMPDIR=str(unusable)), \
+                mock.patch.object(tempfile, 'tempdir', str(unusable)):
+            self.assertIs(self.probe().worktrees()[1]['clean'], True)
+            (self.project / '.git/info/exclude').write_text('build/\n')
+            ignored = linked / 'build'
+            ignored.mkdir()
+            self.assertIs(self.probe().worktrees()[1]['clean'], False)
+            ignored.rmdir()
+            (linked / 'module' / 'tracked').write_text('dirty')
+            self.assertIs(self.probe().worktrees()[1]['clean'], False)
+            (linked / 'tracked').write_text('after!')
+            probe = self.probe()
+            command = probe.command
+            marker = self.root / 'filter-ran'
+
+            def install_filter(argv, **kwargs):
+                if '--absolute-git-dir' in argv and str(linked) in argv:
+                    git(linked, 'config', 'filter.late.clean', f'touch "{marker}"')
+                return command(argv, **kwargs)
+
+            with mock.patch.object(probe, 'command', side_effect=install_filter):
+                self.assertIs(probe.worktrees()[1]['clean'], False)
+            self.assertIn(str(marker).encode(), git(linked, 'config', 'filter.late.clean'))
+            self.assertFalse(marker.exists())
+
     def test_embedded_gitlink_without_gitmodules_keeps_directory_evidence(self):
         def git(root, *args):
             return subprocess.check_output(['git', '-C', str(root), *args])

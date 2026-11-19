@@ -168,8 +168,14 @@ HARD_STOP_DENY = ",".join(f"Bash({command}:*)" for command in (
     "grep", "egrep", "fgrep", "rg", "find", "cat", "strings", "xxd", "od", "base64"))
 
 
+def claude_state_root():
+    # Match token-audit and allow-rule. Check private descendants without
+    # following symlinks below the configured root.
+    return Path(os.path.realpath(claude_home()))
+
+
 def audits_dir():
-    return claude_home() / "audits"
+    return claude_state_root() / "audits"
 
 
 def global_config_path():
@@ -1307,9 +1313,12 @@ def ledger_deny():
     return [f"{tool}({path})" for path in paths for tool in ("Edit", "Write")]
 
 
-def backup_root():
+def backup_root(*, resolve_config=True):
     # The same rule as scripts/kaizen-backup.
-    return Path(os.environ.get("KAIZEN_BACKUP_DIR") or claude_home() / "kaizen-backups").expanduser()
+    override = os.environ.get("KAIZEN_BACKUP_DIR")
+    if override:
+        return Path(override).expanduser()
+    return (claude_state_root() if resolve_config else claude_home()) / "kaizen-backups"
 
 
 def deny_roots(*paths):
@@ -1326,9 +1335,9 @@ def audit_state_deny(root):
 
 
 def backup_deny():
-    paths = dict.fromkeys(deny_path(backup_root(), resolve=resolve) for resolve in (False, True))
+    paths = deny_roots(backup_root(resolve_config=False), backup_root())
     return ([f"{tool}({path}/**)" for path in paths for tool in ("Read", "Edit", "Write")]
-            + [rule for root in deny_roots(audits_dir()) for rule in action_store_deny(root)])
+            + [rule for root in deny_roots(claude_home() / "audits") for rule in action_store_deny(root)])
 
 
 class LedgerConfigError(ValueError):
@@ -1508,7 +1517,7 @@ def review_command(options, mode, report, session_id, project_dir=None, audits=N
     if auto:
         installed = deny_path(HERE)
         add_denies(installed, [f"{tool}({installed}/**)" for tool in ("Edit", "Write")])
-    default_audits = deny_roots(audits_dir())
+    default_audits = deny_roots(claude_home() / "audits")
     overrides = (Path(path).expanduser().absolute()
                  for path in (audits, getattr(options, "audits_alias", None)) if path is not None)
     for root in dict.fromkeys((*default_audits, *deny_roots(*overrides))):

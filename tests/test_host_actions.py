@@ -645,6 +645,26 @@ class HostActionsTests(unittest.TestCase):
                                       frozen, self.project, generation)
         self.assertEqual(self.store.import_actions(block((ident, "suggest")), frozen, self.project, older),
                          {ident: "terminal"})
+        with self.assertRaisesRegex(ValueError, "different requests"):
+            self.store.import_actions(block((ident, "apply")), frozen, self.project, older)
+        self.assertEqual(self.store.path.read_bytes(), before)
+
+    def test_verified_legacy_suggestion_cannot_replay_as_apply(self):
+        legacy = self.legacy_store()
+        output = self.project / "build"
+        output.mkdir()
+        ident = self.store.record(self.project, "linux-localsearch", output, "local output", path=True)
+        row, = self.store.scoped(self.project)
+        frozen = {ident: dict(row, intents=["suggest", "apply"])}
+        generation = f"scheduled:{1:020d}"
+        suggest = block((ident, "suggest"))
+        legacy.import_actions(suggest, frozen, self.project, generation)
+        with patch.object(legacy, "_probe", return_value=(True, None)):
+            self.assertEqual(legacy.verify(self.project), {ident: "done"})
+        before = self.store.path.read_bytes()
+        self.assertEqual(self.store.import_actions(suggest, frozen, self.project, generation), {ident: "terminal"})
+        with self.assertRaisesRegex(ValueError, "different requests"):
+            self.store.import_actions(block((ident, "apply")), frozen, self.project, generation)
         self.assertEqual(self.store.path.read_bytes(), before)
 
     def test_legacy_pending_store_can_close_receipts_under_size_cap(self):

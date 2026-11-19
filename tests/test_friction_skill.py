@@ -28,12 +28,15 @@ class FrictionSkillTests(unittest.TestCase):
 
     def test_cycle_refresh_precedes_preparation(self):
         cycle = read("skills/cycle/SKILL.md")
+        prepare = "friction prepare --for <canonical-project>"
         for phrase in ("older than 3 days", "--cwd . --days 14 --out docs/kaizen/",
                        "--no-friction", "--friction-slow-seconds", "--friction-heavy-seconds",
                        "even when friction is off or its gate is empty", "--report <selected-report>",
-                       "only the supplied report and optional prepared view"):
+                       "only the supplied report and optional prepared view", prepare):
             self.assertIn(phrase, cycle)
-        self.assertLess(cycle.index("**Measure.**"), cycle.index("friction prepare --for ."))
+        self.assertLess(cycle.index("**Measure.**"), cycle.index(prepare))
+        self.assertLess(cycle.index("review --dry-run"), cycle.index(prepare))
+        self.assertNotIn("friction prepare --for .", cycle)
 
     def test_cycle_looks_up_canonical_audits_before_refresh(self):
         with tempfile.TemporaryDirectory() as tmp:
