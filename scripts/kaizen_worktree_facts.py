@@ -14,9 +14,7 @@ MAX_OUTPUT = 1024 * 1024
 MAX_TREES = 256
 TIMEOUT = 5
 TOTAL_TIMEOUT = 20
-GIT_PATHS = ('/Library/Developer/CommandLineTools/usr/bin/git',
-             '/Applications/Xcode.app/Contents/Developer/usr/bin/git',
-             '/usr/bin/git', '/opt/homebrew/bin/git', '/usr/local/bin/git')
+GIT_PATHS = ('/usr/bin/git', '/opt/homebrew/bin/git', '/usr/local/bin/git')
 GIT_ENV = dict(PATH='/usr/bin:/bin', LC_ALL='C', GIT_CONFIG_NOSYSTEM='1',
                GIT_CONFIG_GLOBAL=os.devnull, GIT_TERMINAL_PROMPT='0',
                GIT_OPTIONAL_LOCKS='0', GIT_NO_LAZY_FETCH='1', GIT_ALLOW_PROTOCOL='',

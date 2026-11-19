@@ -519,9 +519,7 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         resolve_git = self.script_functions()['resolve_git']
         with patch.dict(os.environ, {'PATH': str(self.target)}):
             os.environ.pop('KAIZEN_GIT', None)
-            locations = ('/Library/Developer/CommandLineTools/usr/bin/git',
-                         '/Applications/Xcode.app/Contents/Developer/usr/bin/git',
-                         '/usr/bin/git', '/opt/homebrew/bin/git', '/usr/local/bin/git')
+            locations = ('/usr/bin/git', '/opt/homebrew/bin/git', '/usr/local/bin/git')
             self.assertIn(resolve_git(self.primary), [Path(path).resolve() for path in locations])
 
     def test_identity_swap_between_passes(self):

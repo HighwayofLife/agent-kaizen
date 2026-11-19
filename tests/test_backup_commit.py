@@ -1605,14 +1605,22 @@ class BackupCommitTests(unittest.TestCase):
 
     def test_untrusted_or_replaced_git_is_never_run(self):
         fake_dir, fake_git, marker = self.fake_git()
+        _, fallback_git, fallback_marker = self.fake_git("trusted-fallback")
+        fallback_git.write_text(f"#!/bin/sh\n: > {shlex.quote(str(fallback_marker))}\nexit 0\n")
+        candidates = (str(fake_git), str(fallback_git))
+        self.assertTrue(all(path not in self.helpers["OPTIONAL_TOOLCHAIN_GIT"] for path in candidates))
+        with patch.dict(self.helpers, TRUSTED_GIT=(str(fallback_git),)):
+            self.assertEqual(self.helpers["resolve_git"]()["path"], str(fallback_git))
         for name, mode in (("group-writable dir", (fake_dir, 0o775)), ("group-writable file", (fake_git, 0o775))):
-            with self.subTest(name), patch.dict(self.helpers, TRUSTED_GIT=(str(fake_git),)):
+            with self.subTest(name), patch.dict(self.helpers, TRUSTED_GIT=candidates):
                 mode[0].chmod(mode[1])
-                with self.assertRaisesRegex(ValueError, "trusted"):
+                with self.assertRaisesRegex(ValueError, "not in a trusted directory|not a trusted regular executable") as error:
                     self.helpers["resolve_git"]()
+                self.assertNotIn("no Git executable at a trusted location", str(error.exception))
                 self.assertIsNone(self.capture(self.repo))
                 mode[0].chmod(0o755)
         self.assertFalse(marker.exists())
+        self.assertFalse(fallback_marker.exists())
         record = self.helpers["resolve_git"]()
         for key, value in (("sha256", "0" * 64), ("ino", record["ino"] + 1), ("path", str(fake_git))):
             with self.subTest(key=key):
