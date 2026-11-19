@@ -8,6 +8,8 @@ import datetime
 import tempfile
 import unittest
 
+from plugin_fixtures import copy_plugin_tree
+
 ROOT = Path(__file__).resolve().parent.parent
 TOOL = ROOT / 'tools/host-acceptance'
 
@@ -36,7 +38,10 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(self.command('install', '--host', 'codex').returncode, 0)
         self.assertIn('Phase 2', self.command('status', '--host', 'codex').stdout)
         commands = (self.home / 'commands').read_text()
-        self.assertIn(str(self.home / 'cache/agent-kaizen-acceptance/source'), commands)
+        export = self.home / 'cache/agent-kaizen-acceptance/source'
+        self.assertIn(str(export), commands)
+        self.assertEqual((export / 'scripts/kaizen-status-git/sha1/info/attributes').readlink(), Path('/dev/stdin'))
+        self.assertEqual((export / 'scripts/kaizen-status-git/sha256/config').readlink(), Path('config.patterns'))
         self.assertNotIn(str(ROOT), commands)
         self.assertTrue((self.home / 'config/agent-kaizen/host-trace/on').exists())
         self.command('cleanup', '--host', 'codex')
@@ -46,7 +51,7 @@ class AcceptanceTests(unittest.TestCase):
         self.command('install', '--host', 'codex')
         version = json.loads((ROOT / '.claude-plugin/plugin.json').read_text())['version']
         installed = self.home / 'codex/plugins/cache/agent-kaizen-tools/agent-kaizen' / version
-        shutil.copytree(ROOT, installed, ignore=shutil.ignore_patterns('.git', 'out', '__pycache__'))
+        copy_plugin_tree(ROOT, installed, ignore=shutil.ignore_patterns('.git', 'out', '__pycache__'))
         trace = self.home / 'config/agent-kaizen/host-trace/trace.jsonl'
         timestamp = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=2)).isoformat()
         events = [('SessionStart', None), ('UserPromptSubmit', None), ('PostToolUse', 'Bash')]

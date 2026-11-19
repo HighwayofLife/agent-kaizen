@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import queue
 import re
+import runpy
 import shutil
 import subprocess
 import sys
@@ -64,12 +65,8 @@ def main():
             try:
                 if args.worktree:
                     listing = run(['git', '-C', str(source), 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], check=True).stdout
-                    for name in set(os.fsdecode(listing).split('\0')) - {''}:
-                        src, dst = source / name, export / name
-                        if not any((source / Path(*Path(name).parts[:i])).is_symlink()
-                                   for i in range(1, len(Path(name).parts) + 1)) and src.is_file():
-                            dst.parent.mkdir(parents=True, exist_ok=True)
-                            shutil.copy2(src, dst)
+                    copy_worktree_files = runpy.run_path(str(ROOT / 'tools/host_source.py'))['copy_worktree_files']
+                    copy_worktree_files(source, export, os.fsdecode(listing))
                 else:
                     archive = run(['git', '-C', str(source), 'archive', 'HEAD'], check=True).stdout
                     run(['tar', '-x', '-C', str(export)], input=archive, check=True)

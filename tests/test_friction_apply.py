@@ -20,6 +20,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from plugin_fixtures import copy_plugin_tree
+
 
 SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 sys.path.insert(0, str(SCRIPTS))
@@ -1180,7 +1182,7 @@ for index, event in enumerate(events):
             root = Path(temporary).resolve()
             cache = root / "plugins/cache/agent-kaizen/version"
             scripts = cache / "scripts"
-            shutil.copytree(SCRIPTS, scripts)
+            copy_plugin_tree(SCRIPTS, scripts)
             config = root / "config"
             cron = root / "crontab"
             cron.write_text(CRONTAB)

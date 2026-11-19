@@ -13,6 +13,7 @@ import subprocess
 import sys
 from unittest.mock import patch
 
+from plugin_fixtures import copy_plugin_tree
 from test_scripts import StubCase, write, executable
 
 
@@ -63,6 +64,12 @@ class ScheduleTests(StubCase):
         executable(self.bin / 'crontab', CRONTAB)
         executable(self.bin / 'claude', '#!/bin/sh\nexit 0\n')
         (self.home / '.claude').mkdir()
+
+    def run_script(self, name, *args, code=0):
+        result = subprocess.run([sys.executable, str(SCRIPTS / name), *map(str, args)],
+                                cwd=self.work, env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, code, result.stdout + result.stderr)
+        return result
 
     def isolated_path(self, *args, code=2):
         empty = self.root / 'empty-bin'
@@ -185,6 +192,24 @@ class ScheduleTests(StubCase):
         self.assertIn('skip LOCAL notes-ledger', result.stdout)
         self.assertFalse((target / 'notes-ledger').exists())
 
+    def test_copy_and_install_scripts_with_piped_stdin(self):
+        plugin = self.root / 'plugins/cache/agent-kaizen/version'
+        scripts = plugin / 'scripts'
+        copy = 'from plugin_fixtures import copy_plugin_tree; import sys; copy_plugin_tree(*sys.argv[1:])'
+        result = subprocess.run([sys.executable, '-c', copy, str(SCRIPTS), str(scripts)],
+                                cwd=Path(__file__).resolve().parent, stdin=subprocess.PIPE,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        result = subprocess.run([sys.executable, str(scripts / 'install-schedule'),
+                                 '--apply', '--scheduler', 'cron'], env=self.env, stdin=subprocess.PIPE,
+                                capture_output=True, text=True, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        template = self.home / '.claude/bin/kaizen-status-git'
+        self.assertFalse(template.is_symlink())
+        for fmt in ('sha1', 'sha256'):
+            self.assertEqual((template / fmt / 'info/attributes').readlink(), Path('/dev/stdin'))
+        self.assertEqual((template / 'sha256/config').readlink(), Path('config.patterns'))
+
     def test_friction_inventory_in_link_and_cache_installs(self):
         aliases = {name: 'kaizen-' + name for name in
                    ('host-probe', 'host-fix', 'allow-rule', 'worktree-prune', 'friction-catalog.json')}
@@ -192,7 +217,7 @@ class ScheduleTests(StubCase):
         for mode in ('link', 'copy'):
             with self.subTest(mode=mode):
                 plugin = self.root / ('plugins/cache/agent-kaizen/version' if mode == 'copy' else 'plugin')
-                shutil.copytree(SCRIPTS, plugin / 'scripts')
+                copy_plugin_tree(SCRIPTS, plugin / 'scripts')
                 config = self.root / ('config-' + mode)
                 env = dict(self.env, CLAUDE_CONFIG_DIR=str(config))
                 target = config / 'bin'
@@ -238,7 +263,7 @@ class ScheduleTests(StubCase):
 
     def test_friction_cache_upgrade_collision_and_missing_source(self):
         plugin = self.root / 'plugins/cache/agent-kaizen/version'
-        shutil.copytree(SCRIPTS, plugin / 'scripts')
+        copy_plugin_tree(SCRIPTS, plugin / 'scripts')
         target = self.home / '.claude/bin'
         target.mkdir()
         (target / 'kaizen-host-fix').write_text('user collision')
@@ -264,7 +289,7 @@ class ScheduleTests(StubCase):
 
     def test_cache_install_replaces_stale_credentials_module(self):
         plugin = self.root / 'plugins/cache/agent-kaizen/version'
-        shutil.copytree(SCRIPTS, plugin / 'scripts')
+        copy_plugin_tree(SCRIPTS, plugin / 'scripts')
         command = [sys.executable, str(plugin / 'scripts/install-schedule'), '--scheduler', 'cron', '--apply']
         first = subprocess.run(command, env=self.env, capture_output=True, text=True)
         self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
@@ -277,7 +302,7 @@ class ScheduleTests(StubCase):
 
     def test_cache_install_reports_unresolved_dependency_drift(self):
         plugin = self.root / 'plugins/cache/agent-kaizen/version'
-        shutil.copytree(SCRIPTS, plugin / 'scripts')
+        copy_plugin_tree(SCRIPTS, plugin / 'scripts')
         command = [sys.executable, str(plugin / 'scripts/install-schedule'), '--scheduler', 'cron', '--apply']
         first = subprocess.run(command, env=self.env, capture_output=True, text=True)
         self.assertEqual(first.returncode, 0, first.stderr)
@@ -290,7 +315,7 @@ class ScheduleTests(StubCase):
 
     def test_cache_install_copies_dependencies_and_survives_plugin_move(self):
         plugin = self.root / 'plugins/cache/agent-kaizen/version'
-        shutil.copytree(SCRIPTS, plugin / 'scripts')
+        copy_plugin_tree(SCRIPTS, plugin / 'scripts')
         custom = self.root / 'custom-config'
         self.env['CLAUDE_CONFIG_DIR'] = str(custom)
         result = subprocess.run([sys.executable, str(plugin / 'scripts/install-schedule'),

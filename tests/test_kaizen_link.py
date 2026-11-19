@@ -8,6 +8,8 @@ import subprocess
 import tempfile
 import unittest
 
+from plugin_fixtures import copy_plugin_tree
+
 ROOT = Path(__file__).resolve().parent.parent
 LINK = ROOT / "scripts" / "kaizen-link"
 
@@ -34,14 +36,18 @@ class LinkTests(unittest.TestCase):
     def test_stale_installed_cache(self):
         self.env['HOME'] = str(self.home)
         plugin = self.home / 'source'
-        shutil.copytree(ROOT, plugin, ignore=shutil.ignore_patterns('.git', 'out'))
+        copy_plugin_tree(ROOT, plugin, ignore=shutil.ignore_patterns('.git', 'out'))
         cache = self.home / 'cache'
-        shutil.copytree(plugin, cache)
+        copy_plugin_tree(plugin, cache)
         registry = self.home / 'plugins/installed_plugins.json'
         registry.parent.mkdir()
         name = json.loads((plugin / '.claude-plugin/plugin.json').read_text())['name'] + '@market'
         registry.write_text(json.dumps({'plugins': {name: [{'installPath': str(cache)}]}}))
         self.assertEqual(self.run_link('--check', root=plugin).returncode, 0)
+        attributes = cache / 'scripts/kaizen-status-git/sha1/info/attributes'
+        attributes.unlink()
+        self.assertIn('STALE-CACHE ' + name, self.run_link('--check', root=plugin).stdout)
+        attributes.symlink_to('/dev/stdin')
         (cache / 'scripts/kaizen-link').write_text('old')
         result = self.run_link('--check', root=plugin)
         self.assertEqual(result.returncode, 1)
@@ -52,7 +58,7 @@ class LinkTests(unittest.TestCase):
 
     def test_unlink_after_sources_removed(self):
         fake = self.home / 'plugin'
-        shutil.copytree(ROOT / 'scripts', fake / 'scripts')
+        copy_plugin_tree(ROOT / 'scripts', fake / 'scripts')
         self.assertEqual(self.run_link('--apply', root=fake).returncode, 0)
         (self.bin / 'token-audit').unlink()
         (self.bin / 'token-audit').write_text('owner file')
@@ -180,7 +186,7 @@ class LinkTests(unittest.TestCase):
 
     def test_copy_auto_dependencies_and_directories(self):
         fake = self.home / "plugins/cache/example/version"
-        shutil.copytree(ROOT / "scripts", fake / "scripts")
+        copy_plugin_tree(ROOT / "scripts", fake / "scripts")
         result = self.run_link("--apply", root=fake)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertFalse((self.bin / "token-audit").is_symlink())

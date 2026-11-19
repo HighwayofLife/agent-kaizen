@@ -2,17 +2,22 @@
 import hmac
 import json
 import runpy
+import shutil
 from contextlib import nullcontext
 from datetime import timedelta
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from plugin_fixtures import copy_plugin_tree
 from test_friction_prepare import PATH, PreparationTests, prepare
 
 
 class ScheduledFrictionTests(PreparationTests):
     def setUp(self):
         super().setUp()
+        claude = self.write(self.root / 'claude', '#!/bin/sh\nexit 0\n')
+        claude.chmod(0o755)
+        self.review_args = SimpleNamespace(claude=str(claude))
         clock = patch.dict(self.runner["reconcile_scheduled"].__globals__,
                            {"now": lambda: self.current + timedelta(seconds=3)})
         clock.start()
@@ -138,7 +143,7 @@ class ScheduledFrictionTests(PreparationTests):
                 # A native reservation exists. Stub only its verified outcome.
                 self.write(store.friction / ("broker-" + ident + ".json"), "{}")
                 with patch.object(runtime["BrokerLedger"], "locked", return_value=nullcontext(ledger)):
-                    self.runner["run_scheduled_broker"](audits, self.obj, self.runner["command_options"](SimpleNamespace()))
+                    self.runner["run_scheduled_broker"](audits, self.obj, self.runner["command_options"](self.review_args))
             self.assertEqual(store.scoped(self.project)[0]["status"], "done")
             before = store.path.read_bytes()
             self.write(output, request)
@@ -173,7 +178,7 @@ class ScheduledFrictionTests(PreparationTests):
             broker = runner["run_scheduled_broker"]
             with patch.dict(broker.__globals__, scheduled_authority=Mock(return_value=(None, ()))), \
                     patch.object(runpy, "run_path", side_effect=[host, runtime]):
-                broker(audits, self.obj, runner["command_options"](SimpleNamespace()))
+                broker(audits, self.obj, runner["command_options"](self.review_args))
         self.assertEqual(store.scoped(self.project)[0]["status"], "done")
         saved = json.loads(store.path.read_text())
         self.assertEqual(saved["receipts"][str(self.project)][generation], {ident: "terminal"})
@@ -494,7 +499,7 @@ class ScheduledFrictionTests(PreparationTests):
         marker = next((self.backups / "friction").glob("publication-*.json"))
         original = json.dumps(dict(json.loads(marker.read_text()), **{field: value}))
         marker.write_text(original)
-        options = self.runner["command_options"](SimpleNamespace())
+        options = self.runner["command_options"](self.review_args)
         with patch.dict(recover.__globals__, scheduled_action_refusal=lambda _: "proposal-only"):
             if error:
                 with self.assertRaisesRegex(ValueError, error):
@@ -542,7 +547,7 @@ class ScheduledFrictionTests(PreparationTests):
         output.rename(proposal)
         marker = next((self.backups / "friction").glob("publication-*.json"))
         marker.write_text(json.dumps(dict(json.loads(marker.read_text()), reviewed_at=None)))
-        options = self.runner["command_options"](SimpleNamespace())
+        options = self.runner["command_options"](self.review_args)
 
         with patch.dict(recover.__globals__, scheduled_action_refusal=lambda _: "proposal-only"):
             with self.assertRaisesRegex(ValueError, "invalid evidence time"):
@@ -568,7 +573,7 @@ class ScheduledFrictionTests(PreparationTests):
         marker = next((self.backups / "friction").glob("publication-*.json"))
         malformed = json.dumps(dict(json.loads(marker.read_text()), reviewed_at=None))
         marker.write_text(malformed)
-        options = self.runner["command_options"](SimpleNamespace())
+        options = self.runner["command_options"](self.review_args)
         broker = Mock()
 
         with patch.dict(recover.__globals__, run_scheduled_broker=broker):
@@ -687,7 +692,6 @@ if os.environ.get('REVIEW_SLEEP'): time.sleep(10)
         self.assertEqual(len(self.calls()), 1)
 
     def test_publication_uses_state_from_before_auto_review(self):
-        import shutil
         self.write(self.config / 'agent-kaizen.json', '{"scheduledAutonomy":"auto"}')
         audits = self.project / 'custom-audits'
         shutil.copytree(self.config / 'audits', audits)
@@ -741,9 +745,8 @@ if os.environ.get('REVIEW_SLEEP'): time.sleep(10)
         self.assertNotIn('friction-inputs=', self.calls()[0]['argv'][1])
 
     def test_publish_failure_and_crash_recovery_in_review(self):
-        import shutil
         scripts = self.root / 'publication-scripts'
-        shutil.copytree(self.runner_path.parent, scripts)
+        copy_plugin_tree(self.runner_path.parent, scripts)
         runner = scripts / 'kaizen-scheduled'
         source = runner.read_text()
         statement = '                os.replace(temporary, proposal)'
@@ -809,7 +812,6 @@ if os.environ.get('REVIEW_SLEEP'): time.sleep(10)
         self.assertFalse((store.friction / "host-fixes").exists())
 
     def test_recovery_exception_still_closes_recordless_suggestion(self):
-        import shutil
         host = runpy.run_path(str(self.runner_path.parent / "kaizen_friction_actions.py"))
         store = host["HostActions"](self.config / "audits", self.backups,
                                     self.runner["action_project"], self.runner["key"])
@@ -821,7 +823,7 @@ if os.environ.get('REVIEW_SLEEP'): time.sleep(10)
         block = '<!-- kaizen-host-actions ' + json.dumps(dict(v=1, actions=[dict(id=ident, intent="apply")])) + ' -->'
         store.import_actions(block, frozen, self.project, "scheduled:00000000000000000001")
         scripts = self.root / "recovery-scripts"
-        shutil.copytree(self.runner_path.parent, scripts)
+        copy_plugin_tree(self.runner_path.parent, scripts)
         runner = scripts / "kaizen-scheduled"
         source = runner.read_text().replace('    root = backup_root().resolve()\n    statuses = []',
                                             '    raise OSError("injected recovery error")\n    statuses = []', 1)
@@ -875,10 +877,9 @@ if os.environ.get('REVIEW_SLEEP'): time.sleep(10)
 
     def test_probe_refresh_fresh_stale_and_failure(self):
         import os
-        import shutil
         import sys
         scripts = self.root / 'probe-scripts'
-        shutil.copytree(self.runner_path.parent, scripts)
+        copy_plugin_tree(self.runner_path.parent, scripts)
         probe = scripts / 'host-probe'
         probe.write_text("#!" + sys.executable + "\n" + """
 import datetime, json, pathlib, sys
@@ -910,11 +911,10 @@ project = args[args.index('--project') + 1]
                     self.assertIn('injected probe failure', result.stdout)
 
     def test_audit_policy_through_all_scheduled_paths(self):
-        import shutil
         import subprocess
         import sys
         scripts = self.root / 'audit-scripts'
-        shutil.copytree(self.runner_path.parent, scripts)
+        copy_plugin_tree(self.runner_path.parent, scripts)
         recorder = scripts / 'token-audit'
         recorder.write_text("#!" + sys.executable + "\n" + """
 import json, os, sys
@@ -945,12 +945,11 @@ print(os.environ['AUDIT_REPORT'])
 
     def test_copied_install_runs_installed_preparation(self):
         import os
-        import shutil
         import sys
         import subprocess
         from test_schedule import CRONTAB
         plugin = self.root / 'plugins/cache/agent-kaizen/version'
-        shutil.copytree(self.runner_path.parent, plugin / 'scripts')
+        copy_plugin_tree(self.runner_path.parent, plugin / 'scripts')
         binary = self.root / 'bin'
         cron = self.write(binary / 'crontab', CRONTAB.replace('#!/usr/bin/env python3', '#!' + sys.executable))
         cron.chmod(0o755)
@@ -1005,11 +1004,10 @@ print(os.environ['AUDIT_REPORT'])
         self.assertEqual(len(self.calls()), before)
 
     def test_optional_preparation_failures_fall_back(self):
-        import shutil
         for failure in ('missing', 'exception', 'malformed'):
             with self.subTest(failure=failure):
                 scripts = self.root / ('scripts-' + failure)
-                shutil.copytree(self.runner_path.parent, scripts)
+                copy_plugin_tree(self.runner_path.parent, scripts)
                 helper = scripts / 'kaizen_friction_prepare.py'
                 if failure == 'missing':
                     helper.unlink()
@@ -1025,9 +1023,8 @@ print(os.environ['AUDIT_REPORT'])
                 self.assertFalse(list((self.backups / 'friction').glob('prepare-*.json')))
 
     def test_retry_after_failed_import_preserves_generation(self):
-        import shutil
         scripts = self.root / 'retry-scripts'
-        shutil.copytree(self.runner_path.parent, scripts)
+        copy_plugin_tree(self.runner_path.parent, scripts)
         helper = scripts / 'kaizen_friction_actions.py'
         original = helper.read_text()
         # Fail only the transactional import, after preparation has succeeded.

@@ -19,7 +19,7 @@ AGENT_PREAMBLE = PREAMBLE.replace(
 # Tracked and untracked files, minus git-ignored ones (out/, caches, .DS_Store).
 FILES = subprocess.run(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], cwd=ROOT,
                        capture_output=True, text=True, check=True).stdout.split('\0')
-TEXT = [ROOT / f for f in FILES if f and (ROOT / f).is_file() and Path(f).suffix in
+TEXT = [ROOT / f for f in FILES if f and not (ROOT / f).is_symlink() and (ROOT / f).is_file() and Path(f).suffix in
         {'.md', '.json', '.sh', '.py', '.toml', '.conf', '.yml', '.yaml', ''}]
 
 

@@ -14,6 +14,7 @@ from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
 from zipfile import ZipFile
 
+from plugin_fixtures import copy_plugin_tree
 from test_friction_claude import end, start
 from test_schedule import CRONTAB
 from test_scripts import StubCase, jsonl
@@ -151,7 +152,7 @@ class PreparationTests(unittest.TestCase):
 
     def mixed_scripts(self, *legacy, revision="518da76"):
         scripts = pathlib.Path(tempfile.mkdtemp(dir=self.root)) / "scripts"
-        shutil.copytree(PATH.parent, scripts)
+        copy_plugin_tree(PATH.parent, scripts)
         # Exact git blobs from 518da76 and 03325cd, available even in depth-one CI.
         with ZipFile(pathlib.Path(__file__).parent / "fixtures/friction-upgrade.zip") as fixture:
             for name in legacy:
@@ -638,7 +639,7 @@ class PreparationTests(unittest.TestCase):
     def test_installed_runner_prepares_real_disposable_evidence(self):
         self.candidate()
         plugin = self.root / "plugins/cache/disposable/version"
-        shutil.copytree(PATH.parent, plugin / "scripts")
+        copy_plugin_tree(PATH.parent, plugin / "scripts")
         binary = self.root / "bin"
         cron = self.write(binary / "crontab", CRONTAB.replace("#!/usr/bin/env python3", "#!" + sys.executable))
         cron.chmod(0o755)

@@ -58,11 +58,13 @@ HOOKS = ("after-compact.sh", "block-image-read.sh", "limit-big-read.sh",
 def same_copy(source, target):
     if source.is_symlink():
         return target.is_symlink() and target.readlink() == source.readlink()
+    if target.is_symlink():
+        return False
     if source.is_dir():
         if not target.is_dir():
             return False
         return all(same_copy(item, target / item.name) for item in source.iterdir())
-    return target.is_file() and source.read_bytes() == target.read_bytes()
+    return source.is_file() and target.is_file() and source.read_bytes() == target.read_bytes()
 
 
 def status(source, target, local):
@@ -81,11 +83,13 @@ def identical(source, target):
     """True when target is an exact copy of source (no missing or extra files)."""
     if source.is_symlink():
         return target.is_symlink() and target.readlink() == source.readlink()
+    if target.is_symlink():
+        return False
     if source.is_dir():
-        return (target.is_dir() and not target.is_symlink()
+        return (target.is_dir()
                 and sorted(p.name for p in source.iterdir()) == sorted(p.name for p in target.iterdir())
                 and all(identical(item, target / item.name) for item in source.iterdir()))
-    return target.is_file() and not target.is_symlink() and source.read_bytes() == target.read_bytes()
+    return source.is_file() and target.is_file() and source.read_bytes() == target.read_bytes()
 
 
 def plugin_name(root):
@@ -141,7 +145,7 @@ def stale_caches(root):
                                 capture_output=True, check=True)
         files = [Path(os.fsdecode(item)) for item in result.stdout.split(b"\0") if item]
     except (OSError, subprocess.SubprocessError):
-        files = [p.relative_to(root) for p in root.rglob("*") if p.is_file()]
+        files = [p.relative_to(root) for p in root.rglob("*") if p.is_symlink() or p.is_file()]
     files = [p for p in files if not any(part in {".git", "out", "docs", "tests"} for part in p.parts)]
     stale = []
     for plugin, installs in plugins.items():

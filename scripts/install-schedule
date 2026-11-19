@@ -57,7 +57,7 @@ MANAGED_NAMES = (
     "usage-series", "usage-compare", "usage-db", "kaizen-demo-fixtures", "kaizen-scan",
     "packet-event", "flow-report", "experiment-check", "brief-lint",
     "kaizen-host-probe", "kaizen-host-fix", "kaizen-allow-rule", "kaizen-worktree-prune",
-    "kaizen-friction-catalog.json", "kaizen_worktree_facts.py", "kaizen_friction_actions.py",
+    "kaizen-friction-catalog.json", "kaizen_worktree_facts.py", "kaizen-status-git", "kaizen_friction_actions.py",
 )
 LABEL = "com.agent-kaizen"
 MARK = "# agent-kaizen"

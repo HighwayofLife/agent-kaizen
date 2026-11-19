@@ -190,9 +190,18 @@ class HostProbeTest(unittest.TestCase):
         outside = self.scratch / 'outside'
         outside.write_text('private')
         (self.source / 'external-link').symlink_to(outside)
+        template = Path('scripts/kaizen-status-git')
+        allowed = template / 'sha1/info/attributes'
+        unexpected = template / 'sha256/info/attributes'
+        for name, target in ((allowed, '/dev/stdin'), (unexpected, outside)):
+            link = self.source / name
+            link.parent.mkdir(parents=True)
+            link.symlink_to(target)
         self.assertEqual(self.run_probe('--host', 'codex', '--worktree').returncode, 0)
         exported = json.loads(self.export_record.read_text())
         self.assertIn('new-file', exported)
+        self.assertIn(str(allowed), exported)
+        self.assertNotIn(str(unexpected), exported)
         self.assertNotIn('external-link', exported)
         self.assertNotIn('d/f.txt', exported)
 

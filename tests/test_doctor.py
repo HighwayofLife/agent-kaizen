@@ -9,6 +9,8 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 
+from plugin_fixtures import copy_plugin_tree
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -19,7 +21,7 @@ class DoctorTests(unittest.TestCase):
         self.home = Path(self.tmp.name)
         self.root = self.home / 'plugin'
         for directory in ('scripts', 'hooks', '.claude-plugin'):
-            shutil.copytree(ROOT / directory, self.root / directory)
+            copy_plugin_tree(ROOT / directory, self.root / directory)
         self.bin = self.home / 'tools'
         self.bin.mkdir()
         for name in ('git', 'bash'):
@@ -42,7 +44,7 @@ class DoctorTests(unittest.TestCase):
         registry.parent.mkdir()
         name = json.loads((self.root / '.claude-plugin/plugin.json').read_text())['name']
         self.cache = self.home / 'cache'
-        shutil.copytree(self.root, self.cache)
+        copy_plugin_tree(self.root, self.cache)
         registry.write_text(json.dumps({'plugins': {name + '@market': [{'installPath': str(self.cache)}]}}))
         pricing = self.root / 'scripts/pricing.json'
         data = json.loads(pricing.read_text())

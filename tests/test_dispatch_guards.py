@@ -1,15 +1,16 @@
 """Dispatch guards exercised with a fake Codex in isolated worktrees."""
 import os
 import shlex
-import shutil
 import signal
 import subprocess
 import sys
 import time
 
 try:
+    from tests.plugin_fixtures import copy_plugin_tree
     from tests.test_scripts import FAKE_CODEX, SCRIPTS, StubCase, executable, write
 except ModuleNotFoundError:
+    from plugin_fixtures import copy_plugin_tree
     from test_scripts import FAKE_CODEX, SCRIPTS, StubCase, executable, write
 
 
@@ -77,7 +78,7 @@ class DispatchGuardTests(StubCase):
 
     def test_brief_lint_missing_tool(self):
         scripts = self.root / 'scripts'
-        shutil.copytree(SCRIPTS, scripts)
+        copy_plugin_tree(SCRIPTS, scripts)
         (scripts / 'brief-lint').unlink()
         command = [str(scripts / 'codex-dispatch'), '-C', str(self.work)]
         result = subprocess.run(command + ['--brief-lint', str(self.brief)], cwd=self.work,
