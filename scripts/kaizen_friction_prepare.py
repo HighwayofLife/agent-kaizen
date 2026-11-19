@@ -618,10 +618,11 @@ def scheduled_publication(audits, store, project, host, persist, ready, *, recei
             return None
         if project.unknown:
             raise ValueError("cannot recover publication with unknown project scope")
-        if not ready():
-            return False
+        broker_ready = ready()
         cutoff = (_stamp(marker["reviewed_at"]) if "reviewed_at" in marker else
                   datetime.fromtimestamp(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mtime, timezone.utc))
+        if not broker_ready:
+            return False
         published = project.folder / filename
         if not published.exists():
             os.unlink(name, dir_fd=directory)

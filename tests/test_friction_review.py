@@ -3,7 +3,7 @@ import json
 import runpy
 from datetime import timedelta
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from test_friction_prepare import PreparationTests, prepare
 
@@ -338,6 +338,34 @@ class ScheduledFrictionTests(PreparationTests):
         self.assertEqual(store["receipts"][str(self.project)][generation], {ident: "terminal"})
         self.assertFalse((target / ".nomedia").exists())
         self.assertTrue(marker.exists())
+        self.assertNotIn("reviewed_at", self.runner["read_state"](self.obj))
+
+    def test_malformed_publication_cutoff_is_reported_when_broker_stays_pending(self):
+        _, ident, output, receipt = self.marker_request()
+        audits = self.config / "audits"
+        reconcile = self.runner["reconcile_scheduled"]
+        with patch.dict(reconcile.__globals__, scheduled_action_refusal=lambda _: None):
+            terminal, _ = reconcile(audits, self.obj, output, receipt, acknowledge=False)
+        self.assertFalse(terminal)
+        proposal = self.obj.folder / "cycle-2026-11-18.md"
+        recover = self.runner["recover_scheduled_publication"]
+        recover(audits, self.obj, receipt, proposal, output)
+        output.rename(proposal)
+        marker = next((self.backups / "friction").glob("publication-*.json"))
+        malformed = json.dumps(dict(json.loads(marker.read_text()), reviewed_at=None))
+        marker.write_text(malformed)
+        options = self.runner["command_options"](SimpleNamespace())
+        broker = Mock()
+
+        with patch.dict(recover.__globals__, run_scheduled_broker=broker):
+            with self.assertRaisesRegex(ValueError, "invalid evidence time"):
+                recover(audits, self.obj, options=options)
+
+        broker.assert_called_once_with(audits, self.obj, options)
+        store = json.loads((audits / "host-actions.json").read_text())
+        generation = "scheduled:" + receipt["generation"]
+        self.assertEqual(store["receipts"][str(self.project)][generation], {ident: "pending"})
+        self.assertEqual(marker.read_text(), malformed)
         self.assertNotIn("reviewed_at", self.runner["read_state"](self.obj))
 
     def test_audit_policy_global_and_scoped(self):
