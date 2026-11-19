@@ -1129,12 +1129,13 @@ def manifest_stamp(change):
     return data, [list(identity), digest]
 
 
-def checked_backup_mode(entry, mode, recorded=None):
+def checked_backup_mode(entry, mode, recorded=None, *, live_mode=None):
+    mode = stat.S_IMODE(mode)
     expected = entry.get("before_mode", recorded)
     if "before_mode" not in entry and recorded is None:
-        # Old journals and Git cannot attest group/other or special permission bits.
-        return stat.S_IMODE(mode) & 0o700
-    if type(expected) is not int or stat.S_IMODE(mode) != expected:
+        # Preserve group/other access only when the verified target has the same mode.
+        return mode & (0o777 if mode == live_mode else 0o700)
+    if type(expected) is not int or mode != expected:
         raise ValueError(f"undo backup mode cannot be verified: {entry['path']}")
     return expected
 
@@ -2027,10 +2028,23 @@ def undo_file_snapshot(path, *, restoring=False, ordinary=False):
         return (parent.st_dev, parent.st_ino), version, digest
 
 
-def undo_snapshot_matches(path, expected, *, ordinary=False):
-    live = undo_file_snapshot(path, ordinary=ordinary)
+def undo_snapshot_matches(live, expected):
     # An earlier restore may have created a shared parent. The target must still be absent.
     return live == expected or (expected[0] is None and live[1] is None)
+
+
+def tracked_undo_aliases(path, versions):
+    if not versions:
+        return []
+    try:
+        info = path.lstat()
+    except (FileNotFoundError, NotADirectoryError):
+        return []
+    if not stat.S_ISREG(info.st_mode) or info.st_nlink < 2:
+        return []
+    identity = info.st_dev, info.st_ino
+    return [alias for alias, (_, version, _) in versions.items()
+            if alias != path and version is not None and version[:2] == identity]
 
 
 def darwin_provenance(fd, label):
@@ -2147,7 +2161,9 @@ def restore_ref_file(change, entry, path, snapshot, blob, before_hash, legacy_mo
                 read_flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
                 with os.fdopen(temp_fd, "wb") as stream, os.fdopen(os.open(source, read_flags), "rb") as backup:
                     metadata = check_restore_metadata(backup.fileno(), temp_fd)
-                    mode = checked_backup_mode(entry, metadata.st_mode, legacy_modes.get(entry["backup"]))
+                    live_mode = stat.S_IMODE(version[2]) if version is not None else None
+                    mode = checked_backup_mode(entry, metadata.st_mode, legacy_modes.get(entry["backup"]),
+                                               live_mode=live_mode)
                     shutil.copyfileobj(backup, stream)
                     stream.flush()
                     os.fchmod(temp_fd, mode)
@@ -2258,7 +2274,8 @@ def undo_locked(args, locked):
             def recheck():
                 if manifest_stamp(change)[1] != record["manifest"]:
                     raise ValueError("commit manifest changed before inverse update")
-                if any(not undo_snapshot_matches(path, versions[path]) for path in backups[change]):
+                if any(not undo_snapshot_matches(undo_file_snapshot(path), versions[path])
+                       for path in backups[change]):
                     raise ValueError("working file changed before inverse update")
 
             if entries is None:
@@ -2270,11 +2287,17 @@ def undo_locked(args, locked):
         for entry in data["files"]:
             path = validate_entry(change, entry, roots)
             before = before_hashes[change, path]
-            shared = not record and path in versions
-            if shared and not undo_snapshot_matches(path, versions[path], ordinary=True):
-                raise ValueError("working file changed during undo")
+            aliases = tracked_undo_aliases(path, versions) if not record and not entry["created"] else []
+            expected = versions.get(path)
+            shared = not record and (expected is not None or bool(aliases))
             expected_mode = None
-            previous = versions[path][1] if shared else None
+            previous = None
+            if shared:
+                live = undo_file_snapshot(path, ordinary=True)
+                if ((expected is not None and not undo_snapshot_matches(live, expected))
+                        or any(live[1:] != versions[alias][1:] for alias in aliases)):
+                    raise ValueError("working file changed during undo")
+                previous = live[1]
             if record:
                 versions[path] = restore_ref_file(change, entry, path, versions[path], backups[change][path],
                                                   before, record.get("legacy_modes", {}))
@@ -2302,7 +2325,11 @@ def undo_locked(args, locked):
                 if (snapshot[2] != (None if entry["created"] else before) or mode != expected_mode
                         or (not entry["created"] and previous is not None and snapshot[1][:2] != previous[:2])):
                     raise ValueError("working file changed during undo")
-                versions[path] = snapshot
+                if expected is not None:
+                    versions[path] = snapshot
+                # An in-place copy updates the same inode through every hard-linked name.
+                for alias in aliases:
+                    versions[alias] = (versions[alias][0], *snapshot[1:])
         for act in data["actions"]:
             print(f"ACTION to reverse by hand (not run): {act['undo']}   # was: {act['did']}")
         data["reverted"] = datetime.date.today().isoformat()

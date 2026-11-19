@@ -145,6 +145,23 @@ class BackupCommitTests(unittest.TestCase):
         self.main("undo", change, "--force")
         self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o600)
 
+    def test_legacy_ref_undo_preserves_matching_live_mode(self):
+        self.target.chmod(0o644)
+        change = self.ready()
+        manifest = self.manifest(change)
+        manifest["files"][0].pop("before_mode", None)
+        (change / "manifest.json").write_text(json.dumps(manifest))
+        ref = self.commit_cli(change).stdout.split()[-1]
+        journal = self.helpers["record_path"](change)
+        record = json.loads(journal.read_text())
+        record.pop("legacy_modes", None)
+        journal.write_text(json.dumps(record))
+
+        self.main("undo", change)
+        self.assertEqual(self.target.read_text(), "before")
+        self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o644)
+        self.assertEqual(self.git("diff", "HEAD", ref), "")
+
     def test_undo_run_does_not_accept_an_editor_save_after_a_shared_restore(self):
         self.check_shared_restore_race(committed=True)
 
@@ -304,6 +321,23 @@ class BackupCommitTests(unittest.TestCase):
         self.assertEqual(self.git("rev-parse", ref), tip)
         self.assertTrue(self.target.samefile(alias))
         self.assertEqual(alias.read_text(), "after")
+
+    def test_ordinary_undo_run_restores_hard_linked_names(self):
+        alias = self.tmp / "hard-link"
+        os.link(self.target, alias)
+        older = self.begin("--run", "shared")
+        self.target.write_text("older edit")
+        self.script("finish", older)
+        newer = Path(self.script("begin", "--run", "shared", "--skill", "trim", "--ledger", "fixture",
+                                 alias, self.target))
+        alias.write_text("newer edit")
+        self.script("finish", newer)
+
+        self.main("undo", "run")
+        self.assertTrue(self.target.samefile(alias))
+        self.assertEqual((self.target.read_text(), alias.read_text()), ("before", "before"))
+        for change in (older, newer):
+            self.assertIsNotNone(self.manifest(change)["reverted"])
 
     def test_forced_ref_undo_recreates_removed_parent_directories(self):
         nested = self.repo / "outer/inner"
