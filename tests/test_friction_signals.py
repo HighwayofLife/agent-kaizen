@@ -28,6 +28,112 @@ class SignedTranscriptTests(SecurityCase):
             self.assertIsNotNone(AUDIT['write_extract'](data, self.root / 'report.md', default, {}))
         self.assertEqual(default.stat().st_mode & 0o777, 0o700)
 
+    def test_extract_missing_unix_flags_does_not_abort(self):
+        from unittest.mock import patch
+        import os
+        with patch.object(os, 'O_DIRECTORY', create=True):
+            del os.O_DIRECTORY
+            self.assertIsNone(AUDIT['write_extract'](dict(since='2025-01-01', agent_usage={}),
+                                                     self.root / 'report.md', self.root / 'extracts', {}))
+
+    def test_nonregular_transcripts_never_block_fallback(self):
+        import os
+        import subprocess
+        import sys
+        for path in (self.cfg / 'projects/fixture/pipe.jsonl', self.cx / 'sessions/2025/01/01/pipe.jsonl'):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            os.mkfifo(path)
+        for flags in ([], ['--no-friction']):
+            result = subprocess.run([sys.executable, str(Path(AUDIT['__file__'])), '--json', *flags],
+                                    cwd=self.work, env=self.env, capture_output=True, text=True, timeout=5)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            if not flags:
+                self.assertEqual(json.loads(result.stdout)['warnings']['unsafe permission transcript'], 2)
+
+    def test_report_writes_utf8_with_legacy_locale(self):
+        import subprocess
+        import sys
+        wrapper = """import pathlib, runpy, sys
+original = pathlib.Path.write_text
+def checked(self, data, *args, **kwargs):
+    if self.suffix == '.md' and kwargs.get('encoding') != 'utf-8':
+        raise AssertionError('report encoding must be UTF-8')
+    return original(self, data, *args, **kwargs)
+pathlib.Path.write_text = checked
+sys.argv = [sys.argv[1], '--json']
+runpy.run_path(sys.argv[0], run_name='__main__')
+"""
+        result = subprocess.run([sys.executable, '-c', wrapper, str(Path(AUDIT['__file__']))],
+                                cwd=self.work, env=self.env, capture_output=True, text=True, timeout=5)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('≥', Path(json.loads(result.stdout)['report_path']).read_text(encoding='utf-8'))
+
+    def test_report_compares_with_legacy_locale(self):
+        import hashlib
+        from unittest.mock import patch
+
+        secret = b'fixture'
+        scope = dict(v=1, window='7d')
+        previous = self.root / 'token-audit-old.md'
+        cohort = dict(signature='cargo test', basis='measured', count=3, p50=60)
+        friction = dict(v=1, thresholds={}, window={}, basis='measured',
+                        summary=dict(capped=False), comparisons=[cohort])
+        name = previous.with_suffix('.extract.json').name
+        raw = json.dumps(dict(v=1, scope=scope, report=previous.name, friction=friction)).encode()
+        (self.root / name).write_bytes(raw)
+        binding = dict(size=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+        mac = AUDIT['regression_binding_mac'](secret, previous.name, binding)
+        report = '\n'.join((
+            'Á',
+            '<!-- token-audit-headline {} -->',
+            f'<!-- token-audit-scope {json.dumps(scope)} -->',
+            f'<!-- token-audit-extract {json.dumps(dict(v=1, file=name))} -->',
+            f'<!-- token-audit-friction {json.dumps(binding)} -->',
+            f'<!-- token-audit-friction-mac {mac} -->',
+            '<!-- token-audit-complete -->',
+            '',
+        ))
+        original_open = Path.open
+
+        def legacy_open(path, mode='r', buffering=-1, encoding=None, errors=None, newline=None):
+            if 'b' not in mode and encoding in (None, 'locale'):
+                encoding = 'cp1252'
+            return original_open(path, mode, buffering, encoding, errors, newline)
+
+        for encoding in ('utf-8', 'cp1252'):
+            with self.subTest(encoding=encoding):
+                previous.write_bytes(report.encode(encoding))
+                current = dict(friction=dict(friction, comparisons=[dict(cohort, p50=90)], flags=[]))
+                with patch.object(Path, 'open', legacy_open), patch.dict(
+                        AUDIT['apply_regression'].__globals__, audit_machine_key=lambda: secret):
+                    AUDIT['apply_regression'](current, self.root / 'token-audit-new.md', scope, self.root)
+                self.assertEqual([item['ratio'] for item in current['friction'].get('regressions', [])], [1.5])
+
+    def test_darwin_deny_acl_is_safe_but_allow_acl_is_not(self):
+        import os
+        import subprocess
+        import sys
+        if sys.platform != 'darwin':
+            self.skipTest('Darwin ACL API')
+        path = self.root / 'acl-test'
+        path.touch()
+        self.addCleanup(subprocess.run, ['chmod', '-N', str(path)], check=True)
+        subprocess.run(['chmod', '+a', 'everyone deny delete', str(path)], check=True)
+        with path.open('rb') as stream:
+            self.assertFalse(AUDIT['has_allow_acl'](stream.fileno()))
+        subprocess.run(['chmod', '+a', 'everyone allow write', str(path)], check=True)
+        with path.open('rb') as stream:
+            self.assertTrue(AUDIT['has_allow_acl'](stream.fileno()))
+
+    def test_unrelated_unsafe_rollout_does_not_warn(self):
+        project = self.project('selected')
+        other = self.project('other')
+        path = self.cx / 'sessions/2025/01/01/rollout.jsonl'
+        jsonl(path, [row('session_meta', 0, cwd=str(other))])
+        path.chmod(0o664)
+        data = json.loads(self.run_script('token-audit', '--cwd', project, '--json').stdout)
+        self.assertFalse(data['warnings'].get('unsafe permission transcript'))
+
     def test_unsafe_codex_rollout_cannot_authenticate_regression(self):
         project = self.project('codex-evidence')
         now = datetime.now(timezone.utc) - timedelta(minutes=1)
@@ -161,6 +267,67 @@ class FrictionSignalTests(FrictionClaudeTests):
         self.assertNotIn(first, json.dumps(data))
         self.assertEqual(self.collect()['friction']['permission_acceptance'], [])
         self.assertNotIn('friction', self.collect(cwd=[first], friction=False))
+
+    def test_timestampless_conflicting_denial_is_ambiguous(self):
+        root = str(self.work.resolve())
+        yes = end('conflict', 2, cwd=root, permissionDecision=dict(source='user', decision='accept'), toolUseResult=dict(durationMs=1000))
+        no = end('conflict', 2, cwd=root, permissionDecision=dict(source='user', decision='reject'))
+        del no['timestamp']
+        no['nested'] = {'timestamp': '2020-01-01T00:00:00Z'}
+        jsonl(self.session, [start('conflict', 0, 'ls', cwd=root), yes, no])
+        evidence = self.collect(cwd=[root])['friction']['permission_acceptance'][0]
+        self.assertEqual((evidence['accepted'], evidence['ambiguous']), (0, 1))
+
+    def test_invalid_outer_timestamp_conflicting_denial_is_ambiguous(self):
+        root = str(self.work.resolve())
+        yes = end('conflict', 2, cwd=root, permissionDecision=dict(source='user', decision='accept'),
+                  toolUseResult=dict(durationMs=1000))
+        no = dict(nested={'timestamp': yes['timestamp']},
+                  **end('conflict', 2, cwd=root, permissionDecision=dict(source='user', decision='reject')))
+        for malformed in ('invalid', '0000-01-01T00:00:00Z', '2020-01-01T00:00:00.' + '0' * 24 + 'Z'):
+            with self.subTest(timestamp=malformed):
+                no['timestamp'] = malformed
+                jsonl(self.session, [start('conflict', 0, 'ls', cwd=root), yes, no])
+                evidence = self.collect(cwd=[root])['friction']['permission_acceptance'][0]
+                self.assertEqual((evidence['accepted'], evidence['ambiguous']), (0, 1))
+
+    def test_long_tool_timestamp_preserves_claude_call_accounting(self):
+        begin = start('long', 2)
+        begin['message'].update(id='usage', model='claude-test', usage=dict(input_tokens=10, output_tokens=5))
+        for stamp in ('2025-01-01T00:00:02.' + '0' * 24 + 'Z',
+                      '2025-01-01T01:00:02.000000+01:00:00.000001'):
+            with self.subTest(timestamp=stamp):
+                begin['timestamp'] = stamp
+                jsonl(self.session, [begin, end('long', 3)])
+                for friction in (True, False):
+                    self.assertEqual(self.collect(friction=friction)['headline']['claude_calls'], 1)
+
+    def test_invalid_tool_result_timestamp_warns_once(self):
+        result = end('invalid', 2)
+        for stamp in ('invalid', 'invalidZ', None):
+            with self.subTest(timestamp=stamp):
+                result.pop('timestamp', None)
+                if stamp is not None:
+                    result['timestamp'] = stamp
+                jsonl(self.session, [start('invalid', 0), result])
+                data = self.collect()
+                self.assertEqual(data['warnings']['malformed rows'], 1)
+                self.assertEqual(data['friction']['summary']['samples'], 0)
+
+    def test_skipped_sample_preserves_transcript_duration(self):
+        from unittest.mock import patch
+        jsonl(self.session, [start('duration', 0), end('duration', 180, toolUseResult=dict(durationMs=120000))])
+        samples = dict(events={}, load=[], procs=[], hours=set(), skipped_days={'2025-01-01'})
+        with patch.dict(AUDIT['collect'].__globals__, read_samples=lambda *args: samples):
+            summary = self.collect()['friction']['summary']
+        self.assertEqual((summary['samples'], summary['measured']), (1, 1))
+        self.assertEqual(summary['slow_calls'][0]['seconds_total'], 120)
+
+    def test_prompt_only_extract_includes_wait(self):
+        jsonl(self.session, [start('wait', 0), end('wait', 10, permissionDecision=dict(source='user', decision='accept'))])
+        data = self.audit('--since', '2025-01-01')
+        extract = json.loads(Path(data['extract_path']).read_text())
+        self.assertEqual(extract['friction']['permission_waits']['count'], 1)
 
     def test_conflicting_decisions_are_ambiguous(self):
         root = str(self.work.resolve())
