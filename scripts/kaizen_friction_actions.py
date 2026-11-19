@@ -240,6 +240,7 @@ class _Rows(dict):
         self.preserved_receipts = {}
         self.receipt_metadata = {}
         self.loaded_generations = set()
+        self.compact_applies = set()
 
 
 def _text(value, limit, *, path=False):
@@ -325,23 +326,14 @@ class HostActions:
             raise ValueError("invalid host-action machine key")
         return secret
 
-    def _load(self, directory):
-        for _ in range(CREATE_RETRIES):
-            try:
-                raw = _read(directory, self.path.name, STORE_LIMIT, replaced=True)
-            except FileNotFoundError:
-                return _Rows(), None, {}
-            try:
-                versions = json.loads(_read(directory, self.path.name + ".receipts", RECEIPT_LIMIT,
-                                            replaced=True), object_pairs_hook=_unique)
-            except FileNotFoundError:
-                versions = {}
-            except (ValueError, RecursionError):
-                raise ValueError("invalid host-action receipt metadata") from None
-            if not versions or raw == _read(directory, self.path.name, STORE_LIMIT, replaced=True):
-                break
-        else:
-            raise ValueError("host-action store changed during read")
+    def _receipt_versions(self, directory, suffix):
+        try:
+            versions = json.loads(_read(directory, self.path.name + suffix, RECEIPT_LIMIT,
+                                        replaced=True), object_pairs_hook=_unique)
+        except FileNotFoundError:
+            return {}
+        except (ValueError, RecursionError):
+            raise ValueError("invalid host-action receipt metadata") from None
         if (not isinstance(versions, dict) or len(versions) > 2
                 or any(not re.fullmatch(r"[0-9a-f]{64}", digest) or not isinstance(saved, dict)
                        or set(saved) - {"guarded"} != {"receipts", "apply_intents"}
@@ -349,7 +341,24 @@ class HostActions:
                        or not isinstance(saved["receipts"], dict) or not isinstance(saved["apply_intents"], dict)
                        for digest, saved in versions.items())):
             raise ValueError("invalid host-action receipt metadata")
-        digest = hashlib.sha256(raw).hexdigest()
+        return versions
+
+    def _load(self, directory):
+        for _ in range(CREATE_RETRIES):
+            try:
+                raw = _read(directory, self.path.name, STORE_LIMIT, replaced=True)
+            except FileNotFoundError:
+                return _Rows(), None, {}
+            digest = hashlib.sha256(raw).hexdigest()
+            # Read the main sidecar first. Its prior snapshot is spilled before replacement.
+            versions = self._receipt_versions(directory, ".receipts")
+            if digest not in versions:
+                previous = self._receipt_versions(directory, ".receipts-previous")
+                versions = {**previous, **versions}
+            if not versions or raw == _read(directory, self.path.name, STORE_LIMIT, replaced=True):
+                break
+        else:
+            raise ValueError("host-action store changed during read")
         matched = digest in versions
         # An older runner can update the shared v1 file without touching the sidecar.
         metadata = [versions[digest]] if matched else [saved for saved in versions.values() if not saved.get("guarded")]
@@ -385,7 +394,8 @@ class HostActions:
                 if not isinstance(generations, dict):
                     raise ValueError("invalid host-action receipt metadata")
                 for generation, receipt in generations.items():
-                    if not isinstance(receipt, dict) or any(state != "terminal" for state in receipt.values()):
+                    if (not isinstance(receipt, dict)
+                            or any(state not in ("terminal", COMPACT_APPLY) for state in receipt.values())):
                         raise ValueError("invalid host-action receipt metadata")
                     current = receipts.setdefault(project, {})
                     if not isinstance(current, dict):
@@ -397,7 +407,7 @@ class HostActions:
                         inline.update(receipt)
                         archived.setdefault(project, {})[generation] = receipt
                     elif generation not in current and (matched or all(ident in rows for ident in receipt)):
-                        current[generation] = receipt
+                        current[generation] = dict(receipt)
                         archived.setdefault(project, {})[generation] = receipt
             for project, generations in saved["apply_intents"].items():
                 if not isinstance(generations, dict):
@@ -424,13 +434,12 @@ class HostActions:
                                for ident, state in receipt.items())):
                     raise ValueError("invalid host-action receipt")
         rows = _Rows((ident, row) for ident, row in rows.items() if ident not in skipped)
-        saved_intents = {project: {generation: sorted(ids) for generation, ids in generations.items()}
-                         for project, generations in intents.items()}
-        if versions:
-            saved = dict(receipts=archived, apply_intents=saved_intents)
-            if guarded:
-                saved["guarded"] = True
-            rows.receipt_metadata = {digest: saved}
+        if matched:
+            rows.receipt_metadata = {digest: versions[digest]}
+        elif versions:
+            saved_intents = {project: {generation: sorted(ids) for generation, ids in generations.items()}
+                             for project, generations in intents.items()}
+            rows.receipt_metadata = {digest: dict(receipts=archived, apply_intents=saved_intents)}
         rows.loaded_generations = {(project, generation) for project, generations in receipts.items()
                                    for generation in generations}
         rows.apply_intents = intents
@@ -462,7 +471,10 @@ class HostActions:
                     if state in ("pending", COMPACT_APPLY):
                         rows.apply_intents.setdefault(project, {}).setdefault(generation, set()).add(ident)
                     if state == COMPACT_APPLY:
+                        rows.compact_applies.add((project, generation, ident))
                         receipt[ident] = "terminal"
+                    elif guarded and state == "terminal" and ident in intents.get(project, {}).get(generation, ()):
+                        rows.compact_applies.add((project, generation, ident))
         if skipped:
             fields = _object_values(raw.decode("utf-8"))
             row_values = _object_values(fields["actions"])
@@ -505,7 +517,8 @@ class HostActions:
 
         output_rows = dict(rows)
         output_rows.update((ident, marker(value)) for ident, value in getattr(rows, "preserved", {}).items())
-        output_receipts = {project: dict(generations) for project, generations in receipts.items()}
+        output_receipts = {project: {generation: dict(receipt) for generation, receipt in generations.items()}
+                           for project, generations in receipts.items()}
         for (project, generation), value in getattr(rows, "preserved_receipts", {}).items():
             receipt = output_receipts[project][generation]
             original = json.loads(value)
@@ -514,7 +527,7 @@ class HostActions:
             else:
                 output_receipts[project][generation] = dict(receipt, **{
                     ident: marker(raw) for ident, raw in _object_values(value).items()
-                    if ident in rows.preserved and original[ident] != COMPACT_APPLY})
+                    if ident in rows.preserved})
         # Prefer the release v1 wire format when it fits without hiding receipts.
         output = {"v": 1, "actions": output_rows, "receipts": output_receipts}
         def encode(compact=False):
@@ -523,7 +536,6 @@ class HostActions:
                 text = text.replace(token, value)
             return (text if compact else text + "\n").encode("utf-8", "backslashreplace")
 
-        raw = encode()
         completed = {}
         for project, generations in receipts.items():
             for generation, receipt in generations.items():
@@ -531,13 +543,23 @@ class HostActions:
                 closed = sorted(ident for ident in ids if receipt.get(ident) == "terminal")
                 if closed:
                     completed.setdefault(project, {})[generation] = closed
-        if len(raw) > STORE_LIMIT:
+        compact_ids = set(rows.compact_applies)
+
+        def compact_applies(force=False):
             for project, generations in completed.items():
                 for generation, ids in generations.items():
                     receipt = output_receipts[project][generation]
                     if isinstance(receipt, dict):
-                        output_receipts[project][generation] = dict(receipt, **{
-                            ident: COMPACT_APPLY for ident in ids if ident not in rows.preserved})
+                        for ident in ids:
+                            slot = project, generation, ident
+                            if ident not in rows.preserved and (force or slot in compact_ids):
+                                receipt[ident] = COMPACT_APPLY
+                                compact_ids.add(slot)
+
+        compact_applies()
+        raw = encode()
+        if len(raw) > STORE_LIMIT:
+            compact_applies(force=True)
             raw = encode(compact=True)
 
         # An old runner must reject a store whose sidecar holds any receipt entries.
@@ -552,7 +574,7 @@ class HostActions:
                 if (project, generation) not in rows.loaded_generations or not isinstance(inline, dict):
                     continue
                 receipt = receipts[project][generation]
-                terminal = {ident: state for ident, state in receipt.items()
+                terminal = {ident: inline[ident] for ident, state in receipt.items()
                             if state == "terminal" and ident not in rows.preserved}
                 if receipt and not terminal:
                     continue
@@ -577,26 +599,46 @@ class HostActions:
                 inline = output_receipts[project].get(generation)
                 if isinstance(inline, dict):
                     ids = [ident for ident in ids if inline.get(ident) != COMPACT_APPLY]
-                    if ids:
-                        generations[generation] = ids
-                    else:
-                        del generations[generation]
+                parked = archived.get(project, {}).get(generation, {})
+                ids = [ident for ident in ids if parked.get(ident) != COMPACT_APPLY]
+                if ids:
+                    generations[generation] = ids
+                else:
+                    del generations[generation]
         completed = {project: generations for project, generations in completed.items() if generations}
         metadata = dict(receipts=archived, apply_intents=completed)
         if archived:
             metadata["guarded"] = True
         digest = hashlib.sha256(raw).hexdigest()
         versions = dict(rows.receipt_metadata, **{digest: metadata})
-        if archived or completed or rows.receipt_metadata:
-            encoded = json.dumps(versions, separators=(",", ":")).encode("utf-8")
+        previous_name = self.path.name + ".receipts-previous"
+        has_metadata = bool(archived or completed or rows.receipt_metadata)
+        if has_metadata:
+            def encode_versions(entries):
+                return json.dumps(entries, ensure_ascii=False, separators=(",", ":")).encode(
+                    "utf-8", "backslashreplace")
+
+            encoded = encode_versions(versions)
             if len(encoded) > RECEIPT_LIMIT:
-                raise ValueError("host-action receipt metadata exceeds size limit")
+                encoded = encode_versions({digest: metadata})
+                previous = encode_versions(rows.receipt_metadata)
+                if max(len(encoded), len(previous)) > RECEIPT_LIMIT:
+                    raise ValueError("host-action receipt metadata exceeds size limit")
+                # Spill the prior snapshot before replacing the main sidecar.
+                _replace(directory, previous_name, previous)
             # Keep the previous metadata until the shared file is durably replaced.
             _replace(directory, self.path.name + ".receipts", encoded)
         _replace(directory, self.path.name, raw)
-        rows.receipt_metadata = {digest: metadata} if archived or completed else {}
+        try:
+            os.unlink(previous_name, dir_fd=directory)
+        except FileNotFoundError:
+            pass
+        else:
+            os.fsync(directory)
+        rows.receipt_metadata = {digest: metadata} if has_metadata else {}
         rows.loaded_generations = {(project, generation) for project, generations in receipts.items()
                                    for generation in generations}
+        rows.compact_applies = compact_ids
 
     def _new_row(self, identity, evidence, stamp):
         project, catalog_id, selector = identity
@@ -672,6 +714,29 @@ class HostActions:
                 del generations[name]
                 rows.apply_intents.get(project, {}).pop(name, None)
 
+    def _legacy_applies(self, project, generation, ids, secret):
+        if not ids or not re.fullmatch(r"scheduled:[0-9]{20}", generation):
+            return set()
+        applied = set()
+        with _directory(self.friction, private=True) as state:
+            for ident in ids:
+                try:
+                    raw = _read(state, "broker-" + ident + ".json", 64 << 10, replaced=True)
+                except FileNotFoundError:
+                    continue
+                record = json.loads(raw, object_pairs_hook=_unique)
+                mac = record.pop("mac", None) if isinstance(record, dict) else None
+                payload = json.dumps(record, sort_keys=True, separators=(",", ":")).encode("ascii")
+                expected = hmac.digest(secret, b"broker-ledger-v1\0" + payload, "sha256").hex()
+                if not isinstance(mac, str) or not mac.isascii() or not hmac.compare_digest(mac, expected):
+                    raise ValueError("invalid legacy host-action broker record")
+                if record.get("operation") == "host-fix" and generation == f"scheduled:{record.get('generation')}":
+                    info = os.stat(project, follow_symlinks=False)
+                    if record.get("id") != ident or record.get("scope") != [project, info.st_dev, info.st_ino]:
+                        raise ValueError("legacy host-action broker scope changed")
+                    applied.add(ident)
+        return applied
+
     def import_actions(self, block, frozen_map, project, generation):
         """Use the private map's identity, comparable evidence text and mode-filtered intents."""
         requests = _requests(block)
@@ -702,8 +767,13 @@ class HostActions:
             generations = receipts.setdefault(project, {})
             if generation in generations:
                 saved = generations[generation]
-                applied = rows.apply_intents.get(project, {}).get(generation, ())
-                if saved.keys() != receipt.keys() or set(applied) != _pending({generation: receipt}):
+                if saved.keys() != receipt.keys():
+                    raise ValueError("different requests for an imported host-action generation")
+                applied = set(rows.apply_intents.get(project, {}).get(generation, ()))
+                # The historical store collapsed completed applies into ordinary terminal receipts.
+                # Only a signed reservation for this action and generation can recover that intent.
+                applied.update(self._legacy_applies(project, generation, saved.keys() - applied, stored_secret))
+                if applied != _pending({generation: receipt}):
                     raise ValueError("different requests for an imported host-action generation")
                 return saved
             pending = _pending(generations)

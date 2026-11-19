@@ -423,6 +423,91 @@ class BrokerLedgerTests(unittest.TestCase):
             self.assertEqual(journal.reconcile(ident), "recorded")
             self.assertEqual(self.ledger.read_text().count(ident), 1)
 
+    def test_directory_replaced_before_finalization_reports_displaced_copy(self):
+        moved = self.root / "moved-backups"
+        report = io.StringIO()
+        with self.locked() as journal:
+            ident = self.ledger_effect(journal)
+            path = journal.ledger_backup_path(self.ledger.stat().st_dev)
+            finish = journal.finish_ledger_exchange
+
+            def replace_before_finish(*args, **kwargs):
+                path.rename(moved)
+                path.mkdir(mode=0o700)
+                backup, = moved.iterdir()
+                (path / backup.name).write_text("decoy")
+                return finish(*args, **kwargs)
+
+            with patch.object(journal, "finish_ledger_exchange", side_effect=replace_before_finish), \
+                    redirect_stdout(report), self.assertRaisesRegex(ValueError, "backup directory changed"):
+                journal.reconcile(ident)
+            backup, = moved.iterdir()
+            self.assertEqual(backup.read_text(), self.table)
+            self.assertEqual((path / backup.name).read_text(), "decoy")
+            self.assertIn(str(backup), report.getvalue())
+            self.assertEqual(journal.load(ident)["phase"], "effect-verified")
+            shutil.rmtree(path)
+            moved.rename(path)
+            self.assertEqual(journal.reconcile(ident), "recorded")
+
+    def test_undo_after_completed_ledger_backup_is_removed(self):
+        with self.locked() as journal:
+            ident = self.ledger_effect(journal)
+            self.assertEqual(journal.reconcile(ident), "recorded")
+            record = journal.load(ident)
+            backup, = record["ledger_backups"]
+            Path(backup).unlink()
+        target = self.project / self.tool["TARGET"]
+        self.assertTrue(target.exists())
+        with self.locked() as journal:
+            journal.undo(ident, lambda _, record: self.tool["transact"](self.project, record=record))
+            record = journal.load(ident)
+            self.assertEqual(record["phase"], "reverted")
+            self.assertNotIn("ledger_exchange", record)
+        self.assertFalse(target.exists())
+
+    def test_undo_recovers_completed_round_one_binding_after_copy_is_removed(self):
+        with self.locked() as journal:
+            ident = self.ledger_effect(journal)
+            save = journal.save
+
+            def save_round_one(record, phase):
+                if phase != "recorded" or record.get("ledger_exchange"):
+                    save(record, phase)
+
+            with patch.object(journal, "save", side_effect=save_round_one):
+                self.assertEqual(journal.reconcile(ident), "recorded")
+            record = journal.load(ident)
+            backup, = record["ledger_backups"]
+            self.assertEqual(record["ledger_exchange"][-1], Path(backup).name)
+            Path(backup).unlink()
+            journal.undo(ident, lambda _, record: self.tool["transact"](self.project, record=record))
+            self.assertEqual(journal.load(ident)["phase"], "reverted")
+        self.assertFalse((self.project / self.tool["TARGET"]).exists())
+
+    def test_directory_replaced_while_clearing_final_binding_restores_recovery(self):
+        moved, report = self.root / "moved-backups", io.StringIO()
+        with self.locked() as journal:
+            ident = self.ledger_effect(journal)
+            path = journal.ledger_backup_path(self.ledger.stat().st_dev)
+            save = journal.save
+
+            def replace_when_cleared(record, phase):
+                save(record, phase)
+                if phase == "recorded" and "ledger_exchange" not in record:
+                    path.rename(moved)
+                    path.mkdir(mode=0o700)
+
+            with patch.object(journal, "save", side_effect=replace_when_cleared), redirect_stdout(report), \
+                    self.assertRaisesRegex(ValueError, "backup directory changed"):
+                journal.reconcile(ident)
+            backup, = moved.iterdir()
+            self.assertEqual(backup.read_text(), self.table)
+            self.assertIn(str(backup), report.getvalue())
+            record = journal.load(ident)
+            self.assertEqual(record["phase"], "effect-verified")
+            self.assertEqual(record["ledger_exchange"][-1], backup.name)
+
     def test_git_cross_device_ledger_refuses_local_backup(self):
         subprocess.run(["git", "init", "-q", str(self.project)], check=True)
         with self.locked() as journal:
@@ -922,7 +1007,7 @@ for index, event in enumerate(events):
 
                 project_policy = project / "docs/kaizen/config.json"
                 if fault == "config-created":
-                    statement = '        self.finish_ledger_exchange(record, "recorded")'
+                    statement = '        self.finish_ledger_exchange(record, "recorded", backups)'
                     runtime.write_text(runtime_source.replace(
                         statement, statement + '\n        (self.project / "docs/kaizen/config.json").write_text("{}")', 1))
                 command(runner, *review, KAIZEN_SKIP_CHECKS="1")
@@ -985,7 +1070,7 @@ for index, event in enumerate(events):
                     statement = '                    terminal(ident, applied=finish_commit(record) == "recorded")'
                     runner.write_text(runner_source.replace(statement, '                    os._exit(77)'))
                 elif case == "after-row":
-                    statement = '        self.finish_ledger_exchange(record, "recorded")'
+                    statement = '        self.finish_ledger_exchange(record, "recorded", backups)'
                     runtime.write_text(runtime_source.replace(statement, statement +
                         '\n        if record["operation"] == LOCAL_COMMIT:\n            os._exit(77)', 1))
                 interrupted = case.startswith(("before-", "after-"))
