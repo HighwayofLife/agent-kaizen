@@ -4,6 +4,7 @@ import io
 import os
 import runpy
 import select
+import shlex
 import shutil
 import subprocess
 import sys
@@ -246,6 +247,56 @@ class DispatchStatusTests(StubCase):
         (self.work / 'task.md').write_text('changed')
         self.assertIn('clean=false', self.run_script('dispatch-status', '--worktree-facts', self.work).stdout)
 
+    def test_submodule_initialized_during_parent_status_is_not_clean(self):
+        staging = self.root / 'staging'
+        self.git('clone', '-q', '.', str(staging))
+        tip = self.git('rev-parse', 'HEAD').stdout.strip()
+        self.git('update-index', '--add', '--cacheinfo', f'160000,{tip},sub')
+        self.git('commit', '-qm', 'gitlink')
+        (staging / 'task.md').write_text('dirty submodule')
+        script_dir = str(Path(__file__).resolve().parents[1] / 'scripts')
+        with patch.object(sys, 'path', [script_dir, *sys.path]):
+            import kaizen_worktree_facts as facts
+
+            def status(run, path):
+                if staging.exists():
+                    staging.rename(self.work / 'sub')
+                return run(path, 'status', '--porcelain', '-z')
+
+            self.assertFalse(facts.read_facts(self.work, status)[0]['clean'])
+
+    def test_advisory_status_without_writable_temporary_storage(self):
+        (self.work / '.gitattributes').write_text('task.md -text\n')
+        (self.work / '.git/info/attributes').write_text('task.md text filter=late\n')
+        task = self.work / 'task.md'
+        task.write_bytes(task.read_bytes().replace(b'\n', b'\r\n'))
+        self.git('add', '.gitattributes', 'task.md')
+        self.git('commit', '-qm', 'attributes')
+        os.utime(task, (time.time() - 60,) * 2)
+        self.git('config', 'extensions.worktreeConfig', 'true')
+        linked = self.root / 'linked'
+        self.git('worktree', 'add', '-qb', 'topic', str(linked))
+        (linked / 'task.md').write_text('dirty worktree')
+        staged = self.root / 'staged'
+        self.git('worktree', 'add', '-qb', 'staged', str(staged))
+        (staged / 'new').touch()
+        self.git('-C', str(staged), 'add', 'new')
+        script_dir = str(Path(__file__).resolve().parents[1] / 'scripts')
+        with patch.object(sys, 'path', [script_dir, *sys.path]):
+            import kaizen_worktree_facts as facts
+
+            def status(run, path):
+                if path == linked:
+                    self.git('-C', str(path), 'config', '--worktree', 'filter.late.clean',
+                             f'touch "{self.root / "filter-ran"}"; cat')
+                return run(path, 'status', '--porcelain', '-z')
+
+            with patch('tempfile.TemporaryDirectory', side_effect=PermissionError('read-only')):
+                rows = facts.read_facts(self.work, status)
+            self.assertEqual({row['path']: row['clean'] for row in rows},
+                             {self.work: True, linked: False, staged: False})
+            self.assertFalse((self.root / 'filter-ran').exists())
+
     def test_submodule_symlink_loop_does_not_abort(self):
         tip = self.git('rev-parse', 'HEAD').stdout.strip()
         self.git('update-index', '--add', '--cacheinfo', f'160000,{tip},sub')
@@ -353,18 +404,65 @@ class DispatchStatusTests(StubCase):
         self.assertIn(str(fake), running)
         self.assertNotIn('codex-dispatch.log', running)
 
+    def dispatch_while_listing(self, target, retarget=None, other=None):
+        ready = self.root / 'check-ready'
+        release = self.root / 'check-release'
+        check = (f'touch {shlex.quote(str(ready))}; '
+                 f'while [ ! -f {shlex.quote(str(release))} ]; do sleep 0.05; done')
+        script = Path(__file__).resolve().parents[1] / 'scripts/codex-dispatch'
+        with subprocess.Popen([str(script), '--allow-no-change', '-C', str(target), '-k', check, 'task.md'],
+                              cwd=self.work, env=self.env, stdout=subprocess.PIPE,
+                              stderr=subprocess.PIPE, text=True) as dispatch:
+            try:
+                deadline = time.monotonic() + 10
+                while not ready.exists() and dispatch.poll() is None and time.monotonic() < deadline:
+                    time.sleep(0.025)
+                self.assertTrue(ready.exists())
+                if retarget is not None:
+                    target.unlink()
+                    target.symlink_to(retarget)
+                status = runpy.run_path(str(script.with_name('dispatch-status')))['running']
+                args = [str(script), '-C', str(target), 'task.md']
+                ps = subprocess.CompletedProcess([], 0, stdout=f'{dispatch.pid} 00:01 {shlex.join(args)}\n')
+                visible = []
+                for checkout in (self.work, other) if other else (self.work,):
+                    listing = io.StringIO()
+                    with patch.object(Path, 'cwd', return_value=checkout), \
+                            patch.object(sys, 'path', [str(script.parent), *sys.path]), \
+                            patch.object(subprocess, 'run', return_value=ps), redirect_stdout(listing):
+                        status(False)
+                    visible.append(any(line.startswith(f'{dispatch.pid} ') for line in listing.getvalue().splitlines()))
+                return visible
+            finally:
+                release.touch()
+                stdout, stderr = dispatch.communicate(timeout=10)
+                self.assertEqual(dispatch.returncode, 0, stdout + stderr)
+
+    def test_retargeted_dispatch_symlink_cannot_expose_other_repository(self):
+        other = self.root / 'private'
+        self.git('clone', '-q', '.', str(other))
+        target = self.root / 'dispatch-link'
+        target.symlink_to(other)
+        self.assertEqual(self.dispatch_while_listing(target, retarget=self.work, other=other), [False, True])
+
+    def test_dispatch_scope_accepts_quoted_home_target(self):
+        (self.home / 'linked checkout').symlink_to(self.work)
+        self.assertEqual(self.dispatch_while_listing('~/linked checkout'), [True])
+
     def test_running_commands_are_scoped_to_current_repository(self):
         linked = self.root / 'linked tree'
         self.git('worktree', 'add', '-qb', 'topic', str(linked))
         other = self.work / 'private nested'
         self.git('init', '-q', str(other))
         dispatch = ['python3', '/bin/codex-dispatch']
-        processes = {11: (dispatch + ['-C', str(linked), 'linked-brief'], other),
-                     12: (dispatch + ['-C', str(other), 'private-brief'], self.work),
-                     13: (dispatch + ['current-brief'], self.work),
-                     14: (dispatch + ['unknown-brief'], None)}
-        ps = '\n'.join(f'{pid} 00:01 {" ".join(argv)}' for pid, (argv, _) in processes.items())
         script = Path(__file__).resolve().parents[1] / 'scripts/dispatch-status'
+        with patch.object(sys, 'path', [str(script.parent), *sys.path]):
+            from kaizen_worktree_facts import dispatch_scope
+        processes = {11: dispatch + [dispatch_scope(linked), str(linked), '-C', str(linked), 'linked-brief'],
+                     12: dispatch + [dispatch_scope(other), str(other), '-C', str(other), 'private-brief'],
+                     13: dispatch + [dispatch_scope(self.work), str(self.work), 'current-brief'],
+                     14: dispatch + ['-C', str(self.work), 'unknown-brief']}
+        ps = '\n'.join(f'{pid} 00:01 {" ".join(argv)}' for pid, argv in processes.items())
         main = runpy.run_path(str(script))['main']
         original_run = subprocess.run
 
@@ -377,7 +475,7 @@ class DispatchStatusTests(StubCase):
             output = io.StringIO()
             with patch.object(sys, 'argv', [str(script), *options]), patch.object(Path, 'cwd', return_value=self.work), \
                     patch.object(sys, 'path', [str(script.parent), *sys.path]):
-                with patch.dict(main.__globals__, process_details=processes.__getitem__):
+                with patch.dict(main.__globals__, process_args=processes.__getitem__):
                     with patch.object(subprocess, 'run', side_effect=run), redirect_stdout(output):
                         main()
             listing = output.getvalue().split('LATEST REPORT')[0]

@@ -73,6 +73,14 @@ def repository_dirs(directory):
     return ()
 
 
+def dispatch_scope(directory):
+    dirs = repository_dirs(directory)
+    if len(dirs) < 2:
+        return None
+    info = (dirs[2] if len(dirs) > 2 else dirs[1]).stat()
+    return f'--kaizen-scope={info.st_dev}:{info.st_ino}'
+
+
 def resolve_git(directory, *protected, deadline=None):
     override = os.environ.get('KAIZEN_GIT')
     directory = Path(directory).resolve(strict=True)
@@ -119,7 +127,8 @@ def resolve_git(directory, *protected, deadline=None):
         return None
 
 
-def git(executable, directory, *args, input_data=b'', deadline=None, select_record=None, status_env=None):
+def git(executable, directory, *args, input_data=b'', deadline=None, select_record=None,
+        status_env=None, worktree_only=False, attributes=None):
     if executable is None:
         return None
     timeout = TIMEOUT if deadline is None else min(TIMEOUT, deadline - time.monotonic())
@@ -149,10 +158,12 @@ def git(executable, directory, *args, input_data=b'', deadline=None, select_reco
         if status:
             end_options = args.index('--') if '--' in args else len(args)
             ignore = 'dirty' if status_env is not None else 'none'
-            args = (*args[:end_options], f'--ignore-submodules={ignore}', *args[end_options:])
+            options = ('--no-renames',) if worktree_only else ()
+            args = (*args[:end_options], f'--ignore-submodules={ignore}', *options, *args[end_options:])
         process = subprocess.Popen([str(executable), '--no-pager', '--no-optional-locks',
                                     '-C', str(directory), *config, *args], env=status_env or GIT_ENV,
-                                   stdin=subprocess.PIPE if input_data else subprocess.DEVNULL,
+                                   stdin=subprocess.PIPE if input_data else (
+                                       attributes if attributes is not None else subprocess.DEVNULL),
                                    stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                    start_new_session=(os.name == 'posix'))
         stdout = process.stdout
@@ -166,14 +177,16 @@ def git(executable, directory, *args, input_data=b'', deadline=None, select_reco
                 if not chunk:
                     incomplete = bool(remainder)
                     break
-                if status and status_env is not None:
+                if status and status_env is not None and not worktree_only:
                     output[:] = b'1'  # Only the presence of a status record matters.
-                elif select_record is None:
+                elif select_record is None and not worktree_only:
                     output.extend(chunk)
                 else:
                     *fields, remainder = (remainder + chunk).split(b'\0')
                     for field in fields:
-                        if select_record(field):
+                        if worktree_only and field[1:2] != b' ':
+                            output[:] = b'1'
+                        elif not worktree_only and select_record(field):
                             output.extend(field + b'\0')
                     if len(remainder) > MAX_OUTPUT:
                         output.extend(remainder)
@@ -238,6 +251,21 @@ def index_version(admin):
     return file_id(info), info.st_ctime_ns, info.st_mtime_ns, info.st_size
 
 
+def submodule_checkout(path, name):
+    try:
+        child = (path / os.fsdecode(name)).resolve(strict=True)
+    except (FileNotFoundError, NotADirectoryError):
+        return ()
+    if child.is_dir() and not os.path.lexists(child / '.git'):
+        with os.scandir(child) as children:
+            if next(children, None) is None:
+                return ()
+    dirs = repository_dirs(child)
+    if child == path or not child.is_relative_to(path) or not dirs or dirs[0] != child:
+        raise ValueError('invalid submodule checkout')
+    return dirs
+
+
 def status_inputs(run, path, dirs, depth=0):
     if depth > 16:
         raise ValueError('submodule depth exceeds its limit')
@@ -247,17 +275,12 @@ def status_inputs(run, path, dirs, depth=0):
                  os.fsdecode(b'^(' + STATUS_KEYS + rb')$|^filter\.'))
     if config is None or config[0] not in (0, 1) or (config[1] and not config[1].endswith(b'\0')):
         raise ValueError('cannot read status configuration')
-    safe = bytearray()
+    safe = []
     for item in config[1].split(b'\0')[:-1]:
         key, has_value, value = item.partition(b'\n')
         if not re.fullmatch(STATUS_KEYS, key):
             raise ValueError('cannot interpret status with configured filters')
-        section, name = key.split(b'.', 1)
-        for old, new in ((b'\\', b'\\\\'), (b'"', b'\\"'), (b'\n', b'\\n'),
-                         (b'\t', b'\\t'), (b'\b', b'\\b')):
-            value = value.replace(old, new)
-        safe.extend(b'[' + section + b']\n' + name)
-        safe.extend(b' = "' + value + b'"\n' if has_value else b'\n')
+        safe.append((key, value if has_value else None))
 
     hidden = False
     def gitlink(item):
@@ -269,52 +292,112 @@ def status_inputs(run, path, dirs, depth=0):
     index = run(path, 'ls-files', '--stage', '-v', '-z', select_record=gitlink)
     if index is None or index[0] or stamp != index_version(admin):
         raise ValueError('cannot read stable status index')
-    entries = index[1].split(b'\0')[:-1]
-    yield path, admin, common, safe, stamp, hidden
-    for item in entries:
+    children = {}
+    for item in index[1].split(b'\0')[:-1]:
         _, sep, name = item.partition(b'\t')
         if not sep or not name or b'..' in name.split(b'/'):
             raise ValueError('invalid submodule path')
-        try:
-            child = (path / os.fsdecode(name)).resolve(strict=True)
-        except (FileNotFoundError, NotADirectoryError):
-            continue
-        if child.is_dir() and not os.path.lexists(child / '.git'):
-            with os.scandir(child) as children:
-                if next(children, None) is None:
-                    continue
-        child_dirs = repository_dirs(child)
-        if child == path or not child.is_relative_to(path) or not child_dirs or child_dirs[0] != child:
-            raise ValueError('invalid submodule checkout')
-        yield from status_inputs(run, child, child_dirs, depth + 1)
+        if name not in children:
+            children[name] = submodule_checkout(path, name)
+    topology = {name: tuple(file_id(directory.stat()) for directory in child)
+                for name, child in children.items()}
+    yield path, admin, common, safe, stamp, hidden, topology
+    for child in children.values():
+        if child:
+            yield from status_inputs(run, child[0], child, depth + 1)
+
+
+def isolated_status(run, read_status, checkout, admin, common, config):
+    try:
+        with tempfile.TemporaryDirectory() as name:
+            isolated = Path(name)
+            # Only data paths are shared with the live repo. Child status is explicit.
+            for item in ('objects', 'refs', 'packed-refs', 'shallow', 'info', 'reftable'):
+                (isolated / item).symlink_to(common / item)
+            with (isolated / 'config').open('wb') as stream:
+                for key, value in config:
+                    section, option = key.split(b'.', 1)
+                    stream.write(b'[' + section + b']\n' + option)
+                    if value is not None:
+                        for old, new in ((b'\\', b'\\\\'), (b'"', b'\\"'), (b'\n', b'\\n'),
+                                         (b'\t', b'\\t'), (b'\b', b'\\b')):
+                            value = value.replace(old, new)
+                        stream.write(b' = "' + value + b'"')
+                    stream.write(b'\n')
+            env = dict(GIT_ENV, GIT_DIR=str(admin), GIT_COMMON_DIR=name, GIT_WORK_TREE=str(checkout))
+            return read_status(partial(run, status_env=env), checkout)
+    except OSError:
+        return readonly_status(run, read_status, checkout, admin, common, config)
+
+
+def readonly_status(run, read_status, checkout, admin, common, config):
+    # Without writable storage, use an installed config with empty refs.
+    # Compare the index to the real HEAD first, using worktree-free plumbing.
+    head = run(checkout, 'rev-parse', '--verify', 'HEAD')
+    if head is None or head[0] not in (0, 128):
+        return None
+    if head[0] == 0:
+        oid = head[1].strip()
+        if not re.fullmatch(rb'[0-9a-f]{40}|[0-9a-f]{64}', oid):
+            return None
+        staged = run(checkout, 'diff-index', '--cached', '--quiet', '--no-ext-diff', '--no-textconv',
+                     '--ignore-submodules=dirty', os.fsdecode(oid), '--')
+        if staged != (0, b''):
+            return (0, b'1') if staged == (1, b'') else None
+    else:
+        branch = run(checkout, 'symbolic-ref', '-q', 'HEAD')
+        if branch is None or branch[0] or not branch[1].startswith(b'refs/heads/'):
+            return None
+    fmt = dict(config).get(b'extensions.objectformat', b'sha1')
+    if fmt not in (b'sha1', b'sha256'):
+        return None
+    isolated = Path(__file__).resolve().with_name('kaizen-status-git') / os.fsdecode(fmt)
+    env = dict(GIT_ENV, GIT_DIR=str(admin), GIT_COMMON_DIR=str(isolated), GIT_WORK_TREE=str(checkout),
+               GIT_OBJECT_DIRECTORY=str(common / 'objects'), GIT_CONFIG_COUNT=str(len(config)))
+    for index, (key, value) in enumerate(config):
+        env[f'GIT_CONFIG_KEY_{index}'] = os.fsdecode(key)
+        env[f'GIT_CONFIG_VALUE_{index}'] = 'true' if value is None else os.fsdecode(value)
+    # The template reads its info/attributes through /dev/stdin so repository
+    # attributes keep their normal precedence without sharing its config.
+    try:
+        fd = os.open(common / 'info/attributes', os.O_RDONLY | os.O_NONBLOCK)
+    except FileNotFoundError:
+        fd = os.open(os.devnull, os.O_RDONLY)
+    else:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            os.close(fd)
+            return None
+    with os.fdopen(fd, 'rb') as attributes:
+        status_run = partial(run, status_env=env, worktree_only=head[0] == 0, attributes=attributes)
+        result = read_status(status_run, checkout)
+    return result if head == run(checkout, 'rev-parse', '--verify', 'HEAD') else None
 
 
 def cleanliness(run, path, dirs, read_status):
     try:
-        inputs = list(status_inputs(run, path, dirs))
-        clean = True
-        for checkout, admin, common, config, stamp, hidden in inputs:
-            with tempfile.TemporaryDirectory() as temporary:
-                isolated = Path(temporary)
-                # Git takes its local config from GIT_COMMON_DIR. Only data
-                # paths are shared with the live repo. Child status is explicit.
-                for name in ('objects', 'refs', 'packed-refs', 'shallow', 'info', 'reftable'):
-                    (isolated / name).symlink_to(common / name)
-                (isolated / 'config').write_bytes(config)
-                env = dict(GIT_ENV, GIT_DIR=str(admin), GIT_COMMON_DIR=temporary,
-                           GIT_WORK_TREE=str(checkout))
-                result = read_status(partial(run, status_env=env), checkout)
-            if result is None or result[0]:
-                clean = None
-            elif result[1]:
-                return False
-            elif hidden:
-                clean = None
-        if any(index_version(admin) != stamp for _, admin, _, _, stamp, _ in inputs):
-            return None
-        return clean
+        for _ in range(2):
+            inputs = list(status_inputs(run, path, dirs))
+            clean = True
+            stable = True
+            for checkout, admin, common, config, stamp, hidden, _ in inputs:
+                result = isolated_status(run, read_status, checkout, admin, common, config)
+                if result is None or result[0]:
+                    clean = None
+                elif result[1]:
+                    return False
+                elif hidden:
+                    clean = None
+            for checkout, admin, _, _, stamp, _, topology in inputs:
+                if index_version(admin) != stamp:
+                    return None
+                for name, identities in topology.items():
+                    current = tuple(file_id(directory.stat()) for directory in submodule_checkout(checkout, name))
+                    stable &= current == identities
+            if stable:
+                return clean
     except (OSError, ValueError, RuntimeError):
-        return None
+        pass
+    return None
 
 
 def read_facts(directory, read_status):
