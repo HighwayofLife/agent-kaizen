@@ -1085,11 +1085,27 @@ def local_ref():
     return f"refs/kaizen/{datetime.date.today().isoformat()}"
 
 
+def check_legacy_record(path, record, folders):
+    identity, digest = record["manifest"]
+    folder = folders.get(tuple(identity))
+    if folder is None:
+        raise ValueError(f"cannot locate the backup for legacy ref record {path.name}")
+    with open_directory(folder) as fd:
+        info = os.fstat(fd)
+        data, live_digest = read_manifest_snapshot(fd)
+    # The legacy writer serialized manifests like save(), with reverted initially null.
+    if data.get("reverted") and (record.get("inverse", {}).get("done") or record["commit"].get("cancelled")):
+        original = json.dumps(dict(data, reverted=None), indent=2) + "\n"
+        live_digest = hashlib.sha256(original.encode("ascii")).hexdigest()
+    if list(identity) != [info.st_dev, info.st_ino] or digest != live_digest:
+        raise ValueError(f"manifest changed or foreign backup for legacy ref record {path.name}")
+
+
 def read_records(*, tolerate_unrelated=False):
     store = ROOT / ".kaizen-refs"
     if not os.path.lexists(store):
         return {}
-    records, owners = {}, set()
+    records, owners, folders = {}, set(), None
     for path in private_store().iterdir():
         if path.name.startswith(".pending-"):
             continue
@@ -1116,6 +1132,14 @@ def read_records(*, tolerate_unrelated=False):
         if (path.name not in (identity_record_name(identity), legacy_record_name(name))
                 or name in records or tuple(identity) in owners):
             raise ValueError(f"foreign or duplicate ref record: {path.name}")
+        if path.name.startswith("r-"):
+            if folders is None:
+                folders = {}
+                for folder in ROOT.iterdir():
+                    info = folder.lstat()
+                    if stat.S_ISDIR(info.st_mode):
+                        folders[info.st_dev, info.st_ino] = folder
+            check_legacy_record(path, record, folders)
         records[name] = record
         owners.add(tuple(identity))
     return records
@@ -1169,8 +1193,8 @@ def checked_backup_mode(entry, mode, recorded=None, *, live_mode=None):
     mode = stat.S_IMODE(mode)
     expected = entry.get("before_mode", recorded)
     if "before_mode" not in entry and recorded is None:
-        # Preserve group/other access only when the verified target has the same mode.
-        return mode & (0o777 if mode == live_mode else 0o700)
+        # A legacy backup is the only source of permissions if the target was removed.
+        return mode & (0o777 if live_mode is None or mode == live_mode else 0o700)
     if type(expected) is not int or mode != expected:
         raise ValueError(f"undo backup mode cannot be verified: {entry['path']}")
     return expected
@@ -2241,11 +2265,35 @@ def exchange_restore(temporary, name, fd):
         raise OSError(error, f"atomic undo exchange failed: {os.strerror(error)}", name)
 
 
-def copy_undo_backup(source, temp_fd):
+def truncate_undo_tail(stream, saved_fd):
+    fd = stream.fileno()
+    info = os.fstat(fd)
+    end = stream.tell()
+    if info.st_size != max(end, os.fstat(saved_fd).st_size):
+        raise ValueError("working file changed during undo")
+    # The copy leaves the old suffix in place. Detect an edit before discarding it.
+    for offset in range(end, info.st_size, 65536):
+        size = min(65536, info.st_size - offset)
+        if os.pread(fd, size, offset) != os.pread(saved_fd, size, offset):
+            raise ValueError("working file changed during undo")
+    if file_version(os.fstat(fd)) != file_version(info):
+        raise ValueError("working file changed during undo")
+    if info.st_size != end:
+        stream.truncate()
+
+
+def copy_undo_backup(source, temp_fd, *, recheck=None, saved_fd=None):
     flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK
     with os.fdopen(temp_fd, "wb") as stream, os.fdopen(os.open(source, flags), "rb") as backup:
+        if recheck is not None:
+            first = backup.read(65536)
+            recheck()
+            stream.write(first)
+            stream.flush()
         shutil.copyfileobj(backup, stream)
         stream.flush()
+        if saved_fd is not None:
+            truncate_undo_tail(stream, saved_fd)
         if sys.platform == "darwin":
             # shutil.copystat calls path-only chflags on macOS.
             info = os.fstat(backup.fileno())
@@ -2259,10 +2307,71 @@ def copy_undo_backup(source, temp_fd):
         os.fsync(temp_fd)
 
 
-def restore_ordinary_file(source, path, versions, before_hash):
+def report_recovery(path):
+    print(f"kaizen-backup: recover displaced file at {path}", file=sys.stderr)
+
+
+def verify_displaced(name, fd, expected):
+    version, digest = expected[1:]
+    live = live_file_version(name, fd)
+    # Rename changes ctime. Recheck the new version after reading its contents.
+    if (live is None or live[:-1] != version[:-1]
+            or undo_file_hash(name, fd, live, ordinary=True) != digest
+            or live_file_version(name, fd) != live):
+        raise ValueError("working file changed during undo")
+
+
+def restore_shared_inode(source, path, fd, versions, aliases, before_hash):
+    expected = versions[path]
+    targets = [path, *aliases]
+    if sha(source) != before_hash:
+        raise ValueError("undo backup changed during restore")
+    with tempfile.NamedTemporaryFile(dir=ROOT, prefix=".kaizen-recovery-", delete=False) as saved:
+        recovery = Path(saved.name)
+        restoring = succeeded = False
+        try:
+            flags = os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK
+            with os.fdopen(os.open(path.name, flags, dir_fd=fd), "r+b") as live:
+                if file_version(os.fstat(live.fileno())) != expected[1]:
+                    raise ValueError("working file changed during undo")
+                shutil.copyfileobj(live, saved)
+                saved.flush()
+                os.fsync(saved.fileno())
+                if sha(recovery) != expected[2]:
+                    raise ValueError("working file changed during undo")
+                live.seek(0)
+
+                def recheck():
+                    nonlocal restoring
+                    if any(undo_file_snapshot(target, ordinary=True) != versions[target] for target in targets):
+                        raise ValueError("working file changed during undo")
+                    if live_file_version(path.name, fd) != expected[1]:
+                        raise ValueError("working file changed during undo")
+                    restoring = True
+
+                # POSIX provides no conditional in-place write. Keep the verified preimage.
+                copy_undo_backup(source, os.dup(live.fileno()), recheck=recheck, saved_fd=saved.fileno())
+                written = file_version(os.fstat(live.fileno()))
+                restored = {}
+                for target in targets:
+                    snapshot = undo_file_snapshot(target, ordinary=True)
+                    if (snapshot != (versions[target][0], written, before_hash)
+                            or written[:2] != expected[1][:2]):
+                        raise ValueError("working file changed during undo")
+                    restored[target] = snapshot
+                versions.update(restored)
+                succeeded = True
+        finally:
+            if restoring and not succeeded:
+                report_recovery(recovery)
+            else:
+                recovery.unlink()
+
+
+def restore_ordinary_file(source, path, versions, before_hash, retained_links):
     aliases = tracked_undo_aliases(path, versions)
+    expected_links = 1 + len(aliases)
     stages, displaced, restored = [], [], {}
-    failed = True
     with ExitStack() as stack:
         try:
             for index, target in enumerate([path, *aliases]):
@@ -2270,12 +2379,25 @@ def restore_ordinary_file(source, path, versions, before_hash):
                 fd = stack.enter_context(open_directory_walk(target.parent, create=parent is None,
                                                              search=True))
                 temporary = ".kaizen-recovery-" + os.urandom(16).hex()
-                if index == 0:
-                    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
-                    temp_fd = os.open(temporary, flags, 0o600, dir_fd=fd)
-                else:
-                    _, first_fd, first_name = stages[0]
-                    os.link(first_name, temporary, src_dir_fd=first_fd, dst_dir_fd=fd, follow_symlinks=False)
+                if index == 0 and versions[path][1] is not None:
+                    info = os.stat(path.name, dir_fd=fd, follow_symlinks=False)
+                    if file_version(info) != versions[path][1]:
+                        raise ValueError("working file changed during undo")
+                    expected_links += retained_links.get((info.st_dev, info.st_ino), 0)
+                    if info.st_nlink > expected_links:
+                        return restore_shared_inode(source, path, fd, versions, aliases, before_hash)
+                try:
+                    if index == 0:
+                        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+                        temp_fd = os.open(temporary, flags, 0o600, dir_fd=fd)
+                    else:
+                        _, first_fd, first_name = stages[0]
+                        os.link(first_name, temporary, src_dir_fd=first_fd, dst_dir_fd=fd, follow_symlinks=False)
+                except OSError as error:
+                    if versions[path][1] is None or error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS):
+                        raise
+                    write_fd = stages[0][1] if stages else fd
+                    return restore_shared_inode(source, path, write_fd, versions, aliases, before_hash)
                 stages.append((target, fd, temporary))
                 if index == 0:
                     copy_undo_backup(source, temp_fd)
@@ -2295,7 +2417,7 @@ def restore_ordinary_file(source, path, versions, before_hash):
                                                 or live[:-1] != version[:-1]))
                         or undo_file_hash(target.name, fd, live, ordinary=True) != digest):
                     raise ValueError("working file changed during undo")
-                if live is not None and os.stat(target.name, dir_fd=fd, follow_symlinks=False).st_nlink != len(stages):
+                if live is not None and os.stat(target.name, dir_fd=fd, follow_symlinks=False).st_nlink != expected_links:
                     raise ValueError(f"cannot safely restore a working file with untracked hard links: {target}")
                 with open_directory_walk(target.parent, search=True) as current:
                     if not os.path.samestat(info, os.fstat(current)):
@@ -2321,27 +2443,56 @@ def restore_ordinary_file(source, path, versions, before_hash):
                     raise ValueError("working file changed during undo")
                 restored[target] = snapshot
             for target, fd, temporary in displaced:
-                version, digest = versions[target][1:]
-                live = live_file_version(temporary, fd)
-                if (live is None or live[:-1] != version[:-1]
-                        or undo_file_hash(temporary, fd, live, ordinary=True) != digest):
-                    raise ValueError("working file changed during undo")
-            failed = False
+                verify_displaced(temporary, fd, versions[target])
         finally:
             for stage in stages:
                 target, fd, temporary = stage
-                if failed and stage in displaced:
+                if stage in displaced:
                     # An interruption can arrive as the exchange returns to Python.
                     live = live_file_version(temporary, fd)
                     if live is not None and live[:2] != written[:2]:
-                        print(f"kaizen-backup: recover displaced file at {target.with_name(temporary)}",
-                              file=sys.stderr)
+                        # A writer may still hold this inode open after the final check.
+                        report_recovery(target.with_name(temporary))
                         continue
                 try:
                     os.unlink(temporary, dir_fd=fd)
                 except FileNotFoundError:
                     pass
     versions.update(restored)
+
+
+def remove_ordinary_created(path, versions, retained_links):
+    expected = versions[path]
+    aliases = tracked_undo_aliases(path, versions)
+    with open_directory_walk(path.parent, search=True) as fd:
+        temporary = ".kaizen-recovery-" + os.urandom(16).hex()
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        with os.fdopen(os.open(temporary, flags, 0o600, dir_fd=fd), "wb") as spare:
+            identity = file_version(os.fstat(spare.fileno()))[:2]
+        try:
+            info = os.fstat(fd)
+            if (expected[0] != (info.st_dev, info.st_ino)
+                    or undo_file_snapshot(path, ordinary=True) != expected
+                    or live_file_version(path.name, fd) != expected[1]):
+                raise ValueError("working file changed during undo")
+            os.rename(path.name, temporary, src_dir_fd=fd, dst_dir_fd=fd)
+            for alias in aliases:
+                previous = versions[alias]
+                snapshot = undo_file_snapshot(alias, ordinary=True)
+                if (snapshot[0] != previous[0] or snapshot[1] is None
+                        or snapshot[1][:-1] != previous[1][:-1] or snapshot[2] != previous[2]):
+                    raise ValueError("working file changed during undo")
+                versions[alias] = snapshot
+            verify_displaced(temporary, fd, expected)
+            removed = expected[1][:2]
+            retained_links[removed] = retained_links.get(removed, 0) + 1
+        finally:
+            recovery = live_file_version(temporary, fd)
+            if recovery is not None:
+                if recovery[:2] == identity:
+                    os.unlink(temporary, dir_fd=fd)
+                else:
+                    report_recovery(path.with_name(temporary))
 
 
 def undo_locked(args, locked):
@@ -2359,6 +2510,7 @@ def undo_locked(args, locked):
     git_exe = resolve_git() if observing is not None else None
     conflicts = []
     backups, versions, before_hashes = {}, {}, {}
+    retained_links = {}  # Moving a created hard link aside adds a known name for its inode.
     seen = {}  # the plan is newest first: path -> (newer change name, hash of its backup, i.e. the state it began from)
     for change, data in plan:
         record = records.get(change.name)
@@ -2445,21 +2597,13 @@ def undo_locked(args, locked):
                 if not undo_snapshot_matches(live, versions[path]):
                     raise ValueError("working file changed during undo")
                 if live[1] is not None and (args.force or live[2] == entry["after_sha256"]):
-                    aliases = tracked_undo_aliases(path, versions)
-                    path.unlink()
-                    for alias in aliases:
-                        expected = versions[alias]
-                        snapshot = undo_file_snapshot(alias, ordinary=True)
-                        if (snapshot[0] != expected[0] or snapshot[1] is None
-                                or snapshot[1][:-1] != expected[1][:-1] or snapshot[2] != expected[2]):
-                            raise ValueError("working file changed during undo")
-                        versions[alias] = snapshot  # Removing a link advances the shared inode's ctime.
+                    remove_ordinary_created(path, versions, retained_links)
                     print(f"removed created {path}")
                 versions[path] = undo_file_snapshot(path, ordinary=True)
                 if versions[path][1] is not None:
                     raise ValueError("working file changed during undo")
             else:
-                restore_ordinary_file(change / entry["backup"], path, versions, before)
+                restore_ordinary_file(change / entry["backup"], path, versions, before, retained_links)
                 print(f"restored {path}")
         for act in data["actions"]:
             print(f"ACTION to reverse by hand (not run): {act['undo']}   # was: {act['did']}")
