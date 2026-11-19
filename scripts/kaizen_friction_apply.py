@@ -315,16 +315,15 @@ class BrokerLedger:
                     and pending["rule"] == rule and pending["undo"] is False and pending["after"]):
                 if pending.get("published"):
                     return pending["published"][1][2]
-                # A native crash just after rename can precede its publication receipt.
+                # The exact interrupted write is recoverable by undo without a publication receipt.
                 path = self.project / tool["TARGET"].parent
                 with self.host["_directory"](path) as settings:
-                    current = tool["effect_id"](*tool["snapshot"](settings))
-                    parked = tool["effect_id"](*tool["snapshot"](settings, pending["temp"]))
                     info = os.fstat(settings)
+                    current = tool["effect_id"](*tool["snapshot"](settings))
                     if (entry["bound"][1][:2] == [info.st_dev, info.st_ino]
-                            and current == pending["after"] and parked == pending["before"][1]):
+                            and tool["can_restore_preimage"](settings, pending, current)):
                         os.fsync(settings)
-                        return current[2]
+                        return pending["after"][2]
             raise ValueError("no verified native allow-rule effect")
 
     def tool_record(self, ident, operation):
@@ -716,6 +715,10 @@ class BrokerLedger:
         if record["phase"] == "apply-pending":
             record["verification"] = self.verify_allow_rule(record)
             self.save(record, "effect-verified")
+        elif (record["operation"] == "allow-rule" and "literal" in record
+              and record["phase"] in ("effect-verified", "recorded")):
+            # A recoverable native write can be cancelled after the first verification.
+            self.verify_allow_rule(record)
         phase = record["phase"]
         with self.table(ident, record, files) as (lines, start, end, width, match, write):
             expected = self.row(record, legacy_metric=match is not None and not record.get("absolute_metric"))
