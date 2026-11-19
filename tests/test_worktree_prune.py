@@ -67,6 +67,24 @@ class WorktreePruneTests(unittest.TestCase):
         self.assertEqual(self.git(self.primary, 'worktree', 'list', '--porcelain'), before)
         self.assertEqual(self.git(self.primary, 'show-ref'), refs)
 
+    def test_unknown_admin_file_and_bounded_private_walk(self):
+        patch_file = self.admin / 'saved.patch'
+        patch_file.write_text('valuable patch')
+        self.refused('unrecognized worktree metadata')
+        patch_file.unlink()
+        namespace = self.script_functions()
+        refs = self.admin / 'refs'
+        refs.mkdir(exist_ok=True)
+        for number in range(3):
+            (refs / str(number)).mkdir()
+        with patch.dict(namespace['check_metadata'].__globals__, MAX_WALK_ENTRIES=2):
+            with self.assertRaisesRegex(namespace['Refused'], 'limit'):
+                namespace['check_metadata'](self.admin, self.common)
+
+    def test_shebang_uses_path_interpreter_in_isolated_mode(self):
+        with SCRIPT.open('rb') as script:
+            self.assertEqual(script.readline(), b'#!/usr/bin/env -S python3 -I\n')
+
     def test_eligible_apply_and_protected_directories(self):
         self.refused('eligible worktree')
         self.assertFalse(self.home.exists())

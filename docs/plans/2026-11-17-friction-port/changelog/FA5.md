@@ -1,0 +1,4 @@
+- Make advisory worktree facts refuse unsafe Git filters and unavailable trusted Git, and avoid reporting cleanliness for stale registrations.
+- Refuse unknown worktree metadata and bound private-ref scanning. Restore the isolated interpreter selected through PATH for worktree pruning. Defer the audit finding that a checkout-local interpreter can run first on PATH.
+- Refuse truncated project audit extracts and recover interrupted undos with missing staged files.
+- In advisory mode, omit the legacy dirty-worktree scan; report uninitialized submodules and stale registrations safely. Do not adopt grants without publication evidence.

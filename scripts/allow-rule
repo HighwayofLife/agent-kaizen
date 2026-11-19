@@ -135,11 +135,11 @@ def find_extract(audits, project, now):
                     if cutoff <= info.st_mtime <= now.timestamp():
                         if not private:
                             raise Refused(UNSAFE_EXTRACTS)
-                        candidates.append((info.st_mtime_ns, fd, entry.name, version(info)))
+                        candidates.append((info.st_mtime_ns, fd, entry.name, version(info), directory != primary))
                         if len(candidates) > 512:
                             raise Refused("too many recent audit extracts")
         latest, tied = None, False
-        for stamp, fd, name, expected in sorted(candidates, reverse=True):
+        for stamp, fd, name, expected, scoped_store in sorted(candidates, reverse=True):
             modified = datetime.fromtimestamp(stamp / 1e9, timezone.utc)
             if latest is not None and modified < latest[0]:
                 break
@@ -150,6 +150,8 @@ def find_extract(audits, project, now):
             try:
                 data = json.loads(raw)
             except (ValueError, RecursionError):
+                if scoped_store:
+                    raise Refused("invalid project audit extract") from None
                 continue
             scope = data.get("scope") if isinstance(data, dict) else None
             roots = scope.get("cwd") if isinstance(scope, dict) else None
@@ -696,9 +698,20 @@ def publication_recorded(settings, pending, before):
     after = pending["after"]
     temporary = pending["temp"]
     if temporary:
-        if after is None or before[0] is None or before[0][:3] != after[0]:
+        if after is None:
             return False
         parked_name = temporary
+        parked = named_version(settings, parked_name)
+        if parked is None and pending["before"][0] is None:
+            return True  # Creation consumed the staged file.
+        if parked is not None:
+            try:
+                if effect_id(*snapshot(settings, parked_name)) == pending["before"][1]:
+                    return True
+            except (OSError, ValueError, Refused):
+                pass
+        if before[0] is None or before[0][:3] != after[0]:
+            return False
     else:
         if before[0] is not None or not pending.get("backup"):
             return False
@@ -742,7 +755,12 @@ def update_rule(settings, path, entry, records, ident, root, rule, undo, action_
         published = publication_recorded(settings, pending, before)
         # An editor can replace the published inode before the receipt is
         # durable. Keep a managed undo record whenever the exact grant remains.
-        if (pending["undo"] and not count) or (not pending["undo"] and count):
+        if not pending["undo"] and count and not published:
+            cancel_pending(settings, entry, records, save)
+            if same_request:
+                raise Refused("pending grant cancelled because publication was not verified")
+            pending = None
+        elif (pending["undo"] and not count) or (not pending["undo"] and count):
             remove_stage(settings, pending["temp"] or pending.get("backup"),
                          pending["before"][1] if published else pending["after"])
             os.fsync(settings)
@@ -771,6 +789,13 @@ def update_rule(settings, path, entry, records, ident, root, rule, undo, action_
                 cancel_pending(settings, entry, records, save)
                 if same_request:
                     raise Refused("pending undo cancelled because ownership of the current entry cannot be verified")
+                pending = None
+        elif pending["undo"] and pending["temp"] and pending["after"] is not None and named_version(settings, pending["temp"]) is None:
+            if same_request:
+                pending.update(temp=stage_name(), after=None)
+                save()
+            else:
+                cancel_pending(settings, entry, records, save)
                 pending = None
         elif not same_request:
             raise Refused("another settings transaction is pending")

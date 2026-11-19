@@ -125,6 +125,15 @@ class AllowRuleTests(SecurityCase):
         denial.rename(legacy / denial.name)
         self.add(code=2)
 
+    def test_truncated_newest_project_extract_refuses(self):
+        old = self.extract(self.row(), name="old")
+        earlier = (datetime.now(timezone.utc) - timedelta(hours=1)).timestamp()
+        os.utime(old, (earlier, earlier))
+        legacy = self.cfg / "audits/projects" / self.runner.key(self.repo)
+        legacy.mkdir(mode=0o700, parents=True)
+        write(legacy / "broken.extract.json", '{')
+        self.add(code=2)
+
     def test_unenrolled_nested_checkout_is_not_a_worktree_peer(self):
         main, linked = self.root / "outer", self.root / "linked"
         self.repo = write(main / "inner/docs/kaizen/config.json", "{}").parents[2]
@@ -384,6 +393,20 @@ class AllowRuleTests(SecurityCase):
             self.assertFalse(self.target.exists())
         self.assertEqual(tool(self.repo, "ls", action_id=self.broker_action(self.repo, "ls"))["status"], "applied")
 
+    def test_interrupted_undo_recreates_missing_stage(self):
+        tool = self.transaction()
+        state = tool.__globals__
+        write(self.target, '{"other":true}')
+        record = tool(self.repo, 'ls')['record']
+        def interrupt(*_):
+            raise OSError('interrupted')
+        with patch.dict(state, write_effect=interrupt), self.assertRaises(OSError):
+            tool(self.repo, record=record)
+        staged, = self.target.parent.glob('settings.kaizen-*.json')
+        staged.unlink()
+        self.assertEqual(tool(self.repo, record=record)['status'], 'undone')
+        self.assertEqual(json.loads(self.target.read_bytes())['permissions']['allow'], [])
+
     def test_stale_pending_grant_cancels_and_unblocks_undo(self):
         def interrupt(*_):
             raise OSError("fixture interruption before settings publication")
@@ -423,6 +446,20 @@ class AllowRuleTests(SecurityCase):
                 self.assertEqual(json.loads(journal.read_bytes())["records"][action][2], "cancelled")
                 self.extract(self.row(literal="ls -a"))
                 self.assertEqual(tool(self.repo, "ls -a")["status"], "applied")
+
+    def test_editor_added_pending_grant_is_not_adopted(self):
+        tool = self.transaction()
+        state = tool.__globals__
+        action = self.broker_action(self.repo, "ls")
+        with patch.dict(state, write_effect=lambda *_: (_ for _ in ()).throw(OSError("interrupted"))):
+            with self.assertRaises(OSError):
+                tool(self.repo, "ls", action_id=action)
+        self.target.write_text('{"permissions":{"allow":["Bash(ls)"]}}')
+        with self.assertRaises(state["Refused"]):
+            tool(self.repo, "ls", action_id=action)
+        with self.assertRaises(state["Refused"]):
+            tool(self.repo, record=action)
+        self.assertIn("Bash(ls)", self.target.read_text())
 
     def test_recover_published_grant_after_editor_change(self):
         tool = self.transaction()
