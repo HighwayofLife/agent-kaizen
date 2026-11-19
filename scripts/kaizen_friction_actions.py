@@ -26,7 +26,7 @@ STATES = {"done": "done", "dismiss": "dismissed", "reopen": "open"}
 CATALOG_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 ACTION_ID = re.compile(r"fa1_[0-9a-f]{64}")
 INTENTS = {"suggest": "terminal", "apply": "pending"}
-COMPACT_APPLY = "a"  # Accept compact closed receipts from earlier builds on read.
+COMPACT_APPLY = "a"
 RECEIPT_STATES = (*INTENTS.values(), COMPACT_APPLY)
 BLOCK_PREFIX = "<!-- kaizen-host-actions "
 ROW_OPTIONAL = {"steps", "metric_at_done", "flaps"}
@@ -344,14 +344,15 @@ class HostActions:
             raise ValueError("host-action store changed during read")
         if (not isinstance(versions, dict) or len(versions) > 2
                 or any(not re.fullmatch(r"[0-9a-f]{64}", digest) or not isinstance(saved, dict)
-                       or set(saved) != {"receipts", "apply_intents"}
+                       or set(saved) - {"guarded"} != {"receipts", "apply_intents"}
+                       or ("guarded" in saved and saved["guarded"] is not True)
                        or not isinstance(saved["receipts"], dict) or not isinstance(saved["apply_intents"], dict)
                        for digest, saved in versions.items())):
             raise ValueError("invalid host-action receipt metadata")
         digest = hashlib.sha256(raw).hexdigest()
         matched = digest in versions
         # An older runner can update the shared v1 file without touching the sidecar.
-        metadata = [versions[digest]] if matched else list(versions.values())
+        metadata = [versions[digest]] if matched else [saved for saved in versions.values() if not saved.get("guarded")]
         try:
             store = json.loads(raw, object_pairs_hook=_unique)
         except (ValueError, RecursionError):
@@ -359,8 +360,10 @@ class HostActions:
         if (not isinstance(store, dict) or set(store) - {"receipts", "apply_intents"} != {"v", "actions"}
                 or not isinstance(store.get("receipts", {}), dict)
                 or not isinstance(store.get("apply_intents", {}), dict)
-                or type(store["v"]) is not int or store["v"] != 1 or not isinstance(store["actions"], dict)):
+                or type(store["v"]) is not int or store["v"] not in (1, 2) or not isinstance(store["actions"], dict)
+                or (store["v"] == 2) != bool(matched and versions[digest].get("guarded"))):
             raise ValueError("invalid host-action store format")
+        guarded = store["v"] == 2
         rows = store["actions"]
         secret = self._secret() if rows else None
         skipped = set()
@@ -387,7 +390,13 @@ class HostActions:
                     current = receipts.setdefault(project, {})
                     if not isinstance(current, dict):
                         raise ValueError("invalid host-action receipt scope")
-                    if generation not in current and (matched or all(ident in rows for ident in receipt)):
+                    if guarded and generation in current:
+                        inline = current[generation]
+                        if not isinstance(inline, dict) or inline.keys() & receipt.keys():
+                            raise ValueError("conflicting host-action receipt metadata")
+                        inline.update(receipt)
+                        archived.setdefault(project, {})[generation] = receipt
+                    elif generation not in current and (matched or all(ident in rows for ident in receipt)):
                         current[generation] = receipt
                         archived.setdefault(project, {})[generation] = receipt
             for project, generations in saved["apply_intents"].items():
@@ -417,7 +426,11 @@ class HostActions:
         rows = _Rows((ident, row) for ident, row in rows.items() if ident not in skipped)
         saved_intents = {project: {generation: sorted(ids) for generation, ids in generations.items()}
                          for project, generations in intents.items()}
-        rows.receipt_metadata = {digest: dict(receipts=archived, apply_intents=saved_intents)} if versions else {}
+        if versions:
+            saved = dict(receipts=archived, apply_intents=saved_intents)
+            if guarded:
+                saved["guarded"] = True
+            rows.receipt_metadata = {digest: saved}
         rows.loaded_generations = {(project, generation) for project, generations in receipts.items()
                                    for generation in generations}
         rows.apply_intents = intents
@@ -496,36 +509,21 @@ class HostActions:
         for (project, generation), value in getattr(rows, "preserved_receipts", {}).items():
             receipt = output_receipts[project][generation]
             original = json.loads(value)
-            if receipt == original:
+            if receipt == {ident: "terminal" if state == COMPACT_APPLY else state for ident, state in original.items()}:
                 output_receipts[project][generation] = marker(value)
             else:
                 output_receipts[project][generation] = dict(receipt, **{
                     ident: marker(raw) for ident, raw in _object_values(value).items()
                     if ident in rows.preserved and original[ident] != COMPACT_APPLY})
-        # Older installed runners share this store and require the release v1 fields and states.
+        # Prefer the release v1 wire format when it fits without hiding receipts.
         output = {"v": 1, "actions": output_rows, "receipts": output_receipts}
-        def encode():
-            text = json.dumps(output, separators=(",", ":"))
+        def encode(compact=False):
+            text = json.dumps(output, ensure_ascii=not compact, separators=(",", ":"))
             for token, value in preserved.items():
                 text = text.replace(token, value)
-            return (text + "\n").encode("utf-8")
+            return (text if compact else text + "\n").encode("utf-8", "backslashreplace")
 
         raw = encode()
-        archived = {}
-        excess = len(raw) - STORE_LIMIT
-        for project, generations in output_receipts.items():
-            for generation, receipt in list(generations.items()):
-                if excess <= 0:
-                    break
-                if ((project, generation) in rows.loaded_generations
-                        and (project, generation) not in rows.preserved_receipts
-                        and isinstance(receipt, dict) and "pending" not in receipt.values()):
-                    archived.setdefault(project, {})[generation] = generations.pop(generation)
-                    excess -= len(json.dumps(generation)) + len(json.dumps(receipt, separators=(",", ":"))) + 1
-        if archived:
-            raw = encode()
-        if len(raw) > STORE_LIMIT:
-            raise ValueError("host-action store exceeds size limit")
         completed = {}
         for project, generations in receipts.items():
             for generation, receipt in generations.items():
@@ -533,7 +531,60 @@ class HostActions:
                 closed = sorted(ident for ident in ids if receipt.get(ident) == "terminal")
                 if closed:
                     completed.setdefault(project, {})[generation] = closed
+        if len(raw) > STORE_LIMIT:
+            for project, generations in completed.items():
+                for generation, ids in generations.items():
+                    receipt = output_receipts[project][generation]
+                    if isinstance(receipt, dict):
+                        output_receipts[project][generation] = dict(receipt, **{
+                            ident: COMPACT_APPLY for ident in ids if ident not in rows.preserved})
+            raw = encode(compact=True)
+
+        # An old runner must reject a store whose sidecar holds any receipt entries.
+        archived = {}
+        excess = len(raw) - STORE_LIMIT
+        for project, generations in output_receipts.items():
+            if excess <= 0:
+                break
+            for generation, inline in list(generations.items()):
+                if excess <= 0:
+                    break
+                if (project, generation) not in rows.loaded_generations or not isinstance(inline, dict):
+                    continue
+                receipt = receipts[project][generation]
+                terminal = {ident: state for ident, state in receipt.items()
+                            if state == "terminal" and ident not in rows.preserved}
+                if receipt and not terminal:
+                    continue
+                remaining = {ident: state for ident, state in inline.items() if ident not in terminal}
+                # Receipt keys and states are ASCII, even in the compact encoding.
+                excess -= len(json.dumps(inline, separators=(",", ":")))
+                if remaining:
+                    generations[generation] = remaining
+                    excess += len(json.dumps(remaining, separators=(",", ":")))
+                else:
+                    excess -= len(json.dumps(generation, ensure_ascii=False).encode("utf-8", "backslashreplace"))
+                    excess -= 1 + (len(generations) > 1)
+                    del generations[generation]
+                archived.setdefault(project, {})[generation] = terminal
+        if archived:
+            output["v"] = 2
+            raw = encode(compact=True)
+        if len(raw) > STORE_LIMIT:
+            raise ValueError("host-action store exceeds size limit")
+        for project, generations in completed.items():
+            for generation, ids in list(generations.items()):
+                inline = output_receipts[project].get(generation)
+                if isinstance(inline, dict):
+                    ids = [ident for ident in ids if inline.get(ident) != COMPACT_APPLY]
+                    if ids:
+                        generations[generation] = ids
+                    else:
+                        del generations[generation]
+        completed = {project: generations for project, generations in completed.items() if generations}
         metadata = dict(receipts=archived, apply_intents=completed)
+        if archived:
+            metadata["guarded"] = True
         digest = hashlib.sha256(raw).hexdigest()
         versions = dict(rows.receipt_metadata, **{digest: metadata})
         if archived or completed or rows.receipt_metadata:

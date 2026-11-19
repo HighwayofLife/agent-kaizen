@@ -423,16 +423,47 @@ class BrokerLedger:
                     self.save(record, record["phase"])
 
     def finish_ledger_exchange(self, record, phase):
-        if pending := record.get("ledger_exchange"):
-            path, dev, ino, _ = pending
+        pending = record.get("ledger_exchange")
+        if not pending:
+            self.save(record, phase)
+            return
+        path, dev, ino, name = pending
+        previous = record["phase"]
+        changed = "broker ledger backup directory changed during publication"
+        with ExitStack() as stack:
             try:
-                info = os.stat(path, follow_symlinks=False)
-            except FileNotFoundError as error:
-                raise ValueError("broker ledger backup directory changed during publication") from error
-            if (info.st_dev, info.st_ino) != (dev, ino):
-                raise ValueError("broker ledger backup directory changed during publication")
-            del record["ledger_exchange"]
-        self.save(record, phase)
+                backups = stack.enter_context(self.host["_directory"](Path(path), private=True))
+            except (FileNotFoundError, NotADirectoryError) as error:
+                raise ValueError(changed) from error
+            pinned = os.fstat(backups)
+            if (pinned.st_dev, pinned.st_ino) != (dev, ino):
+                raise ValueError(changed)
+            try:
+                # Keep the binding on disk in case the process stops before the post-save check.
+                self.save(record, phase)
+            finally:
+                try:
+                    live = os.stat(path, follow_symlinks=False)
+                except OSError:
+                    live = None
+                if live is None or not os.path.samestat(pinned, live):
+                    self.report_displaced_ledger(backups, dev, ino, name)
+                    self.save(record, previous)
+                    raise ValueError(changed)
+
+    def report_displaced_ledger(self, backups, dev, ino, name):
+        try:
+            if sys.platform == "darwin":
+                fcntl = self.host["fcntl"]
+                directory = os.fsdecode(fcntl.fcntl(backups, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0])
+            else:
+                directory = os.readlink(f"/proc/self/fd/{backups}")
+            if not os.path.samestat(os.fstat(backups), os.stat(directory, follow_symlinks=False)):
+                raise OSError("backup path changed")
+        except OSError:
+            print(f"Broker ledger copy {name!r} preserved in backup directory device {dev}, inode {ino}", flush=True)
+        else:
+            print(f"Broker ledger copy preserved at {str(Path(directory) / name)!r}", flush=True)
 
     def recover_ledger_copies(self, directory, ident, *, exchange=None, move_to=None):
         # The same name holds the staged row before the swap and the displaced
