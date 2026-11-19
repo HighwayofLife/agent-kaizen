@@ -100,6 +100,25 @@ class SamplerTests(unittest.TestCase):
         self.assertEqual(self.process_rows(), [b"P\t1735775999999\t4\t4\tmds",
                                                b"P\t1735776299999\t4\t4\tmds"])
 
+    def test_unknown_boot_identity_still_rate_limits(self):
+        self.samples.mkdir(parents=True)
+        lock = os.open(self.samples / sampler.LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, lock)
+        with patch.object(time, "clock_gettime_ns", return_value=123), \
+                patch.object(sampler, "boot_identity", return_value=None):
+            self.assertTrue(sampler.claim_process(lock))
+            self.assertFalse(sampler.claim_process(lock))
+
+    def test_intermittent_boot_identity_does_not_reset_rate_limit(self):
+        self.samples.mkdir(parents=True)
+        lock = os.open(self.samples / sampler.LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o600)
+        self.addCleanup(os.close, lock)
+        with patch.object(time, "clock_gettime_ns", return_value=123), \
+                patch.object(sampler, "boot_identity", side_effect=[b"a" * 16, None, b"a" * 16]):
+            self.assertTrue(sampler.claim_process(lock))
+            self.assertFalse(sampler.claim_process(lock))
+            self.assertFalse(sampler.claim_process(lock))
+
     def test_claim_changes_with_boot_identity(self):
         self.samples.mkdir(parents=True)
         lock = os.open(self.samples / sampler.LOCK_NAME, os.O_CREAT | os.O_RDWR, 0o600)
@@ -173,16 +192,37 @@ class SamplerTests(unittest.TestCase):
         pid_file = self.root / "query-pid"
         for cancel in (False, True):
             with self.subTest(cancel=cancel):
-                query = ("import os, pathlib, signal, sys, time; "
-                         "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                         "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); "
-                         + ("os.kill(os.getppid(), signal.SIGTERM); " if cancel else "") + "time.sleep(3)")
+                worker = """
+import os
+from pathlib import Path
+import signal
+import sys
+import time
+import kaizen_friction_sample as s
+
+s.metrics = lambda: ('4', '4')
+s.PROCESS_COMMAND = (sys.executable, '-c', 'import time; time.sleep(3)')
+spawn = os.posix_spawn
+pid = None
+def record_spawn(*args, **kwargs):
+    global pid
+    # SIG_IGN survives exec, so the child ignores SIGTERM from the start.
+    handler = signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    try:
+        pid = spawn(*args, **kwargs)
+    finally:
+        signal.signal(signal.SIGTERM, handler)
+    if sys.argv[2] == 'True':
+        os.kill(os.getpid(), signal.SIGTERM)
+    return pid
+s.os.posix_spawn = record_spawn
+start = time.monotonic()
+s.main()
+Path(sys.argv[1]).write_text(str(pid))
+assert time.monotonic() - start < s.BUDGET + 0.1
+"""
                 self.command = [sys.executable, "-c",
-                                "import sys, time; import kaizen_friction_sample as s; "
-                                "s.metrics = lambda: ('4', '4'); "
-                                "s.PROCESS_COMMAND = (sys.executable, '-c', *sys.argv[1:]); "
-                                "start = time.monotonic(); s.main(); "
-                                "assert time.monotonic() - start < s.BUDGET + 0.1", query, str(pid_file)]
+                                worker, str(pid_file), str(cancel)]
                 self.run_hook(PYTHONPATH=str(SCRIPTS))
                 with self.assertRaises(ProcessLookupError):
                     os.kill(int(pid_file.read_text()), 0)

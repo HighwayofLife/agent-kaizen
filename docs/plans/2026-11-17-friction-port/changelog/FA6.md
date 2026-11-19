@@ -1,0 +1,1 @@
+Harden host evidence collection and respect friction opt-outs in interactive notices and refreshes. Keep action notices bounded and handle wide and deep output trees and intermittent boot identifiers.

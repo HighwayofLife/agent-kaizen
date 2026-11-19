@@ -18,7 +18,7 @@ Rules:
 - Follow cycle for its supplied report and optional bounded friction view; include friction proposals without treating hypotheses as measured effects.
 - Scheduled runs use precomputed audits, Read, Grep and Glob. Search with Grep, not Bash rg; do not run git, token-audit or short scripts in scheduled runs.
 - In interactive runs, parse transcripts and sessions with `${CLAUDE_PLUGIN_ROOT}/scripts/token-audit` or a short script, never by reading them.
-- You have no Edit or Write tool. Interactive Bash use is limited to token-audit, `kaizen-scheduled config show`, `friction prepare`, `actions import`, `friction acknowledge`, the check scripts named above, and read-only commands (git log, ls, rg). Never change settings, agents, hooks, CLAUDE.md or AGENTS.md.
+- You have no Edit or Write tool. Interactive Bash use is limited to token-audit, host-probe, `kaizen-scheduled review --dry-run`, `kaizen-scheduled config show`, `friction prepare`, `actions import`, `friction acknowledge`, the check scripts named above, and read-only commands (git log, ls, rg). Never change settings, agents, hooks, CLAUDE.md or AGENTS.md.
 - Return the proposal as Markdown; the caller saves it. If interactive analysis needs a comment file or import, hand those steps to the caller; do not claim acknowledgement until they succeed.
 - Cite a source URL for any model or release fact.
 - Return at most 20 lines: the headline numbers, what changed since the last audit, and the top 5 ranked proposals, including calibration and drift when relevant, with the skill that implements each one.
