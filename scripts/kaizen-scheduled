@@ -24,6 +24,7 @@ from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 import hashlib
 import hmac
+from inspect import signature
 import json
 import math
 import os
@@ -2724,8 +2725,12 @@ def _run_review(audits, project_dirs, options, clock, safety):
                     output.flush()
                     os.fsync(output.fileno())
                     publication_time = timestamp(clock())
-                    recover_scheduled_publication(audits, project, prepared[1], proposal, output,
-                                                  reviewed_at=publication_time)
+                    try:
+                        recover_scheduled_publication(audits, project, prepared[1], proposal, output,
+                                                      reviewed_at=publication_time)
+                    except (OSError, ValueError):
+                        recovery_failed = True
+                        raise
                 if not os.path.samestat(temporary.lstat(), os.fstat(output.fileno())):
                     raise ValueError("review output path was replaced")
                 os.replace(temporary, proposal)
@@ -3105,7 +3110,11 @@ def reconcile_scheduled(audits, project, output, receipt, *, acknowledge=True, r
     output.truncate()
     terminal = not reserved and all(value == "terminal" for value in imported.values())
     if terminal and acknowledge:
-        module["acknowledge_scheduled"](store, project, receipt, **helpers)
+        acknowledge_review = module["acknowledge_scheduled"]
+        if "host" in signature(acknowledge_review).parameters:
+            acknowledge_review(store, project, receipt, host)
+        else:
+            acknowledge_review(store, project, receipt)
     return terminal, reserved
 
 
@@ -3122,6 +3131,18 @@ def recover_scheduled_publication(audits, project, receipt=None, proposal=None, 
     store = host["HostActions"](audits, backup_root(), action_project, key)
     name = "publication-" + project.key + ".json"
     limit = 1 << 20
+
+    def publication_receipt(directory, generation):
+        if not isinstance(generation, str) or not re.fullmatch(r"[0-9]{20}", generation):
+            raise ValueError("invalid publication marker")
+        frozen = module["_json"](host["_read"](directory, "receipt-" + project.key + "-" + generation + ".json",
+                                              limit), host)
+        if (frozen.get("channel") != "scheduled" or frozen.get("project") != str(project.canonical)
+                or frozen.get("generation") != generation
+                or not hmac.compare_digest(frozen.get("signature", ""), module["_signature"](frozen, store._secret()))):
+            raise ValueError("invalid publication receipt")
+        return frozen
+
     if receipt is not None:
         with review_output(output) as stream:
             stream.flush()
@@ -3131,7 +3152,18 @@ def recover_scheduled_publication(audits, project, receipt=None, proposal=None, 
                 raise ValueError("review output too large")
         marker = dict(v=1, audits=str(audits), reviewed_at=reviewed_at or timestamp(now()),
                       generation=receipt["generation"], proposal=proposal.name, sha256=hashlib.sha256(raw).hexdigest())
-        with host["_directory"](store.friction, True, private=True) as directory:
+        with host["_directory"](store.friction, True, private=True) as directory, host["_locked"](directory, name):
+            try:
+                previous = module["_json"](host["_read"](directory, name, limit), host)
+            except FileNotFoundError:
+                pass
+            else:
+                owner = previous.get("audits")
+                if "audits" not in previous:
+                    frozen = publication_receipt(directory, previous.get("generation"))
+                    owner = str(Path(frozen["identities"]["extract"]["path"]).parent.parent)
+                if owner != str(audits):
+                    raise ValueError("another audit root owns the earlier review publication")
             host["_replace"](directory, name, module["_encode"](marker))
         return False
 
@@ -3155,6 +3187,7 @@ def recover_scheduled_publication(audits, project, receipt=None, proposal=None, 
     with contextlib.ExitStack() as stack:
         try:
             directory = stack.enter_context(host["_directory"](store.friction, private=True))
+            stack.enter_context(host["_locked"](directory, name))
             marker = module["_json"](host["_read"](directory, name, limit), host)
         except FileNotFoundError:
             return False
@@ -3164,12 +3197,7 @@ def recover_scheduled_publication(audits, project, receipt=None, proposal=None, 
             raise ValueError("invalid publication marker")
         if marker.get("audits", str(audits)) != str(audits):
             return None  # Preserve the generation owned by another audit root.
-        frozen = module["_json"](host["_read"](directory, "receipt-" + project.key + "-" + generation + ".json",
-                                              limit), host)
-        if (frozen.get("channel") != "scheduled" or frozen.get("project") != str(project.canonical)
-                or frozen.get("generation") != generation
-                or not hmac.compare_digest(frozen.get("signature", ""), module["_signature"](frozen, store._secret()))):
-            raise ValueError("invalid publication receipt")
+        frozen = publication_receipt(directory, generation)
         if Path(frozen["identities"]["extract"]["path"]).parent.parent != audits:
             return None
         if project.unknown:
@@ -3187,8 +3215,9 @@ def recover_scheduled_publication(audits, project, receipt=None, proposal=None, 
             os.unlink(name, dir_fd=directory)
             os.fsync(directory)
             return False
-        if module.get("RUNNER_API") == 2:
-            module["acknowledge_scheduled"](store, project, frozen, host, proposal=published, digest=marker.get("sha256"))
+        acknowledge_review = module["acknowledge_scheduled"]
+        if "host" in signature(acknowledge_review).parameters:
+            acknowledge_review(store, project, frozen, host, proposal=published, digest=marker.get("sha256"))
         else:
             # The legacy helper only acknowledges the current generation.
             state_raw = host["_read"](directory, "prepare-" + project.key + ".json", limit)
@@ -3198,7 +3227,7 @@ def recover_scheduled_publication(audits, project, receipt=None, proposal=None, 
                 _, identity = module["_read"](published, host)
                 if identity["sha256"] != marker.get("sha256"):
                     warnings.warn("published review changed before acknowledgement; preserving the edited report")
-                module["acknowledge_scheduled"](store, project, frozen)
+                acknowledge_review(store, project, frozen)
 
         # The in-flight review may have started with a model-writable audit root.
         state = read_state(project) if review_state is None else review_state.copy()

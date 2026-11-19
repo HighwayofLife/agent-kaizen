@@ -149,6 +149,41 @@ class ScheduledFrictionTests(PreparationTests):
             with self.assertRaisesRegex(ValueError, "different requests"):
                 reconcile(audits, self.obj, output, receipt)
 
+    def test_completed_518da76_apply_accepts_identical_review_retry(self):
+        _, ident, output, receipt = self.marker_request()
+        audits = self.config / "audits"
+        scripts = self.mixed_scripts("kaizen-scheduled", "kaizen_friction_actions.py")
+        runner = runpy.run_path(str(scripts / "kaizen-scheduled"))
+        host = runpy.run_path(str(scripts / "kaizen_friction_actions.py"))
+        store = host["HostActions"](audits, self.backups, runner["action_project"], runner["key"])
+        generation = "scheduled:" + receipt["generation"]
+        request = output.read_text()
+        self.assertEqual(store.import_actions(request.strip(), receipt["allowed"], self.project, generation),
+                         {ident: "pending"})
+        self.write(store.friction / ("broker-" + ident + ".json"), "{}")
+        with host["_directory"](store.friction, private=True) as state:
+            record = dict(phase="marker-pending", operation="linux-localsearch",
+                          reservation="fixture", target_identity=[1, 2])
+            ledger = Mock(state=state, load=Mock(return_value=record),
+                          cancel_unstarted_marker=Mock(return_value=False),
+                          scheduled_marker=Mock(return_value="recorded"))
+            runtime = dict(BrokerLedger=Mock(locked=Mock(return_value=nullcontext(ledger))),
+                           LOCAL_COMMIT="local-commit")
+            broker = runner["run_scheduled_broker"]
+            with patch.dict(broker.__globals__, scheduled_authority=Mock(return_value=(None, ()))), \
+                    patch.object(runpy, "run_path", side_effect=[host, runtime]):
+                broker(audits, self.obj, runner["command_options"](SimpleNamespace()))
+        self.assertEqual(store.scoped(self.project)[0]["status"], "done")
+        before = store.path.read_bytes()
+        self.assertEqual(json.loads(before)["receipts"][str(self.project)][generation], {ident: "terminal"})
+        self.assertFalse(store.path.with_suffix(".json.receipts").exists())
+        reconcile = self.runner["reconcile_scheduled"]
+        with patch.dict(reconcile.__globals__, scheduled_action_refusal=lambda _: None):
+            self.assertEqual(reconcile(audits, self.obj, output, receipt), (True, False))
+            self.write(output, request)
+            self.assertEqual(reconcile(audits, self.obj, output, receipt), (True, False))
+        self.assertEqual(store.path.read_bytes(), before)
+
     def test_malformed_output_cannot_acknowledge(self):
         _, receipt = self.scheduled()
         output = self.write(self.obj.folder / "review.md", '<!-- kaizen-host-actions broken -->\n')
@@ -223,6 +258,65 @@ class ScheduledFrictionTests(PreparationTests):
         self.assertEqual(self.runner["recover_scheduled_publication"](audits, self.obj), proposal)
         self.assertTrue(self.runner["read_state"](self.obj)["reviewed_at"])
         self.assertFalse(marker.exists())
+
+    def test_foreign_518da76_publication_cannot_be_overwritten(self):
+        _, receipt = self.scheduled()
+        audits = self.config / "audits"
+        output = self.write(self.obj.folder / "review.tmp", "Review\n" + self.actions().read_text())
+        self.runner["reconcile_scheduled"](audits, self.obj, output, receipt, acknowledge=False)
+        proposal = self.obj.folder / "cycle-2026-11-18.md"
+        legacy = runpy.run_path(str(self.mixed_scripts(PATH.name) / PATH.name))
+        ownership = self.runner["action_project"], self.runner["key"]
+        legacy["scheduled_publication"](audits, self.backups, self.obj, *ownership, receipt, proposal, output)
+        output.rename(proposal)
+        marker = next((self.backups / "friction").glob("publication-*.json"))
+        original = marker.read_bytes()
+        state = self.backups / "friction" / ("prepare-" + self.obj.key + ".json")
+        prior_state = state.read_bytes()
+        self.assertNotIn("audits", json.loads(original))
+        other = self.root / "other-audits"
+        other_project = self.runner["Project"](self.project, [self.project], other / "projects" / self.obj.key)
+        other_output = self.write(other_project.folder / "review.tmp", "Other review\n")
+        other_proposal = other_project.folder / proposal.name
+        other_report = self.write(other_project.folder / self.report.name, self.report.read_text())
+        self.write(other / "extracts" / self.extract.name, self.extract.read_text())
+        self.write(other_project.folder / self.probe_path.name, self.probe_path.read_text())
+        with self.assertRaisesRegex(ValueError, "earlier review publication"):
+            prepare.prepare(other, self.backups, other_project, other_report, self.runner["effective"](self.project),
+                            "propose-only", self.current + timedelta(seconds=2), *ownership, retain=True)
+        self.assertEqual(state.read_bytes(), prior_state)
+        recover = self.runner["recover_scheduled_publication"]
+        for publish in (
+                lambda: prepare.scheduled_publication(other, self.backups, other_project, *ownership,
+                                                      receipt, other_proposal, other_output),
+                lambda: recover(other, other_project, receipt, other_proposal, other_output)):
+            with self.subTest(publish=publish):
+                with self.assertRaisesRegex(ValueError, "earlier review publication"):
+                    publish()
+                self.assertEqual(marker.read_bytes(), original)
+                self.assertEqual(other_output.read_text(), "Other review\n")
+        self.assertEqual(recover(audits, self.obj), proposal)
+        self.assertEqual(json.loads(state.read_bytes())["acknowledged_generation"], receipt["generation"])
+
+    def test_same_root_can_retry_publication_with_pending_apply(self):
+        _, _, output, receipt = self.marker_request()
+        audits = self.config / "audits"
+        reconcile = self.runner["reconcile_scheduled"]
+        with patch.dict(reconcile.__globals__, scheduled_action_refusal=lambda _: None):
+            self.assertEqual(reconcile(audits, self.obj, output, receipt, acknowledge=False), (False, False))
+        recover = self.runner["recover_scheduled_publication"]
+        proposal = self.obj.folder / "cycle-2026-11-18.md"
+        recover(audits, self.obj, receipt, proposal, output)
+        output.rename(proposal)
+        published = proposal.read_bytes()
+        self.assertFalse(recover(audits, self.obj))
+        _, retry = self.scheduled("auto")
+        output.write_text("Retried review\n")
+        new_proposal = self.obj.folder / "cycle-2026-11-18-2.md"
+        recover(audits, self.obj, retry, new_proposal, output)
+        self.assertEqual(proposal.read_bytes(), published)
+        marker = next((self.backups / "friction").glob("publication-*.json"))
+        self.assertEqual(json.loads(marker.read_text())["proposal"], new_proposal.name)
 
     def test_unpublished_suggestion_survives_new_evidence_generation(self):
         self.candidate()
@@ -496,8 +590,8 @@ if os.environ.get('REVIEW_SLEEP'): time.sleep(10)
     def state(self):
         return json.loads(next((self.backups / 'friction').glob('prepare-*.json')).read_text())
 
-    def assert_mixed_review_publishes_in_auto(self, legacy):
-        scripts = self.mixed_scripts(legacy)
+    def assert_mixed_review_publishes_in_auto(self, legacy, revision="518da76"):
+        scripts = self.mixed_scripts(legacy, revision=revision)
         linked = self.root / "linked"
         self.add_test_worktrees(linked)
         target = linked / "build"
@@ -526,6 +620,12 @@ if os.environ.get('REVIEW_SLEEP'): time.sleep(10)
 
     def test_new_runner_with_legacy_prepare_helper(self):
         self.assert_mixed_review_publishes_in_auto(PATH.name)
+
+    def test_candidate_runner_with_new_prepare_helper(self):
+        self.assert_mixed_review_publishes_in_auto("kaizen-scheduled", "03325cd")
+
+    def test_new_runner_with_candidate_prepare_helper(self):
+        self.assert_mixed_review_publishes_in_auto(PATH.name, "03325cd")
 
     def test_unsafe_publication_directory_still_allows_ordinary_review(self):
         import os
