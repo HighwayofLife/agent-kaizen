@@ -163,6 +163,26 @@ class BackupCommitTests(unittest.TestCase):
         self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o644)
         self.assertEqual(self.git("diff", "HEAD", ref), "")
 
+    def test_legacy_ref_undo_keeps_mode_when_live_file_is_missing(self):
+        self.target.chmod(0o644)
+        change = self.ready()
+        manifest = self.manifest(change)
+        del manifest["files"][0]["before_mode"]
+        (change / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+        ref = self.commit_cli(change).stdout.split()[-1]
+        journal = self.helpers["record_path"](change)
+        record = json.loads(journal.read_text())
+        del record["legacy_modes"]
+        journal = journal.rename(journal.with_name(self.helpers["legacy_record_name"](change.name)))
+        journal.write_text(json.dumps(record))
+        self.target.unlink()
+
+        self.main("undo", change, "--force")
+        self.assertEqual(self.target.read_text(), "before")
+        self.assertEqual(stat.S_IMODE(self.target.stat().st_mode), 0o644)
+        self.assertEqual(self.git("diff", "HEAD", ref), "")
+        self.main("prune", "--older-than", 1, "--apply")
+
     def test_undo_run_does_not_accept_an_editor_save_after_a_shared_restore(self):
         self.check_shared_restore_race(committed=True)
 
@@ -202,6 +222,61 @@ class BackupCommitTests(unittest.TestCase):
         self.assertEqual(self.target.read_text(), "after")
         for pending in (change, newer):
             self.assertIsNone(self.manifest(pending)["reverted"])
+
+    def test_ordinary_undo_keeps_save_after_displaced_hash(self):
+        change = self.begin()
+        self.target.write_text("after")
+        self.script("finish", change)
+        original = self.target.stat()
+        hash_file = self.helpers["undo_file_hash"]
+        with self.target.open("r+") as editor:
+            def save_after_hash(name, fd, version, **kwargs):
+                digest = hash_file(name, fd, version, **kwargs)
+                if name.startswith(".kaizen-recovery-") and version[:2] == (original.st_dev, original.st_ino):
+                    editor.write("late editor save")
+                    editor.flush()
+                return digest
+
+            error = self.main("undo", change, expected=2, undo_file_hash=save_after_hash)
+        recovery, = self.repo.glob(".kaizen-recovery-*")
+        self.assertIn(str(recovery), error)
+        self.assertEqual(recovery.read_text(), "late editor save")
+        self.assertEqual(self.target.read_text(), "before")
+        self.assertIsNone(self.manifest(change)["reverted"])
+
+    def test_displaced_inode_remains_recoverable_after_undo(self):
+        change = self.begin()
+        self.target.write_text("after")
+        self.script("finish", change)
+        with self.target.open("r+") as editor:
+            report = self.main("undo", change)
+            editor.write("later editor save")
+            editor.flush()
+        recovery, = self.repo.glob(".kaizen-recovery-*")
+        self.assertIn(str(recovery), report)
+        self.assertEqual(recovery.read_text(), "later editor save")
+        self.assertEqual(self.target.read_text(), "before")
+
+    def test_ordinary_undo_run_keeps_concurrent_save_to_created_file(self):
+        self.target.unlink()
+        change = self.begin("--run", "created")
+        self.target.write_text("created")
+        self.script("finish", change)
+        unlink, rename = os.unlink, os.rename
+
+        def save_before(operation):
+            def edit(name, *args, **kwargs):
+                if Path(name).name == self.target.name:
+                    self.target.write_text("late editor save")
+                return operation(name, *args, **kwargs)
+            return edit
+
+        with patch.object(os, "unlink", save_before(unlink)), patch.object(os, "rename", save_before(rename)):
+            error = self.main("undo", "run", expected=2)
+        recovery, = self.repo.glob(".kaizen-recovery-*")
+        self.assertIn(str(recovery), error)
+        self.assertEqual(recovery.read_text(), "late editor save")
+        self.assertIsNone(self.manifest(change)["reverted"])
 
     def check_shared_restore_race(self, *, committed):
         older = self.ready("shared") if committed else self.begin("--run", "shared")
@@ -367,6 +442,32 @@ class BackupCommitTests(unittest.TestCase):
         self.assertIsNone(self.manifest(moved)["reverted"])
         self.assertEqual((moved / "files/1").read_text(), "before")
 
+    def test_legacy_journal_with_changed_inode_blocks_undo_and_prune(self):
+        change = self.ready()
+        (change / "manifest.json").write_text(json.dumps(dict(self.manifest(change), created_at="2000-01-01")))
+        ref = self.commit_cli(change).stdout.split()[-1]
+        tip = self.git("rev-parse", ref)
+        journal = self.helpers["record_path"](change)
+        journal = journal.rename(journal.with_name(self.helpers["legacy_record_name"](change.name)))
+        record = json.loads(journal.read_text())
+        moved = change.rename(change.with_name("renamed"))
+        self.assertEqual(self.begin("--run", "commit"), change)
+        inode = record["manifest"][0][1]
+        for foreign_inode in (inode ^ 1, change.stat().st_ino):
+            with self.subTest(inode=foreign_inode):
+                record["manifest"][0][1] = foreign_inode
+                journal.write_text(json.dumps(record))
+                self.assertIn("ref record", self.main("undo", moved, "--force", expected=2))
+                self.assertIn("ref record", self.main("prune", "--older-than", 1, "--apply", expected=2))
+
+        record["manifest"][0][1] = inode
+        journal.write_text(json.dumps(record))
+        self.assertIn("renamed", self.main("undo", moved, "--force", expected=2))
+        self.main("prune", "--older-than", 1, "--apply")
+        self.assertEqual((self.git("rev-parse", ref), self.target.read_text()), (tip, "after"))
+        self.assertIsNone(self.manifest(moved)["reverted"])
+        self.assertEqual((moved / "files/1").read_text(), "before")
+
     def test_ref_undo_refuses_to_replace_a_hard_link(self):
         change = self.ready()
         ref = self.commit_cli(change).stdout.split()[-1]
@@ -397,8 +498,91 @@ class BackupCommitTests(unittest.TestCase):
         self.assertFalse(created.exists())
         self.assertTrue(self.target.samefile(alias))
         self.assertEqual((self.target.read_text(), alias.read_text()), ("before", "before"))
+        for recovery in self.repo.glob(".kaizen-recovery-*"):
+            self.assertFalse(self.target.samefile(recovery))
         for change in (older, newer, Path(newest)):
             self.assertIsNotNone(self.manifest(change)["reverted"])
+
+    def test_ordinary_undo_restores_untracked_hard_link(self):
+        alias = self.tmp / "hard-link"
+        os.link(self.target, alias)
+        change = self.begin()
+        self.target.write_text("after")
+        self.script("finish", change)
+
+        self.main("undo", change)
+        self.assertTrue(self.target.samefile(alias))
+        self.assertEqual((self.target.read_text(), alias.read_text()), ("before", "before"))
+        self.assertIsNotNone(self.manifest(change)["reverted"])
+
+    def test_ordinary_undo_restores_file_in_read_only_parent(self):
+        parent = self.repo / "read-only"
+        parent.mkdir()
+        self.target = self.target.rename(parent / "tracked")
+        change = self.begin()
+        self.target.write_text("after")
+        self.script("finish", change)
+        parent.chmod(0o555)
+        self.addCleanup(parent.chmod, 0o700)
+        inode = self.target.stat().st_ino
+
+        open_file = os.open
+
+        def stage_without_parent_write(name, flags, *args, **kwargs):
+            if Path(name).name.startswith(".kaizen-recovery-") and kwargs.get("dir_fd") is not None:
+                raise PermissionError(errno.EACCES, "parent is read-only", name)
+            return open_file(name, flags, *args, **kwargs)
+
+        if os.access(parent, os.W_OK):  # Root can stage even in a 0555 directory.
+            with patch.object(os, "open", stage_without_parent_write):
+                self.main("undo", change)
+        else:
+            self.main("undo", change)
+        self.assertEqual(self.target.read_text(), "before")
+        self.assertEqual(self.target.stat().st_ino, inode)
+        self.assertEqual(stat.S_IMODE(parent.stat().st_mode), 0o555)
+
+    def test_in_place_undo_reports_concurrent_save(self):
+        alias = self.tmp / "hard-link"
+        os.link(self.target, alias)
+        change = self.begin()
+        self.target.write_text("after")
+        self.script("finish", change)
+        copy = self.helpers["copy_undo_backup"]
+
+        def copy_then_save(*args, **kwargs):
+            copy(*args, **kwargs)
+            alias.write_text("editor save")
+
+        error = self.main("undo", change, expected=2, copy_undo_backup=copy_then_save)
+        recovery, = self.backups.glob(".kaizen-recovery-*")
+        self.assertIn(str(recovery), error)
+        self.assertEqual(recovery.read_text(), "after")
+        self.assertEqual(self.target.read_text(), "editor save")
+        self.assertIsNone(self.manifest(change)["reverted"])
+
+    def test_in_place_undo_keeps_save_to_tail_before_truncation(self):
+        alias = self.tmp / "hard-link"
+        os.link(self.target, alias)
+        change = self.begin()
+        self.target.write_text("after is longer")
+        self.script("finish", change)
+        copy = shutil.copyfileobj
+
+        def edit_tail(source, destination, *args, **kwargs):
+            copy(source, destination, *args, **kwargs)
+            if os.path.samestat(os.fstat(destination.fileno()), alias.stat()):
+                with alias.open("r+") as editor:
+                    editor.seek(len("before"))
+                    editor.write("new bytes")
+
+        with patch.object(shutil, "copyfileobj", edit_tail):
+            error = self.main("undo", change, expected=2)
+        recovery, = self.backups.glob(".kaizen-recovery-*")
+        self.assertIn(str(recovery), error)
+        self.assertEqual(recovery.read_text(), "after is longer")
+        self.assertEqual(self.target.read_text(), "beforenew bytes")
+        self.assertIsNone(self.manifest(change)["reverted"])
 
     def test_forced_ref_undo_recreates_removed_parent_directories(self):
         nested = self.repo / "outer/inner"
