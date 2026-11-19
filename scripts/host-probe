@@ -20,6 +20,11 @@ import threading
 import time
 import uuid
 
+try:
+    import resource
+except ImportError:
+    resource = None
+
 HERE = Path(__file__).resolve().parent
 LIMIT = 1024 * 1024
 STATUS_CONFIG = {
@@ -58,6 +63,14 @@ def open_directory(path, create=False):
     except BaseException:
         os.close(fd)
         raise
+
+
+def index_stamp(path):
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return None
+    return info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
 
 
 class Probe:
@@ -214,13 +227,12 @@ class Probe:
             self.warn('proc_unavailable')
             return None
 
-    def git(self, root, *args, index_records=False):
+    def git(self, root, *args):
         if args and args[0] == 'status':
             return self.status(Path(root), args)
-        argv = ['git', '-c', 'core.fsmonitor=false', '-C', str(root), *args]
-        return self.command(argv, index_records=True) if index_records else self.command(argv)
+        return self.command(['git', '-c', 'core.fsmonitor=false', '-C', str(root), *args])
 
-    def status(self, root, args, config=None):
+    def status(self, root, args, config=None, *, with_index=False):
         # Give status a private Git directory with only allowlisted configuration.
         # Git must not read live config or recurse into a submodule's live config.
         if config is None:
@@ -265,8 +277,17 @@ class Probe:
                     (shadow / 'info').mkdir()
                     for source, name in ((common, 'exclude'), (common, 'attributes'), (admin, 'sparse-checkout')):
                         (shadow / 'info' / name).symlink_to(source / 'info' / name)
-                return self.command(['git', '-C', str(root), f'--git-dir={shadow}',
-                                     f'--work-tree={root}', *args, '--ignore-submodules=dirty'])
+                git = ['git', '-C', str(root), f'--git-dir={shadow}', f'--work-tree={root}']
+                before = index_stamp(admin / 'index') if with_index else None
+                status = self.command([*git, *args, '--ignore-submodules=dirty'])
+                if status is None or not with_index:
+                    return status
+                # Check flags after status, and reject changes across both reads.
+                index = self.command([*git, 'ls-files', '-v', '--stage', '-z'], index_records=True)
+                if index_stamp(admin / 'index') != before:
+                    self.warn('index_changed')
+                    return None
+                return (status, index) if index is not None else None
         except (OSError, ValueError):
             self.warn('command_unavailable')
             return None
@@ -274,8 +295,7 @@ class Probe:
     def clean(self, root, depth=0):
         config = self.git(root, 'config', '--null', '--list')
         modules = self.git(root, 'config', '--null', '--file', '.gitmodules', '--list') if (root / '.gitmodules').exists() else ''
-        index = self.git(root, 'ls-files', '-v', '--stage', '-z', index_records=True)
-        if config is None or modules is None or index is None:
+        if config is None or modules is None:
             return None
         if any(re.fullmatch(r'(?:diff\.ignoresubmodules|submodule\..*\.ignore)\n'
                             r'(?:untracked|dirty|all)', entry, re.I)
@@ -284,9 +304,10 @@ class Probe:
         args = ('status', '--porcelain=v1', '-z', '--untracked-files=all')
         if not depth:
             args += ('--ignored=matching',)
-        status = self.status(root, args, config)
-        if status is None:
+        evidence = self.status(root, args, config, with_index=True)
+        if evidence is None:
             return None
+        status, index = evidence
         dirty = bool(status)
         for entry in filter(None, index.split('\0')):
             if entry[0].islower() or entry[0] == 'S':
@@ -402,6 +423,12 @@ class Probe:
         total, count, queued = 0, 0, 0
         parents, held = [], {}
         fd = None
+        parent_limit = SIZE_PARENT_FDS
+        if resource is not None:
+            soft, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+            if soft != resource.RLIM_INFINITY:
+                # Leave room for stdio, traversal, and the descriptor used by scandir.
+                parent_limit = min(parent_limit, max(2, soft - 8))
 
         def parent_fd(level):
             if level in held:
@@ -420,7 +447,7 @@ class Probe:
                     previous = child
                     if not os.path.samestat(expected, os.fstat(child)):
                         raise OSError('directory moved')
-                    if index == level or level - index < SIZE_PARENT_FDS - len(held):
+                    if index == level or level - index < parent_limit - len(held):
                         held[index] = child
                 return previous
             finally:
@@ -460,7 +487,7 @@ class Probe:
                 if children:
                     child_name = children.pop()
                     if children or queued:
-                        if len(held) >= SIZE_PARENT_FDS:
+                        if len(held) >= parent_limit:
                             # Thin the checkpoints while keeping the root.
                             for level in sorted(held)[1::2]:
                                 close_parent(level)

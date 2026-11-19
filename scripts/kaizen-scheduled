@@ -2875,6 +2875,22 @@ def canonical_project(directory):
     return directory
 
 
+def primary_worktree_project(directory):
+    """Find enrollment in the registered main checkout for a linked path."""
+    checkout = checkout_root(directory)
+    if checkout is None or not (checkout / ".git").is_file():
+        return None
+    listed, _ = worktree_paths(checkout) or ([], False)
+    if checkout not in listed[1:]:
+        return None
+    primary = listed[0]
+    gitdir = _git(primary, "rev-parse", "--absolute-git-dir")
+    if (gitdir and (primary / gitdir).resolve() == git_common_dir(checkout)
+            and (primary / "docs/kaizen").is_dir()):
+        return primary
+    return None
+
+
 @contextlib.contextmanager
 def config_lock(path):
     """Serialize read-modify-write of a config file with flock on <name>.lock beside the file (beside the link when the file is a symlink)."""
@@ -2905,6 +2921,8 @@ def update_auto_projects(project, enable):
 def show_config(project_dir=None):
     if project_dir is not None:
         project_dir = canonical_project(project_dir)
+        if not (project_dir / "docs/kaizen").is_dir():
+            project_dir = primary_worktree_project(project_dir) or project_dir
     result = effective(project_dir)
     result["reports"] = (str(audits_dir() / "projects" / key(project_dir)) + "/"
                          if project_dir is not None else None)

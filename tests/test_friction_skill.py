@@ -45,20 +45,33 @@ class FrictionSkillTests(unittest.TestCase):
                 subprocess.run(["git", "-C", str(main), *args], check=True, capture_output=True)
 
             git("init", "-q")
+            git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-qm", "initial")
+            git("worktree", "add", "-qb", "linked", str(linked))
             audits = main / "docs/kaizen"
             audits.mkdir(parents=True)
             (audits / "LEDGER.md").touch()
-            git("add", ".")
-            git("-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-                "-c", "commit.gpgsign=false", "commit", "-qm", "initial")
-            git("worktree", "add", "-qb", "linked", str(linked))
-            config = json.loads(subprocess.check_output([
-                sys.executable, str(ROOT / "scripts/kaizen-scheduled"),
-                "config", "show", "--for", str(linked),
-            ]))
+            recent = audits / "token-audit-2026-11-19.md"
+            recent.touch()
+            self.assertFalse((linked / "docs/kaizen").exists())
+
+            def config_for(checkout):
+                return json.loads(subprocess.check_output([
+                    sys.executable, str(ROOT / "scripts/kaizen-scheduled"),
+                    "config", "show", "--for", str(checkout),
+                ]))
+
+            config = config_for(linked)
             self.assertEqual(Path(config["localAudits"]), audits)
+            self.assertEqual(list(Path(config["localAudits"]).glob("token-audit-*.md")), [recent])
+            self.assertEqual(config["reports"], config_for(main)["reports"])
+            (linked / "docs/kaizen").mkdir(parents=True)
+            (linked / "docs/kaizen/LEDGER.md").touch()
+            self.assertEqual(config_for(linked), config)
         lookup = read("skills/cycle/SKILL.md").split("**Measure.**")[0]
         self.assertIn("newest `token-audit-*.md` across `docs/kaizen/` and `localAudits`", lookup)
+        self.assertIn("`LEDGER.md` in `docs/kaizen/` or `localAudits`", lookup)
+        self.assertLess(lookup.rindex("config show --for ."), lookup.index("`LEDGER.md`"))
         self.assertNotIn("review --dry-run", lookup)
 
     def test_entry_points_and_policy(self):
@@ -82,7 +95,8 @@ class FrictionSkillTests(unittest.TestCase):
 
     def test_scoped_refresh_backup_and_review(self):
         cycle = read("skills/cycle/SKILL.md")
-        for phrase in ("review --dry-run --project-dir .", "paths:", "--cwd <path>"):
+        for phrase in ("review --dry-run --project-dir <project>` with `docs/kaizen` stripped from `localAudits`",
+                       "paths:", "--cwd <path>"):
             self.assertIn(phrase, cycle)
         autonomy = read("docs/autonomy.md")
         self.assertIn('begin --skill <skill> --ledger "<ledger text>" --repo <project root>', autonomy)
