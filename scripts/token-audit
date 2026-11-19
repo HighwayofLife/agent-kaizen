@@ -454,31 +454,41 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                     continue
                 if keep_model and not (session_meta or b'"token_count"' in prefix or b'"user_message"' in prefix or b'"role":"user"' in prefix or b'"role": "user"' in prefix or b'"model"' in line or (bounds is not None and b'"turn_context"' in prefix)):
                     continue
+                signal_row = bounds is None and keep_signals and (b'"tool_use"' in line or b'"tool_result"' in line)
                 if bounds is not None:
                     timestamp = last_timestamp
+                elif signal_row:
+                    timestamp = envelope_timestamp(line)
+                    if timestamp is not None and len(timestamp) <= 40 and friction_stamp(timestamp) is None:
+                        timestamp = None
                 else:
-                    signal_row = keep_signals and (b'"tool_use"' in line or b'"tool_result"' in line)
-                    if signal_row:
-                        timestamp = envelope_timestamp(line)
-                        if timestamp is not None and (len(timestamp) > 40 or friction_stamp(timestamp) is None):
-                            timestamp = None
-                    else:
-                        match = TIMESTAMP.search(line)
-                        timestamp = match[1].decode("ascii", "replace") if match else None
-                    if timestamp is None:
-                        if signal_row:
-                            # Missing and malformed tool timestamps still affect replay reconciliation.
-                            warnings["malformed rows"] += 1
-                            try:
-                                row = json.loads(line) if decoded is UNPARSED else decoded
-                                if isinstance(row, dict):
-                                    yield dict(row, _invalid_friction_timestamp=True)
-                            except (ValueError, RecursionError):
-                                pass
-                        continue
+                    match = TIMESTAMP.search(line)
+                    timestamp = match[1].decode("ascii", "replace") if match else None
+                old = None
                 try:
-                    old = (timestamp[:19] < cutoff if timestamp.endswith(("Z", "+00:00"))
-                           else date_time(timestamp) < since)
+                    if timestamp is not None:
+                        if timestamp.endswith(("Z", "+00:00")):
+                            old = timestamp[:19] < cutoff
+                        elif signal_row:
+                            stamp = friction_stamp(timestamp)
+                            if stamp is not None:
+                                old = stamp < since
+                        else:
+                            old = date_time(timestamp) < since
+                except (ValueError, TypeError):
+                    warnings["malformed rows"] += 1
+                if signal_row and (old is None or (old and len(timestamp) > 40)):
+                    # Reconcile malformed rows and oversized timestamps even outside the window.
+                    warnings["malformed rows"] += 1
+                    try:
+                        decoded = json.loads(line) if decoded is UNPARSED else decoded
+                        if isinstance(decoded, dict):
+                            yield dict(decoded, _invalid_friction_timestamp=True)
+                    except (ValueError, RecursionError):
+                        continue
+                if old is None:
+                    continue
+                try:
                     if old and keep_tools:
                         if b'"usage"' in line and b'"assistant"' in prefix:
                             try:
@@ -975,7 +985,7 @@ def friction_block(state, row, block, start, result_count=0, row_event=None, tru
     if pair is None and not trusted_source:
         return
     if stamp is None or stamp < state["since"]:
-        if stamp is None:
+        if stamp is None and not row.get("_invalid_friction_timestamp"):
             state["warnings"]["malformed rows"] += 1
         pairs[key] = None
         if trusted_source:

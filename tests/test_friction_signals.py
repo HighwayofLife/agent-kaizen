@@ -291,6 +291,29 @@ class FrictionSignalTests(FrictionClaudeTests):
                 evidence = self.collect(cwd=[root])['friction']['permission_acceptance'][0]
                 self.assertEqual((evidence['accepted'], evidence['ambiguous']), (0, 1))
 
+    def test_long_tool_timestamp_preserves_claude_call_accounting(self):
+        begin = start('long', 2)
+        begin['message'].update(id='usage', model='claude-test', usage=dict(input_tokens=10, output_tokens=5))
+        for stamp in ('2025-01-01T00:00:02.' + '0' * 24 + 'Z',
+                      '2025-01-01T01:00:02.000000+01:00:00.000001'):
+            with self.subTest(timestamp=stamp):
+                begin['timestamp'] = stamp
+                jsonl(self.session, [begin, end('long', 3)])
+                for friction in (True, False):
+                    self.assertEqual(self.collect(friction=friction)['headline']['claude_calls'], 1)
+
+    def test_invalid_tool_result_timestamp_warns_once(self):
+        result = end('invalid', 2)
+        for stamp in ('invalid', 'invalidZ', None):
+            with self.subTest(timestamp=stamp):
+                result.pop('timestamp', None)
+                if stamp is not None:
+                    result['timestamp'] = stamp
+                jsonl(self.session, [start('invalid', 0), result])
+                data = self.collect()
+                self.assertEqual(data['warnings']['malformed rows'], 1)
+                self.assertEqual(data['friction']['summary']['samples'], 0)
+
     def test_skipped_sample_preserves_transcript_duration(self):
         from unittest.mock import patch
         jsonl(self.session, [start('duration', 0), end('duration', 180, toolUseResult=dict(durationMs=120000))])
