@@ -12,6 +12,7 @@ import unittest
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from unittest.mock import patch
+from zipfile import ZipFile
 
 from test_friction_claude import end, start
 from test_schedule import CRONTAB
@@ -148,17 +149,19 @@ class PreparationTests(unittest.TestCase):
         self.write(self.extract, raw)
         self.probe_path = self.write(self.obj.folder / "host-probe-disposable.json", json.dumps(self.probe))
 
-    def mixed_scripts(self, legacy):
-        source = subprocess.run(["git", "show", "518da76:scripts/" + legacy], cwd=PATH.parent,
-                                capture_output=True)
-        if source.returncode and subprocess.check_output(
-                ["git", "rev-parse", "--is-shallow-repository"], cwd=PATH.parent).strip() == b"true":
-            self.skipTest("the 518da76 upgrade baseline is unavailable in this shallow checkout")
-        self.assertEqual(source.returncode, 0, source.stderr.decode())
-        scripts = self.root / "mixed-scripts"
+    def mixed_scripts(self, *legacy, revision="518da76"):
+        scripts = pathlib.Path(tempfile.mkdtemp(dir=self.root)) / "scripts"
         shutil.copytree(PATH.parent, scripts)
-        (scripts / legacy).write_bytes(source.stdout)
+        # Exact git blobs from 518da76 and 03325cd, available even in depth-one CI.
+        with ZipFile(pathlib.Path(__file__).parent / "fixtures/friction-upgrade.zip") as fixture:
+            for name in legacy:
+                (scripts / name).write_bytes(fixture.read(f"{revision}/{name}"))
         return scripts
+
+    def test_upgrade_fixture_without_git_history(self):
+        with patch.object(subprocess, "run", side_effect=AssertionError("upgrade fixture tried to run Git")):
+            scripts = self.mixed_scripts(PATH.name)
+        self.assertIn("scheduled_publication", runpy.run_path(str(scripts / PATH.name)))
 
     def run_prepare(self, report=None, interactive=True):
         return prepare.prepare(self.config / "audits", self.backups, self.obj, report,

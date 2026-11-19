@@ -325,7 +325,23 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
     catalog_raw, identities["catalog"] = _read(catalog_path, host)
     catalog_data = _json(catalog_raw, host)
     catalog = {row["id"]: row for row in catalog_data["actions"]}
-    with host["_directory"](store.friction, True, private=True) as directory, host["_locked"](directory, "prepare"):
+    with ExitStack() as stack:
+        directory = stack.enter_context(host["_directory"](store.friction, True, private=True))
+        new_scheduled = not interactive and _check is None
+        if new_scheduled:
+            marker_name = "publication-" + project.key + ".json"
+            stack.enter_context(host["_locked"](directory, marker_name))
+        stack.enter_context(host["_locked"](directory, "prepare"))
+        if new_scheduled:
+            # A 518da76 runner can continue after the helper reports a foreign marker.
+            # Keep the earlier generation available until its owning runner recovers it.
+            try:
+                marker = _json(host["_read"](directory, marker_name, LIMIT), host)
+            except FileNotFoundError:
+                pass
+            else:
+                if _publication_owner(directory, store, project, marker, host) != str(audits):
+                    raise ValueError("another audit root owns the earlier review publication")
         if _check is not None:
             live_cfg = canonical_project.__globals__["effective"](project.canonical)
             current = max(current, datetime.now(timezone.utc))
@@ -459,7 +475,7 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
         # Compare stored evidence only after choosing the strongest finding across worktrees.
         for ident, candidate in list(allowed.items()):
             was_imported = imported is not None and ident in imported
-            # The action store verifies the exact selection and intents for an imported generation.
+            # The action store validates a retry against the saved receipt.
             if not interactive and was_imported:
                 continue
             evidence = candidate["evidence"]
@@ -635,13 +651,38 @@ def import_scheduled(audits, backups, project, receipt, cfg, current, canonical_
                    _check=receipt, _complete=complete, host=host)
 
 
-def scheduled_publication(audits, backups, project, canonical_project, project_key,
-                          receipt=None, proposal=None, output=None):
-    """Compatibility entry point for runners that persist their own review state."""
-    if project.unknown:
-        return False
-    host = runpy.run_path(str(Path(__file__).resolve().parent / "kaizen_friction_actions.py"))
-    store = host["HostActions"](audits, backups, canonical_project, project_key)
+def _publication_receipt(directory, store, project, generation, host):
+    if not isinstance(generation, str) or not re.fullmatch(r"[0-9]{20}", generation):
+        raise ValueError("invalid publication marker")
+    frozen = _json(host["_read"](directory, "receipt-" + project.key + "-" + generation + ".json", LIMIT), host)
+    if (frozen.get("channel") != "scheduled" or frozen.get("project") != str(project.canonical)
+            or frozen.get("generation") != generation
+            or not hmac.compare_digest(frozen.get("signature", ""), _signature(frozen, store._secret()))):
+        raise ValueError("invalid publication receipt")
+    return frozen
+
+
+def _publication_owner(directory, store, project, marker, host):
+    if "audits" in marker:
+        return marker["audits"]
+    frozen = _publication_receipt(directory, store, project, marker.get("generation"), host)
+    return str(Path(frozen["identities"]["extract"]["path"]).parent.parent)
+
+
+def scheduled_publication(audits, backups, project, canonical_project, project_key, ready=None,
+                          *legacy, receipt=None, proposal=None, output=None, digest=None, reviewed_at=None):
+    """Accept publication calls from both the 518da76 and release-candidate runners."""
+    if callable(ready):
+        store, host, persist = backups, canonical_project, project_key
+    else:
+        if project.unknown:
+            return False
+        if legacy:
+            receipt, proposal, output = (ready, *legacy)
+        host = runpy.run_path(str(Path(__file__).resolve().parent / "kaizen_friction_actions.py"))
+        store = host["HostActions"](audits, backups, canonical_project, project_key)
+        persist = None  # 518da76 checks broker readiness and persists its own cutoff.
+    broker_ready = not project.unknown and (receipt is not None or persist is None or ready())
     name = "publication-" + project.key + ".json"
     with ExitStack() as stack:
         try:
@@ -651,36 +692,45 @@ def scheduled_publication(audits, backups, project, canonical_project, project_k
                 raise
             return False
         try:
+            stack.enter_context(host["_locked"](directory, name))
             marker = _json(host["_read"](directory, name, LIMIT), host)
         except FileNotFoundError:
             if receipt is None:
                 return False
             marker = None
         if receipt is not None:
-            if marker is not None and marker.get("audits", str(audits)) != str(audits):
+            if marker is not None and _publication_owner(directory, store, project, marker, host) != str(audits):
                 raise ValueError("another audit root owns the earlier review publication")
-            _, identity = _read(Path(output), host)
-            host["_replace"](directory, name, _encode(dict(v=1, audits=str(audits),
-                                                           generation=receipt["generation"],
-                                                           proposal=proposal.name, sha256=identity["sha256"])))
-            return False
-        if marker.get("audits", str(audits)) != str(audits):
+            if persist is None:
+                _, identity = _read(Path(output), host)
+                digest = identity["sha256"]
+            marker = dict(v=1, audits=str(audits), generation=receipt["generation"],
+                          proposal=proposal.name, sha256=digest)
+            if reviewed_at is not None:
+                marker["reviewed_at"] = reviewed_at
+            host["_replace"](directory, name, _encode(marker))
             return False
         generation, filename = marker.get("generation"), marker.get("proposal")
         if (not isinstance(generation, str) or not re.fullmatch(r"[0-9]{20}", generation)
                 or not isinstance(filename, str) or not re.fullmatch(r"cycle-[0-9-]+\.md", filename)):
             raise ValueError("invalid publication marker")
-        frozen = _json(host["_read"](directory, "receipt-" + project.key + "-" + generation + ".json", LIMIT), host)
-        if (frozen.get("channel") != "scheduled" or frozen.get("project") != str(project.canonical)
-                or frozen.get("generation") != generation
-                or not hmac.compare_digest(frozen.get("signature", ""), _signature(frozen, store._secret()))):
-            raise ValueError("invalid publication receipt")
+        if marker.get("audits", str(audits)) != str(audits):
+            return None
+        frozen = _publication_receipt(directory, store, project, generation, host)
         if Path(frozen["identities"]["extract"]["path"]).parent.parent != audits:
+            return None
+        if project.unknown:
+            raise ValueError("cannot recover publication with unknown project scope")
+        cutoff = (_stamp(marker["reviewed_at"]) if "reviewed_at" in marker else
+                  datetime.fromtimestamp(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mtime, timezone.utc))
+        if not broker_ready:
             return False
         published = project.folder / filename
         exists = published.exists()
         if exists:
             acknowledge_scheduled(store, project, frozen, host, proposal=published, digest=marker.get("sha256"))
+            if persist is not None:
+                persist(published, cutoff, frozen["identities"]["report"]["path"])
         os.unlink(name, dir_fd=directory)
         os.fsync(directory)
         return published if exists else False

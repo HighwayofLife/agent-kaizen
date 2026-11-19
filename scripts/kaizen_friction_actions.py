@@ -770,10 +770,19 @@ class HostActions:
                 if saved.keys() != receipt.keys():
                     raise ValueError("different requests for an imported host-action generation")
                 applied = set(rows.apply_intents.get(project, {}).get(generation, ()))
+                requested_apply = _pending({generation: receipt})
                 # The historical store collapsed completed applies into ordinary terminal receipts.
                 # Only a signed reservation for this action and generation can recover that intent.
                 applied.update(self._legacy_applies(project, generation, saved.keys() - applied, stored_secret))
-                if applied != _pending({generation: receipt}):
+                # The 518da76 broker wrote plain terminal receipts after verified completion.
+                # A replay may recognize that outcome, but must never reopen or queue the action.
+                if re.fullmatch(r"scheduled:[0-9]{20}", generation):
+                    for ident in requested_apply - applied:
+                        row = rows.get(ident, {})
+                        if (saved.get(ident) == "terminal" and row.get("done_by") == "verify"
+                                and row["evidence"] == candidates[ident][1]):
+                            applied.add(ident)
+                if applied != requested_apply:
                     raise ValueError("different requests for an imported host-action generation")
                 return saved
             pending = _pending(generations)
