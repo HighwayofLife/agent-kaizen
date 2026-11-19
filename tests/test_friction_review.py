@@ -182,6 +182,9 @@ class ScheduledFrictionTests(PreparationTests):
             self.assertEqual(reconcile(audits, self.obj, output, receipt), (True, False))
             self.write(output, request)
             self.assertEqual(reconcile(audits, self.obj, output, receipt), (True, False))
+            self.write(output, self.actions([ident]).read_text())
+            with self.assertRaisesRegex(ValueError, "different requests"):
+                reconcile(audits, self.obj, output, receipt)
         self.assertEqual(store.path.read_bytes(), before)
 
     def test_malformed_output_cannot_acknowledge(self):

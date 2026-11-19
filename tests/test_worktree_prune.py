@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import runpy
+import shlex
 import shutil
 import subprocess
 import sys
@@ -27,7 +28,17 @@ class WorktreePruneTests(unittest.TestCase):
         binary_dir = self.root / 'bin'
         binary_dir.mkdir()
         interpreter = binary_dir / 'python3'
-        shutil.copyfile(Path(sys.executable).resolve(), interpreter)
+        # Keep framework Python in its installation, but let the trust check see the test launcher.
+        bootstrap = '''import runpy
+import sys
+sys.executable = sys.argv.pop(1)
+sys.argv.pop(0)
+runpy.run_path(sys.argv[0], run_name='__main__')
+'''
+        interpreter.write_text(
+            '#!/bin/sh\nflag=$1\nshift\n'
+            f'exec {shlex.quote(sys.executable)} "$flag" -c {shlex.quote(bootstrap)} "$0" "$@"\n'
+        )
         interpreter.chmod(0o755)
         executable = patch.object(sys, 'executable', str(interpreter))
         executable.start()
