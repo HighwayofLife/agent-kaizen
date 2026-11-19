@@ -210,10 +210,10 @@ class PreparationTests(unittest.TestCase):
         self.probe["regenerable_dirs"] = [dict(path=str(canonical), size_bytes=42)]
         self.write_evidence()
         original = self.runner["action_project"]
-        def canonicalize(project, *, selector=None):
+        def canonicalize(project, *, selector=None, allow_missing=False):
             if selector in (linked, str(canonical)):
                 return self.project, canonical
-            return original(project, selector=selector)
+            return original(project, selector=selector, allow_missing=allow_missing)
         with patch.dict(self.runner, {"action_project": canonicalize}):
             self.assertEqual(len(json.loads(self.run_prepare().read_text())["actions"]), 1)
             self.probe["regenerable_dirs"] = []
@@ -221,11 +221,21 @@ class PreparationTests(unittest.TestCase):
             with self.assertWarns(UserWarning):
                 self.assertEqual(json.loads(self.run_prepare().read_text())["actions"], [])
 
+    def add_test_worktrees(self, *paths):
+        git = self.runner["_git"]
+        self.assertIsNotNone(git(self.project, "init"))
+        self.assertIsNotNone(git(self.project, "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+                                 "commit", "--allow-empty", "-m", "initial"))
+        for path in paths:
+            self.assertIsNotNone(git(self.project, "worktree", "add", "--detach", str(path)))
+        self.obj.paths = sorted([self.project, *paths])
+        self.scope["cwd"] = list(map(str, self.obj.paths))
+
     def test_worktree_only_outputs_merge_and_keep_flags(self):
         linked1, linked2 = self.root / 'linked1', self.root / 'linked2'
+        self.add_test_worktrees(linked1, linked2)
         for linked in (linked1, linked2):
             (linked / 'build').mkdir(parents=True)
-        self.obj.anchors.extend([linked1, linked2])
         self.probe['findings'] = [dict(id='indexed-output', catalog_id='spotlight-output',
                                        subject=str(linked / 'build'), evidence=dict(size_bytes=size))
                                   for linked, size in ((linked1, 42), (linked2, 84))]
@@ -240,11 +250,11 @@ class PreparationTests(unittest.TestCase):
         self.assertEqual(len(next(iter(receipt['allowed'].values()))['provenance']), 2)
 
     def test_acknowledged_worktree_finding_stays_closed(self):
-        for i, size in enumerate((42, 84)):
-            linked = self.root / f'linked{i}'
+        links = [self.root / 'linked0', self.root / 'linked1']
+        self.add_test_worktrees(*links)
+        for linked, size in zip(links, (42, 84)):
             build = linked / 'build'
             build.mkdir(parents=True)
-            self.obj.anchors.append(linked)
             self.probe['findings'].append(dict(id='indexed-output', catalog_id='spotlight-output',
                                                subject=str(build), evidence=dict(size_bytes=size)))
             self.probe['regenerable_dirs'].append(dict(path=str(build), size_bytes=size))
@@ -273,6 +283,29 @@ class PreparationTests(unittest.TestCase):
             view = json.loads(self.run_prepare().read_text())
         self.assertFalse(view['actions'])
         self.assertTrue(view['flags'])
+
+    def test_indexed_output_of_nested_enrolled_repo_is_dropped(self):
+        nested = self.project / 'nested'
+        (nested / 'docs/kaizen').mkdir(parents=True)
+        target = nested / 'build'
+        target.mkdir()
+        self.assertIsNotNone(self.runner['_git'](nested, 'init'))
+        self.probe['findings'] = [dict(id='indexed-output', catalog_id='spotlight-output',
+                                       subject=str(target), evidence=dict(size_bytes=42))]
+        self.probe['regenerable_dirs'] = [dict(path=str(target), size_bytes=42)]
+        self.write_evidence()
+        with self.assertWarns(UserWarning):
+            view = json.loads(self.run_prepare().read_text())
+        self.assertEqual(view['actions'], [])
+
+    def test_prepared_regression_flags_keep_distinct_timing_bases(self):
+        self.block.update(basis='mixed', flags=[
+            dict(id='regression', subject='private subject', value=4, basis=basis)
+            for basis in ('measured', 'row_gap')])
+        self.write_evidence()
+        flags = json.loads(self.run_prepare().read_text())['flags']
+        self.assertEqual({flag['basis'] for flag in flags}, {'measured', 'row_gap'})
+        self.assertEqual(len({flag['id'] for flag in flags}), 2)
 
     def test_flapping_action_is_held(self):
         _, ident = self.candidate()

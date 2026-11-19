@@ -330,6 +330,17 @@ class DiscoveryRootTests(SecurityCase):
     def discover(self, project_dirs):
         return self.runner.discover(self.cfg / 'projects', self.cx / 'sessions', {}, project_dirs)
 
+    def test_enrolled_submodule_has_a_known_action_scope(self):
+        source = self.monorepo(root_enrolled=True)
+        parent = self.project('parent')
+        self.git(parent, 'init')
+        self.git(parent, '-c', 'protocol.file.allow=always', 'submodule', 'add', str(source), 'sub')
+        submodule = parent / 'sub'
+        self.assertTrue((submodule / '.git').is_file())
+        projects, _ = self.discover([submodule])
+        self.assertFalse(projects[0].unknown)
+        self.assertEqual(self.runner.action_project(submodule), submodule)
+
     def test_enrolled_subdirectory_is_its_own_project(self):
         repo = self.monorepo('pkg')
         projects, not_enrolled = self.discover([repo / 'pkg'])
@@ -472,6 +483,18 @@ class AutoEditDenyTests(SecurityCase):
     def rules(self, project, mode):
         command = self.runner.review_command(self.options(), mode, 'report', 'session', project)
         return set(self.values(command, '--disallowedTools')[0].split(','))
+
+    def test_auto_protects_installed_helpers_and_overridden_action_store(self):
+        project = SCRIPTS.parent
+        audits = project / 'custom-audits'
+        command = self.runner.review_command(self.options(), 'auto', 'report', 'session', project, audits)
+        denied = set(self.values(command, '--disallowedTools')[0].split(','))
+        for tool in ('Edit', 'Write'):
+            self.assertIn(f'{tool}({self.runner.deny_path(SCRIPTS)}/**)', denied)
+            self.assertIn(f'{tool}({self.runner.deny_path(audits)}/projects/*/state.json)', denied)
+        for tool in ('Read', 'Edit', 'Write'):
+            for name in ('host-actions.json', 'host-actions.json.*'):
+                self.assertIn(f'{tool}({self.runner.deny_path(audits)}/{name})', denied)
 
     def test_auto_denies_edit_and_write_to_trusted_files(self):
         project = self.project('proj')
