@@ -101,6 +101,17 @@ class RobustCase(SecurityCase):
 class SignalTests(RobustCase):
     """S-2a: a killed runner still rolls back and checks the ledger."""
 
+    def test_launcher_resets_inherited_ignored_signals(self):
+        def ignore_signals():
+            signal.signal(signal.SIGHUP, signal.SIG_IGN)
+            signal.signal(signal.SIGINT, signal.SIG_IGN)
+
+        result = subprocess.run([sys.executable, '-m', 'unittest',
+                                 'test_schedule_robustness.SignalTests.test_signals_in_propose_mode_record_a_failed_project'],
+                                cwd=str(SCRIPTS.parent / 'tests'), env=self.env,
+                                preexec_fn=ignore_signals, capture_output=True, text=True, timeout=90)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_sigterm_in_auto_mode_rolls_back_and_restores_ledger(self):
         path = self.auto_fixture()
         process = self.start('--project-dir', path)
@@ -121,7 +132,7 @@ class SignalTests(RobustCase):
 
     def test_signals_in_propose_mode_record_a_failed_project(self):
         executable(self.claude, SLEEPER)
-        for number in (signal.SIGTERM, signal.SIGHUP):
+        for number in (signal.SIGTERM, signal.SIGHUP, signal.SIGINT):
             with self.subTest(signal=number.name):
                 self.pid_file.unlink(missing_ok=True)
                 path = self.due('proj ' + number.name.lower())
