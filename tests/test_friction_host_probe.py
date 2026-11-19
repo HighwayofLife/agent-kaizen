@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 import importlib.machinery
 import importlib.util
 import json
@@ -140,6 +141,62 @@ class HostProbeTests(unittest.TestCase):
         with mock.patch.object(probe_module.os, 'open', wraps=os.open) as open_fd:
             self.assertEqual(self.probe().size(build), 3)
         self.assertEqual(open_fd.call_count, len(build.parts) + 100)
+
+    def test_deep_branching_tree_keeps_directory_evidence_under_descriptor_limit(self):
+        import resource
+        build = path = self.project / 'build'
+        build.mkdir()
+        depth = 70
+        for _ in range(depth):
+            (path / 'a-sibling').mkdir()
+            path = path / 'z-next'
+            path.mkdir()
+        (path / 'data').write_bytes(b'abc')
+        (build / 'a-sibling/data').write_bytes(b'de')
+
+        scandir = os.scandir
+
+        @contextmanager
+        def ordered_scan(directory):
+            with scandir(directory) as entries:
+                yield iter(sorted(entries, key=lambda entry: entry.name))
+
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        limit = 60 if soft == resource.RLIM_INFINITY else min(soft, 60)
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (limit, hard))
+            with mock.patch.object(probe_module.os, 'scandir', ordered_scan), \
+                 mock.patch.object(probe_module.os, 'open', wraps=os.open) as open_fd:
+                self.assertEqual(self.probe().size(build), 5)
+            self.assertLessEqual(open_fd.call_count, len(build.parts) + 4 * depth)
+        finally:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (soft, hard))
+
+    def test_scan_backtracking_rejects_reparented_directory(self):
+        build = self.project / 'build'
+        outside = self.root / 'outside'
+        children = {}
+        for name in ('first', 'second'):
+            child = build / name
+            child.mkdir(parents=True)
+            children[child.stat().st_ino] = child
+            (outside / name).mkdir(parents=True)
+            (outside / name / 'data').write_bytes(b'outside')
+
+        scandir = os.scandir
+        moved = outside / 'moved'
+
+        def move_child(fd):
+            child = children.get(os.fstat(fd).st_ino)
+            if child is not None and not moved.exists():
+                child.rename(moved)
+            return scandir(fd)
+
+        probe = self.probe()
+        with mock.patch.object(probe_module.os, 'scandir', move_child):
+            self.assertIsNone(probe.size(build))
+        self.assertTrue(moved.is_dir())
+        self.assertIn('directory_unavailable', probe.warnings)
 
     def test_output_stays_with_open_directory_after_replacement(self):
         out = self.root / 'reports'

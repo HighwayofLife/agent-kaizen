@@ -311,56 +311,65 @@ class Probe:
         return trees
 
     def size(self, path):
-        total, count = 0, 0
-        pending = []
+        total, count, queued = 0, 0, 0
+        parents = []
         fd = None
         try:
             fd = open_directory(path)
-            while fd is not None:
-                try:
+            flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+            while True:
+                if self.remaining('size') <= 0:
+                    return None
+                entries = []
+                with os.scandir(fd) as scan:
+                    for entry in scan:
+                        count += 1
+                        if count > 20000 or self.remaining('size') <= 0:
+                            self.warn('directory_limit')
+                            return None
+                        entries.append(entry)
+                names = {entry.name for entry in entries}
+                if '.git' in names or {'HEAD', 'objects', 'refs'} <= names:
+                    return None
+                children = []
+                for entry in entries:
                     if self.remaining('size') <= 0:
                         return None
-                    entries = []
-                    with os.scandir(fd) as scan:
-                        for entry in scan:
-                            count += 1
-                            if count > 20000 or self.remaining('size') <= 0:
-                                self.warn('directory_limit')
-                                return None
-                            entries.append(entry)
-                    names = {entry.name for entry in entries}
-                    if '.git' in names or {'HEAD', 'objects', 'refs'} <= names:
+                    if entry.is_dir(follow_symlinks=False):
+                        children.append(entry.name)
+                    elif entry.is_file(follow_symlinks=False):
+                        total += entry.stat(follow_symlinks=False).st_size
+                if children:
+                    info = os.fstat(fd)
+                    parents.append(((info.st_dev, info.st_ino), children))
+                    queued += len(children)
+                elif not queued:
+                    break
+
+                # Follow parent links only as far as the next unvisited sibling.
+                # A concurrent move can change '..', so verify it before using it.
+                while not children:
+                    if self.remaining('size') <= 0:
                         return None
-                    children = []
-                    for entry in entries:
-                        if self.remaining('size') <= 0:
-                            return None
-                        if entry.is_dir(follow_symlinks=False):
-                            children.append(entry.name)
-                        elif entry.is_file(follow_symlinks=False):
-                            total += entry.stat(follow_symlinks=False).st_size
-                    if children:
-                        # Keep one descriptor per parent with unvisited children.
-                        pending.append((fd, children))
-                        fd = None
-                finally:
-                    if fd is not None:
-                        os.close(fd)
-                        fd = None
-                if pending:
-                    parent, children = pending[-1]
-                    fd = os.open(children.pop(), os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+                    expected, children = parents[-1]
+                    fd, previous = os.open('..', flags, dir_fd=fd), fd
+                    os.close(previous)
+                    info = os.fstat(fd)
+                    if (info.st_dev, info.st_ino) != expected:
+                        self.warn('directory_unavailable')
+                        return None
                     if not children:
-                        pending.pop()
-                        os.close(parent)
+                        parents.pop()
+
+                fd, previous = os.open(children.pop(), flags, dir_fd=fd), fd
+                os.close(previous)
+                queued -= 1
         except (OSError, AttributeError, NotImplementedError):
             self.warn('directory_unavailable')
             return None
         finally:
             if fd is not None:
                 os.close(fd)
-            for parent, _ in pending:
-                os.close(parent)
         return total
 
     def directories(self, trees):
