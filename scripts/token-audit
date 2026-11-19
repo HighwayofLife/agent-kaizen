@@ -145,13 +145,17 @@ def codex_fields(prefix, pos=0, wrapped=False):
     return fields
 
 
-def envelope_timestamp(line):
+def envelope_timestamp(line, require_closed_envelope=False):
     # The usual envelope puts the timestamp first or just after type.
     lead = re.match(rb'^\s*\{\s*(?:"type"\s*:\s*"[^"\\]*"\s*,\s*)?"timestamp"\s*:\s*"([^"\n]+)"', line)
-    if lead:
-        return lead[1].decode('ascii', 'replace')
-    # Skip nested values and strings without decoding potentially huge outputs.
+    stamp = None
     depth, pos = 0, 0
+    if lead:
+        stamp = lead[1].decode('ascii', 'replace')
+        if not require_closed_envelope:
+            return stamp
+        depth, pos = 1, lead.end()
+    # Skip nested values and strings without decoding potentially huge outputs.
     token = re.compile(rb'["{}\[\]]')
     while match := token.search(line, pos):
         value = match.group()
@@ -168,14 +172,18 @@ def envelope_timestamp(line):
                 pos = end + 1
                 if (end - slash) % 2 == 0:
                     break
-            if depth == 1 and end - start == 10 and line[start:pos] == b'"timestamp"':
+            if stamp is None and depth == 1 and end - start == 10 and line[start:pos] == b'"timestamp"':
                 tail = re.match(rb'\s*:\s*"([^"\n]+)"', line[pos:pos + 100])
                 if tail:
-                    return tail[1].decode('ascii', 'replace')
+                    stamp = tail[1].decode('ascii', 'replace')
+                    if not require_closed_envelope:
+                        return stamp
         elif value in (b'{', b'['):
             depth += 1
         else:
             depth -= 1
+            if require_closed_envelope and depth == 0:
+                return stamp if value == b'}' and re.compile(rb'\s*\Z').match(line, pos) else None
     return None
 
 
@@ -292,13 +300,18 @@ def canary_row(line, since, counts, codex, session_version, output_type=None, ro
     # Large ordinary Codex response items are content, not usage records.
     # Their session metadata carries the version; avoid decoding their bodies.
     if output_type is not None or (match and match[1] == b"response_item" and not VERSION_FIELD.search(prefix)):
-        if output_type is not None and nested_output and not line[-64:].rstrip().endswith(b'}}') and not re.search(rb'}\s*}\s*$', line[-64:]):
-            try:
-                json.loads(line)
-            except (ValueError, RecursionError):
+        suffix = line[-64:]
+        if (output_type is not None and nested_output and not suffix.rstrip().endswith(b'}}')
+                and not re.search(rb'}\s*}\s*$', suffix)):
+            if len(line) <= LINE_LIMIT:
+                try:
+                    json.loads(line)
+                except (ValueError, RecursionError):
+                    return session_version
+            elif envelope_timestamp(line, require_closed_envelope=True) is None:
                 return session_version
         stamp = envelope_timestamp(line) if envelope_stamp is UNPARSED else envelope_stamp
-        if stamp and (output_type is None or CODEX_OUTPUT_END.search(line[-64:])):
+        if stamp and (output_type is None or CODEX_OUTPUT_END.search(suffix)):
             try:
                 if (stamp_time := friction_stamp(stamp)) is not None and stamp_time >= since:
                     entry = counts[session_version or "unknown"]
@@ -444,25 +457,25 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                 if bounds is not None:
                     timestamp = last_timestamp
                 else:
-                    match = TIMESTAMP.search(line)
-                    if keep_signals and match and (b'"tool_use"' in line or b'"tool_result"' in line):
-                        outer = envelope_timestamp(line)
-                        if outer is None:
-                            match = None
-                        else:
-                            timestamp = outer
-                    if not match:
-                        if keep_signals and (b'"tool_use"' in line or b'"tool_result"' in line):
+                    signal_row = keep_signals and (b'"tool_use"' in line or b'"tool_result"' in line)
+                    if signal_row:
+                        timestamp = envelope_timestamp(line)
+                        if timestamp is not None and (len(timestamp) > 40 or friction_stamp(timestamp) is None):
+                            timestamp = None
+                    else:
+                        match = TIMESTAMP.search(line)
+                        timestamp = match[1].decode("ascii", "replace") if match else None
+                    if timestamp is None:
+                        if signal_row:
+                            # Missing and malformed tool timestamps still affect replay reconciliation.
                             warnings["malformed rows"] += 1
                             try:
-                                row = json.loads(line)
+                                row = json.loads(line) if decoded is UNPARSED else decoded
                                 if isinstance(row, dict):
                                     yield dict(row, _invalid_friction_timestamp=True)
                             except (ValueError, RecursionError):
                                 pass
                         continue
-                    if not (keep_signals and (b'"tool_use"' in line or b'"tool_result"' in line)):
-                        timestamp = match[1].decode("ascii", "replace")
                 try:
                     old = (timestamp[:19] < cutoff if timestamp.endswith(("Z", "+00:00"))
                            else date_time(timestamp) < since)
@@ -2530,7 +2543,8 @@ def previous_audit(out, scope, eligible=None):
     match, other = None, None
     for path in candidates:
         try:
-            with path.open() as stream:
+            # Report markers are ASCII, including in older locale-encoded reports.
+            with path.open(encoding="utf-8", errors="replace") as stream:
                 for line in stream:
                     if line.startswith("<!-- token-audit-headline "):
                         value = json.loads(line.removeprefix("<!-- token-audit-headline ").rstrip("\r\n").removesuffix(" -->"))
@@ -2589,7 +2603,7 @@ def regression_cohorts(path, scope, extract_dir, friction, secret):
     try:
         if path.stat().st_size > 1024 * 1024:
             return
-        report_text = path.read_text()
+        report_text = path.read_text(encoding="utf-8", errors="replace")
         if not report_text.endswith("<!-- token-audit-complete -->\n"):
             return
         metadata = next(line for line in report_text.splitlines() if line.startswith("<!-- token-audit-extract "))

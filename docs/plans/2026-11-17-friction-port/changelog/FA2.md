@@ -1,3 +1,4 @@
 - Fix transcript trust checks, replay reconciliation and friction extract reporting.
 - Preserve measured timings and scope Codex warnings to the selected project.
 - Keep audits nonblocking for nonregular transcripts, write reports as UTF-8, and correct replay and format coverage handling.
+- Keep malformed Claude results in replay reconciliation, bound memory for oversized Codex outputs, and compare UTF-8 reports on legacy locales.

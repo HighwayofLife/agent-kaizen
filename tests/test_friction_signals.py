@@ -68,6 +68,47 @@ runpy.run_path(sys.argv[0], run_name='__main__')
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('≥', Path(json.loads(result.stdout)['report_path']).read_text(encoding='utf-8'))
 
+    def test_report_compares_with_legacy_locale(self):
+        import hashlib
+        from unittest.mock import patch
+
+        secret = b'fixture'
+        scope = dict(v=1, window='7d')
+        previous = self.root / 'token-audit-old.md'
+        cohort = dict(signature='cargo test', basis='measured', count=3, p50=60)
+        friction = dict(v=1, thresholds={}, window={}, basis='measured',
+                        summary=dict(capped=False), comparisons=[cohort])
+        name = previous.with_suffix('.extract.json').name
+        raw = json.dumps(dict(v=1, scope=scope, report=previous.name, friction=friction)).encode()
+        (self.root / name).write_bytes(raw)
+        binding = dict(size=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+        mac = AUDIT['regression_binding_mac'](secret, previous.name, binding)
+        report = '\n'.join((
+            'Á',
+            '<!-- token-audit-headline {} -->',
+            f'<!-- token-audit-scope {json.dumps(scope)} -->',
+            f'<!-- token-audit-extract {json.dumps(dict(v=1, file=name))} -->',
+            f'<!-- token-audit-friction {json.dumps(binding)} -->',
+            f'<!-- token-audit-friction-mac {mac} -->',
+            '<!-- token-audit-complete -->',
+            '',
+        ))
+        original_open = Path.open
+
+        def legacy_open(path, mode='r', buffering=-1, encoding=None, errors=None, newline=None):
+            if 'b' not in mode and encoding in (None, 'locale'):
+                encoding = 'cp1252'
+            return original_open(path, mode, buffering, encoding, errors, newline)
+
+        for encoding in ('utf-8', 'cp1252'):
+            with self.subTest(encoding=encoding):
+                previous.write_bytes(report.encode(encoding))
+                current = dict(friction=dict(friction, comparisons=[dict(cohort, p50=90)], flags=[]))
+                with patch.object(Path, 'open', legacy_open), patch.dict(
+                        AUDIT['apply_regression'].__globals__, audit_machine_key=lambda: secret):
+                    AUDIT['apply_regression'](current, self.root / 'token-audit-new.md', scope, self.root)
+                self.assertEqual([item['ratio'] for item in current['friction'].get('regressions', [])], [1.5])
+
     def test_darwin_deny_acl_is_safe_but_allow_acl_is_not(self):
         import os
         import subprocess
@@ -236,6 +277,19 @@ class FrictionSignalTests(FrictionClaudeTests):
         jsonl(self.session, [start('conflict', 0, 'ls', cwd=root), yes, no])
         evidence = self.collect(cwd=[root])['friction']['permission_acceptance'][0]
         self.assertEqual((evidence['accepted'], evidence['ambiguous']), (0, 1))
+
+    def test_invalid_outer_timestamp_conflicting_denial_is_ambiguous(self):
+        root = str(self.work.resolve())
+        yes = end('conflict', 2, cwd=root, permissionDecision=dict(source='user', decision='accept'),
+                  toolUseResult=dict(durationMs=1000))
+        no = dict(nested={'timestamp': yes['timestamp']},
+                  **end('conflict', 2, cwd=root, permissionDecision=dict(source='user', decision='reject')))
+        for malformed in ('invalid', '0000-01-01T00:00:00Z', '2020-01-01T00:00:00.' + '0' * 24 + 'Z'):
+            with self.subTest(timestamp=malformed):
+                no['timestamp'] = malformed
+                jsonl(self.session, [start('conflict', 0, 'ls', cwd=root), yes, no])
+                evidence = self.collect(cwd=[root])['friction']['permission_acceptance'][0]
+                self.assertEqual((evidence['accepted'], evidence['ambiguous']), (0, 1))
 
     def test_skipped_sample_preserves_transcript_duration(self):
         from unittest.mock import patch

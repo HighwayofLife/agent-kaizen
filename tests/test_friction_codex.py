@@ -93,6 +93,18 @@ class FrictionCodexTests(unittest.TestCase):
         self.assertEqual(data['friction']['summary']['measured'], 1)
         self.assertEqual(data['format_canary']['1.2.3']['records'], 2)
 
+    def test_oversized_canary_outputs_are_not_decoded(self):
+        large = result('one', output='x' * 4_000_000)
+        timestamp_last = dict(type=large['type'], payload=large['payload'], timestamp=large['timestamp'])
+        jsonl(self.rollout, [self.meta, timestamp_last])
+        with self.rollout.open('ab') as stream:
+            stream.write(json.dumps(large).encode()[:-1] + b'\n')
+        with patch.object(json, 'loads', wraps=json.loads) as loads:
+            data = self.collect(cwd=[self.work])
+        self.assertFalse(any(isinstance(args[0], bytes) and len(args[0]) > AUDIT['LINE_LIMIT']
+                             for args, _ in loads.call_args_list))
+        self.assertEqual(data['format_canary']['1.2.3']['records'], 1)
+
     def test_envelope_timestamp_skips_large_strings_with_bounded_memory(self):
         import tracemalloc
         stamp = '2025-01-01T00:00:05Z'
