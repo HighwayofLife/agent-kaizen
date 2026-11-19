@@ -104,6 +104,12 @@ Settings live in `agent-kaizen.json` in the Claude config directory and in each 
 | `autoProjects` | Global only | List of absolute project paths, default `[]`; the opt-in for project-level `auto` |
 | `retention` | Global only | `auto` (default), `off` keeps everything |
 | `retentionOverrides` | Global only | Object, default `{}`; for example `{"extracts":{"days":14}}` |
+| `friction` | Global or project | `on` (default), `off` skips friction preparation |
+| `frictionSampler` | Global only | `on` (default), `off` disables the sampler |
+| `frictionSlowCallSeconds` | Global or project | Slow-call threshold in seconds; default `120`, minimum `10` |
+| `frictionHeavySeconds` | Global or project | Heavy-call threshold in seconds; default `60`, minimum `5` |
+| `frictionOutputDirs` | Project only | Absolute output directory paths; default `[]` |
+| `hostActions` | Global or project | `apply` (default), `suggest`, `off`; autonomy and action gates still apply |
 | `projectCommands` | Global only | Object mapping absolute project paths (or `~/` paths) to `outcomeLog` relative paths and `shadowStatus`, `slowTests`, or `speedReport` argv lists; default `{}` |
 | `notesLedger` | Global only | Object with `csv` path, optional `timeline` path and positive integer `measureAfterDays`; paths must be absolute after `~` expansion; default `{}` (off) |
 | `calibrationLadder` | Global only | List of `model` or `model effort` strings; default `["haiku", "sonnet medium", "sonnet high", "opus high"]` |
@@ -170,6 +176,7 @@ The runner tidies after each scheduled audit and review; interactive cycles run 
 
 | Kind | Files | Default |
 |---|---|---|
+| `samples` | `samples/*.tsv` | 14 days; 50 MB cap |
 | `extracts` | `extracts/*.extract.json`, `projects/*/*.extract.json`, `projects/*/host-probe-*.json`, `projects/*/friction-inputs-*.json` | 30 days; 200 MB cap |
 | `markers` | `projects/*/cycle-*.failed.md`, `*.noticed-*`, `projects/*/*.noticed-*` | 30 days |
 | `ledger-runs` | `projects/*/.ledger-*/*` (ledger snapshots kept after a violation, failed rollback or interrupted run) | 7 days |
@@ -248,6 +255,18 @@ Recovery removes the marker only after rollback and ledger verification or resto
 The `recovery:` status reports the problem, a non-forced undo command when a matching backup exists, and a command to discard the recovery record after the owner resolves changes and ledger by hand if needed. Undo commands include custom `CLAUDE_CONFIG_DIR` and `KAIZEN_BACKUP_DIR` assignments when needed. Removal uses `rm --` for files and symlinks, or `rm -r --` for a legacy directory. The runner never executes this removal command. Unreadable protected markers and legacy audit-local markers are reported as `ledger-unverified`; audit-local markers cannot authorize rollback or ledger restoration. A failed ledger restore is left for a later retry.
 
 `audit`, `review` and `housekeep` take `<audits>/.lock`. A second run prints `waiting up to <N> s for the run lock <audits>/.lock` once, waits up to `KAIZEN_LOCK_WAIT` seconds (default 1800), then logs `another run holds the lock <audits>/.lock; this run was skipped` and exits 0. Dry runs and `config` take no lock.
+
+## Friction and host actions
+
+Friction preparation uses bounded audit extracts and a fresh host probe for the selected project. Data and action state stay machine-local. Sampling is on by default; set `frictionSampler=off` globally to stop it. Set `friction=off` for a project or globally to skip friction analysis, or `hostActions=off` to disable host actions. `hostActions=suggest` retains suggestions without applying them. The slow and heavy thresholds default to 120 and 60 seconds. Real-input collection and action behavior remain pending verification.
+
+Scheduled reviews default to propose mode. In auto mode with `hostActions=apply`, the runner accepts only eligible Linux LocalSearch marker requests and its own local backup commit request, subject to the mutation budget and action checks. Marker writes are currently disabled pending Linux compatibility checks. Local commits use a local Kaizen ref after a successful review; they do not push. Other requests remain suggestions. The runner owns execution and recovery, outside the model's Bash grants. If preparation is unavailable, the ordinary review continues.
+
+Interactive exact Claude project allow-rule candidates are limited to `ls`, `ls -a` and `ls -l` in `.claude/settings.local.json`, with at least ten verified acceptances for the same literal and scope within seven days and no denied or ambiguous observations. Writes are disabled pending live matching and scheduled-boundary proof. Worktree removal and undo are disabled pending safe recovery. On macOS, Time Machine exclusion is a manual catalogue action pending same-target verification.
+
+Use `/agent-kaizen:undo` and the recorded scoped action ID for supported effects; helpers recheck the target and may refuse unsafe undo. Backups and action records are retained outside ordinary housekeeping. Preview sample and extract retention with `kaizen-scheduled housekeep --dry-run`; `retention=off` disables housekeeping.
+
+After upgrading, re-run `install-schedule --apply` with `--review` and any desired `--auto` options to refresh managed commands and retain the intended schedule. Codex users must re-trust changed hooks in `/hooks`. Existing non-Claude host configuration changes remain proposals.
 
 ## 0.3.x migration
 

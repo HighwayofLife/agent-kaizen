@@ -2,6 +2,28 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.13.0 (2026-11-18)
+
+### Added
+
+- Add friction analysis, a host action catalogue and scoped host probes to reviews. Findings distinguish measured evidence from hypotheses.
+- Collect bounded timing, waiting and contention signals, and show worktree facts and open host actions. Real-input behavior remains pending verification.
+- Add private action records, recovery and undo, and opt-in local backup commits on a Kaizen ref.
+
+### Changed
+
+- Prepare friction inputs for interactive and scheduled reviews, with settings for collection, actions and retention. Disabled or unavailable friction inputs leave ordinary reviews available.
+- Keep macOS Time Machine exclusions manual. LocalSearch marker writes, exact permission-rule writes and worktree removal remain disabled pending verification; broader rules remain proposals.
+- Limit scheduled action requests to eligible LocalSearch markers and local backup commits, subject to their gates and the review's autonomy settings.
+
+### Fixed
+
+- Harden backup, restore and action recovery against unsafe paths, interrupted operations and intervening edits.
+- Preserve scoped audit evidence and handle malformed or oversized inputs without blocking ordinary reviews.
+- Keep scheduled review publication, action receipts and recovery tied to the original project and audit scope.
+
+Known issues: residual safety and recovery work is planned for the 0.14 follow-up.
+
 ## 0.12.0 (2026-11-18)
 
 Codex CLI and GitHub Copilot support: the same plugin installs on Codex CLI and the Copilot runtime. Claude Code behaviour is unchanged.
