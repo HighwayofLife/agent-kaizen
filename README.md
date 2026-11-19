@@ -167,6 +167,10 @@ If you'd rather not approve every change:
 
 In every mode, each applied change is backed up (to `KAIZEN_BACKUP_DIR`, or `kaizen-backups/` under the Claude config dir), verified (`jq`, hook tests, `claude plugin validate`), rolled back automatically if verification fails, and logged in the ledger. At most 3 changes are made per run (`maxChangesPerRun`), so the next audit can tell which change did what. `/agent-kaizen:undo last` (or `run`) reverses changes. Claude Code's own permission prompts still apply: run the session with edits auto-accepted to avoid them. Details: [docs/autonomy.md](docs/autonomy.md).
 
+### Friction analysis
+
+`/agent-kaizen:friction` uses a bounded, machine-local view of audit and host signals to suggest remedies. Real-input behavior is pending verification. `friction=off` disables preparation; `frictionSampler=off` disables sampling, and `hostActions=off` disables host actions. See [scheduling](docs/scheduling.md#friction-and-host-actions) for defaults, limits and undo.
+
 ### 3. Make it periodic
 
 SessionStart runs an audit when the last successful audit is over 3 days old. An OS schedule is optional and useful for fixed schedules or infrequent sessions. Run `/agent-kaizen:schedule` to install one. It finds the plugin path and asks before it installs anything. Or run `scripts/install-schedule` from the plugin or your clone; the plugin path varies by install.

@@ -3,7 +3,7 @@
 Python 3.9+ and the standard library are sufficient. Dispatch and review also
 require an installed, authenticated `codex` CLI on PATH; status uses `ps` when
 available. No package installation is needed. Run `--help` on any executable.
-No script commits or pushes. Logs and transcripts can contain repository data;
+The backup helper can make an opt-in local commit on a Kaizen ref; scripts do not push. Logs and transcripts can contain repository data;
 keep generated output private unless you have reviewed it.
 
 Install the entire directory together so relative imports and prompt files work:
@@ -242,6 +242,12 @@ is Unpriced and appears in the Unpriced table. When `source.checked` is more tha
 60 days old the Cost section adds `Pricing last checked <date> (<N> days before
 this audit); rates may be out of date.` (`cost.pricing_warning` in `--json`).
 Zero-usage `<synthetic>` rows are not counted as calls.
+
+## Friction commands
+
+Managed installs provide `kaizen-host-probe`, `kaizen-host-fix`, `kaizen-allow-rule`, `kaizen-worktree-prune` and `kaizen-friction-catalog.json`, alongside the `kaizen_friction_*.py` and `kaizen_worktree_facts.py` helpers. Keep these files together; re-run `install-schedule --apply` after updating a scheduled installation. Use each command's `--help` for its arguments.
+
+`kaizen-scheduled friction prepare --for DIR --report FILE` prepares a private, bounded view from a selected audit. `actions import` and `friction acknowledge` record validated interactive results. Host actions and their undo references stay in machine-local state. See [friction and host actions](../docs/scheduling.md#friction-and-host-actions) for gates and opt-outs. Real-input behavior is pending verification.
 
 ## kaizen-scheduled
 

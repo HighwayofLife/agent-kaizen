@@ -62,7 +62,7 @@ def main():
         hooks = sorted(str(p) for p in (ROOT / 'hooks').glob('*.sh'))
         stage('shellcheck', lambda: run(['shellcheck', '-S', 'warning'] + hooks))
         def json_check():
-            for pattern in ('.claude-plugin/*.json', 'hooks/hooks.json', 'templates/*.json', 'scripts/pricing.json'):
+            for pattern in ('.claude-plugin/*.json', 'hooks/hooks.json', 'templates/*.json', 'scripts/pricing.json', 'scripts/friction-catalog.json'):
                 for path in ROOT.glob(pattern):
                     json.loads(path.read_text())
         stage('JSON', json_check)
