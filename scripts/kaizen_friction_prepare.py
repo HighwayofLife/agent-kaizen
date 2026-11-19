@@ -478,15 +478,19 @@ def prepare(audits, backups, project, report, cfg, mode, current, canonical_proj
         return (path, receipt) if retain else path
 
 
-def acknowledge_scheduled(store, project, receipt, host, *, allow_superseded=False):
+def acknowledge_scheduled(store, project, receipt, host, *, proposal=None, digest=None):
     with host["_directory"](store.friction, private=True) as directory, host["_locked"](directory, "prepare"):
         name = "prepare-" + project.key + ".json"
         state = _json(host["_read"](directory, name, LIMIT), host)
         receipt_generation = int(receipt["generation"])
-        if (allow_superseded and state.get("project") == str(project.canonical)
+        if (proposal is not None and state.get("project") == str(project.canonical)
                 and type(state.get("generation")) is int and state["generation"] > receipt_generation):
             # Leave the newer preparation intact. Publication still needs to save its cutoff.
             return
+        if proposal is not None:
+            _, identity = _read(proposal, host)
+            if identity["sha256"] != digest:
+                warnings.warn("published review changed before acknowledgement; preserving the edited report")
         if (state.get("project") == str(project.canonical)
                 and state.get("generation") == receipt_generation
                 and state.get("acknowledged_generation") == receipt["generation"]
@@ -614,18 +618,15 @@ def scheduled_publication(audits, store, project, host, persist, ready, *, recei
             return None
         if project.unknown:
             raise ValueError("cannot recover publication with unknown project scope")
-        cutoff = (_stamp(marker["reviewed_at"]) if "reviewed_at" in marker else
-                  datetime.fromtimestamp(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mtime, timezone.utc))
         if not ready():
             return False
+        cutoff = (_stamp(marker["reviewed_at"]) if "reviewed_at" in marker else
+                  datetime.fromtimestamp(os.stat(name, dir_fd=directory, follow_symlinks=False).st_mtime, timezone.utc))
         published = project.folder / filename
         if not published.exists():
             os.unlink(name, dir_fd=directory)
             return False
-        raw, _ = _read(published, host)
-        if hashlib.sha256(raw).hexdigest() != marker.get("sha256"):
-            warnings.warn("published review changed before acknowledgement; preserving the edited report")
-        acknowledge_scheduled(store, project, frozen, host, allow_superseded=True)
+        acknowledge_scheduled(store, project, frozen, host, proposal=published, digest=marker.get("sha256"))
         persist(published, cutoff, frozen["identities"]["report"]["path"])
         os.unlink(name, dir_fd=directory)
         os.fsync(directory)

@@ -249,6 +249,28 @@ class ScheduledFrictionTests(PreparationTests):
         self.assertEqual(prepared["generation"], int(receipt["generation"]) + 1)
         self.assertNotIn("acknowledged_generation", prepared)
 
+    def test_oversized_superseded_publication_recovers_without_reading_report(self):
+        _, receipt = self.scheduled()
+        audits = self.config / "audits"
+        output = self.write(self.obj.folder / "review.tmp", "Review\n" + self.actions().read_text())
+        self.runner["reconcile_scheduled"](audits, self.obj, output, receipt, acknowledge=False)
+        proposal = self.obj.folder / "cycle-2026-11-18.md"
+        cutoff = self.runner["timestamp"](self.current)
+        recover = self.runner["recover_scheduled_publication"]
+        recover(audits, self.obj, receipt, proposal, output, reviewed_at=cutoff)
+        output.rename(proposal)
+        self.assertIsNotNone(self.run_prepare(self.report))
+        edited = b"x" * (prepare.LIMIT + 1)
+        proposal.write_bytes(edited)
+        prepared = next((self.backups / "friction").glob("prepare-*.json"))
+        newer_state = prepared.read_bytes()
+
+        self.assertEqual(recover(audits, self.obj), proposal)
+        self.assertEqual(self.runner["read_state"](self.obj)["reviewed_at"], cutoff)
+        self.assertFalse(list((self.backups / "friction").glob("publication-*.json")))
+        self.assertEqual(prepared.read_bytes(), newer_state)
+        self.assertEqual(proposal.read_bytes(), edited)
+
     def test_degraded_recovery_acknowledges_terminal_publication(self):
         import os
         _, receipt = self.scheduled()
@@ -291,6 +313,32 @@ class ScheduledFrictionTests(PreparationTests):
             self.assertFalse(recover(self.config / "audits", self.obj, degraded=True))
         state = json.loads(next((self.backups / "friction").glob("prepare-*.json")).read_text())
         self.assertNotIn("acknowledged_generation", state)
+
+    def test_malformed_publication_cutoff_still_recovers_pending_actions(self):
+        target, ident, output, receipt = self.marker_request()
+        audits = self.config / "audits"
+        generation = "scheduled:" + receipt["generation"]
+        reconcile = self.runner["reconcile_scheduled"]
+        with patch.dict(reconcile.__globals__, scheduled_action_refusal=lambda _: None):
+            terminal, _ = reconcile(audits, self.obj, output, receipt, acknowledge=False)
+        self.assertFalse(terminal)
+        proposal = self.obj.folder / "cycle-2026-11-18.md"
+        recover = self.runner["recover_scheduled_publication"]
+        recover(audits, self.obj, receipt, proposal, output)
+        output.rename(proposal)
+        marker = next((self.backups / "friction").glob("publication-*.json"))
+        marker.write_text(json.dumps(dict(json.loads(marker.read_text()), reviewed_at=None)))
+        options = self.runner["command_options"](SimpleNamespace())
+
+        with patch.dict(recover.__globals__, scheduled_action_refusal=lambda _: "proposal-only"):
+            with self.assertRaisesRegex(ValueError, "invalid evidence time"):
+                recover(audits, self.obj, options=options)
+
+        store = json.loads((audits / "host-actions.json").read_text())
+        self.assertEqual(store["receipts"][str(self.project)][generation], {ident: "terminal"})
+        self.assertFalse((target / ".nomedia").exists())
+        self.assertTrue(marker.exists())
+        self.assertNotIn("reviewed_at", self.runner["read_state"](self.obj))
 
     def test_audit_policy_global_and_scoped(self):
         options = self.runner["command_options"](type("Args", (), {"dry_run": True})())
