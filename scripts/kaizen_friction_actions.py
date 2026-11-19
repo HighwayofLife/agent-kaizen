@@ -25,6 +25,8 @@ STATES = {"done": "done", "dismiss": "dismissed", "reopen": "open"}
 CATALOG_ID = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
 ACTION_ID = re.compile(r"fa1_[0-9a-f]{64}")
 INTENTS = {"suggest": "terminal", "apply": "pending"}
+COMPACT_APPLY = "a"  # On disk only, for a closed apply receipt.
+RECEIPT_STATES = (*INTENTS.values(), COMPACT_APPLY)
 BLOCK_PREFIX = "<!-- kaizen-host-actions "
 ROW_OPTIONAL = {"steps", "metric_at_done", "flaps"}
 ROW_FIELDS = set("canonical_project catalog_id selector_key subject projects status first_seen updated_at "
@@ -356,7 +358,7 @@ class HostActions:
             for generation, receipt in generations.items():
                 if (not _text(generation, 128) or not isinstance(receipt, dict) or len(receipt) > 16
                         or any(ident not in rows or rows[ident]["canonical_project"] != project
-                               or state not in INTENTS.values()
+                               or state not in RECEIPT_STATES
                                or (state == "pending" and rows[ident]["status"] != "open")
                                for ident, state in receipt.items())):
                     raise ValueError("invalid host-action receipt")
@@ -382,12 +384,14 @@ class HostActions:
                         or len(set(ids)) != len(ids) or _pending({generation: receipt}) - set(ids)):
                     raise ValueError("invalid host-action import intents")
                 rows.apply_intents.setdefault(project, {})[generation] = set(ids)
-        # Pending receipts already encode intent. Remember it through in-place completion.
+        # Both pending and compact closed receipts encode their original apply intent.
         for project, generations in receipts.items():
             for generation, receipt in generations.items():
-                pending = _pending({generation: receipt})
-                if pending:
-                    rows.apply_intents.setdefault(project, {}).setdefault(generation, set()).update(pending)
+                for ident, state in receipt.items():
+                    if state in ("pending", COMPACT_APPLY):
+                        rows.apply_intents.setdefault(project, {}).setdefault(generation, set()).add(ident)
+                    if state == COMPACT_APPLY:
+                        receipt[ident] = "terminal"
         if skipped:
             fields = _object_values(raw.decode("utf-8"))
             row_values = _object_values(fields["actions"])
@@ -421,6 +425,14 @@ class HostActions:
                 and row["eligible"] is False)
 
     def _save(self, directory, rows, receipts):
+        raw = self._encode(rows, receipts)
+        if len(raw) > STORE_LIMIT:
+            raw = self._encode(rows, receipts, compact=True)
+        if len(raw) > STORE_LIMIT:
+            raise ValueError("host-action store exceeds size limit")
+        _replace(directory, self.path.name, raw)
+
+    def _encode(self, rows, receipts, *, compact=False):
         # Mark preserved values before serializing, then restore their exact original JSON bytes.
         preserved = {}
         def marker(value):
@@ -430,7 +442,25 @@ class HostActions:
 
         output_rows = dict(rows)
         output_rows.update((ident, marker(value)) for ident, value in getattr(rows, "preserved", {}).items())
-        output_receipts = {project: dict(generations) for project, generations in receipts.items()}
+        output_receipts = {project: {generation: dict(receipt) for generation, receipt in generations.items()}
+                           for project, generations in receipts.items()}
+        for (project, generation), value in getattr(rows, "preserved_receipts", {}).items():
+            output_receipts[project][generation].update(
+                (ident, state) for ident, state in json.loads(value).items()
+                if ident in rows.preserved and state == COMPACT_APPLY)
+        # At the cap, encode closed applies in place to avoid growing legacy pending receipts.
+        apply_intents = {}
+        for project, generations in getattr(rows, "apply_intents", {}).items():
+            mask, bit = 0, 0
+            for generation, ident in _terminal_slots(output_receipts[project]):
+                if ident in generations.get(generation, ()):
+                    if compact and ident not in rows.preserved:
+                        output_receipts[project][generation][ident] = COMPACT_APPLY
+                        continue
+                    mask |= 1 << bit
+                bit += 1
+            if mask:
+                apply_intents[project] = format(mask, "x")
         for (project, generation), value in getattr(rows, "preserved_receipts", {}).items():
             receipt = output_receipts[project][generation]
             if receipt == json.loads(value):
@@ -439,23 +469,13 @@ class HostActions:
                 output_receipts[project][generation] = dict(receipt, **{
                     ident: marker(raw) for ident, raw in _object_values(value).items() if ident in rows.preserved})
         output = {"v": 1, "actions": output_rows, "receipts": output_receipts}
-        # Only completed applies need extra metadata. Pack their positions among terminal receipts.
-        apply_intents = {}
-        for project, generations in getattr(rows, "apply_intents", {}).items():
-            slots = _terminal_slots(receipts[project])
-            mask = sum(1 << bit for bit, (generation, ident) in enumerate(slots)
-                       if ident in generations.get(generation, ()))
-            if mask:
-                apply_intents[project] = format(mask, "x")
         if apply_intents:
             output["apply_intents"] = apply_intents
         text = json.dumps(output, separators=(",", ":"))
         for token, value in preserved.items():
             text = text.replace(token, value)
-        raw = (text + "\n").encode("utf-8")
-        if len(raw) > STORE_LIMIT:
-            raise ValueError("host-action store exceeds size limit")
-        _replace(directory, self.path.name, raw)
+        raw = text.encode("utf-8")
+        return raw + b"\n" if len(raw) < STORE_LIMIT else raw
 
     def _new_row(self, identity, evidence, stamp):
         project, catalog_id, selector = identity

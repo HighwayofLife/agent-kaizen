@@ -427,8 +427,9 @@ class HostActionsTests(unittest.TestCase):
         row, = self.store.scoped(self.project)
         project = str(self.project)
         document = json.loads(self.store.path.read_text())
-        document["receipts"] = {project: {f"scheduled:{i:020d}": {ident: "pending"} for i in range(8400)}}
+        document["receipts"] = {project: {f"scheduled:{i:020d}": {ident: "pending"} for i in range(9000)}}
         self.store.path.write_text(json.dumps(document, separators=(",", ":")))
+        self.assertLessEqual(self.store.path.stat().st_size, actions.STORE_LIMIT)
         with actions._directory(self.store.path.parent) as directory:
             rows, _, receipts = self.store._load(directory)
             self.store._save(directory, rows, receipts)

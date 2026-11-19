@@ -2,6 +2,7 @@
 import base64
 from contextlib import redirect_stdout
 from datetime import date, datetime, timedelta, timezone
+import errno
 import hashlib
 import hmac
 import io
@@ -364,6 +365,35 @@ class BrokerLedgerTests(unittest.TestCase):
                 self.assertEqual(journal.reconcile(ident), "recorded")
             self.assert_ledger_backup(journal, ident, self.table, report)
 
+    def test_failed_final_save_keeps_backup_directory_bound(self):
+        with self.locked() as journal:
+            ident = self.ledger_effect(journal)
+            save = journal.save
+
+            def fail_final_save(record, phase):
+                if phase == "recorded":
+                    raise OSError("before final receipt save")
+                return save(record, phase)
+
+            with patch.object(journal, "save", side_effect=fail_final_save), \
+                    self.assertRaisesRegex(OSError, "before final receipt save"):
+                journal.reconcile(ident)
+            path = journal.ledger_backup_path(self.ledger.stat().st_dev)
+            backup, = path.iterdir()
+            path.rename(self.root / "moved-backups")
+            path.mkdir(mode=0o700)
+            backup.write_text("decoy")
+        with self.locked() as journal:
+            with self.assertRaisesRegex(ValueError, "backup directory changed"):
+                journal.reconcile(ident)
+            self.assertEqual(journal.load(ident)["phase"], "effect-verified")
+
+    def test_git_cross_device_ledger_refuses_local_backup(self):
+        subprocess.run(["git", "init", "-q", str(self.project)], check=True)
+        with self.locked() as journal:
+            with self.assertRaisesRegex(ValueError, "requires a private backup directory"):
+                journal.ledger_backup_path(self.ledger.stat().st_dev + 1)
+
     def test_non_git_cross_device_ledger_uses_private_local_backup(self):
         with self.locked() as journal:
             ident = self.ledger_effect(journal)
@@ -399,6 +429,21 @@ class BrokerLedgerTests(unittest.TestCase):
             self.assertEqual({path.read_text() for path in paths}, {self.table, "older ledger copy"})
             self.assertFalse(any(path.is_relative_to(self.project) for path in paths))
             self.assertEqual(list(legacy.iterdir()), [])
+
+    def test_reconcile_and_undo_keep_read_only_legacy_backup(self):
+        legacy = self.ledger.parent / apply.LEDGER_BACKUPS
+        legacy.mkdir(mode=0o700)
+        with self.locked() as journal:
+            ident = self.ledger_effect(journal)
+            displaced = legacy / (ident + "-" + "1" * 32 + ".md")
+            displaced.write_text("older ledger copy")
+            with patch.object(os, "rename", side_effect=PermissionError(errno.EACCES, "read-only legacy directory")):
+                self.assertEqual(journal.reconcile(ident), "recorded")
+                journal.undo(ident, lambda *_: None)
+            record = journal.load(ident)
+            self.assertEqual(record["phase"], "reverted")
+            self.assertIn(str(displaced), record["ledger_backups"])
+            self.assertEqual(displaced.read_text(), "older ledger copy")
 
     def ledger_effect(self, journal):
         self.signed_extract([self.project])
@@ -816,7 +861,7 @@ for index, event in enumerate(events):
 
                 project_policy = project / "docs/kaizen/config.json"
                 if fault == "config-created":
-                    statement = '        self.save(record, "recorded")'
+                    statement = '        self.finish_ledger_exchange(record, "recorded")'
                     runtime.write_text(runtime_source.replace(
                         statement, statement + '\n        (self.project / "docs/kaizen/config.json").write_text("{}")', 1))
                 command(runner, *review, KAIZEN_SKIP_CHECKS="1")
@@ -879,7 +924,7 @@ for index, event in enumerate(events):
                     statement = '                    terminal(ident, applied=finish_commit(record) == "recorded")'
                     runner.write_text(runner_source.replace(statement, '                    os._exit(77)'))
                 elif case == "after-row":
-                    statement = '        self.save(record, "recorded")'
+                    statement = '        self.finish_ledger_exchange(record, "recorded")'
                     runtime.write_text(runtime_source.replace(statement, statement +
                         '\n        if record["operation"] == LOCAL_COMMIT:\n            os._exit(77)', 1))
                 interrupted = case.startswith(("before-", "after-"))

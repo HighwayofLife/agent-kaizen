@@ -390,7 +390,9 @@ class BrokerLedger:
         if (common is not None and checkout is not None and common.stat().st_dev == ledger_device
                 and (common == checkout / ".git" or not common.is_relative_to(checkout))):
             return common / name
-        return self.path.parent / LEDGER_BACKUPS
+        if common is None and checkout is None:
+            return self.path.parent / LEDGER_BACKUPS
+        raise ValueError("broker ledger requires a private backup directory on its filesystem")
 
     def recover_ledger_backups(self, ident, record):
         device = self.path.parent.stat().st_dev
@@ -415,10 +417,22 @@ class BrokerLedger:
                 kept.difference_update(str(legacy / Path(path).name) for path in paths
                                        if Path(path).parent == preferred)
             kept = sorted(kept)
-            if pending or kept != record.get("ledger_backups", []):
-                record.pop("ledger_exchange", None)
+            if kept != record.get("ledger_backups", []):
                 record["ledger_backups"] = kept
-                self.save(record, record["phase"])
+                if not pending:  # Save bound copies with the final phase.
+                    self.save(record, record["phase"])
+
+    def finish_ledger_exchange(self, record, phase):
+        if pending := record.get("ledger_exchange"):
+            path, dev, ino, _ = pending
+            try:
+                info = os.stat(path, follow_symlinks=False)
+            except FileNotFoundError as error:
+                raise ValueError("broker ledger backup directory changed during publication") from error
+            if (info.st_dev, info.st_ino) != (dev, ino):
+                raise ValueError("broker ledger backup directory changed during publication")
+            del record["ledger_exchange"]
+        self.save(record, phase)
 
     def recover_ledger_copies(self, directory, ident, *, exchange=None, move_to=None):
         # The same name holds the staged row before the swap and the displaced
@@ -439,11 +453,17 @@ class BrokerLedger:
                     raise ValueError("unsafe broker ledger backup file")
                 folder, owner_fd = directory, backups
                 if move_to and safe:
-                    folder, owner_fd = move_to
+                    target, target_fd = move_to
                     try:
-                        os.stat(name, dir_fd=owner_fd, follow_symlinks=False)
+                        os.stat(name, dir_fd=target_fd, follow_symlinks=False)
                     except FileNotFoundError:
-                        os.rename(name, name, src_dir_fd=backups, dst_dir_fd=owner_fd)
+                        try:
+                            os.rename(name, name, src_dir_fd=backups, dst_dir_fd=target_fd)
+                        except OSError as error:
+                            if error.errno not in (errno.EACCES, errno.EPERM, errno.EROFS, errno.EXDEV):
+                                raise
+                        else:
+                            folder, owner_fd = target, target_fd
                     else:
                         raise ValueError("conflicting legacy broker ledger backup")
                 path = str(folder / name)
@@ -650,7 +670,7 @@ class BrokerLedger:
                 write()
             elif cells(lines[match]) != expected:
                 raise ValueError("broker ledger row conflicts with verified effect")
-        self.save(record, "recorded")
+        self.finish_ledger_exchange(record, "recorded")
         return "recorded"
 
     def cancel_unstarted_marker(self, record):
@@ -765,7 +785,7 @@ class BrokerLedger:
             if phase == "effect-verified":
                 if row != expected:
                     raise ValueError("broker ledger row conflicts with verified effect")
-                self.save(record, "recorded")
+                self.finish_ledger_exchange(record, "recorded")
                 phase = "recorded"
             status = hashlib.sha256(row[5].encode("utf-8")).hexdigest()
             undo_date = record.get("undo_date") or date.today().isoformat()
@@ -794,7 +814,7 @@ class BrokerLedger:
                 self.save(record, "undo-verified")
             if update:
                 write()
-        self.save(record, "reverted")
+        self.finish_ledger_exchange(record, "reverted")
 
 
 def observe_review(run, command, version, *, backup, scope, project, **kwargs):
