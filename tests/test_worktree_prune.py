@@ -81,8 +81,9 @@ class WorktreePruneTests(unittest.TestCase):
             with self.assertRaisesRegex(namespace['Refused'], 'limit'):
                 namespace['check_metadata'](self.admin, self.common)
 
-    def test_shebang_does_not_use_path_interpreter(self):
-        self.assertTrue(SCRIPT.read_text().startswith('#!/usr/bin/python3 -I\n'))
+    def test_shebang_uses_path_interpreter_in_isolated_mode(self):
+        with SCRIPT.open('rb') as script:
+            self.assertEqual(script.readline(), b'#!/usr/bin/env -S python3 -I\n')
 
     def test_eligible_apply_and_protected_directories(self):
         self.refused('eligible worktree')

@@ -226,8 +226,9 @@ def safe_status_config(run, path, depth=0):
             if not sep or not name or b'..' in name.split(b'/'):
                 return False
             try:
-                child = (path / os.fsdecode(name)).resolve()
-                if not child.exists():
+                try:
+                    child = (path / os.fsdecode(name)).resolve(strict=True)
+                except (FileNotFoundError, NotADirectoryError):
                     continue
                 if child.is_dir() and not os.path.lexists(child / '.git'):
                     with os.scandir(child) as entries:

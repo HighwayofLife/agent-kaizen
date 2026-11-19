@@ -1,4 +1,4 @@
-#!/usr/bin/python3 -I
+#!/usr/bin/env -S python3 -I
 """Check whether a linked worktree can be removed or restored."""
 # Explicit `python3 worktree-prune` without -I honours the caller's PYTHONPATH
 # at interpreter startup. The re-exec guard isolates the rest of the command.

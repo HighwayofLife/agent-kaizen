@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from tests.test_scripts import StubCase
 
@@ -76,6 +76,17 @@ class DispatchStatusTests(StubCase):
         self.assertNotIn(str(other), output.split('WORKTREE FACTS (advisory)')[0])
         selected = self.run_script('dispatch-status', '--worktree-facts', other).stdout
         self.assertNotIn('primary=true', selected.split('WORKTREE FACTS (advisory)')[1])
+
+    def test_advisory_selection_matches_case_aliases(self):
+        other = self.root / 'Linked'
+        self.git('worktree', 'add', '-qb', 'topic', str(other))
+        (other / 'nested').mkdir()
+        selected = other.with_name('linked') / 'nested'
+        output = self.run_script('dispatch-status', '--worktree-facts', selected, other).stdout
+        facts = output.split('WORKTREE FACTS (advisory)')[1].strip().splitlines()
+        expected_unknown = [] if selected.is_dir() else [f'{selected}: unknown']
+        self.assertEqual(facts[:-1], expected_unknown)
+        self.assertTrue(facts[-1].startswith(f'path={other} branch=topic '), facts)
 
     def test_hidden_index_flags_make_clean_unknown(self):
         for flag in ('assume-unchanged', 'skip-worktree'):
@@ -204,6 +215,18 @@ class DispatchStatusTests(StubCase):
         self.git('update-index', '--add', '--cacheinfo', f'160000,{tip},sub')
         (self.work / 'sub').symlink_to('sub')
         self.assertIn('clean=unknown', self.run_script('dispatch-status', '--worktree-facts', self.work).stdout)
+
+    def test_submodule_ancestor_symlink_loop_blocks_status_scan(self):
+        tip = self.git('rev-parse', 'HEAD').stdout.strip()
+        self.git('update-index', '--add', '--cacheinfo', f'160000,{tip},sub/nested')
+        (self.work / 'sub').symlink_to('sub')
+        script_dir = str(Path(__file__).resolve().parents[1] / 'scripts')
+        with patch.object(sys, 'path', [script_dir, *sys.path]):
+            import kaizen_worktree_facts as facts
+            status = Mock(return_value=(0, b''))
+            rows = facts.read_facts(self.work, status)
+        status.assert_not_called()
+        self.assertIsNone(rows[0]['clean'])
 
     def test_replaced_primary_does_not_supply_cleanliness(self):
         other = self.root / 'linked'

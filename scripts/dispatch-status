@@ -126,16 +126,25 @@ def main():
                             selected = roots[0]
                     except (OSError, ValueError, RuntimeError):
                         pass
+                matched = False
                 for fact in facts:
-                    if (selected is not None and fact['path'] != selected) or fact['path'] in shown:
+                    path = fact['path']
+                    if selected is not None and path != selected:
+                        try:
+                            if not path.samefile(selected):
+                                continue
+                        except OSError:
+                            continue
+                    matched = True
+                    if path in shown:
                         continue
-                    shown.add(fact['path'])
+                    shown.add(path)
                     def value(item):
                         return 'unknown' if item is None else str(item).lower() if isinstance(item, bool) else str(item)
                     print(' '.join(f'{key}={value(fact[key])}' for key in
                                    ('path', 'branch', 'tip', 'primary', 'linked', 'locked', 'detached',
                                     'clean', 'merged', 'git_source') if key in fact))
-                if selected is not None and selected not in shown:
+                if selected is not None and not matched:
                     print(f'{directory}: unknown')
     return 0
 
