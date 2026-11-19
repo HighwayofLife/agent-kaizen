@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -120,6 +121,54 @@ class FrictionRecoveryTests(RobustCase):
         self.assertIn('/agent-kaizen:cycle auto ', self.values(self.last_argv(), '-p')[0])
         self.assertIn('resolved as a suggestion', result.stdout + result.stderr)
         self.assertNotIn('pending', store.scoped(project)[0])
+
+    def mutation_authority(self, project):
+        options = self.runner.command_options(SimpleNamespace(claude=str(self.claude)))
+        audits = self.runner.audits_dir()
+        command = self.runner.review_command(options, 'auto', '', '', project, audits)
+        _, policy = self.runner.scheduled_authority(audits, project, options, command, self.runner.backup_root())
+        return policy
+
+    def test_mutation_authority_accepts_symlinked_claude_config(self):
+        project = self.due('proj', '{"scheduledAutonomy":"auto","hostActions":"apply"}')
+        write(self.global_path, json.dumps({'autoProjects': [str(project)], 'maxChangesPerRun': 2}))
+        expected = self.mutation_authority(project)
+        self.assertEqual(expected[0], 2)
+
+        config_link = self.root / 'config-link'
+        config_link.symlink_to(self.cfg, target_is_directory=True)
+        with self.subTest(root='CLAUDE_CONFIG_DIR'):
+            self.setenv(CLAUDE_CONFIG_DIR=str(config_link))
+            self.assertEqual(self.mutation_authority(project), expected)
+        with self.subTest(root='default'):
+            (self.home / '.claude').symlink_to(self.cfg, target_is_directory=True)
+            os.environ.pop('CLAUDE_CONFIG_DIR')
+            self.assertEqual(self.mutation_authority(project), expected)
+
+    def test_mutation_authority_refuses_untrusted_symlinked_claude_config(self):
+        project = self.due('proj')
+        write(self.global_path, '{"scheduledAutonomy":"auto"}')
+        config_link = self.root / 'config-link'
+        config_link.symlink_to(self.cfg, target_is_directory=True)
+        self.setenv(CLAUDE_CONFIG_DIR=str(config_link))
+        for mode in (0o770, 0o707):
+            with self.subTest(mode=oct(mode)):
+                self.cfg.chmod(mode)
+                with self.assertRaisesRegex(ValueError, 'mutation config root is not trusted'):
+                    self.mutation_authority(project)
+
+        self.cfg.chmod(0o700)
+        lstat = Path.lstat
+
+        def other_owner(path):
+            info = lstat(path)
+            if path == self.cfg:
+                return os.stat_result((*info[:4], os.getuid() + 1, *info[5:]))
+            return info
+
+        with patch.object(Path, 'lstat', other_owner):
+            with self.assertRaisesRegex(ValueError, 'mutation config root is not trusted'):
+                self.mutation_authority(project)
 
 
 class SignalTests(RobustCase):

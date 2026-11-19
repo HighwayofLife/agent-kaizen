@@ -179,7 +179,7 @@ def audits_dir():
 
 
 def global_config_path():
-    return claude_home() / "agent-kaizen.json"
+    return claude_state_root() / "agent-kaizen.json"
 
 
 def project_config_path(project_dir):
@@ -295,8 +295,13 @@ def freeze_mutation_config(project, backup):
     project = Path(project)
     if canonical_path(project) != project or enrolled_project(project) != project:
         raise ValueError("mutation config scope is not the enrolled project")
+    global_path = global_config_path()
+    root_info = global_path.parent.lstat()
+    if (not stat.S_ISDIR(root_info.st_mode) or root_info.st_uid != os.getuid()
+            or root_info.st_mode & (stat.S_IWGRP | stat.S_IWOTH)):
+        raise ValueError("mutation config root is not trusted")
     layers, stamps = [], [backup["directory_identity"](project)]
-    for path in (global_config_path(), project_config_path(project)):
+    for path in (global_path, project_config_path(project)):
         if path.resolve() != path:
             raise ValueError("mutation config path is not canonical")
         try:
@@ -2257,7 +2262,7 @@ def scheduled_authority(audits, project, options, command, root):
         if path.is_relative_to(project) or any(
                 path.is_relative_to(home) and not any(path.is_relative_to(home / name)
                                                      for name in ("bin", "plugins"))
-                for home in (claude_home().resolve(), codex_home().resolve())):
+                for home in (claude_state_root(), codex_home().resolve())):
             raise ValueError("broker code is in a model-writable location")
     for path in ledger_paths().values():
         for target in (path.resolve(), path.with_name(path.name + ".lock").resolve()):
