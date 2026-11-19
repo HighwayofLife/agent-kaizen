@@ -1,8 +1,11 @@
 """Offline agent usage and extract contract tests."""
 from collections import Counter, defaultdict
+from contextlib import redirect_stderr, redirect_stdout
 import copy
 from datetime import datetime, timezone
+import io
 import json
+import os
 from pathlib import Path
 import runpy
 import unittest
@@ -225,7 +228,8 @@ class UsageTests(StubCase):
     def test_atomic_publication_failure_cleans_temporary_file(self):
         directory = self.root / 'extracts'
         out = self.root / 'token-audit-test.md'
-        with mock.patch.object(AUDIT['os'], 'link', side_effect=OSError('fixture')), \
+        with mock.patch.dict(AUDIT['write_extract'].__globals__,
+                             rename_extract=mock.Mock(side_effect=OSError('fixture'))), \
                 mock.patch.object(AUDIT['sys'], 'stderr') as stderr:
             self.assertIsNone(AUDIT['write_extract'](dict(since='date', agent_usage=[]), out, directory, {}))
         self.assertEqual(list(directory.iterdir()), [])
@@ -244,19 +248,54 @@ class UsageTests(StubCase):
         existing.unlink()
 
         moved = directory.with_name('moved')
-        link = AUDIT['os'].link
+        rename = AUDIT['rename_extract']
 
-        def move_store(*args, **kwargs):
-            directory.rename(moved)
-            directory.mkdir(mode=0o700)
-            return link(*args, **kwargs)
+        def move_store(fd, source, target):
+            if target == name:
+                directory.rename(moved)
+                directory.mkdir(mode=0o700)
+            return rename(fd, source, target)
 
-        with mock.patch.object(AUDIT['os'], 'link', side_effect=move_store), mock.patch('sys.stderr') as errors:
+        with mock.patch.dict(AUDIT['write_extract'].__globals__, rename_extract=move_store), \
+                mock.patch('sys.stderr') as errors:
             self.assertIsNone(AUDIT['write_extract'](data, out, directory, {}))
         diagnostic = ''.join(call.args[0] for call in errors.write.call_args_list)
         recovery = next(path for path in moved.iterdir() if path.name in diagnostic)
         self.assertEqual(json.loads(recovery.read_text())['report'], out.name)
         self.assertEqual(list(directory.iterdir()), [])
+
+    def test_extract_detects_in_place_publication_edit_and_recovers_both_versions(self):
+        directory = self.root / 'extracts'
+        rename = AUDIT['rename_extract']
+        bodies = []
+
+        def edit_after_publication(fd, source, target):
+            rename(fd, source, target)
+            if target.endswith('.extract.json'):
+                path = directory / target
+                original = path.read_bytes()
+                info = path.stat()
+                edited = original.replace(b'"v": 1', b'"v": 2', 1)
+                self.assertNotEqual(original, edited)
+                path.write_bytes(edited)
+                os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+                bodies.extend([original, edited])
+
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, self.env, clear=True), mock.patch.object(
+                AUDIT['sys'], 'argv', ['token-audit', '--json', '--out', str(self.root / 'reports'),
+                                       '--extract-out', str(directory)]), mock.patch.dict(
+                AUDIT['write_extract'].__globals__, rename_extract=edit_after_publication), \
+                redirect_stdout(stdout), redirect_stderr(stderr):
+            code = AUDIT['main']()
+        self.assertEqual(code, AUDIT['EXTRACT_WRITE_FAILED'], stderr.getvalue())
+        result = json.loads(stdout.getvalue())
+        self.assertIsNone(result['extract_path'])
+        self.assertNotIn('<!-- token-audit-friction ', Path(result['report_path']).read_text())
+        self.assertEqual(list(directory.glob('*.extract.json')), [])
+        recovered = [path.read_bytes() for path in directory.iterdir() if path.name in stderr.getvalue()]
+        self.assertCountEqual(recovered, bodies)
+        self.assertEqual(len(recovered), 2)
 
     def test_missing_and_malformed_model_and_effort(self):
         now = datetime.now(timezone.utc).isoformat()

@@ -2,6 +2,7 @@
 """Stream Claude project transcripts and Codex sessions into a compact audit."""
 import argparse
 import bisect
+import codecs
 import ctypes
 import errno
 from contextlib import ExitStack, nullcontext
@@ -125,11 +126,12 @@ CODEX_LOCK = re.compile(r"\b(?:database is locked|EBUSY|(?:could not|unable to) 
 CODEX_INOTIFY = re.compile(r"upper limit on inotify watches reached|user limit of inotify instances reached", re.I)
 CODEX_COMMAND = re.compile(r'^(?:text\(\s*)?(?:await\s+)?(?:tools\.)?exec_command\(\s*\{\s*"?cmd"?\s*:\s*["\x27]([^"\x27\n]{1,200})')
 ENVELOPE_LEAD = re.compile(rb'^\s*\{\s*(?:"type"\s*:\s*"[^"\\]*"\s*,\s*)?"timestamp"\s*:\s*')
+CLAUDE_TIMESTAMP = re.compile(ENVELOPE_LEAD.pattern + rb'"([^"\\\x00-\x1f]+)"')
 ENVELOPE_VALUE = re.compile(rb'\s*:\s*')
 ENVELOPE_TOKEN = re.compile(rb'["{}\[\]]')
 JSON_SPACE = re.compile(rb'[ \t\r\n]*')
 JSON_SCALAR = re.compile(rb'true|false|null|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?')
-JSON_STRING_SPECIAL = re.compile(rb'["\\\x00-\x1f\x80-\xff]')
+JSON_STRING_SPECIAL = re.compile(rb'["\\\x00-\x1f]')
 JSON_ESCAPE = re.compile(rb'\\(?:["\\/bfnrt]|u[A-Fa-f0-9]{4})')
 
 
@@ -145,10 +147,6 @@ def json_string_end(line, pos):
             if not escape:
                 break
             pos = escape.end() - 1
-        elif byte >= 0xc2:
-            width = 2 if byte < 0xe0 else 3 if byte < 0xf0 else 4
-            line[pos:pos + width].decode('utf-8')
-            pos += width - 1
         else:
             break
     raise ValueError("invalid JSON string")
@@ -185,6 +183,13 @@ def valid_large_json(line):
             pos = JSON_SPACE.match(line, pos + 1).end()
 
     try:
+        if not line.isascii():
+            # Decode bounded chunks in C and carry partial code points across chunks.
+            decoder = codecs.getincrementaldecoder("utf-8")()
+            view = memoryview(line)
+            for start in range(0, len(line), 65536):
+                decoder.decode(view[start:start + 65536])
+            decoder.decode(b"", final=True)
         return JSON_SPACE.match(line, value_end(0)).end() == len(line)
     except (ValueError, RecursionError):
         return False
@@ -522,24 +527,33 @@ def rows(path, since, warnings, keep_model=False, keep_tools=False, bounds=None,
                     continue
                 if bounds is not None:
                     timestamp = last_timestamp
+                elif keep_tools:
+                    # The common envelope has a literal timestamp near the front.
+                    # Decode reordered, escaped or potentially duplicate keys.
+                    match = CLAUDE_TIMESTAMP.match(line)
+                    if (match and match[1].isascii() and line.find(b'"timestamp"', match.end()) == -1
+                            and line.find(b'\\u00', match.end()) == -1):
+                        timestamp = match[1].decode("ascii", "replace")
+                    else:
+                        try:
+                            decoded = json.loads(line) if decoded is UNPARSED else decoded
+                        except (ValueError, RecursionError):
+                            warnings["malformed rows"] += 1
+                            continue
+                        timestamp = decoded.get("timestamp") if isinstance(decoded, dict) else None
                 else:
                     match = TIMESTAMP.search(line)
                     timestamp = match[1].decode("ascii", "replace") if match else None
                 old = None
                 malformed = False
                 try:
-                    if timestamp is not None:
+                    if isinstance(timestamp, str):
                         old = (timestamp[:19] < cutoff if timestamp.endswith(("Z", "+00:00"))
                                else date_time(timestamp) < since)
-                except (ValueError, TypeError):
+                except (ValueError, TypeError, OverflowError):
                     malformed = True
                 if old is not False and bounds is None and keep_signals and (b'"tool_use"' in line or b'"tool_result"' in line):
-                    # Skip old payloads unless a later literal or escaped key
-                    # could change the effective top-level timestamp.
-                    stable_old = old and line.find(b'"timestamp"', match.end()) == -1
-                    if stable_old and (escape := line.find(b'\\', match.end())) != -1:
-                        stable_old = line.find(b'\\u00', escape) == -1
-                    stamp = friction_stamp(envelope_timestamp(line)) if stable_old else None
+                    stamp = friction_stamp(timestamp)
                     if stamp is None or stamp >= since:
                         # Reconcile friction independently of the legacy usage gate.
                         try:
@@ -2682,12 +2696,13 @@ def describe(scope):
     return "window " + scope["window"] + ", " + projects
 
 
-def audit_machine_key(*, create=False):
+def audit_machine_key(*, create=False, config_root=None):
     helper = Path(__file__).resolve().with_name("kaizen_friction_actions.py")
     if helper.is_file():
         actions = runpy.run_path(str(helper))["HostActions"]
-        backups = Path(os.environ.get("KAIZEN_BACKUP_DIR") or claude_home() / "kaizen-backups").expanduser()
-        return actions(claude_home().absolute() / "audits", backups, None, None)._secret(create=create)
+        config = config_root if config_root is not None else Path(os.path.realpath(claude_home()))
+        backups = Path(os.environ.get("KAIZEN_BACKUP_DIR") or config / "kaizen-backups").expanduser()
+        return actions(config / "audits", backups, None, None)._secret(create=create)
 
 
 def regression_binding_mac(secret, report_name, binding):
@@ -2930,14 +2945,76 @@ def report(data, out, scope, extract_binding=None, extract_mac=None):
 EXTRACT_WRITE_FAILED = 4
 
 
-def write_extract(data, out, directory, scope, now=None):
+def rename_extract(directory, source, target):
+    """Atomically publish or quarantine an entry without replacing a name."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    if sys.platform == "darwin":
+        rename, flags = getattr(libc, "renameatx_np", None), 4  # RENAME_EXCL
+    else:
+        rename, flags = getattr(libc, "renameat2", None), 1  # RENAME_NOREPLACE
+    if rename is None:
+        raise ValueError("exclusive extract rename is unavailable")
+    rename.argtypes = (ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint)
+    rename.restype = ctypes.c_int
+    if rename(directory, os.fsencode(source), directory, os.fsencode(target), flags):
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def open_extract_stage(directory, name):
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    return os.fdopen(os.open(name, flags, 0o600, dir_fd=directory), "w+b")
+
+
+def extract_version(info):
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid, info.st_nlink,
+            info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def recover_extract(directory_fd, directory, name, identity, raw):
+    try:
+        if sys.platform == "darwin":
+            import fcntl
+            location = os.fsdecode(fcntl.fcntl(directory_fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0])
+        else:
+            location = os.readlink(f"/proc/self/fd/{directory_fd}")
+    except (OSError, AttributeError):
+        location = f"original directory for {directory}"
+    notes = []
+    recovery = ".extract-recovery-" + os.urandom(16).hex()
+    try:
+        with open_extract_stage(directory_fd, recovery) as copy:
+            copy.write(raw)
+            copy.flush()
+            os.fsync(copy.fileno())
+        notes.append(f"recovery copy {recovery} in {location}")
+    except OSError as exc:
+        notes.append(f"could not save recovery copy in {location} ({exc})")
+    try:
+        named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        if os.path.samestat(identity, named):
+            # Keep the actual entry moved, even if it changed since stat().
+            quarantine = ".extract-conflict-" + os.urandom(16).hex()
+            rename_extract(directory_fd, name, quarantine)
+            notes.append(f"quarantined {name} as {quarantine} in {location}")
+            moved = os.stat(quarantine, dir_fd=directory_fd, follow_symlinks=False)
+            if not os.path.samestat(named, moved):
+                notes.append("the quarantined entry was a concurrent replacement")
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError) as exc:
+        notes.append(f"could not quarantine {name} in {location} ({exc})")
+    return "; ".join(notes)
+
+
+def write_extract(data, out, directory, scope, now=None, *, config_root=None):
     directory_fd = temporary = None
     try:
         if not all(hasattr(os, name) for name in ("O_NOFOLLOW", "O_DIRECTORY", "geteuid")):
             raise ValueError("secure extract storage unavailable on this platform")
         directory = directory.expanduser().absolute()
         config = claude_home().absolute()
-        resolved_config = Path(os.path.realpath(config))
+        resolved_config = config_root if config_root is not None else Path(os.path.realpath(config))
         audits = resolved_config / "audits"
         default = directory in (config / "audits" / "extracts", audits / "extracts")
         configured_root = config if default else directory
@@ -2979,38 +3056,43 @@ def write_extract(data, out, directory, scope, now=None):
             # A standalone audit can still emit an extract. Only an install with
             # the machine key helper can attest counters for a settings write.
             try:
-                secret = audit_machine_key(create=True)
+                secret = audit_machine_key(create=True, config_root=resolved_config)
                 if secret is not None:
                     payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii")
                     value["allow_rule_mac"] = hmac.digest(secret, b"allow-rule-extract-v2\0" + payload, "sha256").hex()
             except (OSError, ValueError):
                 print("token-audit: could not authenticate allow-rule evidence", file=sys.stderr)
         raw = (json.dumps(value) + "\n").encode("ascii")
+        binding = dict(size=len(raw), sha256=hashlib.sha256(raw).hexdigest())
         candidate = ".extract-" + os.urandom(16).hex()
-        fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=directory_fd)
-        temporary = candidate
-        with os.fdopen(fd, "wb") as stream:
+        with open_extract_stage(directory_fd, candidate) as stream:
+            temporary = candidate
             stream.write(raw)
+            stream.flush()
             identity = os.fstat(stream.fileno())
-        # Publish without overwriting a destination created by another writer.
-        os.link(temporary, name, src_dir_fd=directory_fd, dst_dir_fd=directory_fd, follow_symlinks=False)
-        try:
-            if (not os.path.samestat(root_info, configured_root.stat())
-                    or not os.path.samestat(store, directory.lstat())
-                    or not os.path.samestat(identity, (directory / name).lstat())):
-                raise ValueError("extract path changed during publication")
-        except (OSError, ValueError) as conflict:
-            recovery, temporary = temporary, None
+            rename_extract(directory_fd, temporary, name)
+            temporary = None
             try:
-                if sys.platform == "darwin":
-                    import fcntl
-                    location = os.fsdecode(fcntl.fcntl(directory_fd, fcntl.F_GETPATH, bytes(1024)).split(b"\0", 1)[0])
-                else:
-                    location = os.readlink(f"/proc/self/fd/{directory_fd}")
-            except (OSError, AttributeError):
-                location = f"original directory for {directory}"
-            raise ValueError(f"{conflict}; recovery copy {recovery} in {location}") from conflict
-        return str(directory / name), dict(size=len(raw), sha256=hashlib.sha256(raw).hexdigest())
+                published = extract_version(os.fstat(stream.fileno()))
+                stream.seek(0)
+                unchanged = stream.read(len(raw) + 1) == raw
+                visible_store = directory.lstat()
+                if (not os.path.samestat(root_info, configured_root.stat())
+                        or not os.path.samestat(store, visible_store)
+                        or visible_store.st_uid != store.st_uid
+                        or stat.S_IMODE(visible_store.st_mode) != 0o700):
+                    raise ValueError("extract path changed during publication")
+                visible = (directory / name).lstat()
+                final = os.fstat(stream.fileno())
+                # The rename may update ctime. Bytes and the rest of the
+                # metadata must match, and the post-rename snapshot must hold.
+                if (not unchanged or visible.st_nlink != 1 or extract_version(identity)[:-1] != published[:-1]
+                        or published != extract_version(visible) or published != extract_version(final)):
+                    raise ValueError("extract file changed during publication")
+            except (OSError, ValueError) as conflict:
+                recovery = recover_extract(directory_fd, directory, name, identity, raw)
+                raise ValueError(f"{conflict}; {recovery}") from conflict
+        return str(directory / name), binding
     except (OSError, ValueError) as exc:
         print(f"token-audit: extract not written ({exc})", file=sys.stderr)
         return None
@@ -3018,8 +3100,9 @@ def write_extract(data, out, directory, scope, now=None):
         if temporary is not None:
             try:
                 os.unlink(temporary, dir_fd=directory_fd)
-            except OSError:
-                pass
+            except OSError as exc:
+                print(f"token-audit: could not remove staging file {temporary} in {directory} ({exc})",
+                      file=sys.stderr)
         if directory_fd is not None:
             os.close(directory_fd)
 
@@ -3086,7 +3169,8 @@ def main():
         parser.error(f"--days must be between 0 and {MAX_DAYS}")
     now = datetime.now(timezone.utc)
     since = args.since or (now - timedelta(days=args.days)).replace(microsecond=0)
-    root = claude_home() / "projects"
+    config_root = Path(os.path.realpath(claude_home()))
+    root = config_root / "projects"
     projects = [p.expanduser().resolve() for p in args.project_dir] if args.project_dir else (
         sorted(p for p in root.iterdir() if p.is_dir()) if root.is_dir() else [])
     codex_root = codex_home() / "sessions"
@@ -3122,11 +3206,12 @@ def main():
         extract_path = binding = extract_mac = None
         if not args.no_write:
             out.parent.mkdir(parents=True, exist_ok=True)
-            extract_path, binding = write_extract(data, out, args.extract_out, scope, now) or (None, None)
+            extract_path, binding = write_extract(
+                data, out, args.extract_out, scope, now, config_root=config_root) or (None, None)
             if (binding is not None and data.get("friction", {}).get("comparisons")
                     and not data["warnings"].get("unsafe permission transcript")):
                 try:
-                    secret = audit_machine_key(create=True)
+                    secret = audit_machine_key(create=True, config_root=config_root)
                     if secret is not None:
                         extract_mac = regression_binding_mac(secret, out.name, binding)
                 except (OSError, ValueError):

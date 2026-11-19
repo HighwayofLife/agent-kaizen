@@ -74,6 +74,20 @@ class FrictionClaudeTests(StubCase):
         self.assertEqual(self.collect()['headline']['claude_calls'], 1)
         self.assertEqual(self.collect()['friction']['summary']['samples'], 1)
 
+    def test_nested_timestamp_does_not_set_claude_usage_window(self):
+        begin = start('one', 1)
+        stamp = begin.pop('timestamp')
+        begin['message'].update(id='usage', usage=dict(input_tokens=10, output_tokens=5))
+        begin['message']['timestamp'] = (SINCE - timedelta(days=1)).isoformat()
+        for key in ('"timestamp"', r'"t\u0069mestamp"'):
+            with self.subTest(key=key):
+                jsonl(self.session, [begin, end('one', 3)])
+                first, last = self.session.read_text().splitlines()
+                self.session.write_text(first[:-1] + f', {key}: "{stamp}"}}\n' + last + '\n')
+                self.assertEqual(self.collect()['headline']['claude_calls'], 1)
+                self.assertEqual(self.collect(friction=False)['headline']['claude_calls'], 1)
+                self.assertEqual(self.collect()['friction']['summary']['samples'], 1)
+
     def test_pairs_replays_conflicts_and_timing_basis(self):
         prompt = dict(source='user_permanent', decision='accept')
         rows = [

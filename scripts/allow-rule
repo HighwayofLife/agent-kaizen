@@ -78,11 +78,11 @@ def extract_directory(path):
     path = path.absolute()
     if ".." in path.parts:
         raise ValueError("extract path traversal")
-    check_acl = helper("kaizen_friction_actions.py")["_check_acl"]
+    actions = helper("kaizen_friction_actions.py")
     with ExitStack() as stack:
         fd = os.open(path.anchor, flags)
         stack.callback(os.close, fd)
-        for part in path.parts:
+        for depth, part in enumerate(path.parts, 1):
             if part != path.anchor:
                 fd = os.open(part, flags, dir_fd=fd)
                 stack.callback(os.close, fd)
@@ -90,7 +90,10 @@ def extract_directory(path):
             if (info.st_uid not in (0, os.geteuid())
                     or info.st_mode & 0o022 and not info.st_mode & stat.S_ISVTX):
                 raise ValueError("unsafe extract ancestor")
-            check_acl(fd, "extract directory")
+            if depth == len(path.parts):
+                actions["_check_acl"](fd, "extract directory")
+            elif sys.platform == "darwin" and actions["_has_extended_acl"](fd, allow_deny_only=True):
+                raise ValueError("unsafe extract ancestor ACL")
         yield fd
 
 
@@ -249,14 +252,25 @@ def grant_rule(literal):
     return f"Bash({literal})"
 
 
+def audit_paths(runner):
+    audits = runner["audits_dir"]()
+    config = Path(os.path.realpath(audits.parent))
+    backups = runner["backup_root"]()
+    if not os.environ.get("KAIZEN_BACKUP_DIR"):
+        backups = config / backups.name
+    return config / audits.name, backups
+
+
 def host_store(runner):
     actions = helper("kaizen_friction_actions.py")["HostActions"]
-    return actions(runner["audits_dir"](), runner["backup_root"](), runner["action_project"], runner["key"])
+    audits, backups = audit_paths(runner)
+    return actions(audits, backups, runner["action_project"], runner["key"])
 
 
 def evidence(runner, project, literal, secret=None):
     now = datetime.now(timezone.utc)
-    extract, stamp = find_extract(runner["audits_dir"](), project, now)
+    audits, _ = audit_paths(runner)
+    extract, stamp = find_extract(audits, project, now)
     signature = extract.pop("allow_rule_mac", None)
     payload = json.dumps(extract, sort_keys=True, separators=(",", ":")).encode("ascii")
     if secret is not None or signature is not None:

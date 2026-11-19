@@ -11,7 +11,7 @@ import subprocess
 import sys
 from unittest.mock import patch
 
-from test_friction_claude import end, start
+from test_friction_claude import AUDIT, end, start
 from test_schedule_security import SecurityCase
 from test_scripts import SCRIPTS, jsonl, write
 
@@ -86,6 +86,48 @@ class AllowRuleTests(SecurityCase):
             self.assertFalse(self.target.parent.exists())
         self.extract(self.row(), self.row(denied=1, literal="ls -a"))
         self.add()
+
+    def test_extract_publication_keeps_older_evidence_readable_when_unlink_fails(self):
+        older = self.extract(self.row())
+        unlink = os.unlink
+
+        def fail_staging_cleanup(path, *args, **kwargs):
+            if str(path).startswith('.extract-'):
+                raise PermissionError('fixture staging cleanup denied')
+            return unlink(path, *args, **kwargs)
+
+        with patch.object(os, 'unlink', side_effect=fail_staging_cleanup):
+            written = AUDIT['write_extract'](dict(since='date', agent_usage=[]),
+                                             self.root / 'new.md', self.extracts, {})
+        self.assertIsNotNone(written)
+        self.assertEqual(Path(written[0]).stat().st_nlink, 1)
+        self.assertEqual(older.stat().st_nlink, 1)
+        self.assertEqual(json.loads(self.add().stdout)['accepted'], 10)
+
+    def test_symlinked_config_preserves_signed_transcript_evidence(self):
+        real_config = self.root / 'dotfiles/claude'
+        real_config.mkdir(parents=True)
+        self.cfg.symlink_to(real_config, target_is_directory=True)
+        if sys.platform == 'darwin':
+            subprocess.run(['chmod', '+a', 'everyone deny delete', str(real_config.parent)], check=True)
+            self.addCleanup(subprocess.run, ['chmod', '-N', str(real_config.parent)], check=True)
+        now = datetime.now(timezone.utc) - timedelta(minutes=1)
+        events = []
+        for index in range(10):
+            begin = start(str(index), 0, 'ls', cwd=str(self.repo))
+            finish = end(str(index), 1, cwd=str(self.repo), toolUseResult=dict(durationMs=1),
+                         permissionDecision=dict(source='user', decision='accept'))
+            events.extend([dict(begin, timestamp=now.isoformat()),
+                           dict(finish, timestamp=(now + timedelta(seconds=1)).isoformat())])
+        jsonl(real_config / 'projects/fixture/session.jsonl', events)
+        result = json.loads(self.run_script('token-audit', '--cwd', self.repo, '--json').stdout)
+        self.assertNotIn('unsafe permission transcript', result['warnings'])
+        extract = json.loads(Path(result['extract_path']).read_bytes())
+        self.assertIn('allow_rule_mac', extract)
+        self.assertEqual(json.loads(self.add().stdout)['accepted'], 10)
+        if sys.platform == 'darwin':
+            subprocess.run(['chmod', '+a', 'everyone allow write', str(real_config.parent)], check=True)
+            self.add(code=2)
 
     def test_fresh_exact_scope_and_known_schema(self):
         scope = dict(v=1, cwd=[str(self.repo)], project=None, project_dirs=[])
