@@ -1,5 +1,6 @@
 """Repository consistency checks: manifests, skills, references, README table, privacy."""
 import json
+import os
 import re
 import subprocess
 import unittest
@@ -19,8 +20,13 @@ AGENT_PREAMBLE = PREAMBLE.replace(
 # Tracked and untracked files, minus git-ignored ones (out/, caches, .DS_Store).
 FILES = subprocess.run(['git', 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], cwd=ROOT,
                        capture_output=True, text=True, check=True).stdout.split('\0')
-TEXT = [ROOT / f for f in FILES if f and not (ROOT / f).is_symlink() and (ROOT / f).is_file() and Path(f).suffix in
-        {'.md', '.json', '.sh', '.py', '.toml', '.conf', '.yml', '.yaml', ''}]
+TEXT = [ROOT / f for f in FILES if f and ((ROOT / f).is_symlink() or
+        ((ROOT / f).is_file() and Path(f).suffix in
+         {'.md', '.json', '.sh', '.py', '.toml', '.conf', '.yml', '.yaml', ''}))]
+
+
+def scan_text(path):
+    return os.readlink(path) if path.is_symlink() else path.read_text()
 
 
 def frontmatter(path):
@@ -106,7 +112,7 @@ class RepoTests(unittest.TestCase):
             # Implementation plans may reference files that later packets create.
             if path.relative_to(ROOT).parts[:2] == ('docs', 'plans'):
                 continue
-            for ref in re.findall(r'\$\{CLAUDE_PLUGIN_ROOT\}/([A-Za-z0-9_./*-]+)', path.read_text()):
+            for ref in re.findall(r'\$\{CLAUDE_PLUGIN_ROOT\}/([A-Za-z0-9_./*-]+)', scan_text(path)):
                 ref = ref.rstrip('.,`)')
                 with self.subTest(file=str(path.relative_to(ROOT)), ref=ref):
                     if '*' in ref:
@@ -124,10 +130,10 @@ class RepoTests(unittest.TestCase):
         pattern = re.compile(r'/Users/[A-Za-z]|/home/[a-z]+/|[A-Za-z0-9._%+-]+@(gmail|outlook|yahoo|icloud)\.com'
                              r'|sk-[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{20,}')
         for path in TEXT:
-            if path.name == 'test_repo.py':
+            if path == ROOT / 'tests/test_repo.py':
                 continue
             with self.subTest(file=str(path.relative_to(ROOT))):
-                self.assertIsNone(pattern.search(path.read_text()))
+                self.assertIsNone(pattern.search(scan_text(path)))
 
 
 if __name__ == '__main__':

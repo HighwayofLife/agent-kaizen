@@ -1,12 +1,13 @@
 """Copy worktree files for local host installation checks."""
 from pathlib import Path
+import os
 import shutil
 
 
 STATUS_LINKS = {
-    'scripts/kaizen-status-git/sha1/info/attributes': Path('/dev/stdin'),
-    'scripts/kaizen-status-git/sha256/info/attributes': Path('/dev/stdin'),
-    'scripts/kaizen-status-git/sha256/config': Path('config.patterns'),
+    'scripts/kaizen-status-git/sha1/info/attributes': '/dev/stdin',
+    'scripts/kaizen-status-git/sha256/info/attributes': '/dev/stdin',
+    'scripts/kaizen-status-git/sha256/config': 'config.patterns',
 }
 
 
@@ -19,7 +20,7 @@ def copy_worktree_files(source, destination, listing):
         if src.is_symlink():
             # The isolated Git template needs these exact links in a local export.
             link = STATUS_LINKS.get(name)
-            if link is not None and src.readlink() == link:
+            if link is not None and os.readlink(src) == link:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 dst.symlink_to(link)
         elif src.is_file():

@@ -8,7 +8,10 @@ import datetime
 import tempfile
 import unittest
 
-from plugin_fixtures import copy_plugin_tree
+if __package__:
+    from .plugin_fixtures import copy_plugin_tree
+else:
+    from plugin_fixtures import copy_plugin_tree
 
 ROOT = Path(__file__).resolve().parent.parent
 TOOL = ROOT / 'tools/host-acceptance'

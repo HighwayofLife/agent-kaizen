@@ -13,8 +13,12 @@ import subprocess
 import sys
 from unittest.mock import patch
 
-from plugin_fixtures import copy_plugin_tree
-from test_scripts import StubCase, write, executable
+if __package__:
+    from .plugin_fixtures import copy_plugin_tree
+    from .test_scripts import StubCase, write, executable
+else:
+    from plugin_fixtures import copy_plugin_tree
+    from test_scripts import StubCase, write, executable
 
 
 SCRIPTS = Path(__file__).resolve().parents[1] / 'scripts'
@@ -196,14 +200,22 @@ class ScheduleTests(StubCase):
         plugin = self.root / 'plugins/cache/agent-kaizen/version'
         scripts = plugin / 'scripts'
         copy = 'from plugin_fixtures import copy_plugin_tree; import sys; copy_plugin_tree(*sys.argv[1:])'
-        result = subprocess.run([sys.executable, '-c', copy, str(SCRIPTS), str(scripts)],
-                                cwd=Path(__file__).resolve().parent, stdin=subprocess.PIPE,
-                                capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        result = subprocess.run([sys.executable, str(scripts / 'install-schedule'),
-                                 '--apply', '--scheduler', 'cron'], env=self.env, stdin=subprocess.PIPE,
-                                capture_output=True, text=True, timeout=10)
-        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        commands = ([sys.executable, '-c', copy, str(SCRIPTS), str(scripts)],
+                    [sys.executable, str(scripts / 'install-schedule'), '--apply', '--scheduler', 'cron'])
+        for command in commands:
+            with subprocess.Popen(command, cwd=Path(__file__).resolve().parent, env=self.env,
+                                  stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True) as process:
+                try:
+                    process.wait(timeout=10)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                        process.wait()
+                    process.stdin.close()
+                process.stdin = None
+                stdout, stderr = process.communicate()
+                self.assertEqual(process.returncode, 0, stdout + stderr)
         template = self.home / '.claude/bin/kaizen-status-git'
         self.assertFalse(template.is_symlink())
         for fmt in ('sha1', 'sha256'):
@@ -214,6 +226,9 @@ class ScheduleTests(StubCase):
         aliases = {name: 'kaizen-' + name for name in
                    ('host-probe', 'host-fix', 'allow-rule', 'worktree-prune', 'friction-catalog.json')}
         helpers = ('kaizen_worktree_facts.py', 'kaizen_friction_actions.py')
+        interpreter_bin = self.root / 'interpreter-bin'
+        interpreter_bin.mkdir()
+        (interpreter_bin / 'python3').symlink_to(sys.executable)
         for mode in ('link', 'copy'):
             with self.subTest(mode=mode):
                 plugin = self.root / ('plugins/cache/agent-kaizen/version' if mode == 'copy' else 'plugin')
@@ -227,6 +242,10 @@ class ScheduleTests(StubCase):
                     self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertEqual(self.cron_file.read_text().count('# agent-kaizen-audit'), 1)
                 self.assertNotIn('# agent-kaizen-review', self.cron_file.read_text())
+                direct_env = dict(env, PATH=str(interpreter_bin) + os.pathsep + env['PATH'])
+                runner = subprocess.run([str(target / 'kaizen-scheduled'), '--help'], env=direct_env,
+                                        capture_output=True, text=True)
+                self.assertEqual(runner.returncode, 0, runner.stderr)
                 for source, name in list(aliases.items()) + [(name, name) for name in helpers]:
                     path = target / name
                     self.assertEqual(path.read_bytes(), (plugin / 'scripts' / source).read_bytes())
@@ -235,7 +254,8 @@ class ScheduleTests(StubCase):
                         self.assertFalse((target / source).exists())
                     if source in ('host-probe', 'host-fix', 'allow-rule', 'worktree-prune'):
                         self.assertTrue(os.access(path, os.X_OK))
-                        result = subprocess.run([sys.executable, str(path), '--help'], env=env,
+                        result = subprocess.run([str(path), '--help'],
+                                                env=direct_env,
                                                 capture_output=True, text=True)
                         self.assertEqual(result.returncode, 0, result.stderr)
                 check = subprocess.run([sys.executable, str(target / 'kaizen-link'), '--check'],

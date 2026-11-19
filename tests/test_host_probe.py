@@ -202,6 +202,10 @@ class HostProbeTest(unittest.TestCase):
         self.assertIn('new-file', exported)
         self.assertIn(str(allowed), exported)
         self.assertNotIn(str(unexpected), exported)
+        (self.source / allowed).unlink()
+        (self.source / allowed).symlink_to('/dev/stdin/')
+        self.assertEqual(self.run_probe('--host', 'codex', '--worktree').returncode, 0)
+        self.assertNotIn(str(allowed), json.loads(self.export_record.read_text()))
         self.assertNotIn('external-link', exported)
         self.assertNotIn('d/f.txt', exported)
 
