@@ -476,8 +476,8 @@ class GroupPopen(subprocess.Popen):
                     os.killpg(self.pid, signal.SIGTERM)
                     time.sleep(0.15)  # Let Git release a prepared ref lock.
                 os.killpg(self.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            except (ProcessLookupError, PermissionError):
+                pass  # Gone; macOS answers EPERM when only exited processes remain.
             self.group_killed = True
         else:
             super().kill()

@@ -2,6 +2,13 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.15.2 (2026-11-20)
+
+### Fixed
+
+- Release of 0.15.0 and 0.15.1, which were tagged but never released. On macOS, `tools/host-acceptance` reported its offline Copilot hook check as failed when the detached scheduler had already exited: macOS answers a process-group check with "not permitted" while only exited processes remain, and the check counted that as an error.
+- `kaizen-scheduled` no longer raises in a background thread when it stops a finished Git process group on macOS, for the same reason.
+
 ## 0.15.1 (2026-11-20)
 
 ### Fixed

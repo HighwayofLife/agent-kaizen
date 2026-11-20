@@ -441,6 +441,10 @@ def check(args, state, statefile, cli):
                                 os.killpg(proc.pid, 0)
                             except ProcessLookupError:
                                 break
+                            except PermissionError:
+                                # macOS reports EPERM, not ESRCH, while the group
+                                # holds only exited (zombie) processes.
+                                break
                             if time.monotonic() >= deadline:
                                 os.killpg(proc.pid, signal.SIGKILL)
                                 raise subprocess.TimeoutExpired(proc.args, 60)
