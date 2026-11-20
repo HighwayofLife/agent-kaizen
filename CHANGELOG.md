@@ -2,6 +2,22 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.15.0 (2026-11-19)
+
+### Added
+
+- `kaizen-doctor` and `tools/host-acceptance` detect Copilot plugins loaded live from a local directory marketplace, and suggest updating that directory when its version differs.
+- `tools/host-acceptance check` finds plugins that VS Code installed under its `agentPlugins` folder.
+- `tools/host-acceptance install --host vscode` registers the plugin in the VS Code user settings (`chat.plugins.enabled`, `chat.pluginLocations`) when the Copilot CLI is missing. It backs up a settings file before changing it, keeps comments and formatting, and changes nothing on a second run. `--print-only` prints the steps instead.
+
+### Changed
+
+- docs/hosts.md: VS Code Agents app sessions use the Copilot CLI plugin install. VS Code chat can instead install from source, for editor chat only.
+
+### Fixed
+
+- `tools/host-acceptance check --host vscode` skips the CLI row instead of failing when only VS Code's Copilot stand-in command is on PATH.
+
 ## 0.14.0 (2026-11-19)
 
 ### Added
@@ -68,8 +84,6 @@ Codex CLI and GitHub Copilot support: the same plugin installs on Codex CLI and 
 
 `host support`:
 
-- Detect Copilot plugins loaded live from a local directory marketplace and suggest updating that directory when its version differs.
-
 - GitHub Copilot support is experimental and has not been checked in a live session; Copilot usage is not measured yet.
 
 `skills/*/agents/openai.yaml`:
@@ -79,7 +93,6 @@ Codex CLI and GitHub Copilot support: the same plugin installs on Codex CLI and 
 `docs/hosts.md`, `docs/autonomy.md`:
 
 - New docs/hosts.md maps Claude Code, Codex CLI and the Copilot runtime (install, invocation, which features work); on non-Claude hosts, changes to the host's own settings, hooks and agent files stay proposals in every autonomy mode.
-- Clarify that the VS Code Agents app uses the Copilot CLI plugin install, while VS Code chat can install from source.
 
 `skills`:
 
