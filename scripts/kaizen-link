@@ -26,6 +26,7 @@ def codex_home():
 
 
 SCRIPTS = {
+    "check-profile": "check-profile",
     "token-audit": "token-audit", "kaizen-token-audit": "token-audit",
     "kaizen-scheduled": "kaizen-scheduled", "kaizen-backup": "kaizen-backup",
     "kaizen_credentials.py": "kaizen_credentials.py",

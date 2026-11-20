@@ -690,6 +690,28 @@ usage: kaizen-project-report [-h] --project PROJECT [--since SINCE]
 
 Example: `kaizen-project-report --project .`.
 
+## check-profile
+
+Measure startup, command and test timings, scan for possible slow code, and compare profiles.
+
+```text
+check-profile probe [--programs PROGS] [--runs N] [--threshold-ms MS]
+check-profile run [--trace PROGS] [--junit PATH] -- COMMAND [ARGS...]
+check-profile unittest [-s START_DIR] [-p PATTERN] [--top N]
+check-profile hints [PATHS...]
+check-profile compare [--threshold PCT] [--min-delta-ms MS] [--exit-zero] BASE NEW
+```
+
+Each subcommand accepts `--out DIR` and `--json` for JSON on stdout. Results are saved as JSON in `out/speed` by default. `compare` saves `compare.json` only when `--out` is given.
+
+- `probe` measures the median startup time of each `<prog> --version` and reports its resolved real path. It flags programs above `--threshold-ms` (default 100 ms). `--programs` takes a comma-separated list.
+- `run` records an untraced baseline: wall time, child CPU where available, and exit code. On POSIX, `--trace PROGS` runs the command again with timing wrappers on `PATH` for the comma-separated programs. Traced wall time includes wrapper overhead; use the untraced run as the baseline. Nested wrapper calls overlap in `total_ms`, and absolute-path calls bypass wrappers. Windows skips tracing with a note. `--junit PATH` parses test timings from JUnit XML. The exit code follows the untraced command.
+- `unittest` runs standard-library test discovery and reports per-test and per-module timings. It preserves the test run's pass/fail exit code.
+- `hints` uses a static regex scan to count sleeps, large literal timeouts, non-localhost network calls, and subprocess spawns per file. These are hypotheses, not measurements.
+- `compare` diffs two `run` or `unittest` JSON files. It exits 1 when a total, per-test, per-module, or per-program figure increases by more than `--threshold PCT` (default 20%) and by at least `--min-delta-ms` (default 50 ms). Otherwise it exits 0. `--exit-zero` returns 0 for regressions, for use with `projectCommands.<project>.speedReport`.
+
+Invalid arguments or runtime errors exit 2.
+
 ## rules-lint
 
 Find stale wording using `rules-lint.patterns`, the user file `kaizen-rules-lint.txt` in the Claude config directory, and each project's `docs/kaizen/rules-lint.txt`. Global `rulesLintFiles` adds files to scan.

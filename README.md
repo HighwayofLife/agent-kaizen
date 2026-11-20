@@ -171,6 +171,8 @@ In every mode, each applied change is backed up (to `KAIZEN_BACKUP_DIR`, or `kai
 
 `/agent-kaizen:friction` uses a bounded, machine-local view of audit and host signals to suggest remedies. Real-input behavior is pending verification. `friction=off` disables preparation; `frictionSampler=off` disables sampling, and `hostActions=off` disables host actions. See [scheduling](docs/scheduling.md#friction-and-host-actions) for defaults, limits and undo.
 
+`/agent-kaizen:speed` profiles slow test and check commands with `scripts/check-profile`.
+
 ### 3. Make it periodic
 
 SessionStart runs an audit when the last successful audit is over 3 days old. An OS schedule is optional and useful for fixed schedules or infrequent sessions. Run `/agent-kaizen:schedule` to install one. It finds the plugin path and asks before it installs anything. Or run `scripts/install-schedule` from the plugin or your clone; the plugin path varies by install.
@@ -263,6 +265,7 @@ All skills are user-triggered (`disable-model-invocation: true`), so their descr
 | `/agent-kaizen:batch-wakeups` | Swarm lead plus merged reviews, so the main session wakes once | Many small spawns |
 | `/agent-kaizen:planning` | Plan dirs, standalone briefs, right-sized planners, exploration budget | Multi-step features |
 | `/agent-kaizen:flow` | Packet state events and flow reports | Orchestrated packet work |
+| `/agent-kaizen:speed` | Profile tests and checks and verify speed improvements | Slow test or check commands |
 | `/agent-kaizen:test-loop` | Tiered tests for game/engine projects, engine slots, fast worktrees | Slow test feedback |
 | `/agent-kaizen:models` | New Claude and Codex models vs your routing rows, with sources | Monthly |
 | `/agent-kaizen:whats-new` | Claude Code and Codex release notes and new CLI tools vs your setup | Monthly |
@@ -287,7 +290,7 @@ agents/             kaizen-auditor (propose-only)
 hooks/              audit-notice and bash-burst (enabled by the plugin), plus opt-in guardrails:
                     limit-big-read, block-image-read, subagent-context, after-compact, session-notes
                     (lists running dispatches and dirty worktrees, pending ledger rows and stale rules at session start)
-scripts/            token-audit (+ pricing.json), usage-series, usage-compare, usage-db, kaizen-backup (backups + undo), codex-dispatch, codex-run, codex-review,
+scripts/            check-profile, token-audit (+ pricing.json), usage-series, usage-compare, usage-db, kaizen-backup (backups + undo), codex-dispatch, codex-run, codex-review,
                     dispatch-status, install-schedule, kaizen-scheduled, kaizen-link, packet-report,
                     kaizen-project-report, rules-lint (+ rules-lint.patterns), notes-ledger,
                     packet-event, flow-report, experiment-check, brief-lint

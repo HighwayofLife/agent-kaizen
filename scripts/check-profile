@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+"""Measure command and test timings, inspect static hints, and compare profiles."""
+import argparse
+import json
+import math
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import statistics
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+import xml.etree.ElementTree as ET
+
+try:
+    import resource
+except ImportError:
+    resource = None
+
+IS_WINDOWS = os.name == 'nt' or sys.platform == 'win32'
+
+
+def positive(value):
+    number = int(value)
+    if number < 1:
+        raise argparse.ArgumentTypeError('must be positive')
+    return number
+
+
+def save(out, name, data):
+    (out / (name + '.json')).write_text(json.dumps(data, indent=2) + '\n', encoding='utf-8')
+
+
+def probe(args, out):
+    rows = []
+    for name in filter(None, args.programs.split(',')):
+        path = shutil.which(name)
+        row = dict(program=name, which=path, real=os.path.realpath(path) if path else None,
+                   median_ms=None, min_ms=None, max_ms=None, flagged=False)
+        if path:
+            samples = []
+            try:
+                for _ in range(args.runs):
+                    start = time.perf_counter()
+                    subprocess.run([path, '--version'], stdin=subprocess.DEVNULL,
+                                   capture_output=True, timeout=10, check=False)
+                    samples.append((time.perf_counter() - start) * 1000)
+                row.update(median_ms=statistics.median(samples), min_ms=min(samples), max_ms=max(samples))
+                row['flagged'] = row['median_ms'] > args.threshold_ms
+            except (OSError, subprocess.TimeoutExpired) as exc:
+                row['error'] = str(exc)
+        rows.append(row)
+    data = dict(kind='probe', programs=rows)
+    save(out, 'probe', data)
+    lines = ['## Program startup'] + [f"- {r['program']}: {r['real'] or 'missing'}; " +
+        (f"{r['median_ms']:.1f} ms" + (' (slow)' if r['flagged'] else '') if r['median_ms'] is not None else r.get('error', 'unavailable')) for r in rows]
+    return data, lines, 0
+
+
+def timed_command(cmd, log, env=None):
+    before = resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None
+    start = time.perf_counter()
+    with log.open('w', encoding='utf-8') as stream:
+        result = subprocess.run(cmd, stdout=stream, stderr=subprocess.STDOUT, env=env, check=False)
+    elapsed = (time.perf_counter() - start) * 1000
+    after = resource.getrusage(resource.RUSAGE_CHILDREN) if resource else None
+    return dict(wall_ms=elapsed, user_s=after.ru_utime-before.ru_utime if before else None,
+                sys_s=after.ru_stime-before.ru_stime if before else None, returncode=result.returncode)
+
+
+HELPER = '''import os, subprocess, sys, time
+prog, real, log = sys.argv[1:4]
+args = sys.argv[4:]
+start = time.perf_counter()
+try:
+    result = subprocess.run([real, *args], close_fds=False)
+    rc = result.returncode
+except OSError:
+    rc = 127
+elapsed = (time.perf_counter() - start) * 1000
+arg = args[0].replace("\\t", "").replace("\\n", "").replace("\\r", "")[:40] if args else "-"
+try:
+    with open(log, "a", encoding="utf-8", errors="backslashreplace") as f:
+        f.write("%s\\t%s\\t%.6f\\n" % (prog, arg, elapsed))
+except OSError:
+    pass
+sys.exit(128 - rc if rc < 0 else rc)
+'''
+
+
+def aggregate(log):
+    grouped = {}
+    for line in log.read_text(encoding='utf-8').splitlines():
+        try:
+            name, arg, ms = line.split('\t')
+            grouped.setdefault(name, []).append((arg, float(ms)))
+        except ValueError:
+            continue
+    rows = []
+    for name, calls in sorted(grouped.items()):
+        args = {}
+        for arg, ms in calls:
+            item = args.setdefault(arg, dict(argv1=arg, calls=0, total_ms=0.0))
+            item['calls'] += 1
+            item['total_ms'] += ms
+        rows.append(dict(program=name, calls=len(calls), total_ms=sum(ms for _, ms in calls),
+                         median_ms=statistics.median(ms for _, ms in calls),
+                         top_args=sorted(args.values(), key=lambda x: (x['total_ms'], x['calls']), reverse=True)[:5]))
+    return rows
+
+
+def run_command(args, out):
+    cmd = args.command
+    if cmd and cmd[0] == '--':
+        cmd = cmd[1:]
+    if not cmd:
+        raise ValueError('run requires a command after --')
+    run_start = time.time()
+    baseline = timed_command(cmd, out / 'run-untraced.log')
+    traced, programs, notes = None, [], []
+    tests = []
+    if args.junit and Path(args.junit).exists():
+        try:
+            if Path(args.junit).stat().st_mtime < run_start:
+                notes.append('stale JUnit file: ' + str(args.junit))
+            root = ET.parse(args.junit).getroot()
+            for case in root.iter('testcase'):
+                tests.append(dict(classname=case.get('classname', ''), name=case.get('name', ''),
+                                  ms=float(case.get('time', '0')) * 1000))
+            tests.sort(key=lambda x: x['ms'], reverse=True)
+        except (ET.ParseError, ValueError) as exc:
+            tests = []
+            notes.append('invalid JUnit file: ' + str(exc))
+    if args.trace:
+        if IS_WINDOWS:
+            notes.append('tracing skipped on Windows')
+        else:
+            notes.extend(['Traced wall time includes wrapper overhead; the untraced run is the baseline.',
+                          'Calls by absolute path bypass the PATH wrappers.',
+                          'Nested wrapper calls overlap in total_ms.'])
+            paths = [(name, shutil.which(name)) for name in filter(None, args.trace.split(','))]
+            notes.extend(f'Trace skipped for relative PATH hit: {name}' for name, path in paths if path and not os.path.isabs(path))
+            notes.extend(f'Trace program not found: {name}' for name, path in paths if not path)
+            paths = [(name, os.path.realpath(path) if path and os.path.isabs(path) else None) for name, path in paths]
+            fd, log_name = tempfile.mkstemp(prefix=f'trace-{os.getpid()}-{time.time_ns()}-', suffix='.tsv', dir=str(out.resolve()))
+            os.close(fd)
+            log = Path(log_name)
+            with tempfile.TemporaryDirectory(prefix='wrappers-', dir=str(out.resolve())) as directory:
+                helper = Path(directory) / 'helper.py'
+                helper.write_text(HELPER, encoding='utf-8')
+                for name, binary in paths:
+                    if binary and Path(name).name == name:
+                        wrapper = Path(directory) / name
+                        command = ' '.join(shlex.quote(str(x)) for x in (sys.executable, helper, name, binary, log))
+                        wrapper.write_text('#!/bin/sh\nexec ' + command + ' "$@"\n', encoding='utf-8')
+                        wrapper.chmod(0o755)
+                env = os.environ.copy()
+                env['PATH'] = directory + os.pathsep + env.get('PATH', '')
+                traced = timed_command(cmd, out / 'run-traced.log', env)
+                programs = aggregate(log)
+                if traced['returncode'] < 0:
+                    traced['returncode'] = 128 - traced['returncode']
+    data = dict(kind='run', total_ms=baseline['wall_ms'], untraced=baseline,
+                traced=traced, programs=programs, tests=tests, notes=notes)
+    save(out, 'run', data)
+    lines = [f"## Run: {baseline['wall_ms']:.1f} ms (exit {baseline['returncode']})"]
+    if traced is not None:
+        lines.append(f"- Traced: {traced['wall_ms']:.1f} ms (exit {traced['returncode']})")
+    lines += [f"- {p['program']}: {p['calls']} calls, {p['total_ms']:.1f} ms" for p in programs]
+    lines += [f"- {t['classname']}.{t['name']}: {t['ms']:.1f} ms" for t in tests[:15]]
+    lines += notes
+    rc = baseline['returncode']
+    return data, lines, 128 - rc if rc < 0 else rc
+
+
+class TimedResult(unittest.TextTestResult):
+    def startTest(self, test):
+        super().startTest(test)
+        self.started = time.perf_counter()
+        self.status = 'ok'
+
+    def addFailure(self, test, err):
+        if self.status != 'error':
+            self.status = 'fail'
+        super().addFailure(test, err)
+
+    def addError(self, test, err):
+        self.status = 'error'
+        super().addError(test, err)
+
+    def addSkip(self, test, reason):
+        if self.status == 'ok':
+            self.status = 'skip'
+        super().addSkip(test, reason)
+
+    def addSubTest(self, test, subtest, err):
+        if err is not None:
+            status = 'fail' if issubclass(err[0], test.failureException) else 'error'
+            if self.status != 'error':
+                self.status = status
+        super().addSubTest(test, subtest, err)
+
+    def addExpectedFailure(self, test, err):
+        self.status = 'expected_failure'
+        super().addExpectedFailure(test, err)
+
+    def addUnexpectedSuccess(self, test):
+        self.status = 'unexpected_success'
+        super().addUnexpectedSuccess(test)
+
+    def stopTest(self, test):
+        self.rows.append(dict(id=test.id(), module=test.__class__.__module__,
+                              ms=(time.perf_counter()-self.started)*1000, status=self.status))
+        super().stopTest(test)
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.rows = []
+
+
+def profile_unittest(args, out):
+    script_dir = os.path.dirname(os.path.realpath(__file__))
+    old_path = sys.path[:]
+    sys.path[:] = [os.getcwd()] + [p for p in sys.path if os.path.abspath(p or os.getcwd()) not in (script_dir, os.getcwd())]
+    saved_fds = []
+    old_bytecode = sys.dont_write_bytecode
+    streams = (sys.stdout, sys.stderr, sys.__stdout__, sys.__stderr__)
+    try:
+        with (out / 'unittest.log').open('w', encoding='utf-8') as log:
+            for stream in streams:
+                if stream is not None:
+                    stream.flush()
+            for fd in (1, 2):
+                saved_fds.append((fd, os.dup(fd)))
+                os.dup2(log.fileno(), fd)
+            sys.dont_write_bytecode = True
+            try:
+                start = time.perf_counter()
+                suite = unittest.defaultTestLoader.discover(start_dir=args.start_dir, pattern=args.pattern, top_level_dir=None)
+                result = unittest.TextTestRunner(stream=sys.stderr, resultclass=TimedResult).run(suite)
+                total = (time.perf_counter() - start) * 1000
+            finally:
+                for stream in streams:
+                    if stream is not None:
+                        stream.flush()
+    finally:
+        sys.dont_write_bytecode = old_bytecode
+        for fd, saved in saved_fds:
+            os.dup2(saved, fd)
+            os.close(saved)
+        sys.path[:] = old_path
+    modules = {}
+    for row in result.rows:
+        item = modules.setdefault(row['module'], dict(module=row['module'], tests=0, total_ms=0.0))
+        item['tests'] += 1
+        item['total_ms'] += row['ms']
+    tests = sorted(result.rows, key=lambda x: x['ms'], reverse=True)
+    module_rows = sorted(modules.values(), key=lambda x: x['total_ms'], reverse=True)
+    counts = {status: sum(t['status'] == status for t in tests) for status in ('ok', 'fail', 'error', 'skip', 'expected_failure', 'unexpected_success')}
+    counts['error'] += sum(isinstance(test, unittest.suite._ErrorHolder) for test, _ in result.errors)
+    data = dict(kind='unittest', total_ms=total, tests=tests, modules=module_rows, counts=counts)
+    save(out, 'unittest', data)
+    lines = [f'## Tests: {total:.1f} ms'] + [f"- {t['id']}: {t['ms']:.1f} ms ({t['status']})" for t in tests[:args.top]]
+    lines += ['## Modules'] + [f"- {m['module']}: {m['total_ms']:.1f} ms ({m['tests']} tests)" for m in module_rows]
+    return data, lines, 0 if result.wasSuccessful() else 1
+
+
+PATTERNS = {
+    'sleep': re.compile(r'time\.sleep\s*\(|\bsleep\s+[0-9.]|setTimeout\s*\('),
+    'large_timeout': re.compile(r'timeout\s*=\s*([0-9]+(?:\.[0-9]+)?)'),
+    "network": re.compile(r"urlopen\s*\(|\brequests\.(?:get|post|put|delete|head|request)\b|https?://(?!localhost(?:[:/\s\"']|$)|127\.0\.0\.1(?:[:/\s\"']|$)|\[::1\](?:[:/\s\"']|$))[A-Za-z0-9.-]+"),
+    'subprocess': re.compile(r'\bsubprocess\.(?:run|Popen|call|check_call|check_output)\b|\bos\.system\b'),
+}
+
+
+def hints(args, out):
+    files = set()
+    for entry in args.paths or ['tests']:
+        path = Path(entry)
+        if path.is_file():
+            files.add(path)
+        elif path.is_dir():
+            for root, dirs, names in os.walk(path):
+                dirs[:] = [d for d in dirs if d not in ('.git', '__pycache__', 'out', 'node_modules')]
+                files.update(Path(root) / n for n in names)
+    findings = []
+    for path in sorted(files):
+        if path.suffix not in ('.py', '.js', '.ts', '.sh'):
+            continue
+        groups = {name: [] for name in PATTERNS}
+        for number, line in enumerate(path.read_text(encoding='utf-8', errors='replace').splitlines(), 1):
+            for name, pattern in PATTERNS.items():
+                matches = list(pattern.finditer(line))
+                if name == 'large_timeout':
+                    matches = [m for m in matches if float(m.group(1)) >= 10]
+                groups[name].extend([number] * len(matches))
+        for name, numbers in groups.items():
+            if numbers:
+                findings.append(dict(file=str(path), category=name, count=len(numbers), lines=numbers))
+    data = dict(kind='hints', basis='hypotheses', findings=findings)
+    save(out, 'hints', data)
+    lines = ['## Hypotheses (unmeasured static hints, not measured results)']
+    lines += [f"- {f['file']}: {f['category']} ({f['count']}; lines {', '.join(map(str, f['lines']))})" for f in findings]
+    return data, lines, 0
+
+
+def compare(args, out):
+    with open(args.base, encoding='utf-8') as stream:
+        base = json.load(stream)
+    with open(args.new, encoding='utf-8') as stream:
+        new = json.load(stream)
+    if not isinstance(base, dict) or not isinstance(new, dict) or base.get('kind') != new.get('kind') or base.get('kind') not in ('run', 'unittest'):
+        raise ValueError('profiles must have matching run or unittest kind')
+    regressions = []
+    def check(label, old, current):
+        if any(v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)) for v in (old, current)):
+            raise ValueError(f'{label} timing must be numeric')
+        if old is None or current is None:
+            return
+        delta = current - old
+        if old > 0 and delta >= args.min_delta_ms and delta / old * 100 > args.threshold:
+            regressions.append(dict(item=label, base_ms=old, new_ms=current, delta_ms=delta, percent=delta / old * 100))
+    for profile in (base, new):
+        if 'total_ms' in profile and profile['total_ms'] is None:
+            raise ValueError('total timing must be numeric')
+    check('total', base.get('total_ms'), new.get('total_ms'))
+    for group in ('tests', 'modules', 'programs'):
+        if any(not isinstance(profile.get(group, []), list) for profile in (base, new)):
+            raise ValueError(f'{group} must be a list')
+    for group, key, fields in [('tests', ('id', 'name'), ('ms',)), ('modules', ('module',), ('total_ms',)), ('programs', ('program', 'name'), ('total_ms', 'median_ms'))]:
+        def collect(profile):
+            rows = {}
+            for item in profile.get(group, []):
+                if not isinstance(item, dict):
+                    continue
+                ident = next((item[k] for k in key if k in item), None)
+                if group == 'tests' and item.get('classname') and 'name' in item:
+                    if not isinstance(item['classname'], str) or not isinstance(item['name'], str):
+                        raise ValueError('test identity must be a string')
+                    ident = item['classname'] + '.' + item['name']
+                if ident is not None and not isinstance(ident, str):
+                    raise ValueError(f'{group} identity must be a string')
+                if ident is None:
+                    continue
+                row = rows.setdefault(ident, {})
+                for field in fields:
+                    if field not in item:
+                        continue
+                    value = item[field]
+                    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+                        raise ValueError(f'{group} {ident} {field} timing must be numeric')
+                    total, count = row.get(field, (0, 0))
+                    row[field] = (total + value, count + 1)
+            return rows
+        old_rows, new_rows = collect(base), collect(new)
+        for ident in old_rows.keys() & new_rows.keys():
+            for field in fields:
+                if field in old_rows[ident] and field in new_rows[ident]:
+                    old, old_count = old_rows[ident][field]
+                    current, new_count = new_rows[ident][field]
+                    if field == 'median_ms':
+                        old, current = old / old_count, current / new_count
+                    check(f'{group} {ident} {field}', old, current)
+    regressions.sort(key=lambda x: x['delta_ms'], reverse=True)
+    data = dict(kind='compare', regressions=regressions, threshold=args.threshold, min_delta_ms=args.min_delta_ms)
+    if out is not None:
+        save(out, 'compare', data)
+    lines = [f'## Regressions: {len(regressions)}'] if regressions else ['No regressions.']
+    lines += [f"- {r['item']}: {r['base_ms']:.1f} -> {r['new_ms']:.1f} ms (+{r['percent']:.1f}%)" for r in regressions[:14]]
+    return data, lines, int(bool(regressions) and not args.exit_zero)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--out', default=None)
+    subs = parser.add_subparsers(dest='action', required=True)
+    for name in ('probe', 'run', 'unittest', 'hints', 'compare'):
+        sub = subs.add_parser(name)
+        sub.add_argument('--out', default=argparse.SUPPRESS)
+        sub.add_argument('--json', action='store_true')
+        if name == 'probe':
+            sub.add_argument('--programs', default='git,python3,node,npm,rg,fd,jq,shellcheck,claude,codex')
+            sub.add_argument('--runs', type=positive, default=5)
+            sub.add_argument('--threshold-ms', type=float, default=100.0)
+        elif name == 'run':
+            sub.add_argument('--trace')
+            sub.add_argument('--junit')
+            sub.add_argument('command', nargs=argparse.REMAINDER)
+        elif name == 'unittest':
+            sub.add_argument('-s', dest='start_dir', default='tests')
+            sub.add_argument('-p', dest='pattern', default='test*.py')
+            sub.add_argument('--top', type=positive, default=15)
+        elif name == 'hints':
+            sub.add_argument('paths', nargs='*')
+        else:
+            sub.add_argument('base')
+            sub.add_argument('new')
+            sub.add_argument('--threshold', type=float, default=20.0)
+            sub.add_argument('--min-delta-ms', type=float, default=50.0)
+            sub.add_argument('--exit-zero', action='store_true')
+    args = parser.parse_args()
+    try:
+        out = Path(args.out) if args.out else (None if args.action == 'compare' else Path('out/speed'))
+        if out is not None:
+            out.mkdir(parents=True, exist_ok=True)
+        data, lines, code = {'probe': probe, 'run': run_command, 'unittest': profile_unittest,
+                             'hints': hints, 'compare': compare}[args.action](args, out)
+        print(json.dumps(data) if args.json else '\n'.join(lines))
+        return code
+    except (OSError, ValueError, ET.ParseError, json.JSONDecodeError, ImportError) as exc:
+        print(f'check-profile: {exc}', file=sys.stderr)
+        return 2
+
+
+if __name__ == '__main__':
+    sys.exit(main())

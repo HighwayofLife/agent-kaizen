@@ -2,6 +2,13 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.14.0 (2026-11-19)
+
+### Added
+
+- `scripts/check-profile` measures startup, command and test timings with `probe`, `run` and `unittest`. It scans for possible slow code with `hints` and compares profiles with `compare`.
+- `/agent-kaizen:speed` guides profiling and comparison of project checks.
+
 ## 0.13.4 (2026-11-19)
 
 ### Fixed
