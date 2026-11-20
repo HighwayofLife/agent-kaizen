@@ -201,7 +201,7 @@ class AcceptanceTests(unittest.TestCase):
         statefile.parent.mkdir(parents=True)
         statefile.write_text(json.dumps({'install': 'manual', 'installed_at': '2020-01-01T00:00:00+00:00'}))
         chat = self.home / 'vscode/agentPlugins/file-x/hash'
-        shutil.copytree(ROOT, chat, ignore=shutil.ignore_patterns('.git', 'out', '__pycache__'))
+        copy_plugin_tree(ROOT, chat, ignore=shutil.ignore_patterns('.git', 'out', '__pycache__'))
         self.command('check', '--host', 'vscode', '--observe', 'skill_invoked=pass')
         report = max((ROOT / 'out/host-acceptance').glob('vscode-*.json'), key=lambda p: p.stat().st_mtime_ns)
         rows = {r['id']: r for r in json.loads(report.read_text())['checks']}
@@ -217,7 +217,7 @@ class AcceptanceTests(unittest.TestCase):
         self.assertNotIn('chat only', rows['hooks-live:sessionStart']['detail'])
         statefile.write_text(json.dumps({'installed_at': '2020-01-01T00:00:00+00:00'}))
         copilot = self.home / 'copilot/installed-plugins/agent-kaizen-tools/agent-kaizen'
-        shutil.copytree(chat, copilot)
+        copy_plugin_tree(chat, copilot)
         self.command('check', '--host', 'vscode', '--observe', 'skill_invoked=pass')
         report = max((ROOT / 'out/host-acceptance').glob('vscode-*.json'), key=lambda p: p.stat().st_mtime_ns)
         rows = {r['id']: r for r in json.loads(report.read_text())['checks']}
@@ -228,7 +228,7 @@ class AcceptanceTests(unittest.TestCase):
     def test_copilot_live_marketplace_and_precedence(self):
         marketplace = self.home / 'marketplace'
         live = marketplace / 'plugin'
-        shutil.copytree(ROOT, live, ignore=shutil.ignore_patterns('.git', 'out', '__pycache__'))
+        copy_plugin_tree(ROOT, live, ignore=shutil.ignore_patterns('.git', 'out', '__pycache__'))
         metadata = marketplace / '.claude-plugin'
         metadata.mkdir()
         (metadata / 'marketplace.json').write_text(json.dumps({'plugins': [
@@ -243,7 +243,7 @@ class AcceptanceTests(unittest.TestCase):
         statefile.parent.mkdir(parents=True)
         statefile.write_text(json.dumps({'install': 'manual', 'installed_at': '2020-01-01T00:00:00+00:00'}))
         chat = self.home / 'vscode/agentPlugins/file-x/hash'
-        shutil.copytree(live, chat)
+        copy_plugin_tree(live, chat)
 
         def check(host):
             self.command('check', '--host', host, '--observe', 'skill_invoked=pass')
@@ -269,7 +269,7 @@ class AcceptanceTests(unittest.TestCase):
         settings['enabledPlugins']['agent-kaizen@agent-kaizen-tools'] = True
         settings_file.write_text(json.dumps(settings))
         installed = copilot / 'installed-plugins/agent-kaizen-tools/agent-kaizen'
-        shutil.copytree(live, installed)
+        copy_plugin_tree(live, installed)
         rows = check('vscode')
         self.assertIn('copilot/installed-plugins', rows['installed']['detail'])
         self.assertNotIn('live plugin from', rows['installed']['detail'])

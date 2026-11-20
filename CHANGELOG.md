@@ -2,6 +2,12 @@
 
 Versions follow `version` in `.claude-plugin/plugin.json`. A GitHub marketplace install only picks up a release when that number changes.
 
+## 0.15.1 (2026-11-20)
+
+### Fixed
+
+- Release of 0.15.0, which was tagged but never released: three of its new tests copied the plugin with a plain directory copy, which opens the isolated Git helper's `/dev/stdin` links. That failed on Linux and could hang when stdin was an open pipe. The tests now use the same link-safe copy as the rest of the suite.
+
 ## 0.15.0 (2026-11-19)
 
 ### Added

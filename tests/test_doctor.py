@@ -146,7 +146,7 @@ class DoctorTests(unittest.TestCase):
         manifest.write_text(json.dumps(data))
         # Compare the live marketplace against a separate checkout.
         checkout = self.home / 'checkout'
-        shutil.copytree(self.cache, checkout)
+        copy_plugin_tree(self.cache, checkout)
         result = subprocess.run([sys.executable, str(self.root / 'scripts/kaizen-doctor'),
                                  '--plugin-root', str(checkout), '--project', str(self.home)],
                                 env=self.env, capture_output=True, text=True)
