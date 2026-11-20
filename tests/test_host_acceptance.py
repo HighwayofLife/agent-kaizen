@@ -5,6 +5,8 @@ from pathlib import Path
 import subprocess
 import shutil
 import datetime
+import contextlib
+import io
 import tempfile
 import unittest
 
@@ -82,6 +84,11 @@ class AcceptanceTests(unittest.TestCase):
         result = self.command('install', '--host', 'copilot-cli', '--source', 'github')
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('Missing copilot CLI', result.stderr)
+        self.command('check', '--host', 'vscode')
+        report = max((ROOT / 'out/host-acceptance').glob('vscode-*.json'), key=lambda p: p.stat().st_mtime_ns)
+        rows = {r['id']: r for r in json.loads(report.read_text())['checks']}
+        self.assertEqual(rows['cli']['status'], 'SKIP')
+        self.assertEqual(rows['cli']['detail'], 'CLI not found')
 
     def test_bad_copilot_path_and_missing_install_state(self):
         copilot = self.home / 'copilot'
@@ -314,6 +321,43 @@ class AcceptanceTests(unittest.TestCase):
         cleanup = self.command('cleanup', '--host', 'vscode')
         self.assertIn('chat.pluginLocations', cleanup.stdout)
         self.assertIn('restore the backup', cleanup.stdout)
+
+    def test_vscode_empty_settings_and_repeat(self):
+        import runpy
+        register = runpy.run_path(str(TOOL))['register_vscode_settings']
+        clean = runpy.run_path(str(TOOL))['jsonc_clean']
+        for index, original in enumerate(('', '  \n\t', '// comment', '/* comment */')):
+            with self.subTest(original=original):
+                path = self.home / str(index) / 'settings.json'
+                path.parent.mkdir()
+                path.write_text(original)
+                source = self.home / 'source'
+                register(path, source)
+                content = path.read_text()
+                settings = json.loads(clean(content))
+                self.assertTrue(settings['chat.plugins.enabled'])
+                self.assertTrue(settings['chat.pluginLocations'][str(source)])
+                backup, = path.parent.glob('settings.json.bak-agent-kaizen-*')
+                self.assertEqual(backup.read_text(), original)
+                register(path, source)
+                self.assertEqual(path.read_text(), content)
+                self.assertEqual(list(path.parent.glob('settings.json.bak-agent-kaizen-*')), [backup])
+
+    def test_vscode_settings_windows_source_redaction(self):
+        import runpy
+        register = runpy.run_path(str(TOOL))['register_vscode_settings']
+        register.__globals__['HOME'] = Path(r'C:\Users\bob')
+        source = Path(r'C:\Users\bob\plugin')
+        path = self.home / 'settings.json'
+        for content in ('{ broken', json.dumps({'chat.pluginLocations': {str(source): False}})):
+            with self.subTest(content=content):
+                path.write_text(content)
+                output = io.StringIO()
+                with contextlib.redirect_stdout(output):
+                    register(path, source)
+                self.assertIn('Set ', output.getvalue())
+                self.assertNotIn(r'Users\bob', output.getvalue())
+                self.assertNotIn(r'Users\\bob', output.getvalue())
 
     def test_vscode_existing_locations_and_disabled(self):
         self.without_copilot()

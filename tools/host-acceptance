@@ -26,6 +26,13 @@ def run(args, **kwargs):
                           stderr=subprocess.PIPE, timeout=60, **kwargs)
 
 
+def copilot_available(cli):
+    if not shutil.which(cli):
+        return False
+    result = run([cli, '--version'])
+    return result.returncode == 0 and 'not found' not in (result.stdout + result.stderr).lower()
+
+
 def export_source(dest):
     listing = run(['git', '-C', ROOT, 'ls-files', '-z', '--cached', '--others', '--exclude-standard'], check=True).stdout
     if dest.exists():
@@ -189,9 +196,12 @@ def register_vscode_settings(path, source):
         old = None
     original = old if old is not None else '{}\n'
     manual = 'Set chat.plugins.enabled to true and add {}: true to chat.pluginLocations in {}.'.format(
-        redact(json.dumps(str(source))), redact(str(path)))
+        json.dumps(redact(str(source))), redact(str(path)))
     try:
         clean = jsonc_clean(original)
+        if not clean.strip():
+            original += '\n{}'
+            clean = jsonc_clean(original)
         settings = json.loads(clean)
         if not isinstance(settings, dict):
             raise ValueError('settings must be an object')
@@ -212,7 +222,7 @@ def register_vscode_settings(path, source):
     if 'chat.pluginLocations' not in settings:
         inserts.append('"chat.pluginLocations": {\n        ' + key + ': true\n    }')
     elif not isinstance(locations, dict) or (str(source) in locations and locations[str(source)] is not True):
-        print('Set {}: true in chat.pluginLocations in {}.'.format(redact(key), redact(str(path))))
+        print('Set {}: true in chat.pluginLocations in {}.'.format(json.dumps(redact(str(source))), redact(str(path))))
     elif str(source) not in locations:
         offset = members['chat.pluginLocations'] + 1
         entry = '\n        ' + key + ': true' + (',' if locations else '')
@@ -281,10 +291,7 @@ def main():
                     redact(settings_path), redact(state.get('vscode_source', 'the plugin path'))))
         return 0
     if args.action == 'install':
-        available = bool(shutil.which(cli))
-        if available and cli == 'copilot':
-            result = run([cli, '--version'])
-            available = result.returncode == 0 and 'not found' not in (result.stdout + result.stderr).lower()
+        available = copilot_available(cli) if cli == 'copilot' else bool(shutil.which(cli))
         manual = args.host == 'vscode' and not available
         source = 'HighwayofLife/agent-kaizen'
         if args.source == 'local':
@@ -347,7 +354,7 @@ def check(args, state, statefile, cli):
         rows.append(dict(id=name, status=status, detail=str(detail)))
     binary = shutil.which(cli)
     version = 'unavailable'
-    if binary:
+    if binary and (args.host != 'vscode' or copilot_available(cli)):
         result = run([cli, '--version'])
         version = (result.stdout or result.stderr).strip()
         add('cli', 'PASS' if result.returncode == 0 else 'FAIL', version)
