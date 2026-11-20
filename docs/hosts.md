@@ -37,7 +37,8 @@ Unless marked documented or unverified, these facts were probed as described abo
 These facts are documented, not probed, unless marked unverified.
 
 - Detect: skills use `/agent-kaizen:<name>`. Plugin hooks receive `PLUGIN_ROOT`, `COPILOT_PLUGIN_ROOT` and `CLAUDE_PLUGIN_ROOT`.
-- Install: `copilot plugin marketplace add HighwayofLife/agent-kaizen`, then `copilot plugin install agent-kaizen@agent-kaizen-tools`. The install is under `~/.copilot/installed-plugins/<marketplace>/<plugin>` or `$COPILOT_HOME`. In VS Code, enable `chat.plugins.enabled`, choose the Copilot session target, and run “Chat: Install Plugin from Source”; it also finds the Copilot CLI install.
+- Install: `copilot plugin marketplace add HighwayofLife/agent-kaizen`, then `copilot plugin install agent-kaizen@agent-kaizen-tools`. The install is under `~/.copilot/installed-plugins/<marketplace>/<plugin>` or `$COPILOT_HOME`. VS Code Agents app sessions use this Copilot CLI install and need the CLI installed and signed in. VS Code chat can instead enable `chat.plugins.enabled`, choose the Copilot session target, and run “Chat: Install Plugin from Source”; that install is for editor chat only.
+- A local-directory marketplace install is live: Copilot loads the plugin in place without copying it.
 - Config directory: `~/.copilot` or `$COPILOT_HOME`.
 - Instruction files: `AGENTS.md`, `.github/copilot-instructions.md`, `.github/instructions/*.instructions.md`, and `~/.copilot/copilot-instructions.md`.
 - Agents and hooks: agents use `.agent.md` files; whether plain `agents/kaizen-auditor.md` loads is unverified. Hooks use the plugin's `hooks/hooks.json`, `~/.copilot/hooks/*.json`, and `.github/hooks/*.json`. Claude's nested `matcher`/`hooks` layout is accepted. `sessionStart` uses only top-level `additionalContext`. Handling of `"async": true` is unverified. The Bash tool name may be `bash`; the hook accepts `bash` and `Bash`.

@@ -27,7 +27,8 @@ You are a coding agent running inside Codex CLI, GitHub Copilot CLI, or VS Code 
 - The host CLI, signed in if your host needs it:
   - Codex: `codex --version`.
   - Copilot CLI: `copilot --version`.
-  - VS Code: Copilot Chat signed in. The `copilot` CLI is optional. With it, `install` uses it. Without it, the human installs the plugin by hand (see VS Code below).
+  - VS Code Agents app: GitHub Copilot CLI installed and signed in (`copilot --version`).
+  - VS Code chat: Copilot Chat signed in; the Copilot CLI is not required.
 
 ## Step 0: find your phase
 
@@ -47,17 +48,15 @@ python3 tools/host-acceptance status --host HOST
 
 1. Run `python3 tools/host-acceptance install --host HOST`.
    - By default it copies this checkout to `~/.cache/agent-kaizen-acceptance/source` and installs from there. It never installs from the checkout itself, because Codex copies the whole folder it installs from.
-   - If it removes an existing `agent-kaizen-tools` marketplace first, that is expected.
+   - If it removes an existing `agent-kaizen-tools` marketplace first, it also uninstalls the plugin first; that is expected.
    - `--source github` installs from `HighwayofLife/agent-kaizen` instead. Use it only if the human asks.
    - It also turns on the hook trace by creating `~/.claude/agent-kaizen/host-trace/on`. While that file exists, each Agent Kaizen hook appends one line to `trace.jsonl` in the same folder. The line holds only the event name, the tool name, the payload's key names, and which plugin-root variables are set. It never holds payload values.
-2. VS Code without the `copilot` CLI: the command prints manual steps. Ask the human to do them:
-   1. Set `chat.plugins.enabled` to true.
-   2. Choose Copilot as the chat session target.
-   3. Run **Chat: Install Plugin from Source** with the folder or URL that was printed.
+2. For VS Code, ask the human whether they use the Agents app or the editor Chat view if unclear. The Agents app needs the signed-in Copilot CLI; install it and run `install` again if it is missing. For VS Code chat without the CLI, `install` registers the local plugin in each existing VS Code user settings directory and backs up any settings file it changes. Follow any printed instructions for settings that need manual attention, and choose Copilot as the chat session target. Use `--print-only` to print the manual install steps instead. If no VS Code data directory exists, or the source is GitHub, the command prints those steps.
 3. Stop and tell the human the next step `install` printed. Then end your turn. The human will:
    - Codex: quit Codex, start a new Codex session in this folder, run `/hooks`, and trust the Agent Kaizen hooks. Codex hooks do nothing until they are trusted.
    - Copilot CLI: quit and start a new Copilot CLI session in this folder.
-   - VS Code: run **Developer: Reload Window**, then open a new Copilot chat session.
+   - VS Code Agents app: start a new agent session.
+   - VS Code chat: run **Developer: Reload Window**, then open a new chat.
 
    Then they paste the same prompt again.
 
@@ -74,7 +73,7 @@ Run `status` first (Step 0). If it says Phase 2, make these observations in orde
    - You can't see your skill list: `skip:cannot-tell`.
 3. **Invoke a skill (`skill_invoked`).** Invoke the scan skill in demo mode:
    - Codex: `$agent-kaizen:scan --demo`.
-   - Copilot CLI and VS Code: `/agent-kaizen:scan --demo`. If the host only lets the human type slash commands, ask the human to type it.
+   - Copilot CLI and VS Code: `/agent-kaizen:scan --demo`. Type it in an interactive session: headless `copilot -p` does not run slash commands, and `/scan` without the prefix is unknown. Copilot hides user-only skills from the model.
 
    `pass` if the skill loaded and ran `scripts/kaizen-scan` and printed a demo scorecard, `fail` if the host did not find the skill or it errored. Put a short reason after a colon, for example `fail:skill-not-found`. This observation is required and cannot be skipped. If the host cannot invoke it, report `fail:<reason>`.
 4. **Trigger the shell hook.** Run one command through your host's shell tool, for example `git status`. This fires the after-tool hook. The prompt you were given has already fired the prompt-submit hook.
@@ -88,7 +87,7 @@ Run `status` first (Step 0). If it says Phase 2, make these observations in orde
    ```
 
    Each `VALUE` is `pass`, `fail` or `fail:<reason>`. The optional observations also accept `skip:<reason>`. The reason uses no spaces, for example `skip:no-audit-due`.
-   - If `installed` fails because the plugin is somewhere else (possible with a manual VS Code install), find the folder that holds `.claude-plugin/plugin.json` with `"name": "agent-kaizen"`. Re-run `check` with `--install-dir PATH`.
+   - If `installed` fails because the plugin is somewhere else (possible with a VS Code chat install), find the folder that holds `.claude-plugin/plugin.json` with `"name": "agent-kaizen"`. Re-run `check` with `--install-dir PATH`.
 6. **Turn the trace off:** `python3 tools/host-acceptance cleanup --host HOST`. This removes the trace switch only. It prints the uninstall command but does not run it. Leave the plugin installed unless the human asks.
 
 ## What the checks mean
@@ -99,7 +98,7 @@ Run `status` first (Step 0). If it says Phase 2, make these observations in orde
 | `installed` | The installed copy exists and its version equals this checkout's | Install failed, an older install is active, or it lives elsewhere (`--install-dir`) |
 | `files` | Every skill, hook, `hooks/hooks.json` and, on Codex, every `skills/*/agents/openai.yaml` was installed | The host copied only part of the plugin |
 | `scripts` | `kaizen-doctor`, `kaizen-scan` and `token-audit` from the installed copy run | Python missing or too old |
-| `doctor` | `kaizen-doctor` sees the install for this host; manual VS Code installs may skip this check | Install in an unexpected folder |
+| `doctor` | `kaizen-doctor` sees the install for this host; VS Code chat installs may skip this check | Install in an unexpected folder |
 | `hooks-offline` | The installed hooks give valid output for this host's sample payloads | A hook bug on this host |
 | `hooks-live:sessionStart` | This host ran the session-start hook; the report counts session starts | Codex: hooks not trusted in `/hooks`. Any host: the session started before the install. |
 | `hooks-live:userPromptSubmit` | This host ran the prompt-submit hook | Same as above |
@@ -109,6 +108,14 @@ Run `status` first (Step 0). If it says Phase 2, make these observations in orde
 Only trace lines from this host count. Multiple session starts mean several sessions contributed.
 
 The "Trace combinations" part of the report lists each distinct event, tool name and key set your host sent. Keep it even when everything passes: it records how your host shapes hook payloads.
+
+## Troubleshooting VS Code
+
+For VS Code chat, `install` registers the local source in user settings and backs up changed settings files. Run **Developer: Reload Window**, then open a new chat. Use `--print-only` for manual install instructions. Cleanup prints how to remove the registration or restore a backup.
+
+Local-directory marketplace installs are live: Copilot loads the plugin in place, and `check` reports that location.
+
+The Agents app runs a Copilot runtime agent host that loads plugins from `~/.copilot`, while an install from source in VS Code reaches editor chat. VS Code syncs MCP servers to the agent host, not plugins. Install and sign in to the GitHub Copilot CLI, then run the install again for Agents-app sessions.
 
 ## What to send back
 

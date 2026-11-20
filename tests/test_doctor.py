@@ -131,6 +131,61 @@ class DoctorTests(unittest.TestCase):
         (copilot / '.claude-plugin/plugin.json').write_text(json.dumps({'version': '0.0.1'}))
         self.assertIn('fix: copilot plugin install agent-kaizen@agent-kaizen-tools', self.doctor())
 
+    def test_copilot_live_marketplace_and_bad_settings(self):
+        copilot = Path(self.env['COPILOT_HOME'])
+        copilot.mkdir()
+        settings = copilot / 'settings.json'
+        settings.write_text(json.dumps({
+            'enabledPlugins': {'agent-kaizen@agent-kaizen-tools': True},
+            'extraKnownMarketplaces': {'agent-kaizen-tools': {'source': {
+                'source': 'directory', 'path': str(self.root)}}}}))
+        self.assertIn('PASS Copilot: plugin installed (live from local marketplace)', self.doctor())
+        manifest = self.root / '.claude-plugin/plugin.json'
+        data = json.loads(manifest.read_text())
+        data['version'] = '0.0.1'
+        manifest.write_text(json.dumps(data))
+        # Compare the live marketplace against a separate checkout.
+        checkout = self.home / 'checkout'
+        shutil.copytree(self.cache, checkout)
+        result = subprocess.run([sys.executable, str(self.root / 'scripts/kaizen-doctor'),
+                                 '--plugin-root', str(checkout), '--project', str(self.home)],
+                                env=self.env, capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('fix: update the local marketplace directory (see docs/hosts.md)', result.stdout)
+        settings.write_text(json.dumps({
+            'enabledPlugins': {'agent-kaizen@agent-kaizen-tools': True},
+            'extraKnownMarketplaces': {'agent-kaizen-tools': {'source': {
+                'source': 'directory', 'path': '~nosuchuser-xyz/mp'}}}}))
+        self.assertNotIn('Copilot: plugin installed', self.doctor())
+        self.env['COPILOT_HOME'] = '~nosuchuser-xyz/mp'
+        self.assertNotIn('Copilot: plugin installed', self.doctor())
+        self.env['COPILOT_HOME'] = str(copilot)
+        settings.write_text('{invalid')
+        self.assertNotIn('PASS Copilot:', self.doctor())
+
+    def test_live_manifest_unreadable_hint(self):
+        import contextlib
+        import io
+        import runpy
+        from unittest.mock import patch
+        module = runpy.run_path(str(self.root / 'scripts/kaizen-doctor'))
+        main = module['main']
+        globals_ = main.__globals__
+        original = globals_['read_json']
+        live = self.home / 'live'
+        def read_json(path):
+            if path == live / '.claude-plugin/plugin.json':
+                raise OSError('unreadable')
+            return original(path)
+        output = io.StringIO()
+        with patch.dict(os.environ, self.env, clear=True), patch.dict(globals_, {
+                'copilot_plugin': lambda home: (live, 'live'), 'read_json': read_json}), \
+                patch.object(sys, 'argv', ['kaizen-doctor', '--plugin-root', str(self.root),
+                                           '--project', str(self.home)]), contextlib.redirect_stdout(output):
+            main()
+        self.assertIn('manifest is missing or unreadable (live from local marketplace); fix: '
+                      'update the local marketplace directory (see docs/hosts.md)', output.getvalue())
+
     def test_empty_and_live_wal(self):
         wal = Path(str(self.db) + '-wal')
         wal.touch()

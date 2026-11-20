@@ -41,7 +41,8 @@ def safe_trace(value):
 
 def redact(value):
     if isinstance(value, str):
-        value = value.replace(str(HOME), '~')
+        value = re.sub(re.escape(str(HOME)), lambda _: '~', value, flags=re.IGNORECASE)
+        value = re.sub(r'[A-Za-z]:\\Users\\[^\\\n]+', lambda _: '~', value, flags=re.IGNORECASE)
         return re.sub(r'/(?:Users|home)/[^/\n]+', '~', value)
     if isinstance(value, list):
         return [redact(item) for item in value]
@@ -58,6 +59,191 @@ def observe(value):
     return name, status.upper(), note
 
 
+def copilot_plugin(home):
+    installed = home / 'installed-plugins/agent-kaizen-tools/agent-kaizen'
+    if installed.is_dir():
+        return installed, 'installed'
+    try:
+        settings = json.loads((home / 'settings.json').read_text(encoding='utf-8'))
+        if settings['enabledPlugins']['agent-kaizen@agent-kaizen-tools'] is not True:
+            return None, None
+        source = settings['extraKnownMarketplaces']['agent-kaizen-tools']['source']
+        if source['source'] != 'directory' or not isinstance(source['path'], str):
+            return None, None
+        marketplace = Path(source['path']).expanduser()
+        entries = json.loads((marketplace / '.claude-plugin/marketplace.json').read_text(encoding='utf-8'))['plugins']
+        for entry in entries:
+            if entry.get('name') == 'agent-kaizen':
+                plugin_source = entry.get('source', './')
+                if not isinstance(plugin_source, str):
+                    return None, None
+                root = marketplace / plugin_source
+                manifest = json.loads((root / '.claude-plugin/plugin.json').read_text(encoding='utf-8'))
+                if manifest.get('name') == 'agent-kaizen':
+                    return root, 'live'
+                return None, None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError):
+        pass
+    return None, None
+
+
+def vscode_roots():
+    override = os.environ.get('KAIZEN_VSCODE_DATA_DIRS')
+    if override is not None:
+        roots = [Path(p) for p in override.split(os.pathsep) if p]
+    elif sys.platform == 'darwin':
+        roots = [HOME / 'Library/Application Support' / name for name in ('Code', 'Code - Insiders')]
+    elif sys.platform == 'win32':
+        roots = [Path(os.environ.get('APPDATA') or HOME / 'AppData/Roaming') / name for name in ('Code', 'Code - Insiders')]
+    else:
+        config = Path(os.environ.get('XDG_CONFIG_HOME') or HOME / '.config')
+        roots = [config / name for name in ('Code', 'Code - Insiders')]
+    return roots
+
+
+def vscode_installs():
+    matches = []
+    for root in vscode_roots():
+        for manifest in root.glob('agentPlugins/*/*/.claude-plugin/plugin.json'):
+            try:
+                if json.loads(manifest.read_text()).get('name') == 'agent-kaizen':
+                    matches.append((manifest.stat().st_mtime_ns, manifest.parent.parent, root))
+            except (OSError, ValueError, AttributeError):
+                continue
+    return max(matches, key=lambda item: item[0]) if matches else None
+
+
+def jsonc_clean(text):
+    """Mask comments and trailing commas without moving JSON token offsets."""
+    chars = list(text)
+    i = 0
+    in_string = False
+    while i < len(text):
+        if in_string:
+            if text[i] == '\\':
+                i += 2
+                continue
+            if text[i] == '"':
+                in_string = False
+        elif text[i] == '"':
+            in_string = True
+        elif text.startswith('//', i) or text.startswith('/*', i):
+            block = text[i + 1] == '*'
+            end = text.find('*/' if block else '\n', i + 2)
+            if block and end < 0:
+                raise ValueError('unterminated comment')
+            end = len(text) if end < 0 else end + (2 if block else 0)
+            for j in range(i, end):
+                if text[j] not in '\r\n':
+                    chars[j] = ' '
+            i = end
+            continue
+        i += 1
+    masked = ''.join(chars)
+    # Only commas outside strings remain candidates; scan strings again.
+    i = 0
+    while i < len(masked):
+        if masked[i] == '"':
+            _, i = json.JSONDecoder().raw_decode(masked, i)
+            continue
+        if masked[i] == ',':
+            j = i + 1
+            while j < len(masked) and masked[j].isspace():
+                j += 1
+            if j < len(masked) and masked[j] in '}]':
+                chars[i] = ' '
+        i += 1
+    return ''.join(chars)
+
+
+def object_members(clean, start):
+    """Return member value offsets for a parsed object."""
+    decoder = json.JSONDecoder()
+    members = {}
+    i = start + 1
+    while True:
+        while i < len(clean) and clean[i].isspace():
+            i += 1
+        if clean[i] == '}':
+            return members
+        key, i = decoder.raw_decode(clean, i)
+        while clean[i].isspace():
+            i += 1
+        i += 1  # colon
+        while clean[i].isspace():
+            i += 1
+        value_start = i
+        _, i = decoder.raw_decode(clean, i)
+        members[key] = value_start
+        while clean[i].isspace():
+            i += 1
+        if clean[i] == ',':
+            i += 1
+
+
+def register_vscode_settings(path, source):
+    if path.exists():
+        with path.open(encoding='utf-8', newline='') as handle:
+            old = handle.read()
+    else:
+        old = None
+    original = old if old is not None else '{}\n'
+    manual = 'Set chat.plugins.enabled to true and add {}: true to chat.pluginLocations in {}.'.format(
+        redact(json.dumps(str(source))), redact(str(path)))
+    try:
+        clean = jsonc_clean(original)
+        settings = json.loads(clean)
+        if not isinstance(settings, dict):
+            raise ValueError('settings must be an object')
+        start = clean.index('{')
+        members = object_members(clean, start)
+    except (ValueError, IndexError):
+        print('Invalid VS Code settings. ' + manual)
+        print('VS Code settings unchanged: {} (backup: none)'.format(redact(str(path))))
+        return False
+    inserts = []
+    enabled = settings.get('chat.plugins.enabled')
+    if 'chat.plugins.enabled' not in settings:
+        inserts.append('"chat.plugins.enabled": true')
+    elif enabled is not True:
+        print('Set chat.plugins.enabled to true in {}.'.format(redact(str(path))))
+    locations = settings.get('chat.pluginLocations')
+    key = json.dumps(str(source))
+    if 'chat.pluginLocations' not in settings:
+        inserts.append('"chat.pluginLocations": {\n        ' + key + ': true\n    }')
+    elif not isinstance(locations, dict) or (str(source) in locations and locations[str(source)] is not True):
+        print('Set {}: true in chat.pluginLocations in {}.'.format(redact(key), redact(str(path))))
+    elif str(source) not in locations:
+        offset = members['chat.pluginLocations'] + 1
+        entry = '\n        ' + key + ': true' + (',' if locations else '')
+        original = original[:offset] + entry + original[offset:]
+    if inserts:
+        entry = '\n    ' + ',\n    '.join(inserts) + (',' if settings else '')
+        original = original[:start + 1] + entry + original[start + 1:]
+    # A conflicting setting remains a human action, so do not record it as correct.
+    correct = (enabled is True or 'chat.plugins.enabled' not in settings) and (
+        'chat.pluginLocations' not in settings or
+        isinstance(locations, dict) and (str(source) not in locations or locations[str(source)] is True))
+    if old == original:
+        print('VS Code settings unchanged: {} (backup: none)'.format(redact(str(path))))
+    else:
+        backup = None
+        if old is not None:
+            stamp = datetime.datetime.now(datetime.timezone.utc)
+            while True:
+                backup = path.with_name(path.name + '.bak-agent-kaizen-' + stamp.strftime('%Y%m%d%H%M%S'))
+                if not backup.exists():
+                    break
+                stamp += datetime.timedelta(seconds=1)
+            shutil.copy2(path, backup)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open('w', encoding='utf-8', newline='') as handle:
+            handle.write(original)
+        print('VS Code settings changed: {} (backup: {})'.format(
+            redact(str(path)), redact(str(backup)) if backup else 'none'))
+    return correct or old != original
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest='action', required=True)
@@ -66,6 +252,7 @@ def main():
         p.add_argument('--host', required=True, choices=('codex', 'copilot-cli', 'vscode'))
         if action == 'install':
             p.add_argument('--source', choices=('local', 'github'), default='local')
+            p.add_argument('--print-only', action='store_true', help='print VS Code manual install instructions without editing settings')
         if action == 'check':
             p.add_argument('--install-dir', type=Path)
             p.add_argument('--observe', action='append', type=observe, default=[],
@@ -88,22 +275,45 @@ def main():
     if args.action == 'cleanup':
         (TRACE / 'on').unlink(missing_ok=True)
         print('Trace disabled. Uninstall with: {} plugin {} agent-kaizen@agent-kaizen-tools'.format(cli, 'remove' if cli == 'codex' else 'uninstall'))
+        if args.host == 'vscode':
+            for settings_path in state.get('vscode_settings', []):
+                print('In {}, remove {} from chat.pluginLocations, or restore the backup.'.format(
+                    redact(settings_path), redact(state.get('vscode_source', 'the plugin path'))))
         return 0
     if args.action == 'install':
-        manual = args.host == 'vscode' and not shutil.which(cli)
+        available = bool(shutil.which(cli))
+        if available and cli == 'copilot':
+            result = run([cli, '--version'])
+            available = result.returncode == 0 and 'not found' not in (result.stdout + result.stderr).lower()
+        manual = args.host == 'vscode' and not available
         source = 'HighwayofLife/agent-kaizen'
         if args.source == 'local':
             source = Path(os.environ.get('XDG_CACHE_HOME') or HOME / '.cache') / 'agent-kaizen-acceptance/source'
+            if manual:
+                source = source.absolute()
             export_source(source)
+        vscode_settings = []
         if manual:
-            print('In VS Code enable chat.plugins.enabled, choose the Copilot session target, and run Chat: Install Plugin from Source using {}.'.format(source))
+            print('VS Code Agents app: The Agents app loads plugins only from the Copilot CLI install (~/.copilot). Install GitHub Copilot CLI (see https://docs.github.com/en/copilot/how-tos/copilot-cli/set-up-copilot-cli/install-copilot-cli), sign in, then run install again.')
+            roots = [root for root in vscode_roots() if root.is_dir()]
+            if args.print_only or not roots or args.source != 'local':
+                print('VS Code chat: In VS Code enable chat.plugins.enabled, choose the Copilot session target, and run Chat: Install Plugin from Source using {}.'.format(redact(str(source))))
+            else:
+                for root in roots:
+                    settings_path = root / 'User/settings.json'
+                    if register_vscode_settings(settings_path, source):
+                        vscode_settings.append(str(settings_path))
+                print('VS Code may ask you to trust the folder because chat.pluginLocations is a restricted setting.')
         else:
-            if not shutil.which(cli):
+            if not available:
                 print('Missing {} CLI; install it and sign in first.'.format(cli), file=sys.stderr)
                 return 1
+            statefile.unlink(missing_ok=True)
             # Discover removal syntax from the CLI rather than assuming it.
             helptext = run([cli, 'plugin', 'marketplace', '--help']).stdout
             if 'remove' in helptext:
+                # Copilot refuses to remove a marketplace while its plugin is installed.
+                run([cli, 'plugin', 'remove' if cli == 'codex' else 'uninstall', 'agent-kaizen@agent-kaizen-tools'])
                 run([cli, 'plugin', 'marketplace', 'remove', 'agent-kaizen-tools'])
             else:
                 print('If the marketplace already exists, remove it using {} plugin marketplace --help first.'.format(cli))
@@ -117,11 +327,15 @@ def main():
         (TRACE / 'trace.jsonl').write_text('')
         (TRACE / 'on').touch()
         state = {'installed_at': datetime.datetime.now(datetime.timezone.utc).isoformat(), 'install': 'manual' if manual else args.source}
+        if manual:
+            state['vscode_settings'] = vscode_settings
+            if vscode_settings:
+                state['vscode_source'] = str(source)
         statefile.parent.mkdir(parents=True, exist_ok=True)
         statefile.write_text(json.dumps(state, indent=2) + '\n')
         nxt = {'codex': 'quit Codex, start a new Codex session in this folder, run /hooks and trust the Agent Kaizen hooks.',
                'copilot-cli': 'quit Copilot CLI and start a new Copilot CLI session in this folder.',
-               'vscode': 'run "Developer: Reload Window" in VS Code, then open a new Copilot chat session.'}[args.host]
+               'vscode': 'start a new Agents app session, or for VS Code chat run "Developer: Reload Window" then open a new chat.'}[args.host]
         print('Phase 1 done. Stop here and tell the human to ' + nxt + ' Then paste the same prompt again to run phase 2.')
         return 0
     return check(args, state, statefile, cli)
@@ -139,11 +353,31 @@ def check(args, state, statefile, cli):
         add('cli', 'PASS' if result.returncode == 0 else 'FAIL', version)
     else:
         add('cli', 'SKIP' if args.host == 'vscode' else 'FAIL', 'CLI not found')
-    base = Path(os.environ.get('CODEX_HOME') or HOME / '.codex') / 'plugins/cache/agent-kaizen-tools/agent-kaizen' / VERSION if cli == 'codex' else Path(os.environ.get('COPILOT_HOME') or HOME / '.copilot') / 'installed-plugins/agent-kaizen-tools/agent-kaizen'
+    copilot_home = Path(os.environ.get('COPILOT_HOME') or HOME / '.copilot')
+    try:
+        copilot_home = copilot_home.expanduser()
+    except RuntimeError:
+        pass
+    copilot_root, kind = copilot_plugin(copilot_home) if cli == 'copilot' else (None, None)
+    base = (Path(os.environ.get('CODEX_HOME') or HOME / '.codex') / 'plugins/cache/agent-kaizen-tools/agent-kaizen' / VERSION if cli == 'codex' else copilot_root or copilot_home / 'installed-plugins/agent-kaizen-tools/agent-kaizen')
+    chat_match = vscode_installs() if args.host == 'vscode' and args.install_dir is None else None
     installed = args.install_dir or base
+    chat_install = False
+    if chat_match and not copilot_root:
+        installed = chat_match[1]
+        chat_install = True
+    elif args.host == 'vscode' and args.install_dir is not None:
+        chat_install = 'agentPlugins' in installed.parts
+    location = 'VS Code chat: ' + str(chat_match[2] / 'agentPlugins/<install>') if chat_install and chat_match else str(installed)
+    if kind == 'live' and args.install_dir is None and not chat_install:
+        location = 'live plugin from ' + location
+    if chat_install and not chat_match:
+        location = str(Path(*installed.parts[:installed.parts.index('agentPlugins') + 1]) / '<install>')
+    if chat_match and not chat_install:
+        location += '; VS Code chat install also found at ' + str(chat_match[2] / 'agentPlugins/<install>')
     try:
         actual = json.loads((installed / '.claude-plugin/plugin.json').read_text())['version']
-        add('installed', 'PASS' if actual == VERSION else 'FAIL', 'installed {}, checkout {}'.format(actual, VERSION))
+        add('installed', 'PASS' if actual == VERSION else 'FAIL', 'installed {}, checkout {}; location: {}'.format(actual, VERSION, location))
     except (OSError, ValueError, KeyError) as exc:
         add('installed', 'FAIL', exc)
     files = list(ROOT.glob('skills/*/SKILL.md')) + list(ROOT.glob('hooks/*.sh')) + list(ROOT.glob('hooks/lib/*.sh')) + [ROOT / 'hooks/hooks.json']
@@ -161,7 +395,7 @@ def check(args, state, statefile, cli):
         except (OSError, subprocess.SubprocessError):
             errors.append(script)
     add('scripts', 'FAIL' if errors else 'PASS', ', '.join(errors) or 'help commands passed')
-    manual = args.host == 'vscode' and (state.get('install') == 'manual' or args.install_dir is not None)
+    manual = args.host == 'vscode' and (state.get('install') == 'manual' or args.install_dir is not None or chat_install)
     try:
         result = run([sys.executable, installed / 'scripts/kaizen-doctor'])
         match = 'Codex: plugin version' if cli == 'codex' else 'Copilot: plugin installed'
@@ -234,9 +468,12 @@ def check(args, state, statefile, cli):
     sessions = sum(str(t.get('event', '')).lower() == 'sessionstart' for t in traces)
     for event in ('sessionStart', 'userPromptSubmit', 'postToolUse'):
         found = any(str(t.get('event', '')).lower() == event.lower() and (event != 'postToolUse' or str(t.get('tool', '')).lower() in ('bash', 'shell', 'shell_command', 'powershell')) for t in traces)
-        hint = ('seen: ' + str(seen) if traces else
+        hint = ('install has not completed; run install again and read its errors' if not state.get('installed_at') else
+                'seen: ' + str(seen) if traces else
                 'no {} lines; seen hosts: {}'.format(cli, ', '.join(hosts)) if hosts else
                 'hooks not trusted in /hooks or session started before install' if cli == 'codex' else 'hooks not loaded')
+        if state.get('installed_at') and chat_install and not traces and not hosts:
+            hint += '; plugin is installed for VS Code chat only; Agents-app sessions load plugins from ~/.copilot (install the Copilot CLI)'
         detail = 'observed' if found else hint
         if event == 'sessionStart':
             detail += '; {} sessionStart lines{}'.format(sessions, ' (multiple sessions contributed)' if sessions > 1 else '')

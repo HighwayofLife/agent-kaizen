@@ -32,6 +32,34 @@ def read_json(path):
         return json.load(stream)
 
 
+def copilot_plugin(home):
+    installed = home / 'installed-plugins/agent-kaizen-tools/agent-kaizen'
+    if installed.is_dir():
+        return installed, 'installed'
+    try:
+        settings = json.loads((home / 'settings.json').read_text(encoding='utf-8'))
+        if settings['enabledPlugins']['agent-kaizen@agent-kaizen-tools'] is not True:
+            return None, None
+        source = settings['extraKnownMarketplaces']['agent-kaizen-tools']['source']
+        if source['source'] != 'directory' or not isinstance(source['path'], str):
+            return None, None
+        marketplace = Path(source['path']).expanduser()
+        entries = json.loads((marketplace / '.claude-plugin/marketplace.json').read_text(encoding='utf-8'))['plugins']
+        for entry in entries:
+            if entry.get('name') == 'agent-kaizen':
+                plugin_source = entry.get('source', './')
+                if not isinstance(plugin_source, str):
+                    return None, None
+                root = marketplace / plugin_source
+                manifest = json.loads((root / '.claude-plugin/plugin.json').read_text(encoding='utf-8'))
+                if manifest.get('name') == 'agent-kaizen':
+                    return root, 'live'
+                return None, None
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, RuntimeError):
+        pass
+    return None, None
+
+
 def command(args, timeout=10):
     try:
         return subprocess.run(args, capture_output=True, text=True, timeout=timeout)
@@ -61,9 +89,13 @@ def main():
         versions = sorted(p.name for p in cache.iterdir() if p.is_dir())
     except OSError:
         versions = []
-    copilot = Path(os.environ.get('COPILOT_HOME') or Path.home() / '.copilot').expanduser()
-    installed_copilot = copilot / 'installed-plugins' / marketplace / plugin_name
-    copilot_present = installed_copilot.is_dir()
+    copilot = Path(os.environ.get('COPILOT_HOME') or Path.home() / '.copilot')
+    try:
+        copilot = copilot.expanduser()
+    except RuntimeError:
+        pass
+    installed_copilot, copilot_kind = copilot_plugin(copilot)
+    copilot_present = installed_copilot is not None
     neutral = not (HOME / 'plugins/installed_plugins.json').exists() and (bool(versions) or copilot_present)
     neutral_fix = "update the plugin with your host's plugin command (see docs/hosts.md)"
     if versions:
@@ -82,14 +114,17 @@ def main():
             copilot_version = read_json(installed_copilot / '.claude-plugin/plugin.json')['version']
         except (OSError, ValueError, KeyError, TypeError):
             copilot_version = None
+        live_detail = ' (live from local marketplace)' if copilot_kind == 'live' else ''
+        copilot_fix = ('update the local marketplace directory (see docs/hosts.md)' if copilot_kind == 'live' else
+                       'copilot plugin install {}@{}'.format(plugin_name, marketplace))
         if copilot_version is None:
-            emit('WARN', 'Copilot: plugin folder found but its manifest is missing or unreadable',
-                 'copilot plugin install {}@{}'.format(plugin_name, marketplace))
+            emit('WARN', 'Copilot: plugin folder found but its manifest is missing or unreadable' + live_detail,
+                 copilot_fix)
         elif copilot_version != version:
-            emit('WARN', 'Copilot: installed version(s) {} differ from plugin root {}'.format(copilot_version, version),
-                 'copilot plugin install {}@{}'.format(plugin_name, marketplace))
+            emit('WARN', 'Copilot: installed version(s) {} differ from plugin root {}'.format(copilot_version, version) + live_detail,
+                 copilot_fix)
         else:
-            emit('PASS', 'Copilot: plugin installed')
+            emit('PASS', 'Copilot: plugin installed' + (' (live from local marketplace)' if copilot_kind == 'live' else ''))
     if not neutral:
         link = root / 'scripts/kaizen-link'
         fix_link = 'kaizen-link --check --plugin-root DIR'
